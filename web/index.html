@@ -18,15 +18,6 @@
     </header>
 
     <main>
-      <section class="hero">
-        <p class="eyebrow">Experimental · runs locally</p>
-        <h1>Fold a protein<br /><span>in your browser.</span></h1>
-        <p class="lede">AlphaFold2 model-1 PTM inference on WebGPU. Your sequence, MSA, and prediction stay on this device.</p>
-        <div id="gpu-summary" class="capability" data-state="checking">
-          <span class="capability-dot"></span><span>Checking WebGPU compatibility…</span>
-        </div>
-      </section>
-
       <section class="workspace" aria-labelledby="prediction-heading">
         <div class="panel input-panel">
           <div class="panel-heading">
@@ -116,9 +107,18 @@
         <div id="status" data-state="idle">Ready</div><pre id="result">Waiting for a run.</pre>
       </details>
 
-      <section class="about">
-        <h2>Browser-native, not a remote GPU queue.</h2>
-        <p>The TypeScript runtime preprocesses inputs and orchestrates inference. All learned AlphaFold operations execute as WGSL compute shaders on your local GPU. Custom A3M upload is supported now; MMseqs2 search, multimer models, templates, relaxation, and model ensembling remain to be implemented.</p>
+      <section class="about" aria-labelledby="about-heading">
+        <div>
+          <p class="eyebrow">Experimental · runs locally</p>
+          <h2 id="about-heading">Fold a protein in your browser.</h2>
+        </div>
+        <div class="about-copy">
+          <p>AlphaFold2 model-1 PTM inference on WebGPU. Your sequence, MSA, and prediction stay on this device.</p>
+          <p>The TypeScript runtime preprocesses inputs and orchestrates inference. All learned AlphaFold operations execute as WGSL compute shaders on your local GPU. Custom A3M upload is supported now; MMseqs2 search, multimer models, templates, relaxation, and model ensembling remain to be implemented.</p>
+          <div id="gpu-summary" class="capability" data-state="checking">
+            <span class="capability-dot"></span><span>Checking WebGPU compatibility…</span>
+          </div>
+        </div>
       </section>
     </main>
     <footer><span>AlphaFold2 WebGPU · experimental research software</span><span>AlphaFold parameters: CC BY 4.0</span></footer>
