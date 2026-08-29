@@ -3,6 +3,7 @@ import { makeA3mFeatures } from "../src/input/a3m-features.js";
 import { parseA3m } from "../src/input/a3m.js";
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { HttpTensorStore } from "../src/reference/http-tensor-store.js";
+import type { TensorDownloadProgress } from "../src/reference/http-tensor-store.js";
 import { requestAlphaFoldDevice } from "../src/runtime/device.js";
 import { createDeterministicTriangleInput } from "../src/testing/deterministic-input.js";
 import { triangleMultiplicationOutgoingReference } from "../src/triangle/cpu-reference.js";
@@ -67,6 +68,20 @@ function resetStages(): void {
     const small = item.querySelector("small");
     if (small !== null) small.textContent = "Waiting";
   }
+  const progress = element<HTMLProgressElement>("model-progress");
+  progress.value = 0;
+  element<HTMLElement>("model-progress-wrap").hidden = true;
+  element<HTMLElement>("model-progress-label").textContent = "0%";
+}
+
+function updateModelProgress(value: TensorDownloadProgress): void {
+  const fraction = value.totalBytes === 0 ? 0 : value.loadedBytes / value.totalBytes;
+  element<HTMLElement>("model-progress-wrap").hidden = false;
+  element<HTMLProgressElement>("model-progress").value = fraction;
+  const loaded = value.loadedBytes / 1024 / 1024;
+  const total = value.totalBytes / 1024 / 1024;
+  element<HTMLElement>("model-progress-label").textContent = `${Math.floor(fraction * 100)}%`;
+  stage("model", "active", `${loaded.toFixed(0)} / ${total.toFixed(0)} MiB · ${value.loadedTensors}/${value.totalTensors}`);
 }
 
 function setPredictionStatus(text: string, state = "running"): void {
@@ -231,7 +246,7 @@ async function runPrediction(): Promise<void> {
     const manifestValue = element<HTMLInputElement>("model-url").value.trim();
     if (manifestValue === "") throw new Error("A model manifest URL is required");
     localStorage.setItem("afwebgpu.modelUrl", manifestValue);
-    const fixture = AlphaFoldFixture.fromStore(await HttpTensorStore.open(manifestValue));
+    const fixture = AlphaFoldFixture.fromStore(await HttpTensorStore.open(manifestValue, updateModelProgress));
     const [embedding, template, extraStack, mainStack, structure, confidence, geometry, featureTables, paeBreaks] = await Promise.all([
       fixture.embeddingWeights(), fixture.templateWeights(), fixture.extraStackWeights(), fixture.mainStackWeights(),
       fixture.structureWeights(), fixture.confidenceWeights(), fixture.geometryTables(), fixture.queryOnlyFeatureTables(),

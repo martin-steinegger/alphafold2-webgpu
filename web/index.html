@@ -69,7 +69,12 @@
           <div class="panel-heading"><div><span class="step">02</span><h2>Run</h2></div></div>
           <ol id="run-stages" class="stages">
             <li data-stage="device"><span>1</span><div><strong>WebGPU device</strong><small>Waiting</small></div></li>
-            <li data-stage="model"><span>2</span><div><strong>Model weights</strong><small>Waiting</small></div></li>
+            <li data-stage="model"><span>2</span><div><strong>Model weights</strong><small>Waiting</small>
+              <div id="model-progress-wrap" class="model-progress" hidden>
+                <progress id="model-progress" max="1" value="0"></progress>
+                <small id="model-progress-label">0%</small>
+              </div>
+            </div></li>
             <li data-stage="features"><span>3</span><div><strong>Input features</strong><small>Waiting</small></div></li>
             <li data-stage="inference"><span>4</span><div><strong>AF2 inference</strong><small>Waiting</small></div></li>
             <li data-stage="results"><span>5</span><div><strong>Results</strong><small>Waiting</small></div></li>

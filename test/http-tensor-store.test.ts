@@ -17,9 +17,13 @@ describe("HttpTensorStore", () => {
       active -= 1;
       return new Response(Float32Array.of(1));
     }));
-    const store = await HttpTensorStore.open(new URL("https://example.test/model/manifest.json"));
+    const progress: { loadedBytes: number; loadedTensors: number }[] = [];
+    const store = await HttpTensorStore.open(new URL("https://example.test/model/manifest.json"), (value) => {
+      progress.push({ loadedBytes: value.loadedBytes, loadedTensors: value.loadedTensors });
+    });
     await Promise.all(Object.keys(tensors).map((name) => store.tensor(name)));
     expect(maximum).toBe(8);
+    expect(progress.at(-1)).toEqual({ loadedBytes: 80, loadedTensors: 20 });
   });
 
   it("retries transient tensor responses", async () => {

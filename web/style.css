@@ -61,6 +61,12 @@ input:disabled, select:disabled { color: #71877f; }
 .stages li[data-state="active"] strong, .stages li[data-state="done"] strong { color: var(--ink); }
 .stages li[data-state="done"] > span { color: var(--accent); border-color: #4a8a76; }
 .stages li[data-state="error"] > span { color: var(--danger); border-color: var(--danger); }
+.model-progress { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: .55rem; margin-top: .55rem; }
+.model-progress progress { width: 100%; height: 5px; border: 0; border-radius: 20px; overflow: hidden; background: #1b332c; }
+.model-progress progress::-webkit-progress-bar { background: #1b332c; }
+.model-progress progress::-webkit-progress-value { background: var(--accent); transition: width .18s ease; }
+.model-progress progress::-moz-progress-bar { background: var(--accent); }
+.model-progress small { min-width: 38px; margin: 0; color: #83a398; text-align: right; font-size: .56rem; }
 .run-status { padding-top: 1rem; border-top: 1px solid var(--line); color: var(--accent); font-size: .78rem; font-weight: 600; }
 .run-status[data-state="failed"] { color: var(--danger); }
 .run-log { max-height: 190px; margin: .8rem 0 0; padding: 0; white-space: pre-wrap; overflow: auto; background: transparent; color: #6f877e; font: .65rem/1.65 "DM Mono", monospace; }

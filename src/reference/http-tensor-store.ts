@@ -3,6 +3,16 @@ import type { BinaryTensorManifest } from "./tensor-store.js";
 const MAX_CONCURRENT_DOWNLOADS = 8;
 const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
 
+export interface TensorDownloadProgress {
+  readonly loadedBytes: number;
+  readonly totalBytes: number;
+  readonly loadedTensors: number;
+  readonly totalTensors: number;
+  readonly tensorName?: string;
+}
+
+export type TensorDownloadProgressCallback = (progress: TensorDownloadProgress) => void;
+
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
@@ -26,16 +36,29 @@ export class HttpTensorStore {
   readonly manifest: BinaryTensorManifest;
   readonly #cache = new Map<string, Promise<Float32Array>>();
   readonly #pending: (() => void)[] = [];
+  readonly #onProgress: TensorDownloadProgressCallback | undefined;
+  readonly #totalBytes: number;
+  readonly #totalTensors: number;
   #activeDownloads = 0;
-  private constructor(manifestUrl: URL, manifest: BinaryTensorManifest) {
-    this.manifestUrl = manifestUrl; this.manifest = manifest;
+  #loadedBytes = 0;
+  #loadedTensors = 0;
+  private constructor(manifestUrl: URL, manifest: BinaryTensorManifest, onProgress?: TensorDownloadProgressCallback) {
+    this.manifestUrl = manifestUrl; this.manifest = manifest; this.#onProgress = onProgress;
+    const records = Object.values(manifest.tensors);
+    this.#totalTensors = records.length;
+    this.#totalBytes = records.reduce(
+      (sum, record) => sum + record.shape.reduce((product, dimension) => product * dimension, 1) * 4, 0,
+    );
   }
-  static async open(manifestUrlValue: URL | string): Promise<HttpTensorStore> {
+  static async open(manifestUrlValue: URL | string,
+    onProgress?: TensorDownloadProgressCallback): Promise<HttpTensorStore> {
     const manifestUrl = typeof manifestUrlValue === "string" ? new URL(manifestUrlValue, location.href) : manifestUrlValue;
     const response = await fetchWithRetry(manifestUrl, "model manifest");
     const manifest = await response.json() as BinaryTensorManifest;
     if (manifest.tensors === undefined) throw new Error("model manifest has no tensor table");
-    return new HttpTensorStore(manifestUrl, manifest);
+    const store = new HttpTensorStore(manifestUrl, manifest, onProgress);
+    store.#reportProgress();
+    return store;
   }
   tensor(name: string): Promise<Float32Array> {
     let value = this.#cache.get(name);
@@ -66,6 +89,17 @@ export class HttpTensorStore {
     const buffer = await response.arrayBuffer();
     const elements = record.shape.reduce((product, value) => product * value, 1);
     if (buffer.byteLength !== elements * 4) throw new Error(`${name} has an invalid byte length`);
+    this.#loadedBytes += buffer.byteLength;
+    this.#loadedTensors += 1;
+    this.#reportProgress(name);
     return new Float32Array(buffer);
+  }
+  #reportProgress(tensorName?: string): void {
+    const progress = {
+      loadedBytes: this.#loadedBytes, totalBytes: this.#totalBytes,
+      loadedTensors: this.#loadedTensors, totalTensors: this.#totalTensors,
+      ...(tensorName === undefined ? {} : { tensorName }),
+    };
+    this.#onProgress?.(progress);
   }
 }
