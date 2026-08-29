@@ -1,0 +1,5183 @@
+{
+  "formatVersion": 1,
+  "operator": "TriangleMultiplicationOutgoing",
+  "source": "AlphaFold model_1_ptm query-only MSA, recycle 3, main Evoformer block 0",
+  "sequence": {
+    "name": "user-query",
+    "aminoAcids": "PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK"
+  },
+  "input": {
+    "kind": "query-only",
+    "msaDepth": 1,
+    "maxSeq": 5,
+    "maxExtraSeq": 1
+  },
+  "model": {
+    "name": "model_1",
+    "block": 0,
+    "recycles": 3,
+    "capturedRecycle": 3
+  },
+  "referencePrediction": {
+    "meanPlddt": 64.5,
+    "rankingConfidence": 64.5,
+    "recycleIteration": 3,
+    "recycleMetrics": [
+      {
+        "recycle": 0,
+        "meanPlddt": 57.0,
+        "rankingConfidence": 57.0,
+        "ptm": 0.3759765625,
+        "tol": 17.65625
+      },
+      {
+        "recycle": 1,
+        "meanPlddt": 60.90625,
+        "rankingConfidence": 60.90625,
+        "ptm": 0.41064453125,
+        "tol": 1.5146484375
+      },
+      {
+        "recycle": 2,
+        "meanPlddt": 62.84375,
+        "rankingConfidence": 62.84375,
+        "ptm": 0.4169921875,
+        "tol": 0.7099609375
+      },
+      {
+        "recycle": 3,
+        "meanPlddt": 64.5,
+        "rankingConfidence": 64.5,
+        "ptm": 0.4345703125,
+        "tol": 0.235107421875
+      }
+    ]
+  },
+  "shape": {
+    "length": 59,
+    "cZ": 128,
+    "cHidden": 128
+  },
+  "epsilon": 1e-05,
+  "tensors": {
+    "z": {
+      "file": "z.f32.bin",
+      "shape": [
+        59,
+        59,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "mask": {
+      "file": "mask.f32.bin",
+      "shape": [
+        59,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "expected": {
+      "file": "expected.f32.bin",
+      "shape": [
+        59,
+        59,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "blockInputMsa": {
+      "file": "blockInputMsa.f32.bin",
+      "shape": [
+        5,
+        59,
+        256
+      ],
+      "dtype": "float32"
+    },
+    "blockInputPair": {
+      "file": "blockInputPair.f32.bin",
+      "shape": [
+        59,
+        59,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "blockMsaMask": {
+      "file": "blockMsaMask.f32.bin",
+      "shape": [
+        5,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "blockPairMask": {
+      "file": "blockPairMask.f32.bin",
+      "shape": [
+        59,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "blockExpectedMsa": {
+      "file": "blockExpectedMsa.f32.bin",
+      "shape": [
+        5,
+        59,
+        256
+      ],
+      "dtype": "float32"
+    },
+    "blockExpectedPair": {
+      "file": "blockExpectedPair.f32.bin",
+      "shape": [
+        59,
+        59,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stackRecycle0InputMsa": {
+      "file": "stackRecycle0InputMsa.f32.bin",
+      "shape": [
+        5,
+        59,
+        256
+      ],
+      "dtype": "float32"
+    },
+    "stackRecycle0InputPair": {
+      "file": "stackRecycle0InputPair.f32.bin",
+      "shape": [
+        59,
+        59,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stackRecycle0ExpectedMsa": {
+      "file": "stackRecycle0ExpectedMsa.f32.bin",
+      "shape": [
+        5,
+        59,
+        256
+      ],
+      "dtype": "float32"
+    },
+    "stackRecycle0ExpectedPair": {
+      "file": "stackRecycle0ExpectedPair.f32.bin",
+      "shape": [
+        59,
+        59,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stackRecycle1InputMsa": {
+      "file": "stackRecycle1InputMsa.f32.bin",
+      "shape": [
+        5,
+        59,
+        256
+      ],
+      "dtype": "float32"
+    },
+    "stackRecycle1InputPair": {
+      "file": "stackRecycle1InputPair.f32.bin",
+      "shape": [
+        59,
+        59,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stackRecycle1ExpectedMsa": {
+      "file": "stackRecycle1ExpectedMsa.f32.bin",
+      "shape": [
+        5,
+        59,
+        256
+      ],
+      "dtype": "float32"
+    },
+    "stackRecycle1ExpectedPair": {
+      "file": "stackRecycle1ExpectedPair.f32.bin",
+      "shape": [
+        59,
+        59,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stackRecycle2InputMsa": {
+      "file": "stackRecycle2InputMsa.f32.bin",
+      "shape": [
+        5,
+        59,
+        256
+      ],
+      "dtype": "float32"
+    },
+    "stackRecycle2InputPair": {
+      "file": "stackRecycle2InputPair.f32.bin",
+      "shape": [
+        59,
+        59,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stackRecycle2ExpectedMsa": {
+      "file": "stackRecycle2ExpectedMsa.f32.bin",
+      "shape": [
+        5,
+        59,
+        256
+      ],
+      "dtype": "float32"
+    },
+    "stackRecycle2ExpectedPair": {
+      "file": "stackRecycle2ExpectedPair.f32.bin",
+      "shape": [
+        59,
+        59,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stackRecycle3InputMsa": {
+      "file": "stackRecycle3InputMsa.f32.bin",
+      "shape": [
+        5,
+        59,
+        256
+      ],
+      "dtype": "float32"
+    },
+    "stackRecycle3InputPair": {
+      "file": "stackRecycle3InputPair.f32.bin",
+      "shape": [
+        59,
+        59,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stackInputMsa": {
+      "file": "stackInputMsa.f32.bin",
+      "shape": [
+        5,
+        59,
+        256
+      ],
+      "dtype": "float32"
+    },
+    "stackInputPair": {
+      "file": "stackInputPair.f32.bin",
+      "shape": [
+        59,
+        59,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stackMsaMask": {
+      "file": "stackMsaMask.f32.bin",
+      "shape": [
+        5,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "stackPairMask": {
+      "file": "stackPairMask.f32.bin",
+      "shape": [
+        59,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "stackRecycle3ExpectedMsa": {
+      "file": "stackRecycle3ExpectedMsa.f32.bin",
+      "shape": [
+        5,
+        59,
+        256
+      ],
+      "dtype": "float32"
+    },
+    "stackRecycle3ExpectedPair": {
+      "file": "stackRecycle3ExpectedPair.f32.bin",
+      "shape": [
+        59,
+        59,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stackExpectedMsa": {
+      "file": "stackExpectedMsa.f32.bin",
+      "shape": [
+        5,
+        59,
+        256
+      ],
+      "dtype": "float32"
+    },
+    "stackExpectedPair": {
+      "file": "stackExpectedPair.f32.bin",
+      "shape": [
+        59,
+        59,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extraStackRecycle0InputMsa": {
+      "file": "extraStackRecycle0InputMsa.f32.bin",
+      "shape": [
+        1,
+        59,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "extraStackRecycle0InputPair": {
+      "file": "extraStackRecycle0InputPair.f32.bin",
+      "shape": [
+        59,
+        59,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extraStackRecycle0ExpectedMsa": {
+      "file": "extraStackRecycle0ExpectedMsa.f32.bin",
+      "shape": [
+        1,
+        59,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "extraStackRecycle0ExpectedPair": {
+      "file": "extraStackRecycle0ExpectedPair.f32.bin",
+      "shape": [
+        59,
+        59,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extraStackRecycle1InputMsa": {
+      "file": "extraStackRecycle1InputMsa.f32.bin",
+      "shape": [
+        1,
+        59,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "extraStackRecycle1InputPair": {
+      "file": "extraStackRecycle1InputPair.f32.bin",
+      "shape": [
+        59,
+        59,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extraStackRecycle1ExpectedMsa": {
+      "file": "extraStackRecycle1ExpectedMsa.f32.bin",
+      "shape": [
+        1,
+        59,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "extraStackRecycle1ExpectedPair": {
+      "file": "extraStackRecycle1ExpectedPair.f32.bin",
+      "shape": [
+        59,
+        59,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extraStackRecycle2InputMsa": {
+      "file": "extraStackRecycle2InputMsa.f32.bin",
+      "shape": [
+        1,
+        59,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "extraStackRecycle2InputPair": {
+      "file": "extraStackRecycle2InputPair.f32.bin",
+      "shape": [
+        59,
+        59,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extraStackRecycle2ExpectedMsa": {
+      "file": "extraStackRecycle2ExpectedMsa.f32.bin",
+      "shape": [
+        1,
+        59,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "extraStackRecycle2ExpectedPair": {
+      "file": "extraStackRecycle2ExpectedPair.f32.bin",
+      "shape": [
+        59,
+        59,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extraStackRecycle3InputMsa": {
+      "file": "extraStackRecycle3InputMsa.f32.bin",
+      "shape": [
+        1,
+        59,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "extraStackRecycle3InputPair": {
+      "file": "extraStackRecycle3InputPair.f32.bin",
+      "shape": [
+        59,
+        59,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extraStackInputMsa": {
+      "file": "extraStackInputMsa.f32.bin",
+      "shape": [
+        1,
+        59,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "extraStackInputPair": {
+      "file": "extraStackInputPair.f32.bin",
+      "shape": [
+        59,
+        59,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extraStackMsaMask": {
+      "file": "extraStackMsaMask.f32.bin",
+      "shape": [
+        1,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "extraStackPairMask": {
+      "file": "extraStackPairMask.f32.bin",
+      "shape": [
+        59,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "extraStackRecycle3ExpectedMsa": {
+      "file": "extraStackRecycle3ExpectedMsa.f32.bin",
+      "shape": [
+        1,
+        59,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "extraStackRecycle3ExpectedPair": {
+      "file": "extraStackRecycle3ExpectedPair.f32.bin",
+      "shape": [
+        59,
+        59,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extraStackExpectedMsa": {
+      "file": "extraStackExpectedMsa.f32.bin",
+      "shape": [
+        1,
+        59,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "extraStackExpectedPair": {
+      "file": "extraStackExpectedPair.f32.bin",
+      "shape": [
+        59,
+        59,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "feature_aatype": {
+      "file": "feature_aatype.f32.bin",
+      "shape": [
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_aatype_recycle0": {
+      "file": "feature_aatype_recycle0.f32.bin",
+      "shape": [
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_aatype_recycle1": {
+      "file": "feature_aatype_recycle1.f32.bin",
+      "shape": [
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_aatype_recycle2": {
+      "file": "feature_aatype_recycle2.f32.bin",
+      "shape": [
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_aatype_recycle3": {
+      "file": "feature_aatype_recycle3.f32.bin",
+      "shape": [
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_seq_mask": {
+      "file": "feature_seq_mask.f32.bin",
+      "shape": [
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_seq_mask_recycle0": {
+      "file": "feature_seq_mask_recycle0.f32.bin",
+      "shape": [
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_seq_mask_recycle1": {
+      "file": "feature_seq_mask_recycle1.f32.bin",
+      "shape": [
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_seq_mask_recycle2": {
+      "file": "feature_seq_mask_recycle2.f32.bin",
+      "shape": [
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_seq_mask_recycle3": {
+      "file": "feature_seq_mask_recycle3.f32.bin",
+      "shape": [
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_residue_index": {
+      "file": "feature_residue_index.f32.bin",
+      "shape": [
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_residue_index_recycle0": {
+      "file": "feature_residue_index_recycle0.f32.bin",
+      "shape": [
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_residue_index_recycle1": {
+      "file": "feature_residue_index_recycle1.f32.bin",
+      "shape": [
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_residue_index_recycle2": {
+      "file": "feature_residue_index_recycle2.f32.bin",
+      "shape": [
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_residue_index_recycle3": {
+      "file": "feature_residue_index_recycle3.f32.bin",
+      "shape": [
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_target_feat": {
+      "file": "feature_target_feat.f32.bin",
+      "shape": [
+        59,
+        22
+      ],
+      "dtype": "float32"
+    },
+    "feature_target_feat_recycle0": {
+      "file": "feature_target_feat_recycle0.f32.bin",
+      "shape": [
+        59,
+        22
+      ],
+      "dtype": "float32"
+    },
+    "feature_target_feat_recycle1": {
+      "file": "feature_target_feat_recycle1.f32.bin",
+      "shape": [
+        59,
+        22
+      ],
+      "dtype": "float32"
+    },
+    "feature_target_feat_recycle2": {
+      "file": "feature_target_feat_recycle2.f32.bin",
+      "shape": [
+        59,
+        22
+      ],
+      "dtype": "float32"
+    },
+    "feature_target_feat_recycle3": {
+      "file": "feature_target_feat_recycle3.f32.bin",
+      "shape": [
+        59,
+        22
+      ],
+      "dtype": "float32"
+    },
+    "feature_msa_feat": {
+      "file": "feature_msa_feat.f32.bin",
+      "shape": [
+        1,
+        59,
+        49
+      ],
+      "dtype": "float32"
+    },
+    "feature_msa_feat_recycle0": {
+      "file": "feature_msa_feat_recycle0.f32.bin",
+      "shape": [
+        1,
+        59,
+        49
+      ],
+      "dtype": "float32"
+    },
+    "feature_msa_feat_recycle1": {
+      "file": "feature_msa_feat_recycle1.f32.bin",
+      "shape": [
+        1,
+        59,
+        49
+      ],
+      "dtype": "float32"
+    },
+    "feature_msa_feat_recycle2": {
+      "file": "feature_msa_feat_recycle2.f32.bin",
+      "shape": [
+        1,
+        59,
+        49
+      ],
+      "dtype": "float32"
+    },
+    "feature_msa_feat_recycle3": {
+      "file": "feature_msa_feat_recycle3.f32.bin",
+      "shape": [
+        1,
+        59,
+        49
+      ],
+      "dtype": "float32"
+    },
+    "feature_msa_mask": {
+      "file": "feature_msa_mask.f32.bin",
+      "shape": [
+        1,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_msa_mask_recycle0": {
+      "file": "feature_msa_mask_recycle0.f32.bin",
+      "shape": [
+        1,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_msa_mask_recycle1": {
+      "file": "feature_msa_mask_recycle1.f32.bin",
+      "shape": [
+        1,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_msa_mask_recycle2": {
+      "file": "feature_msa_mask_recycle2.f32.bin",
+      "shape": [
+        1,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_msa_mask_recycle3": {
+      "file": "feature_msa_mask_recycle3.f32.bin",
+      "shape": [
+        1,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_msa": {
+      "file": "feature_extra_msa.f32.bin",
+      "shape": [
+        1,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_msa_recycle0": {
+      "file": "feature_extra_msa_recycle0.f32.bin",
+      "shape": [
+        1,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_msa_recycle1": {
+      "file": "feature_extra_msa_recycle1.f32.bin",
+      "shape": [
+        1,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_msa_recycle2": {
+      "file": "feature_extra_msa_recycle2.f32.bin",
+      "shape": [
+        1,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_msa_recycle3": {
+      "file": "feature_extra_msa_recycle3.f32.bin",
+      "shape": [
+        1,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_has_deletion": {
+      "file": "feature_extra_has_deletion.f32.bin",
+      "shape": [
+        1,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_has_deletion_recycle0": {
+      "file": "feature_extra_has_deletion_recycle0.f32.bin",
+      "shape": [
+        1,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_has_deletion_recycle1": {
+      "file": "feature_extra_has_deletion_recycle1.f32.bin",
+      "shape": [
+        1,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_has_deletion_recycle2": {
+      "file": "feature_extra_has_deletion_recycle2.f32.bin",
+      "shape": [
+        1,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_has_deletion_recycle3": {
+      "file": "feature_extra_has_deletion_recycle3.f32.bin",
+      "shape": [
+        1,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_deletion_value": {
+      "file": "feature_extra_deletion_value.f32.bin",
+      "shape": [
+        1,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_deletion_value_recycle0": {
+      "file": "feature_extra_deletion_value_recycle0.f32.bin",
+      "shape": [
+        1,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_deletion_value_recycle1": {
+      "file": "feature_extra_deletion_value_recycle1.f32.bin",
+      "shape": [
+        1,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_deletion_value_recycle2": {
+      "file": "feature_extra_deletion_value_recycle2.f32.bin",
+      "shape": [
+        1,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_deletion_value_recycle3": {
+      "file": "feature_extra_deletion_value_recycle3.f32.bin",
+      "shape": [
+        1,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_msa_mask": {
+      "file": "feature_extra_msa_mask.f32.bin",
+      "shape": [
+        1,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_msa_mask_recycle0": {
+      "file": "feature_extra_msa_mask_recycle0.f32.bin",
+      "shape": [
+        1,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_msa_mask_recycle1": {
+      "file": "feature_extra_msa_mask_recycle1.f32.bin",
+      "shape": [
+        1,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_msa_mask_recycle2": {
+      "file": "feature_extra_msa_mask_recycle2.f32.bin",
+      "shape": [
+        1,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_msa_mask_recycle3": {
+      "file": "feature_extra_msa_mask_recycle3.f32.bin",
+      "shape": [
+        1,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_template_aatype": {
+      "file": "feature_template_aatype.f32.bin",
+      "shape": [
+        4,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_template_aatype_recycle0": {
+      "file": "feature_template_aatype_recycle0.f32.bin",
+      "shape": [
+        4,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_template_aatype_recycle1": {
+      "file": "feature_template_aatype_recycle1.f32.bin",
+      "shape": [
+        4,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_template_aatype_recycle2": {
+      "file": "feature_template_aatype_recycle2.f32.bin",
+      "shape": [
+        4,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_template_aatype_recycle3": {
+      "file": "feature_template_aatype_recycle3.f32.bin",
+      "shape": [
+        4,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "feature_template_all_atom_positions": {
+      "file": "feature_template_all_atom_positions.f32.bin",
+      "shape": [
+        4,
+        59,
+        37,
+        3
+      ],
+      "dtype": "float32"
+    },
+    "feature_template_all_atom_positions_recycle0": {
+      "file": "feature_template_all_atom_positions_recycle0.f32.bin",
+      "shape": [
+        4,
+        59,
+        37,
+        3
+      ],
+      "dtype": "float32"
+    },
+    "feature_template_all_atom_positions_recycle1": {
+      "file": "feature_template_all_atom_positions_recycle1.f32.bin",
+      "shape": [
+        4,
+        59,
+        37,
+        3
+      ],
+      "dtype": "float32"
+    },
+    "feature_template_all_atom_positions_recycle2": {
+      "file": "feature_template_all_atom_positions_recycle2.f32.bin",
+      "shape": [
+        4,
+        59,
+        37,
+        3
+      ],
+      "dtype": "float32"
+    },
+    "feature_template_all_atom_positions_recycle3": {
+      "file": "feature_template_all_atom_positions_recycle3.f32.bin",
+      "shape": [
+        4,
+        59,
+        37,
+        3
+      ],
+      "dtype": "float32"
+    },
+    "feature_template_all_atom_masks": {
+      "file": "feature_template_all_atom_masks.f32.bin",
+      "shape": [
+        4,
+        59,
+        37
+      ],
+      "dtype": "float32"
+    },
+    "feature_template_all_atom_masks_recycle0": {
+      "file": "feature_template_all_atom_masks_recycle0.f32.bin",
+      "shape": [
+        4,
+        59,
+        37
+      ],
+      "dtype": "float32"
+    },
+    "feature_template_all_atom_masks_recycle1": {
+      "file": "feature_template_all_atom_masks_recycle1.f32.bin",
+      "shape": [
+        4,
+        59,
+        37
+      ],
+      "dtype": "float32"
+    },
+    "feature_template_all_atom_masks_recycle2": {
+      "file": "feature_template_all_atom_masks_recycle2.f32.bin",
+      "shape": [
+        4,
+        59,
+        37
+      ],
+      "dtype": "float32"
+    },
+    "feature_template_all_atom_masks_recycle3": {
+      "file": "feature_template_all_atom_masks_recycle3.f32.bin",
+      "shape": [
+        4,
+        59,
+        37
+      ],
+      "dtype": "float32"
+    },
+    "feature_template_mask": {
+      "file": "feature_template_mask.f32.bin",
+      "shape": [
+        4
+      ],
+      "dtype": "float32"
+    },
+    "feature_template_mask_recycle0": {
+      "file": "feature_template_mask_recycle0.f32.bin",
+      "shape": [
+        4
+      ],
+      "dtype": "float32"
+    },
+    "feature_template_mask_recycle1": {
+      "file": "feature_template_mask_recycle1.f32.bin",
+      "shape": [
+        4
+      ],
+      "dtype": "float32"
+    },
+    "feature_template_mask_recycle2": {
+      "file": "feature_template_mask_recycle2.f32.bin",
+      "shape": [
+        4
+      ],
+      "dtype": "float32"
+    },
+    "feature_template_mask_recycle3": {
+      "file": "feature_template_mask_recycle3.f32.bin",
+      "shape": [
+        4
+      ],
+      "dtype": "float32"
+    },
+    "feature_atom14_atom_exists": {
+      "file": "feature_atom14_atom_exists.f32.bin",
+      "shape": [
+        59,
+        14
+      ],
+      "dtype": "float32"
+    },
+    "feature_atom14_atom_exists_recycle0": {
+      "file": "feature_atom14_atom_exists_recycle0.f32.bin",
+      "shape": [
+        59,
+        14
+      ],
+      "dtype": "float32"
+    },
+    "feature_atom14_atom_exists_recycle1": {
+      "file": "feature_atom14_atom_exists_recycle1.f32.bin",
+      "shape": [
+        59,
+        14
+      ],
+      "dtype": "float32"
+    },
+    "feature_atom14_atom_exists_recycle2": {
+      "file": "feature_atom14_atom_exists_recycle2.f32.bin",
+      "shape": [
+        59,
+        14
+      ],
+      "dtype": "float32"
+    },
+    "feature_atom14_atom_exists_recycle3": {
+      "file": "feature_atom14_atom_exists_recycle3.f32.bin",
+      "shape": [
+        59,
+        14
+      ],
+      "dtype": "float32"
+    },
+    "feature_atom37_atom_exists": {
+      "file": "feature_atom37_atom_exists.f32.bin",
+      "shape": [
+        59,
+        37
+      ],
+      "dtype": "float32"
+    },
+    "feature_atom37_atom_exists_recycle0": {
+      "file": "feature_atom37_atom_exists_recycle0.f32.bin",
+      "shape": [
+        59,
+        37
+      ],
+      "dtype": "float32"
+    },
+    "feature_atom37_atom_exists_recycle1": {
+      "file": "feature_atom37_atom_exists_recycle1.f32.bin",
+      "shape": [
+        59,
+        37
+      ],
+      "dtype": "float32"
+    },
+    "feature_atom37_atom_exists_recycle2": {
+      "file": "feature_atom37_atom_exists_recycle2.f32.bin",
+      "shape": [
+        59,
+        37
+      ],
+      "dtype": "float32"
+    },
+    "feature_atom37_atom_exists_recycle3": {
+      "file": "feature_atom37_atom_exists_recycle3.f32.bin",
+      "shape": [
+        59,
+        37
+      ],
+      "dtype": "float32"
+    },
+    "feature_residx_atom37_to_atom14": {
+      "file": "feature_residx_atom37_to_atom14.f32.bin",
+      "shape": [
+        59,
+        37
+      ],
+      "dtype": "float32"
+    },
+    "feature_residx_atom37_to_atom14_recycle0": {
+      "file": "feature_residx_atom37_to_atom14_recycle0.f32.bin",
+      "shape": [
+        59,
+        37
+      ],
+      "dtype": "float32"
+    },
+    "feature_residx_atom37_to_atom14_recycle1": {
+      "file": "feature_residx_atom37_to_atom14_recycle1.f32.bin",
+      "shape": [
+        59,
+        37
+      ],
+      "dtype": "float32"
+    },
+    "feature_residx_atom37_to_atom14_recycle2": {
+      "file": "feature_residx_atom37_to_atom14_recycle2.f32.bin",
+      "shape": [
+        59,
+        37
+      ],
+      "dtype": "float32"
+    },
+    "feature_residx_atom37_to_atom14_recycle3": {
+      "file": "feature_residx_atom37_to_atom14_recycle3.f32.bin",
+      "shape": [
+        59,
+        37
+      ],
+      "dtype": "float32"
+    },
+    "templatePairUpdateRecycle0": {
+      "file": "templatePairUpdateRecycle0.f32.bin",
+      "shape": [
+        59,
+        59,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "templatePairUpdateRecycle1": {
+      "file": "templatePairUpdateRecycle1.f32.bin",
+      "shape": [
+        59,
+        59,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "templatePairUpdateRecycle2": {
+      "file": "templatePairUpdateRecycle2.f32.bin",
+      "shape": [
+        59,
+        59,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "templatePairUpdateRecycle3": {
+      "file": "templatePairUpdateRecycle3.f32.bin",
+      "shape": [
+        59,
+        59,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "layerNormInWeight": {
+      "file": "layerNormInWeight.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "layerNormInBias": {
+      "file": "layerNormInBias.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "linearAPWeight": {
+      "file": "linearAPWeight.f32.bin",
+      "shape": [
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "linearAPBias": {
+      "file": "linearAPBias.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "linearAGWeight": {
+      "file": "linearAGWeight.f32.bin",
+      "shape": [
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "linearAGBias": {
+      "file": "linearAGBias.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "linearBPWeight": {
+      "file": "linearBPWeight.f32.bin",
+      "shape": [
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "linearBPBias": {
+      "file": "linearBPBias.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "linearBGWeight": {
+      "file": "linearBGWeight.f32.bin",
+      "shape": [
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "linearBGBias": {
+      "file": "linearBGBias.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "layerNormOutWeight": {
+      "file": "layerNormOutWeight.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "layerNormOutBias": {
+      "file": "layerNormOutBias.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "linearZWeight": {
+      "file": "linearZWeight.f32.bin",
+      "shape": [
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "linearZBias": {
+      "file": "linearZBias.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "linearGWeight": {
+      "file": "linearGWeight.f32.bin",
+      "shape": [
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "linearGBias": {
+      "file": "linearGBias.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0000": {
+      "file": "stack_haiku_0000.f32.bin",
+      "shape": [
+        48,
+        8,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0001": {
+      "file": "stack_haiku_0001.f32.bin",
+      "shape": [
+        48,
+        256,
+        8,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0002": {
+      "file": "stack_haiku_0002.f32.bin",
+      "shape": [
+        48,
+        256,
+        8,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0003": {
+      "file": "stack_haiku_0003.f32.bin",
+      "shape": [
+        48,
+        256
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0004": {
+      "file": "stack_haiku_0004.f32.bin",
+      "shape": [
+        48,
+        8,
+        32,
+        256
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0005": {
+      "file": "stack_haiku_0005.f32.bin",
+      "shape": [
+        48,
+        256,
+        8,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0006": {
+      "file": "stack_haiku_0006.f32.bin",
+      "shape": [
+        48,
+        256,
+        8,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0007": {
+      "file": "stack_haiku_0007.f32.bin",
+      "shape": [
+        48,
+        256
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0008": {
+      "file": "stack_haiku_0008.f32.bin",
+      "shape": [
+        48,
+        256
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0009": {
+      "file": "stack_haiku_0009.f32.bin",
+      "shape": [
+        48,
+        128,
+        8
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0010": {
+      "file": "stack_haiku_0010.f32.bin",
+      "shape": [
+        48,
+        8,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0011": {
+      "file": "stack_haiku_0011.f32.bin",
+      "shape": [
+        48,
+        256,
+        8,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0012": {
+      "file": "stack_haiku_0012.f32.bin",
+      "shape": [
+        48,
+        256,
+        8,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0013": {
+      "file": "stack_haiku_0013.f32.bin",
+      "shape": [
+        48,
+        256
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0014": {
+      "file": "stack_haiku_0014.f32.bin",
+      "shape": [
+        48,
+        8,
+        32,
+        256
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0015": {
+      "file": "stack_haiku_0015.f32.bin",
+      "shape": [
+        48,
+        256,
+        8,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0016": {
+      "file": "stack_haiku_0016.f32.bin",
+      "shape": [
+        48,
+        256,
+        8,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0017": {
+      "file": "stack_haiku_0017.f32.bin",
+      "shape": [
+        48,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0018": {
+      "file": "stack_haiku_0018.f32.bin",
+      "shape": [
+        48,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0019": {
+      "file": "stack_haiku_0019.f32.bin",
+      "shape": [
+        48,
+        256
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0020": {
+      "file": "stack_haiku_0020.f32.bin",
+      "shape": [
+        48,
+        256
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0021": {
+      "file": "stack_haiku_0021.f32.bin",
+      "shape": [
+        48,
+        256
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0022": {
+      "file": "stack_haiku_0022.f32.bin",
+      "shape": [
+        48,
+        256
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0023": {
+      "file": "stack_haiku_0023.f32.bin",
+      "shape": [
+        48,
+        1024
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0024": {
+      "file": "stack_haiku_0024.f32.bin",
+      "shape": [
+        48,
+        256,
+        1024
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0025": {
+      "file": "stack_haiku_0025.f32.bin",
+      "shape": [
+        48,
+        256
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0026": {
+      "file": "stack_haiku_0026.f32.bin",
+      "shape": [
+        48,
+        1024,
+        256
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0027": {
+      "file": "stack_haiku_0027.f32.bin",
+      "shape": [
+        48,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0028": {
+      "file": "stack_haiku_0028.f32.bin",
+      "shape": [
+        48,
+        32,
+        32,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0029": {
+      "file": "stack_haiku_0029.f32.bin",
+      "shape": [
+        48,
+        256
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0030": {
+      "file": "stack_haiku_0030.f32.bin",
+      "shape": [
+        48,
+        256
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0031": {
+      "file": "stack_haiku_0031.f32.bin",
+      "shape": [
+        48,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0032": {
+      "file": "stack_haiku_0032.f32.bin",
+      "shape": [
+        48,
+        256,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0033": {
+      "file": "stack_haiku_0033.f32.bin",
+      "shape": [
+        48,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0034": {
+      "file": "stack_haiku_0034.f32.bin",
+      "shape": [
+        48,
+        256,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0035": {
+      "file": "stack_haiku_0035.f32.bin",
+      "shape": [
+        48,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0036": {
+      "file": "stack_haiku_0036.f32.bin",
+      "shape": [
+        48,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0037": {
+      "file": "stack_haiku_0037.f32.bin",
+      "shape": [
+        48,
+        512
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0038": {
+      "file": "stack_haiku_0038.f32.bin",
+      "shape": [
+        48,
+        128,
+        512
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0039": {
+      "file": "stack_haiku_0039.f32.bin",
+      "shape": [
+        48,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0040": {
+      "file": "stack_haiku_0040.f32.bin",
+      "shape": [
+        48,
+        512,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0041": {
+      "file": "stack_haiku_0041.f32.bin",
+      "shape": [
+        48,
+        128,
+        4
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0042": {
+      "file": "stack_haiku_0042.f32.bin",
+      "shape": [
+        48,
+        4,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0043": {
+      "file": "stack_haiku_0043.f32.bin",
+      "shape": [
+        48,
+        128,
+        4,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0044": {
+      "file": "stack_haiku_0044.f32.bin",
+      "shape": [
+        48,
+        128,
+        4,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0045": {
+      "file": "stack_haiku_0045.f32.bin",
+      "shape": [
+        48,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0046": {
+      "file": "stack_haiku_0046.f32.bin",
+      "shape": [
+        48,
+        4,
+        32,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0047": {
+      "file": "stack_haiku_0047.f32.bin",
+      "shape": [
+        48,
+        128,
+        4,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0048": {
+      "file": "stack_haiku_0048.f32.bin",
+      "shape": [
+        48,
+        128,
+        4,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0049": {
+      "file": "stack_haiku_0049.f32.bin",
+      "shape": [
+        48,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0050": {
+      "file": "stack_haiku_0050.f32.bin",
+      "shape": [
+        48,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0051": {
+      "file": "stack_haiku_0051.f32.bin",
+      "shape": [
+        48,
+        128,
+        4
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0052": {
+      "file": "stack_haiku_0052.f32.bin",
+      "shape": [
+        48,
+        4,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0053": {
+      "file": "stack_haiku_0053.f32.bin",
+      "shape": [
+        48,
+        128,
+        4,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0054": {
+      "file": "stack_haiku_0054.f32.bin",
+      "shape": [
+        48,
+        128,
+        4,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0055": {
+      "file": "stack_haiku_0055.f32.bin",
+      "shape": [
+        48,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0056": {
+      "file": "stack_haiku_0056.f32.bin",
+      "shape": [
+        48,
+        4,
+        32,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0057": {
+      "file": "stack_haiku_0057.f32.bin",
+      "shape": [
+        48,
+        128,
+        4,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0058": {
+      "file": "stack_haiku_0058.f32.bin",
+      "shape": [
+        48,
+        128,
+        4,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0059": {
+      "file": "stack_haiku_0059.f32.bin",
+      "shape": [
+        48,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0060": {
+      "file": "stack_haiku_0060.f32.bin",
+      "shape": [
+        48,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0061": {
+      "file": "stack_haiku_0061.f32.bin",
+      "shape": [
+        48,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0062": {
+      "file": "stack_haiku_0062.f32.bin",
+      "shape": [
+        48,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0063": {
+      "file": "stack_haiku_0063.f32.bin",
+      "shape": [
+        48,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0064": {
+      "file": "stack_haiku_0064.f32.bin",
+      "shape": [
+        48,
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0065": {
+      "file": "stack_haiku_0065.f32.bin",
+      "shape": [
+        48,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0066": {
+      "file": "stack_haiku_0066.f32.bin",
+      "shape": [
+        48,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0067": {
+      "file": "stack_haiku_0067.f32.bin",
+      "shape": [
+        48,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0068": {
+      "file": "stack_haiku_0068.f32.bin",
+      "shape": [
+        48,
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0069": {
+      "file": "stack_haiku_0069.f32.bin",
+      "shape": [
+        48,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0070": {
+      "file": "stack_haiku_0070.f32.bin",
+      "shape": [
+        48,
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0071": {
+      "file": "stack_haiku_0071.f32.bin",
+      "shape": [
+        48,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0072": {
+      "file": "stack_haiku_0072.f32.bin",
+      "shape": [
+        48,
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0073": {
+      "file": "stack_haiku_0073.f32.bin",
+      "shape": [
+        48,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0074": {
+      "file": "stack_haiku_0074.f32.bin",
+      "shape": [
+        48,
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0075": {
+      "file": "stack_haiku_0075.f32.bin",
+      "shape": [
+        48,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0076": {
+      "file": "stack_haiku_0076.f32.bin",
+      "shape": [
+        48,
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0077": {
+      "file": "stack_haiku_0077.f32.bin",
+      "shape": [
+        48,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0078": {
+      "file": "stack_haiku_0078.f32.bin",
+      "shape": [
+        48,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0079": {
+      "file": "stack_haiku_0079.f32.bin",
+      "shape": [
+        48,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0080": {
+      "file": "stack_haiku_0080.f32.bin",
+      "shape": [
+        48,
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0081": {
+      "file": "stack_haiku_0081.f32.bin",
+      "shape": [
+        48,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0082": {
+      "file": "stack_haiku_0082.f32.bin",
+      "shape": [
+        48,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0083": {
+      "file": "stack_haiku_0083.f32.bin",
+      "shape": [
+        48,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0084": {
+      "file": "stack_haiku_0084.f32.bin",
+      "shape": [
+        48,
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0085": {
+      "file": "stack_haiku_0085.f32.bin",
+      "shape": [
+        48,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0086": {
+      "file": "stack_haiku_0086.f32.bin",
+      "shape": [
+        48,
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0087": {
+      "file": "stack_haiku_0087.f32.bin",
+      "shape": [
+        48,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0088": {
+      "file": "stack_haiku_0088.f32.bin",
+      "shape": [
+        48,
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0089": {
+      "file": "stack_haiku_0089.f32.bin",
+      "shape": [
+        48,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0090": {
+      "file": "stack_haiku_0090.f32.bin",
+      "shape": [
+        48,
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0091": {
+      "file": "stack_haiku_0091.f32.bin",
+      "shape": [
+        48,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "stack_haiku_0092": {
+      "file": "stack_haiku_0092.f32.bin",
+      "shape": [
+        48,
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0000": {
+      "file": "extra_stack_haiku_0000.f32.bin",
+      "shape": [
+        4,
+        8,
+        8
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0001": {
+      "file": "extra_stack_haiku_0001.f32.bin",
+      "shape": [
+        4,
+        64,
+        8,
+        8
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0002": {
+      "file": "extra_stack_haiku_0002.f32.bin",
+      "shape": [
+        4,
+        64,
+        8
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0003": {
+      "file": "extra_stack_haiku_0003.f32.bin",
+      "shape": [
+        4,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0004": {
+      "file": "extra_stack_haiku_0004.f32.bin",
+      "shape": [
+        4,
+        8,
+        8,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0005": {
+      "file": "extra_stack_haiku_0005.f32.bin",
+      "shape": [
+        4,
+        64,
+        8,
+        8
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0006": {
+      "file": "extra_stack_haiku_0006.f32.bin",
+      "shape": [
+        4,
+        64,
+        8
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0007": {
+      "file": "extra_stack_haiku_0007.f32.bin",
+      "shape": [
+        4,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0008": {
+      "file": "extra_stack_haiku_0008.f32.bin",
+      "shape": [
+        4,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0009": {
+      "file": "extra_stack_haiku_0009.f32.bin",
+      "shape": [
+        4,
+        128,
+        8
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0010": {
+      "file": "extra_stack_haiku_0010.f32.bin",
+      "shape": [
+        4,
+        8,
+        8
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0011": {
+      "file": "extra_stack_haiku_0011.f32.bin",
+      "shape": [
+        4,
+        64,
+        8,
+        8
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0012": {
+      "file": "extra_stack_haiku_0012.f32.bin",
+      "shape": [
+        4,
+        64,
+        8,
+        8
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0013": {
+      "file": "extra_stack_haiku_0013.f32.bin",
+      "shape": [
+        4,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0014": {
+      "file": "extra_stack_haiku_0014.f32.bin",
+      "shape": [
+        4,
+        8,
+        8,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0015": {
+      "file": "extra_stack_haiku_0015.f32.bin",
+      "shape": [
+        4,
+        64,
+        8,
+        8
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0016": {
+      "file": "extra_stack_haiku_0016.f32.bin",
+      "shape": [
+        4,
+        64,
+        8,
+        8
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0017": {
+      "file": "extra_stack_haiku_0017.f32.bin",
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0018": {
+      "file": "extra_stack_haiku_0018.f32.bin",
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0019": {
+      "file": "extra_stack_haiku_0019.f32.bin",
+      "shape": [
+        4,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0020": {
+      "file": "extra_stack_haiku_0020.f32.bin",
+      "shape": [
+        4,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0021": {
+      "file": "extra_stack_haiku_0021.f32.bin",
+      "shape": [
+        4,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0022": {
+      "file": "extra_stack_haiku_0022.f32.bin",
+      "shape": [
+        4,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0023": {
+      "file": "extra_stack_haiku_0023.f32.bin",
+      "shape": [
+        4,
+        256
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0024": {
+      "file": "extra_stack_haiku_0024.f32.bin",
+      "shape": [
+        4,
+        64,
+        256
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0025": {
+      "file": "extra_stack_haiku_0025.f32.bin",
+      "shape": [
+        4,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0026": {
+      "file": "extra_stack_haiku_0026.f32.bin",
+      "shape": [
+        4,
+        256,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0027": {
+      "file": "extra_stack_haiku_0027.f32.bin",
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0028": {
+      "file": "extra_stack_haiku_0028.f32.bin",
+      "shape": [
+        4,
+        32,
+        32,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0029": {
+      "file": "extra_stack_haiku_0029.f32.bin",
+      "shape": [
+        4,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0030": {
+      "file": "extra_stack_haiku_0030.f32.bin",
+      "shape": [
+        4,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0031": {
+      "file": "extra_stack_haiku_0031.f32.bin",
+      "shape": [
+        4,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0032": {
+      "file": "extra_stack_haiku_0032.f32.bin",
+      "shape": [
+        4,
+        64,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0033": {
+      "file": "extra_stack_haiku_0033.f32.bin",
+      "shape": [
+        4,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0034": {
+      "file": "extra_stack_haiku_0034.f32.bin",
+      "shape": [
+        4,
+        64,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0035": {
+      "file": "extra_stack_haiku_0035.f32.bin",
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0036": {
+      "file": "extra_stack_haiku_0036.f32.bin",
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0037": {
+      "file": "extra_stack_haiku_0037.f32.bin",
+      "shape": [
+        4,
+        512
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0038": {
+      "file": "extra_stack_haiku_0038.f32.bin",
+      "shape": [
+        4,
+        128,
+        512
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0039": {
+      "file": "extra_stack_haiku_0039.f32.bin",
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0040": {
+      "file": "extra_stack_haiku_0040.f32.bin",
+      "shape": [
+        4,
+        512,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0041": {
+      "file": "extra_stack_haiku_0041.f32.bin",
+      "shape": [
+        4,
+        128,
+        4
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0042": {
+      "file": "extra_stack_haiku_0042.f32.bin",
+      "shape": [
+        4,
+        4,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0043": {
+      "file": "extra_stack_haiku_0043.f32.bin",
+      "shape": [
+        4,
+        128,
+        4,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0044": {
+      "file": "extra_stack_haiku_0044.f32.bin",
+      "shape": [
+        4,
+        128,
+        4,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0045": {
+      "file": "extra_stack_haiku_0045.f32.bin",
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0046": {
+      "file": "extra_stack_haiku_0046.f32.bin",
+      "shape": [
+        4,
+        4,
+        32,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0047": {
+      "file": "extra_stack_haiku_0047.f32.bin",
+      "shape": [
+        4,
+        128,
+        4,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0048": {
+      "file": "extra_stack_haiku_0048.f32.bin",
+      "shape": [
+        4,
+        128,
+        4,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0049": {
+      "file": "extra_stack_haiku_0049.f32.bin",
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0050": {
+      "file": "extra_stack_haiku_0050.f32.bin",
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0051": {
+      "file": "extra_stack_haiku_0051.f32.bin",
+      "shape": [
+        4,
+        128,
+        4
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0052": {
+      "file": "extra_stack_haiku_0052.f32.bin",
+      "shape": [
+        4,
+        4,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0053": {
+      "file": "extra_stack_haiku_0053.f32.bin",
+      "shape": [
+        4,
+        128,
+        4,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0054": {
+      "file": "extra_stack_haiku_0054.f32.bin",
+      "shape": [
+        4,
+        128,
+        4,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0055": {
+      "file": "extra_stack_haiku_0055.f32.bin",
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0056": {
+      "file": "extra_stack_haiku_0056.f32.bin",
+      "shape": [
+        4,
+        4,
+        32,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0057": {
+      "file": "extra_stack_haiku_0057.f32.bin",
+      "shape": [
+        4,
+        128,
+        4,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0058": {
+      "file": "extra_stack_haiku_0058.f32.bin",
+      "shape": [
+        4,
+        128,
+        4,
+        32
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0059": {
+      "file": "extra_stack_haiku_0059.f32.bin",
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0060": {
+      "file": "extra_stack_haiku_0060.f32.bin",
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0061": {
+      "file": "extra_stack_haiku_0061.f32.bin",
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0062": {
+      "file": "extra_stack_haiku_0062.f32.bin",
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0063": {
+      "file": "extra_stack_haiku_0063.f32.bin",
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0064": {
+      "file": "extra_stack_haiku_0064.f32.bin",
+      "shape": [
+        4,
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0065": {
+      "file": "extra_stack_haiku_0065.f32.bin",
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0066": {
+      "file": "extra_stack_haiku_0066.f32.bin",
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0067": {
+      "file": "extra_stack_haiku_0067.f32.bin",
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0068": {
+      "file": "extra_stack_haiku_0068.f32.bin",
+      "shape": [
+        4,
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0069": {
+      "file": "extra_stack_haiku_0069.f32.bin",
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0070": {
+      "file": "extra_stack_haiku_0070.f32.bin",
+      "shape": [
+        4,
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0071": {
+      "file": "extra_stack_haiku_0071.f32.bin",
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0072": {
+      "file": "extra_stack_haiku_0072.f32.bin",
+      "shape": [
+        4,
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0073": {
+      "file": "extra_stack_haiku_0073.f32.bin",
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0074": {
+      "file": "extra_stack_haiku_0074.f32.bin",
+      "shape": [
+        4,
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0075": {
+      "file": "extra_stack_haiku_0075.f32.bin",
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0076": {
+      "file": "extra_stack_haiku_0076.f32.bin",
+      "shape": [
+        4,
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0077": {
+      "file": "extra_stack_haiku_0077.f32.bin",
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0078": {
+      "file": "extra_stack_haiku_0078.f32.bin",
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0079": {
+      "file": "extra_stack_haiku_0079.f32.bin",
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0080": {
+      "file": "extra_stack_haiku_0080.f32.bin",
+      "shape": [
+        4,
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0081": {
+      "file": "extra_stack_haiku_0081.f32.bin",
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0082": {
+      "file": "extra_stack_haiku_0082.f32.bin",
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0083": {
+      "file": "extra_stack_haiku_0083.f32.bin",
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0084": {
+      "file": "extra_stack_haiku_0084.f32.bin",
+      "shape": [
+        4,
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0085": {
+      "file": "extra_stack_haiku_0085.f32.bin",
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0086": {
+      "file": "extra_stack_haiku_0086.f32.bin",
+      "shape": [
+        4,
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0087": {
+      "file": "extra_stack_haiku_0087.f32.bin",
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0088": {
+      "file": "extra_stack_haiku_0088.f32.bin",
+      "shape": [
+        4,
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0089": {
+      "file": "extra_stack_haiku_0089.f32.bin",
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0090": {
+      "file": "extra_stack_haiku_0090.f32.bin",
+      "shape": [
+        4,
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0091": {
+      "file": "extra_stack_haiku_0091.f32.bin",
+      "shape": [
+        4,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "extra_stack_haiku_0092": {
+      "file": "extra_stack_haiku_0092.f32.bin",
+      "shape": [
+        4,
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "embedding_haiku_0000": {
+      "file": "embedding_haiku_0000.f32.bin",
+      "shape": [
+        64
+      ],
+      "dtype": "float32"
+    },
+    "embedding_haiku_0001": {
+      "file": "embedding_haiku_0001.f32.bin",
+      "shape": [
+        25,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "embedding_haiku_0002": {
+      "file": "embedding_haiku_0002.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "embedding_haiku_0003": {
+      "file": "embedding_haiku_0003.f32.bin",
+      "shape": [
+        22,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "embedding_haiku_0004": {
+      "file": "embedding_haiku_0004.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "embedding_haiku_0005": {
+      "file": "embedding_haiku_0005.f32.bin",
+      "shape": [
+        65,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "embedding_haiku_0006": {
+      "file": "embedding_haiku_0006.f32.bin",
+      "shape": [
+        256
+      ],
+      "dtype": "float32"
+    },
+    "embedding_haiku_0007": {
+      "file": "embedding_haiku_0007.f32.bin",
+      "shape": [
+        22,
+        256
+      ],
+      "dtype": "float32"
+    },
+    "embedding_haiku_0008": {
+      "file": "embedding_haiku_0008.f32.bin",
+      "shape": [
+        256
+      ],
+      "dtype": "float32"
+    },
+    "embedding_haiku_0009": {
+      "file": "embedding_haiku_0009.f32.bin",
+      "shape": [
+        49,
+        256
+      ],
+      "dtype": "float32"
+    },
+    "embedding_haiku_0010": {
+      "file": "embedding_haiku_0010.f32.bin",
+      "shape": [
+        256
+      ],
+      "dtype": "float32"
+    },
+    "embedding_haiku_0011": {
+      "file": "embedding_haiku_0011.f32.bin",
+      "shape": [
+        256
+      ],
+      "dtype": "float32"
+    },
+    "embedding_haiku_0012": {
+      "file": "embedding_haiku_0012.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "embedding_haiku_0013": {
+      "file": "embedding_haiku_0013.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "embedding_haiku_0014": {
+      "file": "embedding_haiku_0014.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "embedding_haiku_0015": {
+      "file": "embedding_haiku_0015.f32.bin",
+      "shape": [
+        15,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "embedding_haiku_0016": {
+      "file": "embedding_haiku_0016.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "embedding_haiku_0017": {
+      "file": "embedding_haiku_0017.f32.bin",
+      "shape": [
+        22,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "embedding_haiku_0018": {
+      "file": "embedding_haiku_0018.f32.bin",
+      "shape": [
+        384
+      ],
+      "dtype": "float32"
+    },
+    "embedding_haiku_0019": {
+      "file": "embedding_haiku_0019.f32.bin",
+      "shape": [
+        256,
+        384
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0000": {
+      "file": "template_haiku_0000.f32.bin",
+      "shape": [
+        64,
+        4,
+        16
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0001": {
+      "file": "template_haiku_0001.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0002": {
+      "file": "template_haiku_0002.f32.bin",
+      "shape": [
+        4,
+        16,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0003": {
+      "file": "template_haiku_0003.f32.bin",
+      "shape": [
+        128,
+        4,
+        16
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0004": {
+      "file": "template_haiku_0004.f32.bin",
+      "shape": [
+        64,
+        4,
+        16
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0005": {
+      "file": "template_haiku_0005.f32.bin",
+      "shape": [
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0006": {
+      "file": "template_haiku_0006.f32.bin",
+      "shape": [
+        88,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0007": {
+      "file": "template_haiku_0007.f32.bin",
+      "shape": [
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0008": {
+      "file": "template_haiku_0008.f32.bin",
+      "shape": [
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0009": {
+      "file": "template_haiku_0009.f32.bin",
+      "shape": [
+        2,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0010": {
+      "file": "template_haiku_0010.f32.bin",
+      "shape": [
+        2,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0011": {
+      "file": "template_haiku_0011.f32.bin",
+      "shape": [
+        2,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0012": {
+      "file": "template_haiku_0012.f32.bin",
+      "shape": [
+        2,
+        64,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0013": {
+      "file": "template_haiku_0013.f32.bin",
+      "shape": [
+        2,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0014": {
+      "file": "template_haiku_0014.f32.bin",
+      "shape": [
+        2,
+        128,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0015": {
+      "file": "template_haiku_0015.f32.bin",
+      "shape": [
+        2,
+        64,
+        4
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0016": {
+      "file": "template_haiku_0016.f32.bin",
+      "shape": [
+        2,
+        4,
+        16
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0017": {
+      "file": "template_haiku_0017.f32.bin",
+      "shape": [
+        2,
+        64,
+        4,
+        16
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0018": {
+      "file": "template_haiku_0018.f32.bin",
+      "shape": [
+        2,
+        64,
+        4,
+        16
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0019": {
+      "file": "template_haiku_0019.f32.bin",
+      "shape": [
+        2,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0020": {
+      "file": "template_haiku_0020.f32.bin",
+      "shape": [
+        2,
+        4,
+        16,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0021": {
+      "file": "template_haiku_0021.f32.bin",
+      "shape": [
+        2,
+        64,
+        4,
+        16
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0022": {
+      "file": "template_haiku_0022.f32.bin",
+      "shape": [
+        2,
+        64,
+        4,
+        16
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0023": {
+      "file": "template_haiku_0023.f32.bin",
+      "shape": [
+        2,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0024": {
+      "file": "template_haiku_0024.f32.bin",
+      "shape": [
+        2,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0025": {
+      "file": "template_haiku_0025.f32.bin",
+      "shape": [
+        2,
+        64,
+        4
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0026": {
+      "file": "template_haiku_0026.f32.bin",
+      "shape": [
+        2,
+        4,
+        16
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0027": {
+      "file": "template_haiku_0027.f32.bin",
+      "shape": [
+        2,
+        64,
+        4,
+        16
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0028": {
+      "file": "template_haiku_0028.f32.bin",
+      "shape": [
+        2,
+        64,
+        4,
+        16
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0029": {
+      "file": "template_haiku_0029.f32.bin",
+      "shape": [
+        2,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0030": {
+      "file": "template_haiku_0030.f32.bin",
+      "shape": [
+        2,
+        4,
+        16,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0031": {
+      "file": "template_haiku_0031.f32.bin",
+      "shape": [
+        2,
+        64,
+        4,
+        16
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0032": {
+      "file": "template_haiku_0032.f32.bin",
+      "shape": [
+        2,
+        64,
+        4,
+        16
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0033": {
+      "file": "template_haiku_0033.f32.bin",
+      "shape": [
+        2,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0034": {
+      "file": "template_haiku_0034.f32.bin",
+      "shape": [
+        2,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0035": {
+      "file": "template_haiku_0035.f32.bin",
+      "shape": [
+        2,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0036": {
+      "file": "template_haiku_0036.f32.bin",
+      "shape": [
+        2,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0037": {
+      "file": "template_haiku_0037.f32.bin",
+      "shape": [
+        2,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0038": {
+      "file": "template_haiku_0038.f32.bin",
+      "shape": [
+        2,
+        64,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0039": {
+      "file": "template_haiku_0039.f32.bin",
+      "shape": [
+        2,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0040": {
+      "file": "template_haiku_0040.f32.bin",
+      "shape": [
+        2,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0041": {
+      "file": "template_haiku_0041.f32.bin",
+      "shape": [
+        2,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0042": {
+      "file": "template_haiku_0042.f32.bin",
+      "shape": [
+        2,
+        64,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0043": {
+      "file": "template_haiku_0043.f32.bin",
+      "shape": [
+        2,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0044": {
+      "file": "template_haiku_0044.f32.bin",
+      "shape": [
+        2,
+        64,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0045": {
+      "file": "template_haiku_0045.f32.bin",
+      "shape": [
+        2,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0046": {
+      "file": "template_haiku_0046.f32.bin",
+      "shape": [
+        2,
+        64,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0047": {
+      "file": "template_haiku_0047.f32.bin",
+      "shape": [
+        2,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0048": {
+      "file": "template_haiku_0048.f32.bin",
+      "shape": [
+        2,
+        64,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0049": {
+      "file": "template_haiku_0049.f32.bin",
+      "shape": [
+        2,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0050": {
+      "file": "template_haiku_0050.f32.bin",
+      "shape": [
+        2,
+        64,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0051": {
+      "file": "template_haiku_0051.f32.bin",
+      "shape": [
+        2,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0052": {
+      "file": "template_haiku_0052.f32.bin",
+      "shape": [
+        2,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0053": {
+      "file": "template_haiku_0053.f32.bin",
+      "shape": [
+        2,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0054": {
+      "file": "template_haiku_0054.f32.bin",
+      "shape": [
+        2,
+        64,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0055": {
+      "file": "template_haiku_0055.f32.bin",
+      "shape": [
+        2,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0056": {
+      "file": "template_haiku_0056.f32.bin",
+      "shape": [
+        2,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0057": {
+      "file": "template_haiku_0057.f32.bin",
+      "shape": [
+        2,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0058": {
+      "file": "template_haiku_0058.f32.bin",
+      "shape": [
+        2,
+        64,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0059": {
+      "file": "template_haiku_0059.f32.bin",
+      "shape": [
+        2,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0060": {
+      "file": "template_haiku_0060.f32.bin",
+      "shape": [
+        2,
+        64,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0061": {
+      "file": "template_haiku_0061.f32.bin",
+      "shape": [
+        2,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0062": {
+      "file": "template_haiku_0062.f32.bin",
+      "shape": [
+        2,
+        64,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0063": {
+      "file": "template_haiku_0063.f32.bin",
+      "shape": [
+        2,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0064": {
+      "file": "template_haiku_0064.f32.bin",
+      "shape": [
+        2,
+        64,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0065": {
+      "file": "template_haiku_0065.f32.bin",
+      "shape": [
+        2,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0066": {
+      "file": "template_haiku_0066.f32.bin",
+      "shape": [
+        2,
+        64,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "structureInputSingle": {
+      "file": "structureInputSingle.f32.bin",
+      "shape": [
+        59,
+        384
+      ],
+      "dtype": "float32"
+    },
+    "structureInputPair": {
+      "file": "structureInputPair.f32.bin",
+      "shape": [
+        59,
+        59,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "structureFinalAtomPositions": {
+      "file": "structureFinalAtomPositions.f32.bin",
+      "shape": [
+        59,
+        37,
+        3
+      ],
+      "dtype": "float32"
+    },
+    "structureFinalAtomMask": {
+      "file": "structureFinalAtomMask.f32.bin",
+      "shape": [
+        59,
+        37
+      ],
+      "dtype": "float32"
+    },
+    "structureFinalRepresentation": {
+      "file": "structureFinalRepresentation.f32.bin",
+      "shape": [
+        59,
+        384
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0000": {
+      "file": "structure_haiku_0000.f32.bin",
+      "shape": [
+        6
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0001": {
+      "file": "structure_haiku_0001.f32.bin",
+      "shape": [
+        384,
+        6
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0002": {
+      "file": "structure_haiku_0002.f32.bin",
+      "shape": [
+        384
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0003": {
+      "file": "structure_haiku_0003.f32.bin",
+      "shape": [
+        384
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0004": {
+      "file": "structure_haiku_0004.f32.bin",
+      "shape": [
+        12
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0005": {
+      "file": "structure_haiku_0005.f32.bin",
+      "shape": [
+        12
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0006": {
+      "file": "structure_haiku_0006.f32.bin",
+      "shape": [
+        128,
+        12
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0007": {
+      "file": "structure_haiku_0007.f32.bin",
+      "shape": [
+        432
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0008": {
+      "file": "structure_haiku_0008.f32.bin",
+      "shape": [
+        384,
+        432
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0009": {
+      "file": "structure_haiku_0009.f32.bin",
+      "shape": [
+        384
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0010": {
+      "file": "structure_haiku_0010.f32.bin",
+      "shape": [
+        384,
+        384
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0011": {
+      "file": "structure_haiku_0011.f32.bin",
+      "shape": [
+        384
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0012": {
+      "file": "structure_haiku_0012.f32.bin",
+      "shape": [
+        2112,
+        384
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0013": {
+      "file": "structure_haiku_0013.f32.bin",
+      "shape": [
+        144
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0014": {
+      "file": "structure_haiku_0014.f32.bin",
+      "shape": [
+        384,
+        144
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0015": {
+      "file": "structure_haiku_0015.f32.bin",
+      "shape": [
+        192
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0016": {
+      "file": "structure_haiku_0016.f32.bin",
+      "shape": [
+        384,
+        192
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0017": {
+      "file": "structure_haiku_0017.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0018": {
+      "file": "structure_haiku_0018.f32.bin",
+      "shape": [
+        384,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0019": {
+      "file": "structure_haiku_0019.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0020": {
+      "file": "structure_haiku_0020.f32.bin",
+      "shape": [
+        384,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0021": {
+      "file": "structure_haiku_0021.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0022": {
+      "file": "structure_haiku_0022.f32.bin",
+      "shape": [
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0023": {
+      "file": "structure_haiku_0023.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0024": {
+      "file": "structure_haiku_0024.f32.bin",
+      "shape": [
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0025": {
+      "file": "structure_haiku_0025.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0026": {
+      "file": "structure_haiku_0026.f32.bin",
+      "shape": [
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0027": {
+      "file": "structure_haiku_0027.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0028": {
+      "file": "structure_haiku_0028.f32.bin",
+      "shape": [
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0029": {
+      "file": "structure_haiku_0029.f32.bin",
+      "shape": [
+        14
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0030": {
+      "file": "structure_haiku_0030.f32.bin",
+      "shape": [
+        128,
+        14
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0031": {
+      "file": "structure_haiku_0031.f32.bin",
+      "shape": [
+        384
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0032": {
+      "file": "structure_haiku_0032.f32.bin",
+      "shape": [
+        384,
+        384
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0033": {
+      "file": "structure_haiku_0033.f32.bin",
+      "shape": [
+        384
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0034": {
+      "file": "structure_haiku_0034.f32.bin",
+      "shape": [
+        384,
+        384
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0035": {
+      "file": "structure_haiku_0035.f32.bin",
+      "shape": [
+        384
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0036": {
+      "file": "structure_haiku_0036.f32.bin",
+      "shape": [
+        384,
+        384
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0037": {
+      "file": "structure_haiku_0037.f32.bin",
+      "shape": [
+        384
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0038": {
+      "file": "structure_haiku_0038.f32.bin",
+      "shape": [
+        384
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0039": {
+      "file": "structure_haiku_0039.f32.bin",
+      "shape": [
+        384
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0040": {
+      "file": "structure_haiku_0040.f32.bin",
+      "shape": [
+        384,
+        384
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0041": {
+      "file": "structure_haiku_0041.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0042": {
+      "file": "structure_haiku_0042.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0043": {
+      "file": "structure_haiku_0043.f32.bin",
+      "shape": [
+        384
+      ],
+      "dtype": "float32"
+    },
+    "structure_haiku_0044": {
+      "file": "structure_haiku_0044.f32.bin",
+      "shape": [
+        384
+      ],
+      "dtype": "float32"
+    },
+    "structureStage_ipa": {
+      "file": "structureStage_ipa.f32.bin",
+      "shape": [
+        8,
+        59,
+        384
+      ],
+      "dtype": "float32"
+    },
+    "structureStage_act_input": {
+      "file": "structureStage_act_input.f32.bin",
+      "shape": [
+        8,
+        59,
+        384
+      ],
+      "dtype": "float32"
+    },
+    "structureStage_affine_input": {
+      "file": "structureStage_affine_input.f32.bin",
+      "shape": [
+        8,
+        59,
+        7
+      ],
+      "dtype": "float32"
+    },
+    "structureStage_act_output": {
+      "file": "structureStage_act_output.f32.bin",
+      "shape": [
+        8,
+        59,
+        384
+      ],
+      "dtype": "float32"
+    },
+    "structureStage_affine_output": {
+      "file": "structureStage_affine_output.f32.bin",
+      "shape": [
+        8,
+        59,
+        7
+      ],
+      "dtype": "float32"
+    },
+    "structureStage_initial_act": {
+      "file": "structureStage_initial_act.f32.bin",
+      "shape": [
+        8,
+        59,
+        384
+      ],
+      "dtype": "float32"
+    },
+    "structureStage_angles": {
+      "file": "structureStage_angles.f32.bin",
+      "shape": [
+        8,
+        59,
+        7,
+        2
+      ],
+      "dtype": "float32"
+    },
+    "structureStage_unnormalized_angles": {
+      "file": "structureStage_unnormalized_angles.f32.bin",
+      "shape": [
+        8,
+        59,
+        7,
+        2
+      ],
+      "dtype": "float32"
+    },
+    "structureStage_atom14": {
+      "file": "structureStage_atom14.f32.bin",
+      "shape": [
+        8,
+        59,
+        14,
+        3
+      ],
+      "dtype": "float32"
+    },
+    "geometryDefaultFrames": {
+      "file": "geometryDefaultFrames.f32.bin",
+      "shape": [
+        21,
+        8,
+        4,
+        4
+      ],
+      "dtype": "float32"
+    },
+    "geometryAtom14ToGroup": {
+      "file": "geometryAtom14ToGroup.f32.bin",
+      "shape": [
+        21,
+        14
+      ],
+      "dtype": "float32"
+    },
+    "geometryAtom14Positions": {
+      "file": "geometryAtom14Positions.f32.bin",
+      "shape": [
+        21,
+        14,
+        3
+      ],
+      "dtype": "float32"
+    },
+    "geometryAtom14Mask": {
+      "file": "geometryAtom14Mask.f32.bin",
+      "shape": [
+        21,
+        14
+      ],
+      "dtype": "float32"
+    },
+    "confidence_haiku_0000": {
+      "file": "confidence_haiku_0000.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "confidence_haiku_0001": {
+      "file": "confidence_haiku_0001.f32.bin",
+      "shape": [
+        384,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "confidence_haiku_0002": {
+      "file": "confidence_haiku_0002.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "confidence_haiku_0003": {
+      "file": "confidence_haiku_0003.f32.bin",
+      "shape": [
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "confidence_haiku_0004": {
+      "file": "confidence_haiku_0004.f32.bin",
+      "shape": [
+        384
+      ],
+      "dtype": "float32"
+    },
+    "confidence_haiku_0005": {
+      "file": "confidence_haiku_0005.f32.bin",
+      "shape": [
+        384
+      ],
+      "dtype": "float32"
+    },
+    "confidence_haiku_0006": {
+      "file": "confidence_haiku_0006.f32.bin",
+      "shape": [
+        50
+      ],
+      "dtype": "float32"
+    },
+    "confidence_haiku_0007": {
+      "file": "confidence_haiku_0007.f32.bin",
+      "shape": [
+        128,
+        50
+      ],
+      "dtype": "float32"
+    },
+    "confidence_haiku_0008": {
+      "file": "confidence_haiku_0008.f32.bin",
+      "shape": [
+        64
+      ],
+      "dtype": "float32"
+    },
+    "confidence_haiku_0009": {
+      "file": "confidence_haiku_0009.f32.bin",
+      "shape": [
+        128,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "confidenceLddtLogits": {
+      "file": "confidenceLddtLogits.f32.bin",
+      "shape": [
+        59,
+        50
+      ],
+      "dtype": "float32"
+    },
+    "confidencePlddt": {
+      "file": "confidencePlddt.f32.bin",
+      "shape": [
+        59
+      ],
+      "dtype": "float32"
+    },
+    "confidencePaeLogits": {
+      "file": "confidencePaeLogits.f32.bin",
+      "shape": [
+        59,
+        59,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "confidencePaeBreaks": {
+      "file": "confidencePaeBreaks.f32.bin",
+      "shape": [
+        63
+      ],
+      "dtype": "float32"
+    },
+    "structureRecycle0FinalAtomPositions": {
+      "file": "structureRecycle0FinalAtomPositions.f32.bin",
+      "shape": [
+        59,
+        37,
+        3
+      ],
+      "dtype": "float32"
+    },
+    "structureRecycle0FinalRepresentation": {
+      "file": "structureRecycle0FinalRepresentation.f32.bin",
+      "shape": [
+        59,
+        384
+      ],
+      "dtype": "float32"
+    },
+    "structureRecycle1FinalAtomPositions": {
+      "file": "structureRecycle1FinalAtomPositions.f32.bin",
+      "shape": [
+        59,
+        37,
+        3
+      ],
+      "dtype": "float32"
+    },
+    "structureRecycle1FinalRepresentation": {
+      "file": "structureRecycle1FinalRepresentation.f32.bin",
+      "shape": [
+        59,
+        384
+      ],
+      "dtype": "float32"
+    },
+    "structureRecycle2FinalAtomPositions": {
+      "file": "structureRecycle2FinalAtomPositions.f32.bin",
+      "shape": [
+        59,
+        37,
+        3
+      ],
+      "dtype": "float32"
+    },
+    "structureRecycle2FinalRepresentation": {
+      "file": "structureRecycle2FinalRepresentation.f32.bin",
+      "shape": [
+        59,
+        384
+      ],
+      "dtype": "float32"
+    },
+    "structureRecycle3FinalAtomPositions": {
+      "file": "structureRecycle3FinalAtomPositions.f32.bin",
+      "shape": [
+        59,
+        37,
+        3
+      ],
+      "dtype": "float32"
+    },
+    "structureRecycle3FinalRepresentation": {
+      "file": "structureRecycle3FinalRepresentation.f32.bin",
+      "shape": [
+        59,
+        384
+      ],
+      "dtype": "float32"
+    },
+    "confidenceRecycle0LddtLogits": {
+      "file": "confidenceRecycle0LddtLogits.f32.bin",
+      "shape": [
+        59,
+        50
+      ],
+      "dtype": "float32"
+    },
+    "confidenceRecycle0PaeLogits": {
+      "file": "confidenceRecycle0PaeLogits.f32.bin",
+      "shape": [
+        59,
+        59,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "confidenceRecycle0Plddt": {
+      "file": "confidenceRecycle0Plddt.f32.bin",
+      "shape": [
+        59
+      ],
+      "dtype": "float32"
+    },
+    "confidenceRecycle1LddtLogits": {
+      "file": "confidenceRecycle1LddtLogits.f32.bin",
+      "shape": [
+        59,
+        50
+      ],
+      "dtype": "float32"
+    },
+    "confidenceRecycle1PaeLogits": {
+      "file": "confidenceRecycle1PaeLogits.f32.bin",
+      "shape": [
+        59,
+        59,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "confidenceRecycle1Plddt": {
+      "file": "confidenceRecycle1Plddt.f32.bin",
+      "shape": [
+        59
+      ],
+      "dtype": "float32"
+    },
+    "confidenceRecycle2LddtLogits": {
+      "file": "confidenceRecycle2LddtLogits.f32.bin",
+      "shape": [
+        59,
+        50
+      ],
+      "dtype": "float32"
+    },
+    "confidenceRecycle2PaeLogits": {
+      "file": "confidenceRecycle2PaeLogits.f32.bin",
+      "shape": [
+        59,
+        59,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "confidenceRecycle2Plddt": {
+      "file": "confidenceRecycle2Plddt.f32.bin",
+      "shape": [
+        59
+      ],
+      "dtype": "float32"
+    },
+    "confidenceRecycle3LddtLogits": {
+      "file": "confidenceRecycle3LddtLogits.f32.bin",
+      "shape": [
+        59,
+        50
+      ],
+      "dtype": "float32"
+    },
+    "confidenceRecycle3PaeLogits": {
+      "file": "confidenceRecycle3PaeLogits.f32.bin",
+      "shape": [
+        59,
+        59,
+        64
+      ],
+      "dtype": "float32"
+    },
+    "confidenceRecycle3Plddt": {
+      "file": "confidenceRecycle3Plddt.f32.bin",
+      "shape": [
+        59
+      ],
+      "dtype": "float32"
+    },
+    "geometryAtom37ToAtom14": {
+      "file": "geometryAtom37ToAtom14.f32.bin",
+      "shape": [
+        21,
+        37
+      ],
+      "dtype": "float32"
+    },
+    "geometryAtom37Mask": {
+      "file": "geometryAtom37Mask.f32.bin",
+      "shape": [
+        21,
+        37
+      ],
+      "dtype": "float32"
+    }
+  },
+  "evoformerStack": {
+    "captured": true,
+    "blocks": 48,
+    "capturedRecycle": 3,
+    "parameterFormat": "stacked-haiku",
+    "parameters": {
+      "msa_column_attention/attention": {
+        "gating_b": "stack_haiku_0000",
+        "gating_w": "stack_haiku_0001",
+        "key_w": "stack_haiku_0002",
+        "output_b": "stack_haiku_0003",
+        "output_w": "stack_haiku_0004",
+        "query_w": "stack_haiku_0005",
+        "value_w": "stack_haiku_0006"
+      },
+      "msa_column_attention/query_norm": {
+        "offset": "stack_haiku_0007",
+        "scale": "stack_haiku_0008"
+      },
+      "msa_row_attention_with_pair_bias": {
+        "feat_2d_weights": "stack_haiku_0009"
+      },
+      "msa_row_attention_with_pair_bias/attention": {
+        "gating_b": "stack_haiku_0010",
+        "gating_w": "stack_haiku_0011",
+        "key_w": "stack_haiku_0012",
+        "output_b": "stack_haiku_0013",
+        "output_w": "stack_haiku_0014",
+        "query_w": "stack_haiku_0015",
+        "value_w": "stack_haiku_0016"
+      },
+      "msa_row_attention_with_pair_bias/feat_2d_norm": {
+        "offset": "stack_haiku_0017",
+        "scale": "stack_haiku_0018"
+      },
+      "msa_row_attention_with_pair_bias/query_norm": {
+        "offset": "stack_haiku_0019",
+        "scale": "stack_haiku_0020"
+      },
+      "msa_transition/input_layer_norm": {
+        "offset": "stack_haiku_0021",
+        "scale": "stack_haiku_0022"
+      },
+      "msa_transition/transition1": {
+        "bias": "stack_haiku_0023",
+        "weights": "stack_haiku_0024"
+      },
+      "msa_transition/transition2": {
+        "bias": "stack_haiku_0025",
+        "weights": "stack_haiku_0026"
+      },
+      "outer_product_mean": {
+        "output_b": "stack_haiku_0027",
+        "output_w": "stack_haiku_0028"
+      },
+      "outer_product_mean/layer_norm_input": {
+        "offset": "stack_haiku_0029",
+        "scale": "stack_haiku_0030"
+      },
+      "outer_product_mean/left_projection": {
+        "bias": "stack_haiku_0031",
+        "weights": "stack_haiku_0032"
+      },
+      "outer_product_mean/right_projection": {
+        "bias": "stack_haiku_0033",
+        "weights": "stack_haiku_0034"
+      },
+      "pair_transition/input_layer_norm": {
+        "offset": "stack_haiku_0035",
+        "scale": "stack_haiku_0036"
+      },
+      "pair_transition/transition1": {
+        "bias": "stack_haiku_0037",
+        "weights": "stack_haiku_0038"
+      },
+      "pair_transition/transition2": {
+        "bias": "stack_haiku_0039",
+        "weights": "stack_haiku_0040"
+      },
+      "triangle_attention_ending_node": {
+        "feat_2d_weights": "stack_haiku_0041"
+      },
+      "triangle_attention_ending_node/attention": {
+        "gating_b": "stack_haiku_0042",
+        "gating_w": "stack_haiku_0043",
+        "key_w": "stack_haiku_0044",
+        "output_b": "stack_haiku_0045",
+        "output_w": "stack_haiku_0046",
+        "query_w": "stack_haiku_0047",
+        "value_w": "stack_haiku_0048"
+      },
+      "triangle_attention_ending_node/query_norm": {
+        "offset": "stack_haiku_0049",
+        "scale": "stack_haiku_0050"
+      },
+      "triangle_attention_starting_node": {
+        "feat_2d_weights": "stack_haiku_0051"
+      },
+      "triangle_attention_starting_node/attention": {
+        "gating_b": "stack_haiku_0052",
+        "gating_w": "stack_haiku_0053",
+        "key_w": "stack_haiku_0054",
+        "output_b": "stack_haiku_0055",
+        "output_w": "stack_haiku_0056",
+        "query_w": "stack_haiku_0057",
+        "value_w": "stack_haiku_0058"
+      },
+      "triangle_attention_starting_node/query_norm": {
+        "offset": "stack_haiku_0059",
+        "scale": "stack_haiku_0060"
+      },
+      "triangle_multiplication_incoming/center_layer_norm": {
+        "offset": "stack_haiku_0061",
+        "scale": "stack_haiku_0062"
+      },
+      "triangle_multiplication_incoming/gating_linear": {
+        "bias": "stack_haiku_0063",
+        "weights": "stack_haiku_0064"
+      },
+      "triangle_multiplication_incoming/layer_norm_input": {
+        "offset": "stack_haiku_0065",
+        "scale": "stack_haiku_0066"
+      },
+      "triangle_multiplication_incoming/left_gate": {
+        "bias": "stack_haiku_0067",
+        "weights": "stack_haiku_0068"
+      },
+      "triangle_multiplication_incoming/left_projection": {
+        "bias": "stack_haiku_0069",
+        "weights": "stack_haiku_0070"
+      },
+      "triangle_multiplication_incoming/output_projection": {
+        "bias": "stack_haiku_0071",
+        "weights": "stack_haiku_0072"
+      },
+      "triangle_multiplication_incoming/right_gate": {
+        "bias": "stack_haiku_0073",
+        "weights": "stack_haiku_0074"
+      },
+      "triangle_multiplication_incoming/right_projection": {
+        "bias": "stack_haiku_0075",
+        "weights": "stack_haiku_0076"
+      },
+      "triangle_multiplication_outgoing/center_layer_norm": {
+        "offset": "stack_haiku_0077",
+        "scale": "stack_haiku_0078"
+      },
+      "triangle_multiplication_outgoing/gating_linear": {
+        "bias": "stack_haiku_0079",
+        "weights": "stack_haiku_0080"
+      },
+      "triangle_multiplication_outgoing/layer_norm_input": {
+        "offset": "stack_haiku_0081",
+        "scale": "stack_haiku_0082"
+      },
+      "triangle_multiplication_outgoing/left_gate": {
+        "bias": "stack_haiku_0083",
+        "weights": "stack_haiku_0084"
+      },
+      "triangle_multiplication_outgoing/left_projection": {
+        "bias": "stack_haiku_0085",
+        "weights": "stack_haiku_0086"
+      },
+      "triangle_multiplication_outgoing/output_projection": {
+        "bias": "stack_haiku_0087",
+        "weights": "stack_haiku_0088"
+      },
+      "triangle_multiplication_outgoing/right_gate": {
+        "bias": "stack_haiku_0089",
+        "weights": "stack_haiku_0090"
+      },
+      "triangle_multiplication_outgoing/right_projection": {
+        "bias": "stack_haiku_0091",
+        "weights": "stack_haiku_0092"
+      }
+    }
+  },
+  "extraMsaStack": {
+    "captured": true,
+    "blocks": 4,
+    "capturedRecycle": 3,
+    "parameterFormat": "stacked-haiku",
+    "parameters": {
+      "msa_column_global_attention/attention": {
+        "gating_b": "extra_stack_haiku_0000",
+        "gating_w": "extra_stack_haiku_0001",
+        "key_w": "extra_stack_haiku_0002",
+        "output_b": "extra_stack_haiku_0003",
+        "output_w": "extra_stack_haiku_0004",
+        "query_w": "extra_stack_haiku_0005",
+        "value_w": "extra_stack_haiku_0006"
+      },
+      "msa_column_global_attention/query_norm": {
+        "offset": "extra_stack_haiku_0007",
+        "scale": "extra_stack_haiku_0008"
+      },
+      "msa_row_attention_with_pair_bias": {
+        "feat_2d_weights": "extra_stack_haiku_0009"
+      },
+      "msa_row_attention_with_pair_bias/attention": {
+        "gating_b": "extra_stack_haiku_0010",
+        "gating_w": "extra_stack_haiku_0011",
+        "key_w": "extra_stack_haiku_0012",
+        "output_b": "extra_stack_haiku_0013",
+        "output_w": "extra_stack_haiku_0014",
+        "query_w": "extra_stack_haiku_0015",
+        "value_w": "extra_stack_haiku_0016"
+      },
+      "msa_row_attention_with_pair_bias/feat_2d_norm": {
+        "offset": "extra_stack_haiku_0017",
+        "scale": "extra_stack_haiku_0018"
+      },
+      "msa_row_attention_with_pair_bias/query_norm": {
+        "offset": "extra_stack_haiku_0019",
+        "scale": "extra_stack_haiku_0020"
+      },
+      "msa_transition/input_layer_norm": {
+        "offset": "extra_stack_haiku_0021",
+        "scale": "extra_stack_haiku_0022"
+      },
+      "msa_transition/transition1": {
+        "bias": "extra_stack_haiku_0023",
+        "weights": "extra_stack_haiku_0024"
+      },
+      "msa_transition/transition2": {
+        "bias": "extra_stack_haiku_0025",
+        "weights": "extra_stack_haiku_0026"
+      },
+      "outer_product_mean": {
+        "output_b": "extra_stack_haiku_0027",
+        "output_w": "extra_stack_haiku_0028"
+      },
+      "outer_product_mean/layer_norm_input": {
+        "offset": "extra_stack_haiku_0029",
+        "scale": "extra_stack_haiku_0030"
+      },
+      "outer_product_mean/left_projection": {
+        "bias": "extra_stack_haiku_0031",
+        "weights": "extra_stack_haiku_0032"
+      },
+      "outer_product_mean/right_projection": {
+        "bias": "extra_stack_haiku_0033",
+        "weights": "extra_stack_haiku_0034"
+      },
+      "pair_transition/input_layer_norm": {
+        "offset": "extra_stack_haiku_0035",
+        "scale": "extra_stack_haiku_0036"
+      },
+      "pair_transition/transition1": {
+        "bias": "extra_stack_haiku_0037",
+        "weights": "extra_stack_haiku_0038"
+      },
+      "pair_transition/transition2": {
+        "bias": "extra_stack_haiku_0039",
+        "weights": "extra_stack_haiku_0040"
+      },
+      "triangle_attention_ending_node": {
+        "feat_2d_weights": "extra_stack_haiku_0041"
+      },
+      "triangle_attention_ending_node/attention": {
+        "gating_b": "extra_stack_haiku_0042",
+        "gating_w": "extra_stack_haiku_0043",
+        "key_w": "extra_stack_haiku_0044",
+        "output_b": "extra_stack_haiku_0045",
+        "output_w": "extra_stack_haiku_0046",
+        "query_w": "extra_stack_haiku_0047",
+        "value_w": "extra_stack_haiku_0048"
+      },
+      "triangle_attention_ending_node/query_norm": {
+        "offset": "extra_stack_haiku_0049",
+        "scale": "extra_stack_haiku_0050"
+      },
+      "triangle_attention_starting_node": {
+        "feat_2d_weights": "extra_stack_haiku_0051"
+      },
+      "triangle_attention_starting_node/attention": {
+        "gating_b": "extra_stack_haiku_0052",
+        "gating_w": "extra_stack_haiku_0053",
+        "key_w": "extra_stack_haiku_0054",
+        "output_b": "extra_stack_haiku_0055",
+        "output_w": "extra_stack_haiku_0056",
+        "query_w": "extra_stack_haiku_0057",
+        "value_w": "extra_stack_haiku_0058"
+      },
+      "triangle_attention_starting_node/query_norm": {
+        "offset": "extra_stack_haiku_0059",
+        "scale": "extra_stack_haiku_0060"
+      },
+      "triangle_multiplication_incoming/center_layer_norm": {
+        "offset": "extra_stack_haiku_0061",
+        "scale": "extra_stack_haiku_0062"
+      },
+      "triangle_multiplication_incoming/gating_linear": {
+        "bias": "extra_stack_haiku_0063",
+        "weights": "extra_stack_haiku_0064"
+      },
+      "triangle_multiplication_incoming/layer_norm_input": {
+        "offset": "extra_stack_haiku_0065",
+        "scale": "extra_stack_haiku_0066"
+      },
+      "triangle_multiplication_incoming/left_gate": {
+        "bias": "extra_stack_haiku_0067",
+        "weights": "extra_stack_haiku_0068"
+      },
+      "triangle_multiplication_incoming/left_projection": {
+        "bias": "extra_stack_haiku_0069",
+        "weights": "extra_stack_haiku_0070"
+      },
+      "triangle_multiplication_incoming/output_projection": {
+        "bias": "extra_stack_haiku_0071",
+        "weights": "extra_stack_haiku_0072"
+      },
+      "triangle_multiplication_incoming/right_gate": {
+        "bias": "extra_stack_haiku_0073",
+        "weights": "extra_stack_haiku_0074"
+      },
+      "triangle_multiplication_incoming/right_projection": {
+        "bias": "extra_stack_haiku_0075",
+        "weights": "extra_stack_haiku_0076"
+      },
+      "triangle_multiplication_outgoing/center_layer_norm": {
+        "offset": "extra_stack_haiku_0077",
+        "scale": "extra_stack_haiku_0078"
+      },
+      "triangle_multiplication_outgoing/gating_linear": {
+        "bias": "extra_stack_haiku_0079",
+        "weights": "extra_stack_haiku_0080"
+      },
+      "triangle_multiplication_outgoing/layer_norm_input": {
+        "offset": "extra_stack_haiku_0081",
+        "scale": "extra_stack_haiku_0082"
+      },
+      "triangle_multiplication_outgoing/left_gate": {
+        "bias": "extra_stack_haiku_0083",
+        "weights": "extra_stack_haiku_0084"
+      },
+      "triangle_multiplication_outgoing/left_projection": {
+        "bias": "extra_stack_haiku_0085",
+        "weights": "extra_stack_haiku_0086"
+      },
+      "triangle_multiplication_outgoing/output_projection": {
+        "bias": "extra_stack_haiku_0087",
+        "weights": "extra_stack_haiku_0088"
+      },
+      "triangle_multiplication_outgoing/right_gate": {
+        "bias": "extra_stack_haiku_0089",
+        "weights": "extra_stack_haiku_0090"
+      },
+      "triangle_multiplication_outgoing/right_projection": {
+        "bias": "extra_stack_haiku_0091",
+        "weights": "extra_stack_haiku_0092"
+      }
+    }
+  },
+  "embedding": {
+    "parameterFormat": "haiku",
+    "parameters": {
+      "extra_msa_activations": {
+        "bias": "embedding_haiku_0000",
+        "weights": "embedding_haiku_0001"
+      },
+      "left_single": {
+        "bias": "embedding_haiku_0002",
+        "weights": "embedding_haiku_0003"
+      },
+      "pair_activiations": {
+        "bias": "embedding_haiku_0004",
+        "weights": "embedding_haiku_0005"
+      },
+      "preprocess_1d": {
+        "bias": "embedding_haiku_0006",
+        "weights": "embedding_haiku_0007"
+      },
+      "preprocess_msa": {
+        "bias": "embedding_haiku_0008",
+        "weights": "embedding_haiku_0009"
+      },
+      "prev_msa_first_row_norm": {
+        "offset": "embedding_haiku_0010",
+        "scale": "embedding_haiku_0011"
+      },
+      "prev_pair_norm": {
+        "offset": "embedding_haiku_0012",
+        "scale": "embedding_haiku_0013"
+      },
+      "prev_pos_linear": {
+        "bias": "embedding_haiku_0014",
+        "weights": "embedding_haiku_0015"
+      },
+      "right_single": {
+        "bias": "embedding_haiku_0016",
+        "weights": "embedding_haiku_0017"
+      },
+      "single_activations": {
+        "bias": "embedding_haiku_0018",
+        "weights": "embedding_haiku_0019"
+      }
+    }
+  },
+  "templateEmbedding": {
+    "parameterFormat": "haiku",
+    "parameters": {
+      "attention": {
+        "key_w": "template_haiku_0000",
+        "output_b": "template_haiku_0001",
+        "output_w": "template_haiku_0002",
+        "query_w": "template_haiku_0003",
+        "value_w": "template_haiku_0004"
+      },
+      "single_template_embedding/embedding2d": {
+        "bias": "template_haiku_0005",
+        "weights": "template_haiku_0006"
+      },
+      "single_template_embedding/output_layer_norm": {
+        "offset": "template_haiku_0007",
+        "scale": "template_haiku_0008"
+      },
+      "single_template_embedding/template_pair_stack/__layer_stack_no_state/pair_transition/input_layer_norm": {
+        "offset": "template_haiku_0009",
+        "scale": "template_haiku_0010"
+      },
+      "single_template_embedding/template_pair_stack/__layer_stack_no_state/pair_transition/transition1": {
+        "bias": "template_haiku_0011",
+        "weights": "template_haiku_0012"
+      },
+      "single_template_embedding/template_pair_stack/__layer_stack_no_state/pair_transition/transition2": {
+        "bias": "template_haiku_0013",
+        "weights": "template_haiku_0014"
+      },
+      "single_template_embedding/template_pair_stack/__layer_stack_no_state/triangle_attention_ending_node": {
+        "feat_2d_weights": "template_haiku_0015"
+      },
+      "single_template_embedding/template_pair_stack/__layer_stack_no_state/triangle_attention_ending_node/attention": {
+        "gating_b": "template_haiku_0016",
+        "gating_w": "template_haiku_0017",
+        "key_w": "template_haiku_0018",
+        "output_b": "template_haiku_0019",
+        "output_w": "template_haiku_0020",
+        "query_w": "template_haiku_0021",
+        "value_w": "template_haiku_0022"
+      },
+      "single_template_embedding/template_pair_stack/__layer_stack_no_state/triangle_attention_ending_node/query_norm": {
+        "offset": "template_haiku_0023",
+        "scale": "template_haiku_0024"
+      },
+      "single_template_embedding/template_pair_stack/__layer_stack_no_state/triangle_attention_starting_node": {
+        "feat_2d_weights": "template_haiku_0025"
+      },
+      "single_template_embedding/template_pair_stack/__layer_stack_no_state/triangle_attention_starting_node/attention": {
+        "gating_b": "template_haiku_0026",
+        "gating_w": "template_haiku_0027",
+        "key_w": "template_haiku_0028",
+        "output_b": "template_haiku_0029",
+        "output_w": "template_haiku_0030",
+        "query_w": "template_haiku_0031",
+        "value_w": "template_haiku_0032"
+      },
+      "single_template_embedding/template_pair_stack/__layer_stack_no_state/triangle_attention_starting_node/query_norm": {
+        "offset": "template_haiku_0033",
+        "scale": "template_haiku_0034"
+      },
+      "single_template_embedding/template_pair_stack/__layer_stack_no_state/triangle_multiplication_incoming/center_layer_norm": {
+        "offset": "template_haiku_0035",
+        "scale": "template_haiku_0036"
+      },
+      "single_template_embedding/template_pair_stack/__layer_stack_no_state/triangle_multiplication_incoming/gating_linear": {
+        "bias": "template_haiku_0037",
+        "weights": "template_haiku_0038"
+      },
+      "single_template_embedding/template_pair_stack/__layer_stack_no_state/triangle_multiplication_incoming/layer_norm_input": {
+        "offset": "template_haiku_0039",
+        "scale": "template_haiku_0040"
+      },
+      "single_template_embedding/template_pair_stack/__layer_stack_no_state/triangle_multiplication_incoming/left_gate": {
+        "bias": "template_haiku_0041",
+        "weights": "template_haiku_0042"
+      },
+      "single_template_embedding/template_pair_stack/__layer_stack_no_state/triangle_multiplication_incoming/left_projection": {
+        "bias": "template_haiku_0043",
+        "weights": "template_haiku_0044"
+      },
+      "single_template_embedding/template_pair_stack/__layer_stack_no_state/triangle_multiplication_incoming/output_projection": {
+        "bias": "template_haiku_0045",
+        "weights": "template_haiku_0046"
+      },
+      "single_template_embedding/template_pair_stack/__layer_stack_no_state/triangle_multiplication_incoming/right_gate": {
+        "bias": "template_haiku_0047",
+        "weights": "template_haiku_0048"
+      },
+      "single_template_embedding/template_pair_stack/__layer_stack_no_state/triangle_multiplication_incoming/right_projection": {
+        "bias": "template_haiku_0049",
+        "weights": "template_haiku_0050"
+      },
+      "single_template_embedding/template_pair_stack/__layer_stack_no_state/triangle_multiplication_outgoing/center_layer_norm": {
+        "offset": "template_haiku_0051",
+        "scale": "template_haiku_0052"
+      },
+      "single_template_embedding/template_pair_stack/__layer_stack_no_state/triangle_multiplication_outgoing/gating_linear": {
+        "bias": "template_haiku_0053",
+        "weights": "template_haiku_0054"
+      },
+      "single_template_embedding/template_pair_stack/__layer_stack_no_state/triangle_multiplication_outgoing/layer_norm_input": {
+        "offset": "template_haiku_0055",
+        "scale": "template_haiku_0056"
+      },
+      "single_template_embedding/template_pair_stack/__layer_stack_no_state/triangle_multiplication_outgoing/left_gate": {
+        "bias": "template_haiku_0057",
+        "weights": "template_haiku_0058"
+      },
+      "single_template_embedding/template_pair_stack/__layer_stack_no_state/triangle_multiplication_outgoing/left_projection": {
+        "bias": "template_haiku_0059",
+        "weights": "template_haiku_0060"
+      },
+      "single_template_embedding/template_pair_stack/__layer_stack_no_state/triangle_multiplication_outgoing/output_projection": {
+        "bias": "template_haiku_0061",
+        "weights": "template_haiku_0062"
+      },
+      "single_template_embedding/template_pair_stack/__layer_stack_no_state/triangle_multiplication_outgoing/right_gate": {
+        "bias": "template_haiku_0063",
+        "weights": "template_haiku_0064"
+      },
+      "single_template_embedding/template_pair_stack/__layer_stack_no_state/triangle_multiplication_outgoing/right_projection": {
+        "bias": "template_haiku_0065",
+        "weights": "template_haiku_0066"
+      }
+    },
+    "queryOnlySimplification": "all mock-template atom masks are zero; one template_mask entry is valid"
+  },
+  "structureModule": {
+    "implementation": "official AlphaFold folding.StructureModule",
+    "dtype": "float32",
+    "iterations": 8,
+    "parameters": {
+      "fold_iteration/affine_update": {
+        "bias": "structure_haiku_0000",
+        "weights": "structure_haiku_0001"
+      },
+      "fold_iteration/attention_layer_norm": {
+        "offset": "structure_haiku_0002",
+        "scale": "structure_haiku_0003"
+      },
+      "fold_iteration/invariant_point_attention": {
+        "trainable_point_weights": "structure_haiku_0004"
+      },
+      "fold_iteration/invariant_point_attention/attention_2d": {
+        "bias": "structure_haiku_0005",
+        "weights": "structure_haiku_0006"
+      },
+      "fold_iteration/invariant_point_attention/kv_point_local": {
+        "bias": "structure_haiku_0007",
+        "weights": "structure_haiku_0008"
+      },
+      "fold_iteration/invariant_point_attention/kv_scalar": {
+        "bias": "structure_haiku_0009",
+        "weights": "structure_haiku_0010"
+      },
+      "fold_iteration/invariant_point_attention/output_projection": {
+        "bias": "structure_haiku_0011",
+        "weights": "structure_haiku_0012"
+      },
+      "fold_iteration/invariant_point_attention/q_point_local": {
+        "bias": "structure_haiku_0013",
+        "weights": "structure_haiku_0014"
+      },
+      "fold_iteration/invariant_point_attention/q_scalar": {
+        "bias": "structure_haiku_0015",
+        "weights": "structure_haiku_0016"
+      },
+      "fold_iteration/rigid_sidechain/input_projection": {
+        "bias": "structure_haiku_0017",
+        "weights": "structure_haiku_0018"
+      },
+      "fold_iteration/rigid_sidechain/input_projection_1": {
+        "bias": "structure_haiku_0019",
+        "weights": "structure_haiku_0020"
+      },
+      "fold_iteration/rigid_sidechain/resblock1": {
+        "bias": "structure_haiku_0021",
+        "weights": "structure_haiku_0022"
+      },
+      "fold_iteration/rigid_sidechain/resblock1_1": {
+        "bias": "structure_haiku_0023",
+        "weights": "structure_haiku_0024"
+      },
+      "fold_iteration/rigid_sidechain/resblock2": {
+        "bias": "structure_haiku_0025",
+        "weights": "structure_haiku_0026"
+      },
+      "fold_iteration/rigid_sidechain/resblock2_1": {
+        "bias": "structure_haiku_0027",
+        "weights": "structure_haiku_0028"
+      },
+      "fold_iteration/rigid_sidechain/unnormalized_angles": {
+        "bias": "structure_haiku_0029",
+        "weights": "structure_haiku_0030"
+      },
+      "fold_iteration/transition": {
+        "bias": "structure_haiku_0031",
+        "weights": "structure_haiku_0032"
+      },
+      "fold_iteration/transition_1": {
+        "bias": "structure_haiku_0033",
+        "weights": "structure_haiku_0034"
+      },
+      "fold_iteration/transition_2": {
+        "bias": "structure_haiku_0035",
+        "weights": "structure_haiku_0036"
+      },
+      "fold_iteration/transition_layer_norm": {
+        "offset": "structure_haiku_0037",
+        "scale": "structure_haiku_0038"
+      },
+      "initial_projection": {
+        "bias": "structure_haiku_0039",
+        "weights": "structure_haiku_0040"
+      },
+      "pair_layer_norm": {
+        "offset": "structure_haiku_0041",
+        "scale": "structure_haiku_0042"
+      },
+      "single_layer_norm": {
+        "offset": "structure_haiku_0043",
+        "scale": "structure_haiku_0044"
+      }
+    },
+    "referenceStages": {
+      "ipa": "structureStage_ipa",
+      "actInput": "structureStage_act_input",
+      "affineInput": "structureStage_affine_input",
+      "actOutput": "structureStage_act_output",
+      "affineOutput": "structureStage_affine_output"
+    }
+  },
+  "residueGeometry": {
+    "source": "alphafold.common.residue_constants",
+    "tensors": [
+      "geometryDefaultFrames",
+      "geometryAtom14ToGroup",
+      "geometryAtom14Positions",
+      "geometryAtom14Mask",
+      "geometryAtom37ToAtom14",
+      "geometryAtom37Mask"
+    ]
+  },
+  "confidenceHeads": {
+    "parameters": {
+      "predictedLddt": {
+        "act_0": {
+          "bias": "confidence_haiku_0000",
+          "weights": "confidence_haiku_0001"
+        },
+        "act_1": {
+          "bias": "confidence_haiku_0002",
+          "weights": "confidence_haiku_0003"
+        },
+        "input_layer_norm": {
+          "offset": "confidence_haiku_0004",
+          "scale": "confidence_haiku_0005"
+        },
+        "logits": {
+          "bias": "confidence_haiku_0006",
+          "weights": "confidence_haiku_0007"
+        }
+      },
+      "predictedAlignedError": {
+        "logits": {
+          "bias": "confidence_haiku_0008",
+          "weights": "confidence_haiku_0009"
+        }
+      }
+    },
+    "reference": {
+      "meanPlddt": 64.51092529296875,
+      "ptm": 0.4346401173642684
+    },
+    "recycleReferences": [
+      {
+        "meanPlddt": 56.99385070800781,
+        "ptm": 0.3759368636572358
+      },
+      {
+        "meanPlddt": 60.907230377197266,
+        "ptm": 0.4106091602491061
+      },
+      {
+        "meanPlddt": 62.83037185668945,
+        "ptm": 0.4169576488043788
+      },
+      {
+        "meanPlddt": 64.51092529296875,
+        "ptm": 0.4346401173642684
+      }
+    ]
+  }
+}

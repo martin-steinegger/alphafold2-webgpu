@@ -1,0 +1,208 @@
+{
+  "formatVersion": 1,
+  "operator": "TriangleMultiplicationOutgoing",
+  "source": "AlphaFold model_1_ptm query-only MSA, recycle 3, main Evoformer block 0",
+  "sequence": {
+    "name": "model1_reference_59",
+    "aminoAcids": "PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK"
+  },
+  "model": {
+    "name": "model_1",
+    "block": 0,
+    "recycles": 3,
+    "capturedRecycle": 3
+  },
+  "referencePrediction": {
+    "meanPlddt": 64.5,
+    "rankingConfidence": 64.5,
+    "recycleIteration": 3,
+    "recycleMetrics": [
+      {
+        "recycle": 0,
+        "meanPlddt": 57.0,
+        "rankingConfidence": 57.0,
+        "ptm": 0.3759765625,
+        "tol": 17.65625
+      },
+      {
+        "recycle": 1,
+        "meanPlddt": 60.90625,
+        "rankingConfidence": 60.90625,
+        "ptm": 0.41064453125,
+        "tol": 1.5068359375
+      },
+      {
+        "recycle": 2,
+        "meanPlddt": 62.84375,
+        "rankingConfidence": 62.84375,
+        "ptm": 0.4169921875,
+        "tol": 0.7099609375
+      },
+      {
+        "recycle": 3,
+        "meanPlddt": 64.5,
+        "rankingConfidence": 64.5,
+        "ptm": 0.434814453125,
+        "tol": 0.2327880859375
+      }
+    ]
+  },
+  "shape": {
+    "length": 59,
+    "cZ": 128,
+    "cHidden": 128
+  },
+  "epsilon": 1e-05,
+  "tensors": {
+    "z": {
+      "file": "z.f32.bin",
+      "shape": [
+        59,
+        59,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "mask": {
+      "file": "mask.f32.bin",
+      "shape": [
+        59,
+        59
+      ],
+      "dtype": "float32"
+    },
+    "expected": {
+      "file": "expected.f32.bin",
+      "shape": [
+        59,
+        59,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "layerNormInWeight": {
+      "file": "layerNormInWeight.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "layerNormInBias": {
+      "file": "layerNormInBias.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "linearAPWeight": {
+      "file": "linearAPWeight.f32.bin",
+      "shape": [
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "linearAPBias": {
+      "file": "linearAPBias.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "linearAGWeight": {
+      "file": "linearAGWeight.f32.bin",
+      "shape": [
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "linearAGBias": {
+      "file": "linearAGBias.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "linearBPWeight": {
+      "file": "linearBPWeight.f32.bin",
+      "shape": [
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "linearBPBias": {
+      "file": "linearBPBias.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "linearBGWeight": {
+      "file": "linearBGWeight.f32.bin",
+      "shape": [
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "linearBGBias": {
+      "file": "linearBGBias.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "layerNormOutWeight": {
+      "file": "layerNormOutWeight.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "layerNormOutBias": {
+      "file": "layerNormOutBias.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "linearZWeight": {
+      "file": "linearZWeight.f32.bin",
+      "shape": [
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "linearZBias": {
+      "file": "linearZBias.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    },
+    "linearGWeight": {
+      "file": "linearGWeight.f32.bin",
+      "shape": [
+        128,
+        128
+      ],
+      "dtype": "float32"
+    },
+    "linearGBias": {
+      "file": "linearGBias.f32.bin",
+      "shape": [
+        128
+      ],
+      "dtype": "float32"
+    }
+  },
+  "referenceExecution": {
+    "implementation": "official AlphaFold Haiku TriangleMultiplication",
+    "platform": "CPU",
+    "dtype": "float32",
+    "matmulPrecision": "highest"
+  }
+}

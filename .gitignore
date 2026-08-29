@@ -1,0 +1,11 @@
+node_modules/
+dist/
+coverage/
+artifacts/
+test-results/
+playwright-report/
+*.log
+.DS_Store
+# Full-model captures are local development assets. The publish branch retains
+# only a small subset needed by the default unit tests.
+test/fixtures/evoformer/

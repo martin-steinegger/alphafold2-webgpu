@@ -1,0 +1,37 @@
+{
+  "name": "afwebgpu",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Differentially tested WebGPU kernels for AlphaFold 2 inference",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "build:web": "vite build --config vite.browser.config.ts",
+    "export:web-model": "tsx tools/export-web-model.ts",
+    "build:web:standalone": "npm run build:web && npm run export:web-model",
+    "dev": "vite --config vite.browser.config.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:gpu": "AFWEBGPU_GPU_TESTS=1 vitest run test/*.gpu.test.ts",
+    "test:gpu:f16": "AFWEBGPU_GPU_TESTS=1 AFWEBGPU_ADAPTER=llvmpipe vitest run test/*.gpu.test.ts",
+    "test:browser": "playwright test",
+    "bench": "tsx tools/benchmark-triangle.ts",
+    "bench:attention": "tsx tools/benchmark-attention.ts",
+    "bench:a3m-stack": "tsx tools/benchmark-a3m-stack.ts",
+    "bench:a3m-model": "tsx tools/benchmark-a3m-model.ts",
+    "check": "npm run build && npm run build:web && npm run test"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.1",
+    "@types/node": "26.4.0",
+    "@webgpu/types": "0.1.72",
+    "tsx": "4.20.6",
+    "typescript": "7.0.2",
+    "vite": "8.2.2",
+    "vitest": "4.1.11",
+    "webgpu": "0.6.0"
+  }
+}
