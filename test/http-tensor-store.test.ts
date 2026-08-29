@@ -49,7 +49,8 @@ describe("HttpTensorStore", () => {
         second: { file: "weights.bin", dtype: "float32", shape: [2], byteOffset: 8 },
       } }));
       downloads += 1;
-      return new Response(shard, { headers: { "content-length": String(shard.byteLength) } });
+      // CDNs may report the compressed transfer length while fetch exposes decoded bytes.
+      return new Response(shard, { headers: { "content-encoding": "gzip", "content-length": "2" } });
     }));
     const store = await HttpTensorStore.open(new URL("https://example.test/model/manifest.json"));
     const [first, second] = await Promise.all([store.tensor("first"), store.tensor("second")]);

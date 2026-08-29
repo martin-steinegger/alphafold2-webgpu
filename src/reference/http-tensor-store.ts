@@ -36,6 +36,7 @@ export class HttpTensorStore {
   readonly manifest: BinaryTensorManifest;
   readonly #cache = new Map<string, Promise<Float32Array>>();
   readonly #fileCache = new Map<string, Promise<ArrayBuffer>>();
+  readonly #fileByteLengths = new Map<string, number>();
   readonly #pending: (() => void)[] = [];
   readonly #onProgress: TensorDownloadProgressCallback | undefined;
   readonly #totalBytes: number;
@@ -50,6 +51,11 @@ export class HttpTensorStore {
     this.#totalBytes = records.reduce(
       (sum, record) => sum + record.shape.reduce((product, dimension) => product * dimension, 1) * 4, 0,
     );
+    for (const record of records) {
+      const elements = record.shape.reduce((product, dimension) => product * dimension, 1);
+      const end = (record.byteOffset ?? 0) + elements * 4;
+      this.#fileByteLengths.set(record.file, Math.max(this.#fileByteLengths.get(record.file) ?? 0, end));
+    }
   }
   static async open(manifestUrlValue: URL | string,
     onProgress?: TensorDownloadProgressCallback): Promise<HttpTensorStore> {
@@ -104,10 +110,11 @@ export class HttpTensorStore {
   }
   async #downloadFile(file: string, tensorName: string): Promise<ArrayBuffer> {
     const response = await fetchWithRetry(new URL(file, this.manifestUrl), `tensor ${tensorName}`);
-    const contentLength = response.headers.get("content-length");
-    const expectedLength = contentLength === null ? Number.NaN : Number(contentLength);
-    if (response.body === null || !Number.isSafeInteger(expectedLength) || expectedLength < 0) {
+    const expectedLength = this.#fileByteLengths.get(file);
+    if (expectedLength === undefined) throw new Error(`${file} is absent from the manifest`);
+    if (response.body === null) {
       const buffer = await response.arrayBuffer();
+      if (buffer.byteLength !== expectedLength) throw new Error(`${file} has an invalid byte length`);
       this.#loadedBytes += buffer.byteLength;
       this.#reportProgress();
       return buffer;
