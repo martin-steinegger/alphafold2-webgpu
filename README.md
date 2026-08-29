@@ -79,7 +79,7 @@ npm run build:web
 npm run build:web:standalone
 ```
 
-The model exporter copies only the 335 tensors required for inference and discards captured activations and reference outputs. The resulting model-1 PTM download is approximately 355 MiB, versus 419 MiB for the query reference fixture and 1.1 GiB for the A3M reference fixture. It remains float32 to avoid silently changing predictions. Full-model captures are intentionally excluded from the published source history.
+The model exporter copies only the 335 tensors required for inference and discards captured activations and reference outputs. It packs them into eight balanced binary shards to avoid hundreds of HTTP round trips. The resulting model-1 PTM download is approximately 355 MiB, versus 419 MiB for the query reference fixture and 1.1 GiB for the A3M reference fixture. It remains float32 to avoid silently changing predictions. Full-model captures are intentionally excluded from the published source history.
 
 The Pages workflow deploys the UI on pushes to `main`. To keep Git history small, the reduced browser model is stored once in the private repository's `model1-ptm` GitHub Release as `afwebgpu-model1-ptm.tar.gz`; the workflow downloads that asset before constructing the Pages artifact. Because GitHub Pages is normally public even when its source repository is private, the workflow does not publish model parameters unless the repository variable `AFWEBGPU_INCLUDE_MODEL` is explicitly set to `true`. Without the bundled model, enter a CORS-enabled manifest URL in Advanced settings.
 

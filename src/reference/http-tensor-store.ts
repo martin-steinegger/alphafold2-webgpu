@@ -35,6 +35,7 @@ export class HttpTensorStore {
   readonly manifestUrl: URL;
   readonly manifest: BinaryTensorManifest;
   readonly #cache = new Map<string, Promise<Float32Array>>();
+  readonly #fileCache = new Map<string, Promise<ArrayBuffer>>();
   readonly #pending: (() => void)[] = [];
   readonly #onProgress: TensorDownloadProgressCallback | undefined;
   readonly #totalBytes: number;
@@ -70,10 +71,29 @@ export class HttpTensorStore {
     return record.shape;
   }
   async #load(name: string): Promise<Float32Array> {
-    return new Promise<Float32Array>((resolve, reject) => {
+    const record = this.manifest.tensors[name];
+    if (record === undefined || record.dtype !== "float32") throw new Error(`missing float32 tensor ${name}`);
+    let pendingFile = this.#fileCache.get(record.file);
+    if (pendingFile === undefined) {
+      pendingFile = this.#scheduleDownload(record.file, name);
+      this.#fileCache.set(record.file, pendingFile);
+    }
+    const buffer = await pendingFile;
+    const elements = record.shape.reduce((product, value) => product * value, 1);
+    const byteOffset = record.byteOffset ?? 0;
+    const byteLength = elements * 4;
+    if (!Number.isSafeInteger(byteOffset) || byteOffset < 0 || byteOffset + byteLength > buffer.byteLength) {
+      throw new Error(`${name} points outside ${record.file}`);
+    }
+    this.#loadedTensors += 1;
+    this.#reportProgress(name);
+    return new Float32Array(buffer, byteOffset, elements);
+  }
+  async #scheduleDownload(file: string, tensorName: string): Promise<ArrayBuffer> {
+    return new Promise<ArrayBuffer>((resolve, reject) => {
       const start = (): void => {
         this.#activeDownloads += 1;
-        void this.#download(name).then(resolve, reject).finally(() => {
+        void this.#downloadFile(file, tensorName).then(resolve, reject).finally(() => {
           this.#activeDownloads -= 1;
           this.#pending.shift()?.();
         });
@@ -82,17 +102,30 @@ export class HttpTensorStore {
       else this.#pending.push(start);
     });
   }
-  async #download(name: string): Promise<Float32Array> {
-    const record = this.manifest.tensors[name];
-    if (record === undefined || record.dtype !== "float32") throw new Error(`missing float32 tensor ${name}`);
-    const response = await fetchWithRetry(new URL(record.file, this.manifestUrl), `tensor ${name}`);
-    const buffer = await response.arrayBuffer();
-    const elements = record.shape.reduce((product, value) => product * value, 1);
-    if (buffer.byteLength !== elements * 4) throw new Error(`${name} has an invalid byte length`);
-    this.#loadedBytes += buffer.byteLength;
-    this.#loadedTensors += 1;
-    this.#reportProgress(name);
-    return new Float32Array(buffer);
+  async #downloadFile(file: string, tensorName: string): Promise<ArrayBuffer> {
+    const response = await fetchWithRetry(new URL(file, this.manifestUrl), `tensor ${tensorName}`);
+    const contentLength = response.headers.get("content-length");
+    const expectedLength = contentLength === null ? Number.NaN : Number(contentLength);
+    if (response.body === null || !Number.isSafeInteger(expectedLength) || expectedLength < 0) {
+      const buffer = await response.arrayBuffer();
+      this.#loadedBytes += buffer.byteLength;
+      this.#reportProgress();
+      return buffer;
+    }
+    const output = new Uint8Array(expectedLength);
+    const reader = response.body.getReader();
+    let offset = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (offset + value.byteLength > output.byteLength) throw new Error(`${file} exceeds its content length`);
+      output.set(value, offset);
+      offset += value.byteLength;
+      this.#loadedBytes += value.byteLength;
+      this.#reportProgress();
+    }
+    if (offset !== output.byteLength) throw new Error(`${file} has an invalid byte length`);
+    return output.buffer;
   }
   #reportProgress(tensorName?: string): void {
     const progress = {

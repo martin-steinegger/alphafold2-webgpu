@@ -5,6 +5,7 @@ export interface BinaryTensorRecord {
   readonly file: string;
   readonly shape: readonly number[];
   readonly dtype: "float32";
+  readonly byteOffset?: number;
   readonly [metadata: string]: unknown;
 }
 
@@ -18,6 +19,7 @@ export class FileTensorStore {
   readonly manifest: BinaryTensorManifest;
   readonly #directory: string;
   readonly #cache = new Map<string, Promise<Float32Array>>();
+  readonly #fileCache = new Map<string, Promise<Buffer>>();
 
   private constructor(manifestPath: string, manifest: BinaryTensorManifest) {
     this.manifestPath = manifestPath;
@@ -52,12 +54,20 @@ export class FileTensorStore {
     if (record === undefined || record.dtype !== "float32") {
       throw new Error(`manifest contains no float32 tensor named ${name}`);
     }
-    const bytes = await readFile(resolve(this.#directory, record.file));
-    const elements = record.shape.reduce((product, value) => product * value, 1);
-    if (bytes.byteLength !== elements * 4) {
-      throw new Error(`${name} has ${bytes.byteLength} bytes; expected ${elements * 4}`);
+    let pendingFile = this.#fileCache.get(record.file);
+    if (pendingFile === undefined) {
+      pendingFile = readFile(resolve(this.#directory, record.file));
+      this.#fileCache.set(record.file, pendingFile);
     }
-    return new Float32Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+    const bytes = await pendingFile;
+    const elements = record.shape.reduce((product, value) => product * value, 1);
+    const byteOffset = record.byteOffset ?? 0;
+    const byteLength = elements * 4;
+    if (!Number.isSafeInteger(byteOffset) || byteOffset < 0 || byteOffset + byteLength > bytes.byteLength) {
+      throw new Error(`${name} points outside ${record.file}`);
+    }
+    return new Float32Array(bytes.buffer.slice(
+      bytes.byteOffset + byteOffset, bytes.byteOffset + byteOffset + byteLength,
+    ));
   }
 }
-

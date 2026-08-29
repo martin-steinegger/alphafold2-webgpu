@@ -1,7 +1,8 @@
-import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, writeFile } from "node:fs/promises";
 import { dirname, relative, resolve } from "node:path";
 
-interface TensorRecord { readonly file: string; readonly dtype: string; readonly shape: readonly number[]; }
+interface TensorRecord { readonly file: string; readonly dtype: string; readonly shape: readonly number[];
+  readonly [metadata: string]: unknown; }
 interface SourceManifest { readonly tensors: Readonly<Record<string, TensorRecord>>; readonly [key: string]: unknown; }
 
 const [, , sourceValue = "test/fixtures/evoformer/model1-query-59-stack/manifest.json", outputValue = "dist/web/model"] = process.argv;
@@ -46,23 +47,43 @@ function collect(value: unknown): void {
 }
 collect(reduced);
 
-const tensors: Record<string, TensorRecord> = {};
-let bytes = 0;
+const SHARDS = 8;
+interface TensorEntry { readonly name: string; readonly record: TensorRecord; readonly source: string; readonly bytes: number; }
+const entries: TensorEntry[] = [];
 await mkdir(outputDirectory, { recursive: true });
 for (const name of [...names].sort()) {
   const record = manifest.tensors[name];
   if (record === undefined) throw new Error(`required tensor ${name} is missing`);
   const source = resolve(sourceDirectory, record.file);
   if (relative(sourceDirectory, source).startsWith("..")) throw new Error(`tensor ${name} escapes the source directory`);
-  const destination = resolve(outputDirectory, record.file);
-  if (relative(outputDirectory, destination).startsWith("..")) throw new Error(`tensor ${name} escapes the output directory`);
-  await mkdir(dirname(destination), { recursive: true });
-  await copyFile(source, destination);
-  tensors[name] = record;
-  bytes += record.shape.reduce((product, dimension) => product * dimension, 1) * 4;
+  entries.push({ name, record, source,
+    bytes: record.shape.reduce((product, dimension) => product * dimension, 1) * 4 });
 }
+const shards = Array.from({ length: SHARDS }, (_, index) => ({ index, bytes: 0, entries: [] as TensorEntry[] }));
+for (const entry of entries.sort((left, right) => right.bytes - left.bytes || left.name.localeCompare(right.name))) {
+  const shard = shards.reduce((smallest, candidate) => candidate.bytes < smallest.bytes ? candidate : smallest);
+  shard.entries.push(entry); shard.bytes += entry.bytes;
+}
+const tensors: Record<string, TensorRecord> = {};
+for (const shard of shards) {
+  const file = `weights-${String(shard.index).padStart(2, "0")}.f32.bin`;
+  const destination = resolve(outputDirectory, file);
+  const handle = await open(destination, "w");
+  let byteOffset = 0;
+  try {
+    for (const entry of shard.entries) {
+      const data = await readFile(entry.source);
+      if (data.byteLength !== entry.bytes) throw new Error(`${entry.name} has an invalid byte length`);
+      await handle.write(data, 0, data.byteLength, byteOffset);
+      tensors[entry.name] = { ...entry.record, file, byteOffset };
+      byteOffset += data.byteLength;
+    }
+  } finally { await handle.close(); }
+}
+const bytes = entries.reduce((sum, entry) => sum + entry.bytes, 0);
 reduced.tensors = tensors;
 (reduced.bundle as Record<string, unknown>).tensors = names.size;
 (reduced.bundle as Record<string, unknown>).bytes = bytes;
+(reduced.bundle as Record<string, unknown>).shards = SHARDS;
 await writeFile(resolve(outputDirectory, "manifest.json"), `${JSON.stringify(reduced, null, 2)}\n`);
-console.log(`Exported model_1_ptm: ${names.size} tensors, ${(bytes / 1024 / 1024).toFixed(1)} MiB`);
+console.log(`Exported model_1_ptm: ${names.size} tensors in ${SHARDS} shards, ${(bytes / 1024 / 1024).toFixed(1)} MiB`);

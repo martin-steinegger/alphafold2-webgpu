@@ -39,4 +39,22 @@ describe("HttpTensorStore", () => {
     expect(Array.from(await store.tensor("value"))).toEqual([7]);
     expect(attempts).toBe(2);
   });
+
+  it("downloads a shared shard once and returns tensor views at byte offsets", async () => {
+    let downloads = 0;
+    const shard = new Float32Array([1, 2, 3, 4]);
+    vi.stubGlobal("fetch", vi.fn(async (input: URL | RequestInfo) => {
+      if (String(input).endsWith("manifest.json")) return new Response(JSON.stringify({ tensors: {
+        first: { file: "weights.bin", dtype: "float32", shape: [2], byteOffset: 0 },
+        second: { file: "weights.bin", dtype: "float32", shape: [2], byteOffset: 8 },
+      } }));
+      downloads += 1;
+      return new Response(shard, { headers: { "content-length": String(shard.byteLength) } });
+    }));
+    const store = await HttpTensorStore.open(new URL("https://example.test/model/manifest.json"));
+    const [first, second] = await Promise.all([store.tensor("first"), store.tensor("second")]);
+    expect(Array.from(first)).toEqual([1, 2]);
+    expect(Array.from(second)).toEqual([3, 4]);
+    expect(downloads).toBe(1);
+  });
 });
