@@ -1,0 +1,38 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { HttpTensorStore } from "../src/reference/http-tensor-store.js";
+
+afterEach(() => vi.unstubAllGlobals());
+
+describe("HttpTensorStore", () => {
+  it("bounds concurrent tensor downloads", async () => {
+    const tensors = Object.fromEntries(Array.from({ length: 20 }, (_, index) => [`tensor${index}`, {
+      file: `tensor${index}.f32.bin`, dtype: "float32", shape: [1],
+    }]));
+    let active = 0; let maximum = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: URL | RequestInfo) => {
+      const url = String(input);
+      if (url.endsWith("manifest.json")) return new Response(JSON.stringify({ tensors }));
+      active += 1; maximum = Math.max(maximum, active);
+      await new Promise((resolve) => setTimeout(resolve, 2));
+      active -= 1;
+      return new Response(Float32Array.of(1));
+    }));
+    const store = await HttpTensorStore.open(new URL("https://example.test/model/manifest.json"));
+    await Promise.all(Object.keys(tensors).map((name) => store.tensor(name)));
+    expect(maximum).toBe(8);
+  });
+
+  it("retries transient tensor responses", async () => {
+    let attempts = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: URL | RequestInfo) => {
+      if (String(input).endsWith("manifest.json")) return new Response(JSON.stringify({
+        tensors: { value: { file: "value.f32.bin", dtype: "float32", shape: [1] } },
+      }));
+      attempts += 1;
+      return attempts === 1 ? new Response(null, { status: 503 }) : new Response(Float32Array.of(7));
+    }));
+    const store = await HttpTensorStore.open(new URL("https://example.test/model/manifest.json"));
+    expect(Array.from(await store.tensor("value"))).toEqual([7]);
+    expect(attempts).toBe(2);
+  });
+});
