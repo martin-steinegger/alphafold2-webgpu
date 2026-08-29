@@ -4,6 +4,14 @@ AFWebGPU is an end-to-end WebGPU implementation of AlphaFold 2 monomer model 1. 
 
 All learned model operations execute in WGSL. The CPU is used only for non-neural input preprocessing, scheduling, readback, and confidence aggregation. There is no ONNX runtime and no CPU neural-network fallback.
 
+## Acknowledgments and citation
+
+AFWebGPU is an independent browser/WebGPU port of AlphaFold2; it does not originate the protein-structure prediction method or model parameters. We thank the AlphaFold team at Google DeepMind for developing AlphaFold2 and releasing its source code and parameters. The scientific method should be credited to the original publication:
+
+> Jumper J, Evans R, Pritzel A, et al. Highly accurate protein structure prediction with AlphaFold. *Nature* 596, 583–589 (2021). [doi:10.1038/s41586-021-03819-2](https://doi.org/10.1038/s41586-021-03819-2)
+
+Please also consult and cite the [official AlphaFold repository](https://github.com/google-deepmind/alphafold) as appropriate. The bundled AlphaFold parameters remain subject to DeepMind's [CC BY 4.0 parameters license](https://github.com/google-deepmind/alphafold/blob/main/WEIGHTS_LICENSE); this repository does not alter their ownership or license.
+
 ## Verified reference predictions
 
 The acceptance sequence is:
