@@ -23,6 +23,7 @@ interface Viewer3D {
   setStyle(selection: object, style: object): void;
   zoomTo(): void;
   render(): void;
+  resize(): void;
 }
 
 interface ThreeDmolApi { createViewer(element: HTMLElement, options: object): Viewer3D; }
@@ -51,6 +52,7 @@ type StageState = "active" | "done" | "error";
 let currentPdb = "";
 let currentScores = "";
 let viewerLoader: Promise<ThreeDmolApi> | undefined;
+let viewerResizeObserver: ResizeObserver | undefined;
 
 function stage(stageName: Stage, state: StageState, detail: string): void {
   const item = document.querySelector<HTMLElement>(`[data-stage="${stageName}"]`);
@@ -174,13 +176,17 @@ function loadViewer(): Promise<ThreeDmolApi> {
 }
 
 async function showStructure(pdb: string): Promise<void> {
-  const container = element<HTMLDivElement>("structure-viewer"); container.replaceChildren();
+  const container = element<HTMLDivElement>("structure-viewer");
+  viewerResizeObserver?.disconnect();
+  container.replaceChildren();
   try {
     const api = await loadViewer();
     const viewer = api.createViewer(container, { backgroundColor: "#07110f" });
     viewer.addModel(pdb, "pdb");
     viewer.setStyle({}, { cartoon: { colorscheme: { prop: "b", gradient: "roygb", min: 50, max: 90 } } });
     viewer.zoomTo(); viewer.render();
+    viewerResizeObserver = new ResizeObserver(() => { viewer.resize(); viewer.render(); });
+    viewerResizeObserver.observe(container);
   } catch (error) {
     const message = document.createElement("p");
     message.textContent = `${error instanceof Error ? error.message : String(error)}. The PDB download is still available.`;
