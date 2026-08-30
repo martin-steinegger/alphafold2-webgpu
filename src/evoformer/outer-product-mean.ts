@@ -114,7 +114,7 @@ var<workgroup> row_mean: array<f32, 1>;
 @compute @workgroup_size(64)
 fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) group: vec3<u32>) {
   let rows = p.sequences * p.length;
-  let row = group.x;
+  let row = group.x + group.y * GRID_WIDTH;
   if (row >= rows) { return; }
   let base = row * p.c_m;
   var sum = 0.0;
@@ -350,11 +350,26 @@ export const OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_RESIDUAL_SHADER = OUTER_PRODUCT_M
 );
 
 const OUTER_FIRST_LIMIT_BYTES = 64 * 1024 * 1024;
+export const OUTER_PRODUCT_MEAN_TILE_SEQUENCES = 32;
 
 export function useOuterFirstContraction(input: Pick<OuterProductMeanInput,
   "sequences" | "length" | "cOuter">): boolean {
   const bytes = input.length * input.length * input.cOuter * input.cOuter * 4;
   return input.sequences >= input.cOuter && bytes <= OUTER_FIRST_LIMIT_BYTES;
+}
+
+export function outerProductMeanTileCapacity(
+  input: Pick<OuterProductMeanInput, "sequences" | "length" | "cOuter" | "cZ">,
+  maxStorageBufferBindingSize: number,
+): number {
+  const values = [input.sequences, input.length, input.cOuter, input.cZ, maxStorageBufferBindingSize];
+  if (!values.every((value) => Number.isSafeInteger(value) && value > 0)) {
+    throw new RangeError("outer-product tile dimensions and binding limit must be positive safe integers");
+  }
+  const bytesPerSequence = input.length * input.cOuter * input.cZ * Float32Array.BYTES_PER_ELEMENT;
+  const capacity = Math.floor(maxStorageBufferBindingSize / bytesPerSequence);
+  if (capacity < 1) throw new RangeError("WebGPU storage binding is too small for one outer-product sequence tile");
+  return Math.min(input.sequences, OUTER_PRODUCT_MEAN_TILE_SEQUENCES, capacity);
 }
 
 export class OuterProductMeanGpu {
@@ -401,7 +416,7 @@ export class OuterProductMeanGpu {
       const normalized = keep(this.allocator.allocate("opm.normalized", rows * input.cM * 4, storage));
       const left = keep(this.allocator.allocate("opm.left", rows * input.cOuter * 4, storage));
       const right = keep(this.allocator.allocate("opm.right", rows * input.cOuter * 4, storage));
-      const tileCapacity = Math.min(input.sequences, 32);
+      const tileCapacity = outerProductMeanTileCapacity(input, this.device.limits.maxStorageBufferBindingSize);
       const intermediateElements = outerFirst
         ? input.length * input.length * input.cOuter * input.cOuter
         : tileCapacity * input.length * input.cOuter * input.cZ;
@@ -424,7 +439,9 @@ export class OuterProductMeanGpu {
         compute.dispatchWorkgroups(x, y);
         compute.end();
       };
-      pass(normalize, [source.buffer, weights.buffer, params.buffer, normalized.buffer], rows);
+      const normalizeGrid = [Math.min(rows, GRID_WIDTH), ceilDivide(rows, GRID_WIDTH)] as const;
+      pass(normalize, [source.buffer, weights.buffer, params.buffer, normalized.buffer],
+        normalizeGrid[0], normalizeGrid[1]);
       const projectGrid = linearGrid(rows * input.cOuter);
       pass(project, [normalized.buffer, mask.buffer, weights.buffer, params.buffer, left.buffer, right.buffer],
         projectGrid[0], projectGrid[1]);

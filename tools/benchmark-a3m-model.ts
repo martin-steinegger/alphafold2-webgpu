@@ -40,15 +40,18 @@ const gpu = create([]);
 const adapter = await gpu.requestAdapter();
 if (adapter === null) throw new Error("no WebGPU adapter");
 const device = await requestAlphaFoldDevice(adapter);
+const compactTransitions = process.env.AFWEBGPU_COMPACT === "1";
 try {
-  const prediction = await new AlphaFoldMonomerGpu(device).predict(features, {
+  const prediction = await new AlphaFoldMonomerGpu(device, { compactTransitions }).predict(features, {
     embedding, template, extraStack, mainStack, structure,
     lddt: confidence.lddt, pae: confidence.pae, geometry,
   }, await model.tensor("confidencePaeBreaks"));
   console.log(JSON.stringify({
     adapter: adapter.info,
+    transitionMode: compactTransitions ? "chunked" : "full",
     shape: { length: 59, msaSequences: 508, extraSequences: 1_024, recycles: 4 },
     elapsedMilliseconds: prediction.elapsedMilliseconds,
+    memory: prediction.memory,
     recycles: prediction.recycles.map((result, recycle) => ({
       recycle,
       elapsedMilliseconds: result.elapsedMilliseconds,

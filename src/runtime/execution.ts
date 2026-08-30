@@ -15,6 +15,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 export interface GpuTensor {
   readonly allocation: AllocatedGpuBuffer;
   readonly elements: number;
+  readonly offsetElements?: number;
 }
 
 export interface GpuTimestampEntry {
@@ -34,19 +35,31 @@ interface PendingTimestampReadback {
   readonly readback: GpuTensor;
 }
 
+export interface WebGpuExecutionOptions {
+  readonly transitionBufferLimit?: number;
+}
+
 export class WebGpuExecution {
   readonly device: GPUDevice;
   readonly allocator: GpuBufferAllocator;
   readonly pipelines: ComputePipelineCache;
+  readonly transitionBufferLimit: number;
   readonly #allocations: AllocatedGpuBuffer[] = [];
   #timestamps: TimestampCapture | undefined;
   #activeEncoder: GPUCommandEncoder | undefined;
   #activePass: GPUComputePassEncoder | undefined;
 
-  constructor(device: GPUDevice) {
+  constructor(device: GPUDevice, options: WebGpuExecutionOptions = {}) {
     this.device = device;
     this.allocator = new GpuBufferAllocator(device, true);
     this.pipelines = pipelineCacheForDevice(device);
+    this.transitionBufferLimit = Math.min(
+      device.limits.maxStorageBufferBindingSize,
+      options.transitionBufferLimit ?? device.limits.maxStorageBufferBindingSize,
+    );
+    if (!Number.isSafeInteger(this.transitionBufferLimit) || this.transitionBufferLimit <= 0) {
+      throw new RangeError("transitionBufferLimit must be a positive safe integer");
+    }
   }
 
   upload(label: string, data: ArrayBufferView, usage: GPUBufferUsageFlags = GPUBufferUsage.STORAGE): GpuTensor {
@@ -59,6 +72,18 @@ export class WebGpuExecution {
     const allocation = this.allocator.allocate(label, elements * 4, usage);
     this.#allocations.push(allocation);
     return { allocation, elements };
+  }
+
+  view(tensor: GpuTensor, offsetElements: number, elements: number): GpuTensor {
+    if (!Number.isSafeInteger(offsetElements) || !Number.isSafeInteger(elements)
+      || offsetElements < 0 || elements <= 0 || offsetElements + elements > tensor.elements) {
+      throw new RangeError(`invalid GPU tensor view ${offsetElements}:${elements} of ${tensor.elements}`);
+    }
+    return {
+      allocation: tensor.allocation,
+      elements,
+      offsetElements: (tensor.offsetElements ?? 0) + offsetElements,
+    };
   }
 
   linearGrid(elements: number, workgroupSize = 64): readonly [number, number] {
@@ -108,10 +133,13 @@ export class WebGpuExecution {
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, this.device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),
-      entries: tensors.map((tensor, binding) => ({
-        binding,
-        resource: { buffer: tensor.allocation.buffer },
-      })),
+      entries: tensors.map((tensor, binding) => ({ binding, resource: tensor.offsetElements === undefined
+        ? { buffer: tensor.allocation.buffer }
+        : {
+          buffer: tensor.allocation.buffer,
+          offset: tensor.offsetElements * 4,
+          size: tensor.elements * 4,
+        } })),
     }));
     pass.dispatchWorkgroups(x, y, z);
     if (reusable) {
@@ -141,7 +169,8 @@ export class WebGpuExecution {
     this.endComputePass(encoder);
     const readback = this.allocate(label, tensor.elements, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
     encoder.copyBufferToBuffer(
-      tensor.allocation.buffer, 0, readback.allocation.buffer, 0, tensor.elements * 4,
+      tensor.allocation.buffer, (tensor.offsetElements ?? 0) * 4,
+      readback.allocation.buffer, 0, tensor.elements * 4,
     );
     return readback;
   }

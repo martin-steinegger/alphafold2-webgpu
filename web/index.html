@@ -59,6 +59,10 @@
                   <input id="model-url" value="./model/manifest.json" spellcheck="false" />
                   <span class="hint">A same-origin Pages bundle or a CORS-enabled external model directory.</span>
                 </label>
+                <div class="wide model-cache-control">
+                  <button id="clear-model-cache" class="quiet" type="button">Clear downloaded model</button>
+                  <span class="hint">Removes persistent model shards and the in-memory model. They will be verified and downloaded again on the next run.</span>
+                </div>
                 <label class="wide">MMseqs2 API URL
                   <input id="msa-api-url" value="https://api.colabfold.com" spellcheck="false" />
                   <span class="hint">Used only for MMseqs2 MSA mode. The default is ColabFold's public API.</span>

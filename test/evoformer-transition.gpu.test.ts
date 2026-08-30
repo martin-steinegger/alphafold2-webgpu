@@ -66,5 +66,15 @@ describe.skipIf(!enabled)("Evoformer Transition WebGPU", () => {
     const metrics = errorMetrics(result.output, expected);
     expect(metrics.meanAbsoluteError).toBeLessThan(1e-5);
     expect(metrics.maxAbsoluteError).toBeLessThan(1e-4);
+    const chunked = await new TransitionGpu(device, { maxChunkRows: 16 }).run({
+      activations,
+      rows: activations.length / channels,
+      channels,
+      hiddenChannels,
+      weights,
+    });
+    const chunkedMetrics = errorMetrics(chunked.output, expected);
+    expect(chunkedMetrics.meanAbsoluteError).toBeLessThan(1e-5);
+    expect(chunkedMetrics.maxAbsoluteError).toBeLessThan(1e-4);
   });
 });

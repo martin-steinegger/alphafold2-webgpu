@@ -5,7 +5,9 @@ import { generateMmseqs2Msa, type Mmseqs2MsaProgress, type Mmseqs2MsaResult } fr
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { HttpTensorStore } from "../src/reference/http-tensor-store.js";
 import type { TensorDownloadProgress } from "../src/reference/http-tensor-store.js";
-import { requestAlphaFoldDevice } from "../src/runtime/device.js";
+import {
+  planMonomerDevice, requestAlphaFoldDevice, suggestMonomerRows, type AlphaFoldDeviceRequirements,
+} from "../src/runtime/device.js";
 import { createDeterministicTriangleInput } from "../src/testing/deterministic-input.js";
 import { triangleMultiplicationOutgoingReference } from "../src/triangle/cpu-reference.js";
 import { errorMetrics, type Precision } from "../src/triangle/types.js";
@@ -53,6 +55,7 @@ const element = <T extends HTMLElement>(id: string): T => {
 const parameter = (name: string, fallback: string): string => new URLSearchParams(location.search).get(name) ?? fallback;
 const normalizedSequence = (): string => element<HTMLTextAreaElement>("sequence").value.replace(/\s+/g, "").toUpperCase();
 const formatSeconds = (milliseconds: number): string => `${(milliseconds / 1000).toFixed(2)} s`;
+const formatMib = (bytes: number): string => `${(bytes / 1024 ** 2).toFixed(0)} MiB`;
 const stageOrder = ["device", "msa", "model", "features", "inference", "results"] as const;
 type Stage = typeof stageOrder[number];
 type StageState = "active" | "done" | "error";
@@ -64,6 +67,18 @@ let lastMsaStatus = "";
 let viewerLoader: Promise<ThreeDmolApi> | undefined;
 let viewerResizeObserver: ResizeObserver | undefined;
 let sharedPredictionDevice: GPUDevice | undefined;
+
+function unifiedMemoryBudget(adapter: GPUAdapter): number | undefined {
+  const identity = `${adapter.info.vendor} ${adapter.info.architecture} ${adapter.info.device} ${adapter.info.description}`
+    .toLowerCase();
+  if (!identity.includes("apple")) return undefined;
+  const deviceMemory = (navigator as Navigator & { readonly deviceMemory?: number }).deviceMemory;
+  if (deviceMemory === undefined || !Number.isFinite(deviceMemory) || deviceMemory <= 0) return undefined;
+  // Apple GPUs share system RAM. navigator.deviceMemory is privacy-rounded and
+  // capped in Chromium, so reserve 30% while relying on the estimator's own
+  // calibrated 2.5x pooling/implementation safety allowance.
+  return Math.floor(deviceMemory * 1024 ** 3 * 0.70);
+}
 
 async function loadModelWeights(manifestValue: string) {
   const store = await HttpTensorStore.open(manifestValue, updateModelProgress);
@@ -89,9 +104,17 @@ function modelWeights(manifestValue: string): {
   return { promise, cached: false };
 }
 
-async function predictionDevice(adapter: GPUAdapter): Promise<{ readonly device: GPUDevice; readonly cached: boolean }> {
-  if (sharedPredictionDevice !== undefined) return { device: sharedPredictionDevice, cached: true };
-  const device = await requestAlphaFoldDevice(adapter);
+async function predictionDevice(adapter: GPUAdapter, requirements: AlphaFoldDeviceRequirements): Promise<{
+  readonly device: GPUDevice; readonly cached: boolean;
+}> {
+  if (sharedPredictionDevice !== undefined
+    && sharedPredictionDevice.limits.maxBufferSize >= requirements.maxBufferSize
+    && sharedPredictionDevice.limits.maxStorageBufferBindingSize >= requirements.maxStorageBufferBindingSize) {
+    return { device: sharedPredictionDevice, cached: true };
+  }
+  sharedPredictionDevice?.destroy();
+  sharedPredictionDevice = undefined;
+  const device = await requestAlphaFoldDevice(adapter, requirements);
   sharedPredictionDevice = device;
   void device.lost.then(() => { if (sharedPredictionDevice === device) sharedPredictionDevice = undefined; });
   return { device, cached: false };
@@ -328,21 +351,17 @@ element<HTMLFormElement>("prediction-form").addEventListener("submit", (event) =
 
 async function runPrediction(): Promise<void> {
   const button = element<HTMLButtonElement>("predict"); button.disabled = true;
+  const clearCacheButton = element<HTMLButtonElement>("clear-model-cache"); clearCacheButton.disabled = true;
   element<HTMLElement>("results-section").hidden = true; resetStages(); log("Starting prediction…", false); lastMsaStatus = "";
   try {
     stage("device", "active", "Requesting adapter"); setPredictionStatus("Preparing WebGPU");
     if (navigator.gpu === undefined) throw new Error("WebGPU is unavailable. Use a current Chrome or Edge browser on a supported GPU.");
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
     if (adapter === null) throw new Error("No compatible WebGPU adapter was found");
-    const deviceResult = await predictionDevice(adapter);
-    const device = deviceResult.device;
     const adapterName = adapter.info.description || adapter.info.device || adapter.info.vendor || "WebGPU adapter";
-    stage("device", "done", `${adapterName}${deviceResult.cached ? " · cached device" : ""}`);
-    log(`GPU: ${adapterName}${deviceResult.cached ? " (reusing device and pipelines)" : ""}`);
+    stage("device", "active", `${adapterName} · sizing buffers`);
+    log(`GPU adapter: ${adapterName}`);
     log(`WebGPU features: ${[...adapter.features].sort().join(", ")}`);
-    log(`WebGPU limits: invocations=${adapter.limits.maxComputeInvocationsPerWorkgroup} `
-      + `workgroupStorage=${adapter.limits.maxComputeWorkgroupStorageSize} `
-      + `storageBinding=${adapter.limits.maxStorageBufferBindingSize} buffer=${adapter.limits.maxBufferSize}`);
 
     stage("msa", "active", "Preparing input");
     stage("model", "active", "Downloading one model"); setPredictionStatus("Preparing alignment and model");
@@ -364,11 +383,44 @@ async function runPrediction(): Promise<void> {
       + `${modelRequest.cached ? "from memory " : ""}in ${formatSeconds(modelLoadMilliseconds)}.`);
 
     stage("features", "active", "Parsing input"); setPredictionStatus("Building AF2 features");
+    const requestedMaxMsa = element<HTMLInputElement>("max-msa").valueAsNumber;
+    const requestedMaxExtra = element<HTMLInputElement>("max-extra").valueAsNumber;
+    const clusteredRows = Math.min(requestedMaxMsa, input.depth);
+    const extraRows = Math.max(1, Math.min(requestedMaxExtra, Math.max(0, input.depth - clusteredRows)));
+    const memoryBudget = unifiedMemoryBudget(adapter);
+    const devicePlan = planMonomerDevice(
+      adapter, input.sequence.length, clusteredRows, extraRows, memoryBudget,
+    );
+    log(`Estimated peak GPU allocations: ${formatMib(devicePlan.memory.estimatedPeakBytes)} `
+      + `(${formatMib(devicePlan.memory.persistentBytes)} persistent, `
+      + `${formatMib(devicePlan.memory.scratchBytes)} scratch).`);
+    if (memoryBudget !== undefined) {
+      log(`Apple unified-memory safety budget: ${formatMib(memoryBudget)}.`);
+      if (devicePlan.memory.estimatedPeakBytes > memoryBudget) {
+        const suggestion = suggestMonomerRows(
+          input.sequence.length, clusteredRows, extraRows, devicePlan.transitionMode, memoryBudget,
+        );
+        const advice = suggestion === undefined
+          ? "This sequence is too large for the conservative safety budget even with one MSA row."
+          : `Set Clustered MSA rows to ${suggestion.msaSequences} and Extra MSA rows to `
+            + `${suggestion.extraSequences} or lower.`;
+        throw new RangeError(`Estimated peak GPU allocation ${formatMib(devicePlan.memory.estimatedPeakBytes)} `
+          + `exceeds this Mac's ${formatMib(memoryBudget)} safety budget. ${advice}`);
+      }
+    }
+    const deviceResult = await predictionDevice(adapter, devicePlan.requirements);
+    const device = deviceResult.device;
+    stage("device", "done", `${adapterName}${deviceResult.cached ? " · cached device" : ""}`);
+    log(`GPU: ${adapterName}${deviceResult.cached ? " (reusing device and pipelines)" : ""}`);
+    log(`WebGPU limits: invocations=${device.limits.maxComputeInvocationsPerWorkgroup} `
+      + `workgroupStorage=${device.limits.maxComputeWorkgroupStorageSize} `
+      + `storageBinding=${device.limits.maxStorageBufferBindingSize} buffer=${device.limits.maxBufferSize}`);
+    log(`Transition memory mode: ${devicePlan.transitionMode}.`);
     const featureOptions = {
       recycles: Number(element<HTMLSelectElement>("recycles").value),
       randomSeed: element<HTMLInputElement>("seed").valueAsNumber,
-      maxMsaSequences: element<HTMLInputElement>("max-msa").valueAsNumber,
-      maxExtraSequences: element<HTMLInputElement>("max-extra").valueAsNumber,
+      maxMsaSequences: requestedMaxMsa,
+      maxExtraSequences: requestedMaxExtra,
     };
     const features = makeA3mFeatures(input.a3m, featureTables, featureOptions);
     stage("features", "done", `${input.sequence.length} aa · ${input.depth} rows`); log(`Features: ${input.sequence.length} residues, A3M depth ${input.depth}.`);
@@ -392,6 +444,7 @@ async function runPrediction(): Promise<void> {
       }
     };
     const prediction = await new AlphaFoldMonomerGpu(device, {
+      compactTransitions: devicePlan.transitionMode === "chunked",
       profile: parameter("profile", "0") === "1",
       profileRecycle: Number(parameter("profileRecycle", "0")),
       profileExtraMsaBlock: Number(parameter("profileExtraBlock", "0")),
@@ -400,6 +453,8 @@ async function runPrediction(): Promise<void> {
       embedding, template, extraStack, mainStack, structure, lddt: confidence.lddt, pae: confidence.pae, geometry,
     }, paeBreaks, reportRecycle);
     stage("inference", "done", formatSeconds(prediction.elapsedMilliseconds));
+    log(`Measured allocator peak: ${formatMib(prediction.memory.peakResidentBytes)} resident `
+      + `(${prediction.memory.bufferCount} GPU buffers).`);
 
     stage("results", "active", "Rendering"); setPredictionStatus("Preparing results");
     const jobName = safeJobName(element<HTMLInputElement>("job-name").value);
@@ -411,8 +466,13 @@ async function runPrediction(): Promise<void> {
     const message = error instanceof Error ? error.message : String(error);
     const active = stageOrder.find((name) => document.querySelector<HTMLElement>(`[data-stage="${name}"]`)?.dataset.state === "active");
     if (active !== undefined) stage(active, "error", "Failed");
+    const memoryFailure = /out.?of.?memory|allocation|device (?:was )?lost/i.test(message);
+    if (memoryFailure) {
+      sharedPredictionDevice?.destroy(); sharedPredictionDevice = undefined;
+      log("The WebGPU device could not retain this allocation set. Reduce clustered/extra MSA rows or sequence length, then retry.");
+    }
     setPredictionStatus("Prediction failed", "failed"); log(error instanceof Error ? error.stack ?? message : message);
-  } finally { button.disabled = false; }
+  } finally { button.disabled = false; clearCacheButton.disabled = false; }
 }
 
 const inputMode = element<HTMLSelectElement>("input-mode");
@@ -434,6 +494,15 @@ element<HTMLInputElement>("a3m-file").addEventListener("change", (event) => {
 });
 try { element<HTMLInputElement>("model-url").value = localStorage.getItem("afwebgpu.modelUrl") ?? "./model/manifest.json"; } catch { /* storage may be unavailable */ }
 try { element<HTMLInputElement>("msa-api-url").value = localStorage.getItem("afwebgpu.msaApiUrl") ?? "https://api.colabfold.com"; } catch { /* storage may be unavailable */ }
+element<HTMLButtonElement>("clear-model-cache").addEventListener("click", () => { void (async () => {
+  const button = element<HTMLButtonElement>("clear-model-cache"); button.disabled = true;
+  try {
+    const removed = await HttpTensorStore.clearPersistentCache();
+    cachedModel = undefined;
+    sharedPredictionDevice?.destroy(); sharedPredictionDevice = undefined;
+    log(removed ? "Cleared the persistent and in-memory model caches." : "Cleared the in-memory model cache; no persistent cache was present.", false);
+  } finally { button.disabled = false; }
+})(); });
 updateInputMode();
 
 async function checkWebGpu(): Promise<void> {

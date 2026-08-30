@@ -270,11 +270,13 @@ export async function encodeInputEmbedder(
   const msa = execution.allocate("embed.msa", msaElements, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
   const pair = execution.allocate("embed.pair", pairElements, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
   const extra = execution.allocate("embed.extra", extraElements);
+  let grid = execution.linearGrid(input.length, 1);
   execution.dispatch(encoder, normalize, [previousMsa, weights, previousMsaNormParams, previousMsaNormalized],
-    input.length);
+    grid[0], grid[1]);
+  grid = execution.linearGrid(input.length * input.length, 1);
   execution.dispatch(encoder, normalize, [previousPair, weights, previousPairNormParams, previousPairNormalized],
-    input.length * input.length);
-  let grid = execution.linearGrid(msaElements);
+    grid[0], grid[1]);
+  grid = execution.linearGrid(msaElements);
   execution.dispatch(encoder, msaPipeline, [target, msaFeatures, previousMsaNormalized, weights, params, msa],
     grid[0], grid[1]);
   grid = execution.linearGrid(pairElements);
@@ -314,6 +316,9 @@ export class InputEmbedderGpu {
       const groups = ceilDivide(elements, 64);
       return [Math.min(groups, GRID_WIDTH), ceilDivide(groups, GRID_WIDTH)];
     };
+    const rowGrid = (rows: number): readonly [number, number] => [
+      Math.min(rows, GRID_WIDTH), ceilDivide(rows, GRID_WIDTH),
+    ];
     try {
       const target = upload("embed.target", input.targetFeatures);
       const msaFeatures = upload("embed.msa-features", input.msaFeatures);
@@ -360,9 +365,13 @@ export class InputEmbedderGpu {
         compute.dispatchWorkgroups(x, y);
         compute.end();
       };
-      pass(normalize, [previousMsa, weights, previousMsaNormParams, previousMsaNormalized], input.length);
-      pass(normalize, [previousPair, weights, previousPairNormParams, previousPairNormalized], input.length * input.length);
-      let dispatch = grid(msaElements);
+      let dispatch = rowGrid(input.length);
+      pass(normalize, [previousMsa, weights, previousMsaNormParams, previousMsaNormalized],
+        dispatch[0], dispatch[1]);
+      dispatch = rowGrid(input.length * input.length);
+      pass(normalize, [previousPair, weights, previousPairNormParams, previousPairNormalized],
+        dispatch[0], dispatch[1]);
+      dispatch = grid(msaElements);
       pass(msaPipeline, [target, msaFeatures, previousMsaNormalized, weights, params, msa], dispatch[0], dispatch[1]);
       dispatch = grid(pairElements);
       pass(pairPipeline, [target, previousPairNormalized, previousPositions, aatype, residueIndex, weights, params, pair],

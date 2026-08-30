@@ -9,8 +9,27 @@ export interface BinaryTensorRecord {
   readonly [metadata: string]: unknown;
 }
 
+export interface BinaryTensorShard {
+  readonly file: string;
+  readonly bytes: number;
+}
+
+export interface BinaryTensorBundle {
+  readonly purpose?: string;
+  readonly model?: string;
+  readonly encoding?: string;
+  readonly version?: number;
+  readonly id?: string;
+  readonly tensors?: number;
+  readonly bytes?: number;
+  /** Legacy manifests stored the shard count as a number. */
+  readonly shards?: number;
+  readonly files?: readonly BinaryTensorShard[];
+}
+
 export interface BinaryTensorManifest {
   readonly tensors: Readonly<Record<string, BinaryTensorRecord>>;
+  readonly bundle?: BinaryTensorBundle;
   readonly [metadata: string]: unknown;
 }
 

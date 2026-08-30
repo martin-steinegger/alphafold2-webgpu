@@ -9,6 +9,8 @@ import { StructureModuleGpu, type StructureModuleResult, type StructureModuleWei
 import type { ResidueGeometryTables } from "../structure/geometry.js";
 import { makeA3mFeatures, type A3mFeatureOptions } from "../input/a3m-features.js";
 import type { QueryOnlyFeatureTables } from "../input/query-only-features.js";
+import { TRANSITION_CHUNK_TARGET_BYTES } from "../evoformer/transition.js";
+import type { AllocationSnapshot } from "../runtime/allocator.js";
 
 export interface MonomerRecycleFeatures {
   readonly targetFeatures: Float32Array; readonly msaFeatures: Float32Array; readonly msaMask: Float32Array;
@@ -37,6 +39,7 @@ export interface MonomerRecycleResult {
 export interface MonomerPrediction {
   readonly recycles: readonly MonomerRecycleResult[]; readonly final: MonomerRecycleResult;
   readonly elapsedMilliseconds: number;
+  readonly memory: AllocationSnapshot;
 }
 
 export interface MonomerTrunkSubmissionCounts {
@@ -50,6 +53,8 @@ export interface MonomerGpuOptions {
   readonly profileRecycle?: number;
   readonly profileExtraMsaBlock?: number;
   readonly profileMainEvoformerBlock?: number;
+  /** Bounds transition scratch even when the device exposes larger binding limits. */
+  readonly compactTransitions?: boolean;
 }
 
 export interface MonomerBlockGpuProfile {
@@ -73,12 +78,14 @@ export class AlphaFoldMonomerGpu {
   readonly profileRecycle: number;
   readonly profileExtraMsaBlock: number;
   readonly profileMainEvoformerBlock: number;
+  readonly compactTransitions: boolean;
   constructor(device: GPUDevice, options: MonomerGpuOptions = {}) {
     this.device = device;
     this.profile = options.profile ?? false;
     this.profileRecycle = options.profileRecycle ?? 0;
     this.profileExtraMsaBlock = options.profileExtraMsaBlock ?? 0;
     this.profileMainEvoformerBlock = options.profileMainEvoformerBlock ?? 0;
+    this.compactTransitions = options.compactTransitions ?? false;
     for (const [name, value] of [
       ["profileRecycle", this.profileRecycle],
       ["profileExtraMsaBlock", this.profileExtraMsaBlock],
@@ -111,7 +118,8 @@ export class AlphaFoldMonomerGpu {
       || this.profileMainEvoformerBlock >= weights.mainStack.length)) {
       throw new RangeError("requested monomer GPU profile block or recycle is out of range");
     }
-    const execution = new WebGpuExecution(this.device);
+    const execution = new WebGpuExecution(this.device, this.compactTransitions
+      ? { transitionBufferLimit: TRANSITION_CHUNK_TARGET_BYTES } : {});
     const results: MonomerRecycleResult[] = [];
     const start = performance.now();
     const submit = async (encoder: GPUCommandEncoder, label: string): Promise<void> => {
@@ -271,6 +279,7 @@ export class AlphaFoldMonomerGpu {
       }
       return {
         recycles: results, final: results[results.length - 1]!, elapsedMilliseconds: performance.now() - start,
+        memory: execution.snapshot(),
       };
     } finally {
       execution.release();

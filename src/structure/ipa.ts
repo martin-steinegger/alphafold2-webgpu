@@ -134,6 +134,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }`;
 
 const LOGITS_SHADER = `${COMMON}
+const GRID_WIDTH: u32 = 32768u;
 @group(0) @binding(0) var<storage, read> query_scalar: array<f32>;
 @group(0) @binding(1) var<storage, read> kv_scalar: array<f32>;
 @group(0) @binding(2) var<storage, read> query_point: array<f32>;
@@ -146,7 +147,7 @@ const LOGITS_SHADER = `${COMMON}
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x;
+  let index = id.x + id.y * GRID_WIDTH * 64u;
   if (index >= p.heads * p.length * p.length) { return; }
   let key_index = index % p.length;
   let query = (index / p.length) % p.length;
@@ -364,7 +365,12 @@ export class InvariantPointAttentionGpu {
         compute.dispatchWorkgroups(x, y);
         compute.end();
       };
-      pass(pipelines[0]!, [pairSource, weights, pairNormParams, pair], input.length * input.length);
+      const grid = (elements: number, workgroupSize = 64): readonly [number, number] => {
+        const groups = Math.ceil(elements / workgroupSize);
+        return [Math.min(groups, 32_768), Math.ceil(groups / 32_768)];
+      };
+      let dispatch = grid(input.length * input.length, 1);
+      pass(pipelines[0]!, [pairSource, weights, pairNormParams, pair], dispatch[0], dispatch[1]);
       const linear = (paramsValue: AllocatedGpuBuffer, result: AllocatedGpuBuffer, columns: number): void =>
         pass(pipelines[1]!, [source, weights, paramsValue, result],
           Math.ceil(columns / TRANSITION_TILE_COLUMNS), Math.ceil(input.length / TRANSITION_TILE_ROWS));
@@ -376,8 +382,9 @@ export class InvariantPointAttentionGpu {
         Math.ceil(queryPoint.byteLength / 4 / 3 / 64));
       pass(pipelines[2]!, [kvPointLocal, affine, kvPointTransformParams, kvPoint],
         Math.ceil(kvPoint.byteLength / 4 / 3 / 64));
+      dispatch = grid(attentionElements);
       pass(pipelines[3]!, [queryScalar, kvScalar, queryPoint, kvPoint, pair, mask, weights, params, logits],
-        Math.ceil(attentionElements / 64));
+        dispatch[0], dispatch[1]);
       pass(pipelines[4]!, [logits, params, attention], input.heads * input.length);
       pass(pipelines[5]!, [attention, kvScalar, params, features],
         Math.ceil(input.length * input.heads * input.scalarV / 64));

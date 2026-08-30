@@ -21,6 +21,7 @@ import {
   OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_RESIDUAL_SHADER,
   OUTER_PRODUCT_MEAN_NORMALIZE_SHADER,
   OUTER_PRODUCT_MEAN_PROJECT_SHADER,
+  outerProductMeanTileCapacity,
   packOuterProductMeanWeights,
   useOuterFirstContraction,
   type OuterProductMeanWeights,
@@ -29,6 +30,7 @@ import {
   createTransitionNormalizeParameters,
   createTransitionShaders,
   packTransitionWeights,
+  transitionChunkRows,
   TRANSITION_TILE_COLUMNS,
   TRANSITION_TILE_ROWS,
   type TransitionWeights,
@@ -261,6 +263,10 @@ async function encodeTransition(
     activations: new Float32Array(0), rows, channels, hiddenChannels, weights: weightsValue,
   };
   const packed = packTransitionWeights(descriptor);
+  const chunkRows = transitionChunkRows(
+    rows, channels, hiddenChannels, execution.transitionBufferLimit,
+    execution.device.limits.minStorageBufferOffsetAlignment,
+  );
   const shaders = createTransitionShaders(descriptor, packed.offsets);
   const [normalize, linear, linearResidual] = await Promise.all([
     execution.pipelines.get("block:transition:normalize", shaders[0]!),
@@ -268,24 +274,58 @@ async function encodeTransition(
     execution.pipelines.get("block:transition:linear-residual", shaders[2]!),
   ]);
   const weights = execution.upload(`${label}.weights`, packed.data);
-  const normalizeParams = uniform(execution, `${label}.normalize-parameters`,
-    createTransitionNormalizeParameters(descriptor, packed.offsets));
-  const firstParams = uniform(execution, `${label}.first-parameters`, new Uint32Array([
-    rows, channels, hiddenChannels, packed.offsets[2]!, packed.offsets[3]!, 1, 0, 0,
-  ]));
-  const secondParams = uniform(execution, `${label}.second-parameters`, new Uint32Array([
-    rows, hiddenChannels, channels, packed.offsets[4]!, packed.offsets[5]!, 0, 0, 0,
-  ]));
-  const normalized = execution.allocate(`${label}.normalized`, rows * channels);
-  const hidden = execution.allocate(`${label}.hidden`, rows * hiddenChannels);
   const output = residualTarget ?? execution.allocate(`${label}.output`, rows * channels);
-  execution.dispatch(encoder, normalize, [source, weights, normalizeParams, normalized], rows, 1, 1,
-    `${label}.normalize`);
-  execution.dispatch(encoder, linear, [normalized, weights, firstParams, hidden],
-    Math.ceil(hiddenChannels / TRANSITION_TILE_COLUMNS), Math.ceil(rows / TRANSITION_TILE_ROWS), 1, `${label}.first`);
-  execution.dispatch(encoder, residualTarget === undefined ? linear : linearResidual,
-    [hidden, weights, secondParams, output],
-    Math.ceil(channels / TRANSITION_TILE_COLUMNS), Math.ceil(rows / TRANSITION_TILE_ROWS), 1, `${label}.second`);
+  if (chunkRows === rows) {
+    const normalizeParams = uniform(execution, `${label}.normalize-parameters`,
+      createTransitionNormalizeParameters(descriptor, packed.offsets));
+    const firstParams = uniform(execution, `${label}.first-parameters`, new Uint32Array([
+      rows, channels, hiddenChannels, packed.offsets[2]!, packed.offsets[3]!, 1, 0, 0,
+    ]));
+    const secondParams = uniform(execution, `${label}.second-parameters`, new Uint32Array([
+      rows, hiddenChannels, channels, packed.offsets[4]!, packed.offsets[5]!, 0, 0, 0,
+    ]));
+    const normalized = execution.allocate(`${label}.normalized`, rows * channels);
+    const hidden = execution.allocate(`${label}.hidden`, rows * hiddenChannels);
+    const normalizeGrid = execution.linearGrid(rows, 1);
+    execution.dispatch(encoder, normalize, [source, weights, normalizeParams, normalized],
+      normalizeGrid[0], normalizeGrid[1], 1, `${label}.normalize`);
+    execution.dispatch(encoder, linear, [normalized, weights, firstParams, hidden],
+      Math.ceil(hiddenChannels / TRANSITION_TILE_COLUMNS), Math.ceil(rows / TRANSITION_TILE_ROWS), 1,
+      `${label}.first`);
+    execution.dispatch(encoder, residualTarget === undefined ? linear : linearResidual,
+      [hidden, weights, secondParams, output],
+      Math.ceil(channels / TRANSITION_TILE_COLUMNS), Math.ceil(rows / TRANSITION_TILE_ROWS), 1,
+      `${label}.second`);
+    return output;
+  }
+  const normalized = execution.allocate(`${label}.normalized-chunk`, chunkRows * channels);
+  const hidden = execution.allocate(`${label}.hidden-chunk`, chunkRows * hiddenChannels);
+  for (let rowOffset = 0; rowOffset < rows; rowOffset += chunkRows) {
+    const count = Math.min(chunkRows, rows - rowOffset);
+    const chunkDescriptor = { ...descriptor, rows: count };
+    const normalizeParams = uniform(execution, `${label}.normalize-parameters-${rowOffset}`,
+      createTransitionNormalizeParameters(chunkDescriptor, packed.offsets));
+    const firstParams = uniform(execution, `${label}.first-parameters-${rowOffset}`, new Uint32Array([
+      count, channels, hiddenChannels, packed.offsets[2]!, packed.offsets[3]!, 1, 0, 0,
+    ]));
+    const secondParams = uniform(execution, `${label}.second-parameters-${rowOffset}`, new Uint32Array([
+      count, hiddenChannels, channels, packed.offsets[4]!, packed.offsets[5]!, 0, 0, 0,
+    ]));
+    const sourceChunk = execution.view(source, rowOffset * channels, count * channels);
+    const outputChunk = execution.view(output, rowOffset * channels, count * channels);
+    const normalizedChunk = execution.view(normalized, 0, count * channels);
+    const hiddenChunk = execution.view(hidden, 0, count * hiddenChannels);
+    const normalizeGrid = execution.linearGrid(count, 1);
+    execution.dispatch(encoder, normalize, [sourceChunk, weights, normalizeParams, normalizedChunk],
+      normalizeGrid[0], normalizeGrid[1], 1, `${label}.normalize-${rowOffset}`);
+    execution.dispatch(encoder, linear, [normalizedChunk, weights, firstParams, hiddenChunk],
+      Math.ceil(hiddenChannels / TRANSITION_TILE_COLUMNS), Math.ceil(count / TRANSITION_TILE_ROWS), 1,
+      `${label}.first-${rowOffset}`);
+    execution.dispatch(encoder, residualTarget === undefined ? linear : linearResidual,
+      [hiddenChunk, weights, secondParams, outputChunk],
+      Math.ceil(channels / TRANSITION_TILE_COLUMNS), Math.ceil(count / TRANSITION_TILE_ROWS), 1,
+      `${label}.second-${rowOffset}`);
+  }
   return output;
 }
 
@@ -342,7 +382,9 @@ async function encodeAttention(
   const gate = execution.allocate(`${options.label}.gate`, elements);
   const weighted = execution.allocate(`${options.label}.weighted`, elements);
   const output = options.residualTarget ?? execution.allocate(`${options.label}.output`, elements);
-  execution.dispatch(encoder, normalize, [options.source, weights, normParams, normalized], rows, 1, 1,
+  let grid = execution.linearGrid(rows, 1);
+  execution.dispatch(encoder, normalize, [options.source, weights, normParams, normalized],
+    grid[0], grid[1], 1,
     `${options.label}.normalize`);
 
   let normalizedPair = normalized;
@@ -356,13 +398,14 @@ async function encodeAttention(
         options.queries * options.queries, options.pairBias.channels, packed.offsets[9]!, packed.offsets[10]!,
         false, 1, options.queries * options.queries, 1e-5,
       ));
+    grid = execution.linearGrid(options.queries * options.queries, 1);
     execution.dispatch(encoder, normalize, [options.pairSource, weights, pairNormParams, normalizedPair],
-      options.queries * options.queries, 1, 1, `${options.label}.pair-normalize`);
+      grid[0], grid[1], 1, `${options.label}.pair-normalize`);
   }
   const pairBiasElements = options.pairBias === undefined ? 1 : options.heads * options.queries * options.queries;
   const pairBias = execution.allocate(`${options.label}.pair-bias`, pairBiasElements);
   if (options.pairBias !== undefined) {
-    const grid = execution.linearGrid(pairBiasElements);
+    grid = execution.linearGrid(pairBiasElements);
     execution.dispatch(encoder, pairProject, [normalizedPair, weights, params, pairBias], grid[0], grid[1], 1,
       `${options.label}.pair-bias`);
   }
@@ -423,9 +466,10 @@ async function encodeGlobalAttention(
   const query = execution.allocate(`${label}.query`, shape.length * w.heads * headDim);
   const attended = execution.allocate(`${label}.attended`, shape.length * w.heads * headDim);
   const output = residualTarget ?? execution.allocate(`${label}.output`, shape.sequences * shape.length * shape.cM);
+  let grid = execution.linearGrid(shape.length * shape.sequences, 1);
   execution.dispatch(encoder, normalize, [source, weights, normParameters, normalized],
-    shape.length * shape.sequences, 1, 1, `${label}.normalize`);
-  let grid = execution.linearGrid(shape.length * shape.sequences * headDim);
+    grid[0], grid[1], 1, `${label}.normalize`);
+  grid = execution.linearGrid(shape.length * shape.sequences * headDim);
   execution.dispatch(encoder, kvPipeline, [normalized, weights, parameters, keys, values],
     grid[0], grid[1], 1, `${label}.kv`);
   grid = execution.linearGrid(shape.length * w.heads * headDim);
@@ -477,15 +521,17 @@ async function encodeOuterProductMean(
   const normalized = execution.allocate("opm.normalized", rows * input.cM);
   const left = execution.allocate("opm.left", rows * input.cOuter);
   const right = execution.allocate("opm.right", rows * input.cOuter);
-  const tileCapacity = Math.min(input.sequences, 32);
+  const tileCapacity = outerProductMeanTileCapacity(input, execution.device.limits.maxStorageBufferBindingSize);
   const intermediateElements = outerFirst
     ? input.length * input.length * input.cOuter * input.cOuter
     : tileCapacity * input.length * input.cOuter * input.cZ;
   const intermediate = execution.allocate("opm.intermediate", intermediateElements);
   const output = outerFirst && residualTarget !== undefined ? residualTarget
     : execution.allocate("opm.output", pairElements, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
-  execution.dispatch(encoder, normalize, [msa, weights, params, normalized], rows, 1, 1, "opm.normalize");
-  let grid = execution.linearGrid(rows * input.cOuter);
+  let grid = execution.linearGrid(rows, 1);
+  execution.dispatch(encoder, normalize, [msa, weights, params, normalized],
+    grid[0], grid[1], 1, "opm.normalize");
+  grid = execution.linearGrid(rows * input.cOuter);
   execution.dispatch(encoder, project, [normalized, msaMask, weights, params, left, right], grid[0], grid[1], 1,
     "opm.project");
   const outputGrid = execution.linearGrid(pairElements);

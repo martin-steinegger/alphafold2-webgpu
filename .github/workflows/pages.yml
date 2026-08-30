@@ -24,7 +24,8 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npm run build:web
+      - run: npm run check
+      - run: npm run test:browser
       - name: Add the single model-1 PTM release bundle
         if: ${{ vars.AFWEBGPU_INCLUDE_MODEL == 'true' }}
         env:
@@ -32,6 +33,9 @@ jobs:
         run: |
           gh release download model1-ptm --pattern afwebgpu-model1-ptm.tar.gz
           tar -xzf afwebgpu-model1-ptm.tar.gz -C dist/web
+      - name: Validate model bundle
+        if: ${{ vars.AFWEBGPU_INCLUDE_MODEL == 'true' }}
+        run: npm run verify:web-model
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

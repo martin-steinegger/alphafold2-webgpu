@@ -25,9 +25,48 @@ export interface TransitionResult {
   readonly memory: AllocationSnapshot;
 }
 
+export interface TransitionGpuOptions {
+  /** Test/diagnostic override; production sizing is derived from WebGPU limits. */
+  readonly maxChunkRows?: number;
+}
+
 const ceilDivide = (value: number, divisor: number): number => Math.ceil(value / divisor);
 export const TRANSITION_TILE_COLUMNS = 64;
 export const TRANSITION_TILE_ROWS = 16;
+export const TRANSITION_CHUNK_TARGET_BYTES = 96 * 1024 * 1024;
+
+const gcd = (left: number, right: number): number => {
+  let a = left; let b = right;
+  while (b !== 0) { const remainder = a % b; a = b; b = remainder; }
+  return a;
+};
+
+/** Selects an aligned row window whose largest transition binding stays bounded. */
+export function transitionChunkRows(
+  rows: number,
+  channels: number,
+  hiddenChannels: number,
+  maxStorageBufferBindingSize: number,
+  minStorageBufferOffsetAlignment = 256,
+): number {
+  if (![rows, channels, hiddenChannels, maxStorageBufferBindingSize, minStorageBufferOffsetAlignment]
+    .every((value) => Number.isSafeInteger(value) && value > 0)) {
+    throw new RangeError("transition chunk dimensions and limits must be positive safe integers");
+  }
+  const rowBytes = Math.max(channels, hiddenChannels) * Float32Array.BYTES_PER_ELEMENT;
+  if (rows * rowBytes <= maxStorageBufferBindingSize) return rows;
+  const capacity = Math.floor(Math.min(maxStorageBufferBindingSize, TRANSITION_CHUNK_TARGET_BYTES) / rowBytes);
+  if (capacity < 1) throw new RangeError("WebGPU storage binding is too small for one transition row");
+  const sourceRowBytes = channels * Float32Array.BYTES_PER_ELEMENT;
+  const offsetRowAlignment = minStorageBufferOffsetAlignment / gcd(sourceRowBytes, minStorageBufferOffsetAlignment);
+  const rowAlignment = TRANSITION_TILE_ROWS * offsetRowAlignment
+    / gcd(TRANSITION_TILE_ROWS, offsetRowAlignment);
+  if (rows <= capacity) return rows;
+  if (capacity < rowAlignment) {
+    throw new RangeError("WebGPU storage binding cannot hold one aligned transition chunk");
+  }
+  return Math.min(rows, Math.floor(capacity / rowAlignment) * rowAlignment);
+}
 
 function validate(input: TransitionInput): void {
   const { rows, channels, hiddenChannels, activations, weights } = input;
@@ -82,6 +121,7 @@ struct NormalizeParameters {
   padding_1: u32,
   padding_2: u32,
 };
+const GRID_WIDTH: u32 = 32768u;
 @group(0) @binding(0) var<storage, read> source: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> parameters: NormalizeParameters;
@@ -94,7 +134,7 @@ fn main(
   @builtin(local_invocation_id) local: vec3<u32>,
   @builtin(workgroup_id) group: vec3<u32>,
 ) {
-  let row = group.x;
+  let row = group.x + group.y * GRID_WIDTH;
   if (row >= parameters.rows) { return; }
   let base = row * parameters.channels;
   var sum = 0.0;
@@ -252,16 +292,26 @@ export class TransitionGpu {
   readonly device: GPUDevice;
   readonly allocator: GpuBufferAllocator;
   readonly pipelines: ComputePipelineCache;
+  readonly maxChunkRows: number | undefined;
 
-  constructor(device: GPUDevice) {
+  constructor(device: GPUDevice, options: TransitionGpuOptions = {}) {
     this.device = device;
     this.allocator = new GpuBufferAllocator(device);
     this.pipelines = pipelineCacheForDevice(device);
+    this.maxChunkRows = options.maxChunkRows;
+    if (this.maxChunkRows !== undefined
+      && (!Number.isSafeInteger(this.maxChunkRows) || this.maxChunkRows <= 0)) {
+      throw new RangeError("maxChunkRows must be a positive safe integer");
+    }
   }
 
   async run(input: TransitionInput): Promise<TransitionResult> {
     validate(input);
     const packed = packTransitionWeights(input);
+    const chunkRows = Math.min(this.maxChunkRows ?? input.rows, transitionChunkRows(
+      input.rows, input.channels, input.hiddenChannels, this.device.limits.maxStorageBufferBindingSize,
+      this.device.limits.minStorageBufferOffsetAlignment,
+    ));
     const code = createTransitionShaders(input, packed.offsets);
     const key = `transition:${input.rows}:${input.channels}:${input.hiddenChannels}:${input.epsilon ?? 1e-5}`;
     const pipelines: GPUComputePipeline[] = [];
@@ -274,17 +324,12 @@ export class TransitionGpu {
     try {
       const source = keep(this.allocator.upload("transition.source", input.activations, storage));
       const weights = keep(this.allocator.upload("transition.weights", packed.data, storage));
-      const layerNormParameters = keep(this.allocator.upload(
-        "transition.normalize.parameters", createTransitionNormalizeParameters(input, packed.offsets), GPUBufferUsage.UNIFORM,
+      const normalized = keep(this.allocator.allocate(
+        "transition.normalized-chunk", chunkRows * input.channels * 4, storage,
       ));
-      const firstParameters = keep(this.allocator.upload("transition.first.parameters", new Uint32Array([
-        input.rows, input.channels, input.hiddenChannels, packed.offsets[2]!, packed.offsets[3]!, 1, 0, 0,
-      ]), GPUBufferUsage.UNIFORM));
-      const secondParameters = keep(this.allocator.upload("transition.second.parameters", new Uint32Array([
-        input.rows, input.hiddenChannels, input.channels, packed.offsets[4]!, packed.offsets[5]!, 0, 0, 0,
-      ]), GPUBufferUsage.UNIFORM));
-      const normalized = keep(this.allocator.allocate("transition.normalized", input.rows * input.channels * 4, storage));
-      const hidden = keep(this.allocator.allocate("transition.hidden", input.rows * input.hiddenChannels * 4, storage));
+      const hidden = keep(this.allocator.allocate(
+        "transition.hidden-chunk", chunkRows * input.hiddenChannels * 4, storage,
+      ));
       const output = keep(this.allocator.allocate(
         "transition.output", input.rows * input.channels * 4, storage | GPUBufferUsage.COPY_SRC,
       ));
@@ -294,22 +339,53 @@ export class TransitionGpu {
       ));
       const encoder = this.device.createCommandEncoder({ label: "transition" });
       this.device.pushErrorScope("validation");
-      const pass = (pipeline: GPUComputePipeline, buffers: readonly GPUBuffer[], x: number, y = 1): void => {
+      type Binding = { readonly buffer: GPUBuffer; readonly offset?: number; readonly size?: number };
+      const pass = (pipeline: GPUComputePipeline, buffers: readonly Binding[], x: number, y = 1): void => {
         const compute = encoder.beginComputePass();
         compute.setPipeline(pipeline);
         compute.setBindGroup(0, this.device.createBindGroup({
           layout: pipeline.getBindGroupLayout(0),
-          entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer } })),
+          entries: buffers.map((resource, binding) => ({ binding, resource })),
         }));
         compute.dispatchWorkgroups(x, y);
         compute.end();
       };
-      pass(pipelines[0]!, [source.buffer, weights.buffer, layerNormParameters.buffer, normalized.buffer],
-        input.rows);
-      pass(pipelines[1]!, [normalized.buffer, weights.buffer, firstParameters.buffer, hidden.buffer],
-        ceilDivide(input.hiddenChannels, TRANSITION_TILE_COLUMNS), ceilDivide(input.rows, TRANSITION_TILE_ROWS));
-      pass(pipelines[1]!, [hidden.buffer, weights.buffer, secondParameters.buffer, output.buffer],
-        ceilDivide(input.channels, TRANSITION_TILE_COLUMNS), ceilDivide(input.rows, TRANSITION_TILE_ROWS));
+      const binding = (buffer: AllocatedGpuBuffer, offset = 0, size = buffer.byteLength): Binding =>
+        ({ buffer: buffer.buffer, offset, size });
+      for (let rowOffset = 0; rowOffset < input.rows; rowOffset += chunkRows) {
+        const count = Math.min(chunkRows, input.rows - rowOffset);
+        const chunkInput = { ...input, rows: count, activations: new Float32Array(0) };
+        const layerNormParameters = keep(this.allocator.upload(
+          `transition.normalize.parameters-${rowOffset}`,
+          createTransitionNormalizeParameters(chunkInput, packed.offsets), GPUBufferUsage.UNIFORM,
+        ));
+        const firstParameters = keep(this.allocator.upload(
+          `transition.first.parameters-${rowOffset}`, new Uint32Array([
+            count, input.channels, input.hiddenChannels, packed.offsets[2]!, packed.offsets[3]!, 1, 0, 0,
+          ]), GPUBufferUsage.UNIFORM,
+        ));
+        const secondParameters = keep(this.allocator.upload(
+          `transition.second.parameters-${rowOffset}`, new Uint32Array([
+            count, input.hiddenChannels, input.channels, packed.offsets[4]!, packed.offsets[5]!, 0, 0, 0,
+          ]), GPUBufferUsage.UNIFORM,
+        ));
+        const sourceBytes = count * input.channels * 4;
+        const hiddenBytes = count * input.hiddenChannels * 4;
+        const sourceOffset = rowOffset * input.channels * 4;
+        const normalizeGrid = [Math.min(count, 32_768), ceilDivide(count, 32_768)] as const;
+        pass(pipelines[0]!, [
+          binding(source, sourceOffset, sourceBytes), binding(weights), binding(layerNormParameters),
+          binding(normalized, 0, sourceBytes),
+        ], normalizeGrid[0], normalizeGrid[1]);
+        pass(pipelines[1]!, [
+          binding(normalized, 0, sourceBytes), binding(weights), binding(firstParameters),
+          binding(hidden, 0, hiddenBytes),
+        ], ceilDivide(input.hiddenChannels, TRANSITION_TILE_COLUMNS), ceilDivide(count, TRANSITION_TILE_ROWS));
+        pass(pipelines[1]!, [
+          binding(hidden, 0, hiddenBytes), binding(weights), binding(secondParameters),
+          binding(output, sourceOffset, sourceBytes),
+        ], ceilDivide(input.channels, TRANSITION_TILE_COLUMNS), ceilDivide(count, TRANSITION_TILE_ROWS));
+      }
       encoder.copyBufferToBuffer(output.buffer, 0, readback.buffer, 0, input.rows * input.channels * 4);
       const start = performance.now();
       this.device.queue.submit([encoder.finish()]);

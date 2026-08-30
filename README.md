@@ -39,7 +39,7 @@ Only the AlphaFold2 `model_1_ptm` parameter set is supported. Keeping a single m
 5. Inspect the MSA coverage, per-recycle confidence, pLDDT, PAE, and interactive 3D structure.
 6. Download the predicted PDB, scores JSON, and generated A3M.
 
-The first prediction downloads approximately 355 MiB of model parameters and compiles WebGPU pipelines. Later predictions can be much faster when browser and operating-system caches are warm.
+The first prediction downloads approximately 355 MiB of model parameters and compiles WebGPU pipelines. Versioned model shards are byte-length validated and retained in the browser's persistent cache when storage policy permits. Later predictions can be much faster; **Clear downloaded model** under Advanced settings removes both persistent and in-memory copies.
 
 ## Input modes and privacy
 
@@ -90,7 +90,7 @@ The application uses the original float32 `model_1_ptm` parameters. Quantization
 
 ### What is the maximum sequence length?
 
-There is no single portable limit. Available GPU memory, WebGPU buffer limits, MSA depth, browser implementation, and adapter performance all matter. The current project is optimized and validated first on short monomers; longer inputs may exhaust memory or take substantially longer.
+There is no single portable limit. Available GPU memory, WebGPU buffer limits, MSA depth, browser implementation, and adapter performance all matter. The application calculates both individual-buffer requirements and a conservative aggregate peak from sequence length and retained MSA depth instead of requesting a fixed limit. When the complete AF2 transition intermediate fits the adapter and memory budget it uses the fast path; otherwise it processes aligned row windows with at most 96 MiB of transition scratch. On Apple unified-memory adapters, inputs that exceed a RAM-derived safety budget are rejected before GPU allocation with explicit suggested MSA row limits. Persistent MSA memory grows as `Nseq × L`, while pair memory and compute grow at least as `L²`, so longer inputs can still take substantially longer.
 
 ### Why is single-sequence confidence lower than the MSA prediction?
 
@@ -133,6 +133,12 @@ Development-host timings on an NVIDIA GB10 were 9.75 and 9.76 seconds for four A
 
 Run `npm run bench:a3m-model` to reproduce the full-model measurement. These values are engineering measurements from one adapter and software configuration, not cross-device performance claims. Compare warm medians on the same machine before and after an optimization.
 
+To force the bounded transition path for portability testing, run:
+
+```bash
+AFWEBGPU_COMPACT=1 npm run bench:a3m-model
+```
+
 ## Installation for development
 
 Node.js 22 or newer is required.
@@ -161,9 +167,14 @@ npm run test:gpu
 npm run test:browser
 npm run bench:attention
 npm run bench:a3m-model
+npm run qualify:hardware
 ```
 
 GPU tests use Dawn's native Node WebGPU implementation. The suite includes operator-level official AlphaFold differential tests, complete block and stack tests, four-recycle single-sequence inference, four-recycle A3M inference, and a literal raw-A3M acceptance test.
+
+The full-model hardware qualification runs both automatic and compact memory paths, checks all recycle confidence values against the official reference, and emits a machine-readable adapter/timing/memory report. See [hardware qualification](docs/HARDWARE_QUALIFICATION.md).
+
+The browser model is distributed as a separate GitHub release asset. See [model bundle release](docs/MODEL_RELEASE.md) for the versioning, validation, packaging, and Pages deployment procedure.
 
 For browser GPU profiling, append `?profile=1` to the development URL. The selected recycle's first extra-MSA and main Evoformer blocks report every dispatch through `timestamp-query` when available, with synchronized wall-clock block timing as the fallback. The `profileRecycle`, `profileExtraBlock`, and `profileMainBlock` query parameters select different zero-based targets.
 
@@ -176,6 +187,8 @@ Implemented components include input and recycling embeddings, mock-template pai
 Attention uses online softmax and never materializes attention-logit cubes. When `subgroups` and `subgroup-size-control` are available, eight 32-lane subgroups process eight queries while sharing a 32-key K/V tile. Other devices use the portable workgroup kernel. Earlier lane-per-channel variants remain selectable for differential benchmarking.
 
 QKV and gate projections use register-blocked 16x16 tiles, attention output uses 16x32 tiles, and transition GEMMs use 16x64 tiles. Triangle multiplication uses cooperative 16x16 joint tiles for split A/B projection, gates, output projection, and output gate. It never materializes an `O(L³)` tensor. For deep, short MSAs, OuterProductMean uses AlphaFold2's canonical outer-first contraction; a bounded path is available when the temporary would exceed 64 MiB.
+
+Device limits are negotiated per prediction shape. A capable adapter receives the exact full-transition requirement rounded to a WebGPU capability tier. Constrained adapters retain the same AF2 weights and operations but execute transition rows through aligned storage-buffer windows capped at 96 MiB. The compact path does not fall back to CPU or truncate the MSA silently; if even the persistent MSA or pair tensor exceeds the adapter limit, the application reports the required and available sizes.
 
 Evoformer blocks are submitted ahead without host waits and alias a pooled set of scratch buffers. Final projections commit directly into residual tensors. Embedding, extra-MSA, and main-stack activations stay device-resident across stage and recycle boundaries; only the first MSA row and pair representation required by the current structure API are read back.
 

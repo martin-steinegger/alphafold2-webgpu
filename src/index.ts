@@ -42,7 +42,13 @@ export type {
   QueryOnlyTemplateWeights,
 } from "./evoformer/template.js";
 export { ElementwiseAddGpu } from "./runtime/elementwise.js";
-export { requestAlphaFoldDevice } from "./runtime/device.js";
+export {
+  estimateMonomerMemory, monomerDeviceRequirements, planMonomerDevice, requestAlphaFoldDevice,
+  suggestMonomerRows,
+} from "./runtime/device.js";
+export type {
+  AlphaFoldDevicePlan, AlphaFoldDeviceRequirements, MonomerMemoryEstimate, MonomerRowSuggestion,
+} from "./runtime/device.js";
 export { InvariantPointAttentionGpu } from "./structure/ipa.js";
 export type {
   InvariantPointAttentionInput,

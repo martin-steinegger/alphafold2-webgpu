@@ -44,6 +44,8 @@ input:disabled, select:disabled { color: #888; background: #eee; }
 .advanced summary { cursor: pointer; padding: .8rem 1rem; color: #424242; font-size: .8rem; }
 .advanced-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); padding: 0 1rem 1rem; }
 .advanced-grid .wide { grid-column: 1 / -1; }
+.model-cache-control { display: flex; align-items: center; gap: .8rem; }
+.model-cache-control .quiet { flex: 0 0 auto; margin: 0; }
 .primary, .secondary, .diagnostic-controls button { border: 0; border-radius: 2px; text-transform: uppercase; letter-spacing: .08em; cursor: pointer; box-shadow: 0 2px 3px #0003; }
 .primary { display: flex; justify-content: space-between; width: max-content; min-width: 240px; padding: .9rem 1rem; color: #fff; background: var(--primary); font-weight: 500; }
 .primary:hover { background: var(--primary-dark); } .primary:disabled { color: #999; background: #ddd; cursor: wait; box-shadow: none; }

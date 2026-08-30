@@ -1,7 +1,12 @@
 export interface AllocationSnapshot {
   readonly currentBytes: number;
   readonly peakBytes: number;
+  /** Bytes held by live and pooled GPUBuffer objects. */
+  readonly residentBytes: number;
+  /** Maximum physical GPUBuffer storage retained by this allocator. */
+  readonly peakResidentBytes: number;
   readonly allocationCount: number;
+  readonly bufferCount: number;
 }
 
 export class AllocatedGpuBuffer {
@@ -29,7 +34,10 @@ export class GpuBufferAllocator {
   readonly device: GPUDevice;
   #currentBytes = 0;
   #peakBytes = 0;
+  #residentBytes = 0;
+  #peakResidentBytes = 0;
   #allocationCount = 0;
+  #bufferCount = 0;
   readonly #pooling: boolean;
   readonly #pool = new Map<string, GPUBuffer[]>();
 
@@ -45,7 +53,13 @@ export class GpuBufferAllocator {
     const byteLength = Math.ceil(requestedBytes / 4) * 4;
     const key = `${byteLength}:${usage}`;
     const pooled = this.#pool.get(key);
-    const buffer = pooled?.pop() ?? this.device.createBuffer({ label, size: byteLength, usage });
+    let buffer = pooled?.pop();
+    if (buffer === undefined) {
+      buffer = this.device.createBuffer({ label, size: byteLength, usage });
+      this.#residentBytes += byteLength;
+      this.#peakResidentBytes = Math.max(this.#peakResidentBytes, this.#residentBytes);
+      this.#bufferCount += 1;
+    }
     if (pooled?.length === 0) this.#pool.delete(key);
     this.#currentBytes += byteLength;
     this.#peakBytes = Math.max(this.#peakBytes, this.#currentBytes);
@@ -77,19 +91,30 @@ export class GpuBufferAllocator {
       this.#pool.set(key, pooled);
     } else {
       buffer.destroy();
+      this.#residentBytes -= byteLength;
     }
   }
 
   destroyPooled(): void {
-    for (const buffers of this.#pool.values()) for (const buffer of buffers) buffer.destroy();
+    for (const [key, buffers] of this.#pool) {
+      const byteLength = Number(key.slice(0, key.indexOf(":")));
+      for (const buffer of buffers) {
+        buffer.destroy();
+        this.#residentBytes -= byteLength;
+      }
+    }
     this.#pool.clear();
+    if (this.#residentBytes < 0) throw new Error("GPU allocator resident accounting underflow");
   }
 
   snapshot(): AllocationSnapshot {
     return {
       currentBytes: this.#currentBytes,
       peakBytes: this.#peakBytes,
+      residentBytes: this.#residentBytes,
+      peakResidentBytes: this.#peakResidentBytes,
       allocationCount: this.#allocationCount,
+      bufferCount: this.#bufferCount,
     };
   }
 }

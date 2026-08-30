@@ -58,4 +58,44 @@ describe("HttpTensorStore", () => {
     expect(Array.from(second)).toEqual([3, 4]);
     expect(downloads).toBe(1);
   });
+
+  it("validates versioned shards and reuses the persistent cache", async () => {
+    const shard = Float32Array.of(3, 5);
+    const manifest = { bundle: { version: 1, id: "test", files: [
+      { file: "weights.v1.bin", bytes: shard.byteLength },
+    ] }, tensors: { value: {
+      file: "weights.v1.bin", dtype: "float32", shape: [2], byteOffset: 0,
+    } } };
+    const stored = new Map<string, Response>(); let shardDownloads = 0;
+    vi.stubGlobal("caches", {
+      open: vi.fn(async () => ({
+        match: async (key: string) => stored.get(key)?.clone(),
+        put: async (key: string, response: Response) => { stored.set(key, response.clone()); },
+        delete: async (key: string) => stored.delete(key),
+      })),
+      delete: vi.fn(async () => { stored.clear(); return true; }),
+    });
+    vi.stubGlobal("fetch", vi.fn(async (input: URL | RequestInfo) => {
+      if (String(input).endsWith("manifest.json")) return new Response(JSON.stringify(manifest));
+      shardDownloads += 1; return new Response(shard);
+    }));
+    const url = new URL("https://example.test/model/manifest.json");
+    expect(Array.from(await (await HttpTensorStore.open(url)).tensor("value"))).toEqual([3, 5]);
+    expect(Array.from(await (await HttpTensorStore.open(url)).tensor("value"))).toEqual([3, 5]);
+    expect(shardDownloads).toBe(1);
+    expect(await HttpTensorStore.clearPersistentCache()).toBe(true);
+  });
+
+  it("rejects a shard that fails its declared byte length", async () => {
+    const shard = Float32Array.of(7, 8);
+    vi.stubGlobal("fetch", vi.fn(async (input: URL | RequestInfo) => {
+      if (String(input).endsWith("manifest.json")) return new Response(JSON.stringify({
+        bundle: { version: 1, id: "bad-length", files: [{ file: "weights.bin", bytes: 4 }] },
+        tensors: { value: { file: "weights.bin", dtype: "float32", shape: [1] } },
+      }));
+      return new Response(shard);
+    }));
+    const store = await HttpTensorStore.open(new URL("https://example.test/model/manifest.json"));
+    await expect(store.tensor("value")).rejects.toThrow(/exceeds its content length|invalid byte length/);
+  });
 });

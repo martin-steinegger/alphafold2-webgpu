@@ -29,22 +29,26 @@ export interface QueryOnlyTemplateResult {
 }
 
 const INIT_SHADER = `
+const GRID_WIDTH: u32 = 32768u;
 @group(0) @binding(0) var<storage, read> bias: array<f32>;
 @group(0) @binding(1) var<storage, read_write> output: array<f32>;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  output[id.x] = bias[id.x % arrayLength(&bias)];
+  let index = id.x + id.y * GRID_WIDTH * 64u;
+  if (index >= arrayLength(&output)) { return; }
+  output[index] = bias[index % arrayLength(&bias)];
 }`;
 
 const VALUE_SHADER = `
 struct Parameters { pairs: u32, template_channels: u32, projected: u32, pair_channels: u32 };
+const GRID_WIDTH: u32 = 32768u;
 @group(0) @binding(0) var<storage, read> source: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> p: Parameters;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x;
+  let index = id.x + id.y * GRID_WIDTH * 64u;
   if (index >= p.pairs * p.projected) { return; }
   let row = index / p.projected;
   let channel = index % p.projected;
@@ -57,6 +61,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
 const OUTPUT_SHADER = `
 struct Parameters { pairs: u32, template_channels: u32, projected: u32, pair_channels: u32 };
+const GRID_WIDTH: u32 = 32768u;
 @group(0) @binding(0) var<storage, read> source: array<f32>;
 @group(0) @binding(1) var<storage, read> output_weight: array<f32>;
 @group(0) @binding(2) var<storage, read> output_bias: array<f32>;
@@ -64,7 +69,7 @@ struct Parameters { pairs: u32, template_channels: u32, projected: u32, pair_cha
 @group(0) @binding(4) var<storage, read_write> output: array<f32>;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x;
+  let index = id.x + id.y * GRID_WIDTH * 64u;
   if (index >= p.pairs * p.pair_channels) { return; }
   let row = index / p.pair_channels;
   let channel = index % p.pair_channels;
@@ -90,9 +95,13 @@ export class QueryOnlyTemplateGpu {
       const bias = execution.upload("template.embedding-bias", input.weights.embeddingBias);
       const init = await execution.pipelines.get("template:init", INIT_SHADER);
       let encoder = this.device.createCommandEncoder({ label: "template.initialize" });
-      execution.dispatch(encoder, init, [bias, pair], Math.ceil(pair.elements / 64), 1, 1, "template.initialize");
+      this.device.pushErrorScope("validation");
+      let grid = execution.linearGrid(pair.elements);
+      execution.dispatch(encoder, init, [bias, pair], grid[0], grid[1], 1, "template.initialize");
       execution.endComputePass(encoder);
       this.device.queue.submit([encoder.finish()]);
+      const initError = await this.device.popErrorScope();
+      if (initError !== null) throw new Error(`WebGPU template initialization failed: ${initError.message}`);
       const persistentCheckpoint = execution.checkpoint();
       const start = performance.now();
 
@@ -140,12 +149,16 @@ export class QueryOnlyTemplateGpu {
       ]);
       encoder = this.device.createCommandEncoder({ label: "template.pointwise-attention" });
       this.device.pushErrorScope("validation");
-      execution.dispatch(encoder, normalize, [pair, normWeightBuffer, normParams, normalized], pairs, 1, 1,
+      grid = execution.linearGrid(pairs, 1);
+      execution.dispatch(encoder, normalize, [pair, normWeightBuffer, normParams, normalized],
+        grid[0], grid[1], 1,
         "template.output-normalize");
+      grid = execution.linearGrid(value.elements);
       execution.dispatch(encoder, valuePipeline, [normalized, valueWeight, params, value],
-        Math.ceil(value.elements / 64), 1, 1, "template.value");
+        grid[0], grid[1], 1, "template.value");
+      grid = execution.linearGrid(output.elements);
       execution.dispatch(encoder, outputPipeline, [value, outputWeight, outputBias, params, output],
-        Math.ceil(output.elements / 64), 1, 1, "template.output");
+        grid[0], grid[1], 1, "template.output");
       const readback = execution.createReadback("template.readback", output, encoder);
       this.device.queue.submit([encoder.finish()]);
       const error = await this.device.popErrorScope();

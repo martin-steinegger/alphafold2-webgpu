@@ -160,6 +160,7 @@ struct NormParameters {
   rows: u32, channels: u32, scale: u32, offset: u32,
   transpose: u32, batch: u32, queries: u32, epsilon: f32,
 };
+const GRID_WIDTH: u32 = 32768u;
 @group(0) @binding(0) var<storage, read> source: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> p: NormParameters;
@@ -176,7 +177,7 @@ fn source_row(row: u32) -> u32 {
 
 @compute @workgroup_size(64)
 fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) group: vec3<u32>) {
-  let row = group.x;
+  let row = group.x + group.y * GRID_WIDTH;
   if (row >= p.rows) { return; }
   let input_base = source_row(row) * p.channels;
   let output_base = row * p.channels;
@@ -904,6 +905,9 @@ export class AttentionGpu {
       const groups = ceilDivide(elements, 64);
       return [Math.min(groups, GRID_WIDTH), ceilDivide(groups, GRID_WIDTH)];
     };
+    const rowGrid = (rowsValue: number): readonly [number, number] => [
+      Math.min(rowsValue, GRID_WIDTH), ceilDivide(rowsValue, GRID_WIDTH),
+    ];
     try {
       const source = keep(this.allocator.upload("attention.source", input.activations, storage));
       const mask = keep(this.allocator.upload("attention.mask", input.mask, storage));
@@ -957,10 +961,12 @@ export class AttentionGpu {
         compute.dispatchWorkgroups(x, y, z);
         compute.end();
       };
-      pass(normalize, [source.buffer, weights.buffer, queryNormParams.buffer, normalized.buffer], rows);
+      let grid = rowGrid(rows);
+      pass(normalize, [source.buffer, weights.buffer, queryNormParams.buffer, normalized.buffer], grid[0], grid[1]);
       if (pairSource !== undefined && pairNormParams !== undefined) {
+        grid = rowGrid(input.queryLength * input.queryLength);
         pass(normalize, [pairSource.buffer, weights.buffer, pairNormParams.buffer, pairNormalized.buffer],
-          input.queryLength * input.queryLength);
+          grid[0], grid[1]);
       }
       if (input.pairBias !== undefined) {
         const pairGrid = linearGrid(input.heads * input.queryLength * input.queryLength);

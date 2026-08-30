@@ -65,10 +65,10 @@ for (const entry of entries.sort((left, right) => right.bytes - left.bytes || le
   shard.entries.push(entry); shard.bytes += entry.bytes;
 }
 const tensors: Record<string, TensorRecord> = {};
+const files: { file: string; bytes: number }[] = [];
 for (const shard of shards) {
-  const file = `weights-${String(shard.index).padStart(2, "0")}.f32.bin`;
-  const destination = resolve(outputDirectory, file);
-  const handle = await open(destination, "w");
+  const file = `weights-${String(shard.index).padStart(2, "0")}.v1.f32.bin`;
+  const handle = await open(resolve(outputDirectory, file), "w");
   let byteOffset = 0;
   try {
     for (const entry of shard.entries) {
@@ -79,11 +79,16 @@ for (const shard of shards) {
       byteOffset += data.byteLength;
     }
   } finally { await handle.close(); }
+  files.push({ file, bytes: byteOffset });
 }
 const bytes = entries.reduce((sum, entry) => sum + entry.bytes, 0);
 reduced.tensors = tensors;
-(reduced.bundle as Record<string, unknown>).tensors = names.size;
-(reduced.bundle as Record<string, unknown>).bytes = bytes;
-(reduced.bundle as Record<string, unknown>).shards = SHARDS;
+const bundle = reduced.bundle as Record<string, unknown>;
+bundle.version = 1;
+bundle.id = "model_1_ptm-f32-v1";
+bundle.tensors = names.size;
+bundle.bytes = bytes;
+bundle.shards = SHARDS;
+bundle.files = files;
 await writeFile(resolve(outputDirectory, "manifest.json"), `${JSON.stringify(reduced, null, 2)}\n`);
 console.log(`Exported model_1_ptm: ${names.size} tensors in ${SHARDS} shards, ${(bytes / 1024 / 1024).toFixed(1)} MiB`);
