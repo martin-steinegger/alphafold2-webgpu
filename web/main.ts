@@ -11,6 +11,7 @@ import { triangleMultiplicationOutgoingReference } from "../src/triangle/cpu-ref
 import { errorMetrics, type Precision } from "../src/triangle/types.js";
 import { TriangleMultiplicationOutgoingGpu } from "../src/triangle/webgpu.js";
 import { confidenceJson, predictionToPdb, safeJobName } from "./prediction-results.js";
+import { drawMsaCoverage } from "./msa-plot.js";
 
 interface BrowserResult {
   readonly elapsedMilliseconds: number;
@@ -213,7 +214,7 @@ async function showStructure(pdb: string): Promise<void> {
   }
 }
 
-function showResults(prediction: MonomerPrediction, sequence: string, depth: number, jobName: string): void {
+function showResults(prediction: MonomerPrediction, sequence: string, depth: number, jobName: string, a3m: string): void {
   const confidence = prediction.final.confidence;
   currentPdb = predictionToPdb(sequence, prediction.final.structure, confidence.plddt);
   currentScores = confidenceJson(sequence, confidence);
@@ -234,6 +235,10 @@ function showResults(prediction: MonomerPrediction, sequence: string, depth: num
   });
   drawPlddt(confidence.plddt);
   drawPae(confidence.predictedAlignedError, sequence.length, confidence.maxPredictedAlignedError);
+  const msa = drawMsaCoverage(element<HTMLCanvasElement>("msa-plot"), a3m);
+  const meanCoverage = Array.from(msa.coverage).reduce((sum, value) => sum + value, 0) / msa.length;
+  element<HTMLElement>("msa-plot-summary").textContent =
+    `${msa.depth.toLocaleString()} sequences · mean ${meanCoverage.toFixed(0)} sequences/position`;
   void showStructure(currentPdb);
   element<HTMLButtonElement>("download-pdb").onclick = () => download(`${jobName}_unrelaxed_model_1.pdb`, currentPdb, "chemical/x-pdb");
   element<HTMLButtonElement>("download-scores").onclick = () => download(`${jobName}_scores.json`, currentScores, "application/json");
@@ -327,7 +332,7 @@ async function runPrediction(): Promise<void> {
 
     stage("results", "active", "Rendering"); setPredictionStatus("Preparing results");
     const jobName = safeJobName(element<HTMLInputElement>("job-name").value);
-    showResults(prediction, input.sequence, input.depth, jobName);
+    showResults(prediction, input.sequence, input.depth, jobName, input.a3m);
     stage("results", "done", "Ready"); setPredictionStatus("Prediction complete", "passed");
     log(`Finished in ${formatSeconds(prediction.elapsedMilliseconds)}.`);
     element<HTMLElement>("results-section").scrollIntoView({ behavior: "smooth", block: "start" });

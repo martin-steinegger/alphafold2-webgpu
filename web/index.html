@@ -101,6 +101,10 @@
           <article><span>MSA depth</span><strong id="msa-depth">—</strong><small>Input rows</small></article>
         </div>
         <div class="result-grid">
+          <article class="result-card msa-card">
+            <div class="card-title"><h3>MSA sequence coverage</h3><small id="msa-plot-summary"></small></div>
+            <canvas id="msa-plot" width="900" height="420" aria-label="MSA sequence coverage sorted by identity to the query"></canvas>
+          </article>
           <article class="result-card structure-card">
             <div class="card-title"><h3>3D structure</h3><div><button id="download-pdb" class="quiet" type="button">PDB</button><button id="download-scores" class="quiet" type="button">Scores JSON</button></div></div>
             <div id="structure-viewer"><p>Structure viewer loads after prediction.</p></div>

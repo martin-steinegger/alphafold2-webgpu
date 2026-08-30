@@ -80,7 +80,7 @@ Evoformer blocks are submitted ahead without host waits and alias a pooled set o
 
 ## Browser demo and GitHub Pages
 
-The static browser UI supports the one implemented parameter set, `model_1_ptm`, with an MMseqs2-generated MSA, a single sequence, or a custom A3M. Its default mode submits the query to ColabFold's public MMseqs2 API, polls the ticket, extracts and combines the UniRef and environmental A3Ms in the browser, and runs inference locally. It reports per-recycle pLDDT/pTM, renders pLDDT and PAE plots, displays the unrelaxed structure with 3Dmol, and exports PDB, score JSON, and generated A3M files.
+The static browser UI supports the one implemented parameter set, `model_1_ptm`, with an MMseqs2-generated MSA, a single sequence, or a custom A3M. Its default mode submits the query to ColabFold's public MMseqs2 API, polls the ticket, extracts and combines the UniRef and environmental A3Ms in the browser, and runs inference locally. It renders a ColabFold-style identity-sorted MSA coverage plot, reports per-recycle pLDDT/pTM, renders pLDDT and PAE plots, displays the unrelaxed structure with 3Dmol, and exports PDB, score JSON, and generated A3M files.
 
 The default MMseqs2 endpoint is `https://api.colabfold.com`; it can be changed under Advanced settings. Selecting this mode sends the protein sequence to that service. Single-sequence and custom-A3M inputs do not leave the browser.
 
