@@ -10,12 +10,24 @@
   </head>
   <body>
     <header class="site-header">
+      <span class="menu-mark" aria-hidden="true">☰</span>
       <a class="brand" href="./" aria-label="AlphaFold2 WebGPU home">
         <span class="brand-mark" aria-hidden="true">α</span>
-        <span>AlphaFold2 <em>WebGPU</em></span>
+        <span>AlphaFold2 WebGPU</span>
       </a>
-      <a class="header-link" href="https://github.com/martin-steinegger/alphafold2-webgpu">Source</a>
+      <nav class="header-links" aria-label="External links">
+        <a href="https://github.com/martin-steinegger/alphafold2-webgpu">GitHub</a>
+        <a href="https://www.soedinglab.org/">Söding Lab</a>
+        <a href="https://steineggerlab.com/">Steinegger Lab</a>
+      </nav>
     </header>
+
+    <nav class="side-rail" aria-label="Page sections">
+      <a href="#prediction-heading" title="Prediction input" aria-label="Prediction input">⌁</a>
+      <a href="#run-heading" title="Run status" aria-label="Run status">▶</a>
+      <a href="#results-heading" title="Prediction results" aria-label="Prediction results">▦</a>
+      <a href="#about-heading" title="About" aria-label="About">?</a>
+    </nav>
 
     <main>
       <section class="workspace" aria-labelledby="prediction-heading">
@@ -27,11 +39,11 @@
           <form id="prediction-form">
             <div class="field-row two-columns">
               <label>Job name<input id="job-name" value="test" autocomplete="off" maxlength="80" /></label>
-              <label>Input mode<select id="input-mode"><option value="single">Single sequence</option><option value="custom">Custom A3M</option></select></label>
+              <label>Input mode<select id="input-mode"><option value="mmseqs2" selected>MMseqs2 MSA</option><option value="single">Single sequence</option><option value="custom">Custom A3M</option></select></label>
             </div>
             <label id="sequence-field">Protein sequence
               <textarea id="sequence" rows="5" spellcheck="false">PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK</textarea>
-              <span class="hint">One monomer, using the 20 standard amino acids or X.</span>
+              <span id="sequence-hint" class="hint">One monomer. MMseqs2 mode sends this sequence to the public ColabFold MSA server.</span>
             </label>
             <label id="a3m-field" class="file-field" hidden>Custom alignment (.a3m)
               <input id="a3m-file" type="file" accept=".a3m,.fa,.fasta,text/plain" />
@@ -49,29 +61,35 @@
                   <input id="model-url" value="./model/manifest.json" spellcheck="false" />
                   <span class="hint">A same-origin Pages bundle or a CORS-enabled external model directory.</span>
                 </label>
+                <label class="wide">MMseqs2 API URL
+                  <input id="msa-api-url" value="https://api.colabfold.com" spellcheck="false" />
+                  <span class="hint">Used only for MMseqs2 MSA mode. The default is ColabFold's public API.</span>
+                </label>
               </div>
             </details>
-            <div class="notice"><strong>Current scope</strong><span>Monomer model 1 PTM · no templates · no Amber relaxation · neural operations stay on WebGPU.</span></div>
-            <button id="predict" class="primary" type="submit"><span>Run prediction</span><span aria-hidden="true">→</span></button>
+            <div class="notice"><strong>Current scope</strong><span>Monomer model 1 PTM · MMseqs2 UniRef + environmental MSA · no templates · no Amber relaxation · neural operations stay on WebGPU.</span></div>
+            <button id="predict" class="primary" type="submit"><span id="predict-label">Generate MSA &amp; predict</span><span aria-hidden="true">⌕</span></button>
           </form>
         </div>
 
         <aside class="panel run-panel" aria-live="polite">
-          <div class="panel-heading"><div><span class="step">02</span><h2>Run</h2></div></div>
+          <div class="panel-heading"><div><span class="step">02</span><h2 id="run-heading">Run</h2></div></div>
           <ol id="run-stages" class="stages">
             <li data-stage="device"><span>1</span><div><strong>WebGPU device</strong><small>Waiting</small></div></li>
-            <li data-stage="model"><span>2</span><div><strong>Model weights</strong><small>Waiting</small>
+            <li data-stage="msa"><span>2</span><div><strong>Sequence alignment</strong><small>Waiting</small></div></li>
+            <li data-stage="model"><span>3</span><div><strong>Model weights</strong><small>Waiting</small>
               <div id="model-progress-wrap" class="model-progress" hidden>
                 <progress id="model-progress" max="1" value="0"></progress>
                 <small id="model-progress-label">0%</small>
               </div>
             </div></li>
-            <li data-stage="features"><span>3</span><div><strong>Input features</strong><small>Waiting</small></div></li>
-            <li data-stage="inference"><span>4</span><div><strong>AF2 inference</strong><small>Waiting</small></div></li>
-            <li data-stage="results"><span>5</span><div><strong>Results</strong><small>Waiting</small></div></li>
+            <li data-stage="features"><span>4</span><div><strong>Input features</strong><small>Waiting</small></div></li>
+            <li data-stage="inference"><span>5</span><div><strong>AF2 inference</strong><small>Waiting</small></div></li>
+            <li data-stage="results"><span>6</span><div><strong>Results</strong><small>Waiting</small></div></li>
           </ol>
           <div id="prediction-status" class="run-status" data-state="idle">Ready to predict</div>
           <pre id="run-log" class="run-log">The first run downloads and parses the model weights.</pre>
+          <button id="download-msa" class="secondary" type="button" hidden>Download generated A3M</button>
         </aside>
       </section>
 
@@ -107,14 +125,20 @@
         <div id="status" data-state="idle">Ready</div><pre id="result">Waiting for a run.</pre>
       </details>
 
+      <section class="reference" aria-labelledby="reference-heading">
+        <h2 id="reference-heading">Reference</h2>
+        <p>AlphaFold2: Jumper J, Evans R, Pritzel A, et al. <a href="https://doi.org/10.1038/s41586-021-03819-2">Highly accurate protein structure prediction with AlphaFold.</a> Nature, 2021.</p>
+        <p>MMseqs2 MSA generation is provided by the public <a href="https://github.com/sokrypton/ColabFold">ColabFold</a> service. Mirdita M, Schütze K, Moriwaki Y, et al. <a href="https://doi.org/10.1038/s41592-022-01488-1">ColabFold: making protein folding accessible to all.</a> Nature Methods, 2022.</p>
+      </section>
+
       <section class="about" aria-labelledby="about-heading">
         <div>
           <p class="eyebrow">Experimental · runs locally</p>
           <h2 id="about-heading">Fold a protein in your browser.</h2>
         </div>
         <div class="about-copy">
-          <p>AlphaFold2 model-1 PTM inference on WebGPU. Your sequence, MSA, and prediction stay on this device.</p>
-          <p>The TypeScript runtime preprocesses inputs and orchestrates inference. All learned AlphaFold operations execute as WGSL compute shaders on your local GPU. Custom A3M upload is supported now; MMseqs2 search, multimer models, templates, relaxation, and model ensembling remain to be implemented.</p>
+          <p>AlphaFold2 model-1 PTM inference on WebGPU. Inference and predictions stay on this device. In MMseqs2 mode, the query sequence is sent to the selected MSA API; single-sequence and custom-A3M modes remain local.</p>
+          <p>The TypeScript runtime preprocesses inputs and orchestrates inference. All learned AlphaFold operations execute as WGSL compute shaders on your local GPU. MMseqs2 search and custom A3M upload are supported now; multimer models, templates, relaxation, and model ensembling remain to be implemented.</p>
           <div id="gpu-summary" class="capability" data-state="checking">
             <span class="capability-dot"></span><span>Checking WebGPU compatibility…</span>
           </div>

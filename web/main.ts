@@ -1,6 +1,7 @@
 import { AlphaFoldMonomerGpu, type MonomerPrediction, type MonomerRecycleResult } from "../src/model/monomer.js";
 import { makeA3mFeatures } from "../src/input/a3m-features.js";
 import { parseA3m } from "../src/input/a3m.js";
+import { generateMmseqs2Msa, type Mmseqs2MsaProgress, type Mmseqs2MsaResult } from "../src/input/mmseqs2-api.js";
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { HttpTensorStore } from "../src/reference/http-tensor-store.js";
 import type { TensorDownloadProgress } from "../src/reference/http-tensor-store.js";
@@ -45,12 +46,14 @@ const element = <T extends HTMLElement>(id: string): T => {
 const parameter = (name: string, fallback: string): string => new URLSearchParams(location.search).get(name) ?? fallback;
 const normalizedSequence = (): string => element<HTMLTextAreaElement>("sequence").value.replace(/\s+/g, "").toUpperCase();
 const formatSeconds = (milliseconds: number): string => `${(milliseconds / 1000).toFixed(2)} s`;
-const stageOrder = ["device", "model", "features", "inference", "results"] as const;
+const stageOrder = ["device", "msa", "model", "features", "inference", "results"] as const;
 type Stage = typeof stageOrder[number];
 type StageState = "active" | "done" | "error";
 
 let currentPdb = "";
 let currentScores = "";
+let generatedMsa: { readonly key: string; readonly result: Mmseqs2MsaResult } | undefined;
+let lastMsaStatus = "";
 let viewerLoader: Promise<ThreeDmolApi> | undefined;
 let viewerResizeObserver: ResizeObserver | undefined;
 
@@ -84,6 +87,22 @@ function updateModelProgress(value: TensorDownloadProgress): void {
   const total = value.totalBytes / 1024 / 1024;
   element<HTMLElement>("model-progress-label").textContent = `${Math.floor(fraction * 100)}%`;
   stage("model", "active", `${loaded.toFixed(0)} / ${total.toFixed(0)} MiB · ${value.loadedTensors}/${value.totalTensors}`);
+}
+
+function updateMsaProgress(value: Mmseqs2MsaProgress): void {
+  const seconds = Math.round(value.elapsedMilliseconds / 1000);
+  const labels: Readonly<Record<string, string>> = {
+    submitting: "Submitting query", queued: "Queued", running: "Searching databases",
+    downloading: "Downloading alignment", complete: "Alignment ready", retrying: "Server busy; retrying",
+  };
+  const label = labels[value.phase] ?? value.status;
+  stage("msa", value.phase === "complete" ? "done" : "active", `${label} · ${seconds}s`);
+  setPredictionStatus(label);
+  const statusKey = `${value.phase}:${value.status}`;
+  if (statusKey !== lastMsaStatus) {
+    log(`MMseqs2: ${label}${value.ticket === undefined ? "" : ` · ticket ${value.ticket}`}.`);
+    lastMsaStatus = statusKey;
+  }
 }
 
 function setPredictionStatus(text: string, state = "running"): void {
@@ -124,8 +143,8 @@ function drawPlddt(values: Float32Array): void {
   const context = canvas.getContext("2d");
   if (context === null) return;
   const { width, height } = canvas; const left = 46; const bottom = 30; const top = 18; const right = 12;
-  context.clearRect(0, 0, width, height); context.fillStyle = "#07110f"; context.fillRect(0, 0, width, height);
-  context.strokeStyle = "#29473e"; context.fillStyle = "#789188"; context.font = "12px DM Mono";
+  context.clearRect(0, 0, width, height); context.fillStyle = "#ffffff"; context.fillRect(0, 0, width, height);
+  context.strokeStyle = "#dddddd"; context.fillStyle = "#777777"; context.font = "12px Roboto Mono";
   for (const tick of [0, 50, 70, 90, 100]) {
     const y = top + (100 - tick) / 100 * (height - top - bottom);
     context.beginPath(); context.moveTo(left, y); context.lineTo(width - right, y); context.stroke();
@@ -138,7 +157,7 @@ function drawPlddt(values: Float32Array): void {
     context.fillStyle = plddtColor(value);
     context.fillRect(left + index * barWidth, height - bottom - barHeight, Math.max(1, barWidth), barHeight);
   }
-  context.fillStyle = "#789188"; context.fillText("Residue", width / 2 - 25, height - 7);
+  context.fillStyle = "#777777"; context.fillText("Residue", width / 2 - 25, height - 7);
 }
 
 function paeColor(value: number, maximum: number): [number, number, number] {
@@ -181,7 +200,7 @@ async function showStructure(pdb: string): Promise<void> {
   container.replaceChildren();
   try {
     const api = await loadViewer();
-    const viewer = api.createViewer(container, { backgroundColor: "#07110f" });
+    const viewer = api.createViewer(container, { backgroundColor: "#ffffff" });
     viewer.addModel(pdb, "pdb");
     viewer.setStyle({}, { cartoon: { colorscheme: { prop: "b", gradient: "roygb", min: 50, max: 90 } } });
     viewer.zoomTo(); viewer.render();
@@ -222,14 +241,34 @@ function showResults(prediction: MonomerPrediction, sequence: string, depth: num
 }
 
 async function predictionInput(): Promise<{ a3m: string; sequence: string; depth: number }> {
-  if (element<HTMLSelectElement>("input-mode").value === "single") {
+  const mode = element<HTMLSelectElement>("input-mode").value;
+  if (mode === "single") {
     const sequence = normalizedSequence();
     if (!/^[ARNDCQEGHILKMFPSTWYVX]+$/.test(sequence)) throw new Error("Sequence must contain only standard amino-acid letters or X");
+    stage("msa", "done", "Single sequence");
     return { a3m: `>query\n${sequence}\n`, sequence, depth: 1 };
+  }
+  if (mode === "mmseqs2") {
+    const sequence = normalizedSequence();
+    const apiUrl = element<HTMLInputElement>("msa-api-url").value.trim();
+    if (apiUrl === "") throw new Error("An MMseqs2 API URL is required");
+    try { localStorage.setItem("afwebgpu.msaApiUrl", apiUrl); } catch { /* storage may be unavailable */ }
+    const key = `${apiUrl}\n${sequence}`;
+    if (generatedMsa?.key === key) {
+      stage("msa", "done", `${generatedMsa.result.depth} rows · cached`); log("Reusing the generated MMseqs2 alignment.");
+      return { a3m: generatedMsa.result.a3m, sequence, depth: generatedMsa.result.depth };
+    }
+    const result = await generateMmseqs2Msa(sequence, { apiUrl, onProgress: updateMsaProgress });
+    generatedMsa = { key, result };
+    stage("msa", "done", `${result.depth} rows · ${formatSeconds(result.elapsedMilliseconds)}`);
+    const downloadButton = element<HTMLButtonElement>("download-msa"); downloadButton.hidden = false;
+    downloadButton.onclick = () => download(`${safeJobName(element<HTMLInputElement>("job-name").value)}.a3m`, result.a3m, "text/plain");
+    return { a3m: result.a3m, sequence, depth: result.depth };
   }
   const file = element<HTMLInputElement>("a3m-file").files?.[0];
   if (file === undefined) throw new Error("Choose a custom A3M file first");
   const a3m = await file.text(); const parsed = parseA3m(a3m);
+  stage("msa", "done", `${parsed.depth} uploaded rows`);
   return { a3m, sequence: parsed.query, depth: parsed.depth };
 }
 
@@ -237,7 +276,7 @@ element<HTMLFormElement>("prediction-form").addEventListener("submit", (event) =
 
 async function runPrediction(): Promise<void> {
   const button = element<HTMLButtonElement>("predict"); button.disabled = true;
-  element<HTMLElement>("results-section").hidden = true; resetStages(); log("Starting prediction…", false);
+  element<HTMLElement>("results-section").hidden = true; resetStages(); log("Starting prediction…", false); lastMsaStatus = "";
   let device: GPUDevice | undefined;
   try {
     stage("device", "active", "Requesting adapter"); setPredictionStatus("Preparing WebGPU");
@@ -248,20 +287,25 @@ async function runPrediction(): Promise<void> {
     const adapterName = adapter.info.description || adapter.info.device || adapter.info.vendor || "WebGPU adapter";
     stage("device", "done", adapterName); log(`GPU: ${adapterName}`);
 
-    stage("model", "active", "Downloading one model"); setPredictionStatus("Loading model 1 PTM");
+    stage("msa", "active", "Preparing input");
+    stage("model", "active", "Downloading one model"); setPredictionStatus("Preparing alignment and model");
     const manifestValue = element<HTMLInputElement>("model-url").value.trim();
     if (manifestValue === "") throw new Error("A model manifest URL is required");
     localStorage.setItem("afwebgpu.modelUrl", manifestValue);
-    const fixture = AlphaFoldFixture.fromStore(await HttpTensorStore.open(manifestValue, updateModelProgress));
-    const [embedding, template, extraStack, mainStack, structure, confidence, geometry, featureTables, paeBreaks] = await Promise.all([
-      fixture.embeddingWeights(), fixture.templateWeights(), fixture.extraStackWeights(), fixture.mainStackWeights(),
-      fixture.structureWeights(), fixture.confidenceWeights(), fixture.geometryTables(), fixture.queryOnlyFeatureTables(),
-      fixture.tensor("confidencePaeBreaks"),
-    ]);
+    const inputPromise = predictionInput();
+    const weightsPromise = HttpTensorStore.open(manifestValue, updateModelProgress).then(async (store) => {
+      const fixture = AlphaFoldFixture.fromStore(store);
+      return Promise.all([
+        fixture.embeddingWeights(), fixture.templateWeights(), fixture.extraStackWeights(), fixture.mainStackWeights(),
+        fixture.structureWeights(), fixture.confidenceWeights(), fixture.geometryTables(), fixture.queryOnlyFeatureTables(),
+        fixture.tensor("confidencePaeBreaks"),
+      ] as const);
+    });
+    const [input, weights] = await Promise.all([inputPromise, weightsPromise]);
+    const [embedding, template, extraStack, mainStack, structure, confidence, geometry, featureTables, paeBreaks] = weights;
     stage("model", "done", "Model 1 PTM loaded"); log("Loaded the reduced model-1 tensor bundle.");
 
     stage("features", "active", "Parsing input"); setPredictionStatus("Building AF2 features");
-    const input = await predictionInput();
     const featureOptions = {
       recycles: Number(element<HTMLSelectElement>("recycles").value),
       randomSeed: element<HTMLInputElement>("seed").valueAsNumber,
@@ -299,17 +343,23 @@ async function runPrediction(): Promise<void> {
 
 const inputMode = element<HTMLSelectElement>("input-mode");
 function updateInputMode(): void {
-  const custom = inputMode.value === "custom";
+  const custom = inputMode.value === "custom"; const remote = inputMode.value === "mmseqs2";
   element<HTMLElement>("sequence-field").hidden = custom; element<HTMLElement>("a3m-field").hidden = !custom;
   element<HTMLElement>("sequence-length").textContent = custom ? "A3M input" : `${normalizedSequence().length} residues`;
+  element<HTMLElement>("sequence-hint").textContent = remote
+    ? "One monomer. MMseqs2 mode sends this sequence to the public ColabFold MSA server."
+    : "One monomer, using the 20 standard amino acids or X. This input stays on the device.";
+  element<HTMLElement>("predict-label").textContent = remote ? "Generate MSA & predict" : "Run prediction";
 }
 inputMode.addEventListener("change", updateInputMode);
-element<HTMLTextAreaElement>("sequence").addEventListener("input", updateInputMode);
+element<HTMLTextAreaElement>("sequence").addEventListener("input", () => { generatedMsa = undefined;
+  element<HTMLButtonElement>("download-msa").hidden = true; updateInputMode(); });
 element<HTMLInputElement>("a3m-file").addEventListener("change", (event) => {
   const file = (event.currentTarget as HTMLInputElement).files?.[0];
   element<HTMLElement>("a3m-file-name").textContent = file?.name ?? "Choose an A3M file";
 });
 try { element<HTMLInputElement>("model-url").value = localStorage.getItem("afwebgpu.modelUrl") ?? "./model/manifest.json"; } catch { /* storage may be unavailable */ }
+try { element<HTMLInputElement>("msa-api-url").value = localStorage.getItem("afwebgpu.msaApiUrl") ?? "https://api.colabfold.com"; } catch { /* storage may be unavailable */ }
 updateInputMode();
 
 async function checkWebGpu(): Promise<void> {

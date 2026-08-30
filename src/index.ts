@@ -77,6 +77,10 @@ export { makeQueryOnlyFeatures } from "./input/query-only-features.js";
 export type { QueryOnlyFeatureOptions, QueryOnlyFeatureTables } from "./input/query-only-features.js";
 export { makeA3mFeatures } from "./input/a3m-features.js";
 export type { A3mFeatureOptions } from "./input/a3m-features.js";
+export { extractMmseqs2A3m, generateMmseqs2Msa, readTarFiles } from "./input/mmseqs2-api.js";
+export type {
+  Mmseqs2MsaOptions, Mmseqs2MsaPhase, Mmseqs2MsaProgress, Mmseqs2MsaResult,
+} from "./input/mmseqs2-api.js";
 export { AlphaFoldFixture } from "./reference/alphafold-fixture.js";
 export type { TensorStore } from "./reference/alphafold-fixture.js";
 export { HttpTensorStore } from "./reference/http-tensor-store.js";

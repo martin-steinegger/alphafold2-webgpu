@@ -12,6 +12,8 @@ AFWebGPU is an independent browser/WebGPU port of AlphaFold2; it does not origin
 
 Please also consult and cite the [official AlphaFold repository](https://github.com/google-deepmind/alphafold) as appropriate. The bundled AlphaFold parameters remain subject to DeepMind's [CC BY 4.0 parameters license](https://github.com/google-deepmind/alphafold/blob/main/WEIGHTS_LICENSE); this repository does not alter their ownership or license.
 
+Remote MSA generation follows the public API client in [ColabFold](https://github.com/sokrypton/ColabFold). Please also cite Mirdita M, Schütze K, Moriwaki Y, et al. *ColabFold: making protein folding accessible to all.* Nature Methods 19, 679–682 (2022). [doi:10.1038/s41592-022-01488-1](https://doi.org/10.1038/s41592-022-01488-1). We thank the MMseqs2, ColabFold, and [MMseqs2-App](https://github.com/soedinglab/MMseqs2-App) developers for making the search infrastructure and interface source available.
+
 ## Verified reference predictions
 
 The acceptance sequence is:
@@ -78,7 +80,9 @@ Evoformer blocks are submitted ahead without host waits and alias a pooled set o
 
 ## Browser demo and GitHub Pages
 
-The static browser UI supports the one implemented parameter set, `model_1_ptm`, with either a single sequence or a custom A3M. It reports per-recycle pLDDT/pTM, renders pLDDT and PAE plots, displays the unrelaxed structure with 3Dmol, and exports PDB and score JSON files.
+The static browser UI supports the one implemented parameter set, `model_1_ptm`, with an MMseqs2-generated MSA, a single sequence, or a custom A3M. Its default mode submits the query to ColabFold's public MMseqs2 API, polls the ticket, extracts and combines the UniRef and environmental A3Ms in the browser, and runs inference locally. It reports per-recycle pLDDT/pTM, renders pLDDT and PAE plots, displays the unrelaxed structure with 3Dmol, and exports PDB, score JSON, and generated A3M files.
+
+The default MMseqs2 endpoint is `https://api.colabfold.com`; it can be changed under Advanced settings. Selecting this mode sends the protein sequence to that service. Single-sequence and custom-A3M inputs do not leave the browser.
 
 Build the UI alone, or—when the local full-model fixture is available—build a self-contained site with the reduced model bundle:
 
@@ -122,5 +126,5 @@ Small reference fixtures needed by the default test suite are committed. Full Ev
 
 - Monomer `model_1_ptm`, FP32 inference, mock templates, and fixed model channel sizes are supported.
 - A3M sampling and clustering are implemented in TypeScript with a deterministic application PRNG. It is distribution-equivalent to AlphaFold preprocessing but does not reproduce TensorFlow's private RNG stream unless exact masked-MSA codes are supplied.
-- Multimer models, real template hits, other AF2 parameter sets, weight quantization, remote MSA search, and result relaxation remain outside the current scope.
+- Multimer models, real template hits, other AF2 parameter sets, weight quantization, and result relaxation remain outside the current scope.
 - Further structure-module residency, weight-layout specialization, and Apple-GPU profiling can improve runtime and peak memory without changing model semantics.
