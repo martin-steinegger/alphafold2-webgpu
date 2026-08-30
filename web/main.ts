@@ -8,19 +8,8 @@ import type { TensorDownloadProgress } from "../src/reference/http-tensor-store.
 import {
   planMonomerDevice, requestAlphaFoldDevice, suggestMonomerRows, type AlphaFoldDeviceRequirements,
 } from "../src/runtime/device.js";
-import { createDeterministicTriangleInput } from "../src/testing/deterministic-input.js";
-import { triangleMultiplicationOutgoingReference } from "../src/triangle/cpu-reference.js";
-import { errorMetrics, type Precision } from "../src/triangle/types.js";
-import { TriangleMultiplicationOutgoingGpu } from "../src/triangle/webgpu.js";
 import { confidenceJson, predictionToPdb, safeJobName } from "./prediction-results.js";
 import { drawMsaCoverage } from "./msa-plot.js";
-
-interface BrowserResult {
-  readonly elapsedMilliseconds: number;
-  readonly peakBytes: number;
-  readonly meanAbsoluteError: number;
-  readonly maxAbsoluteError: number;
-}
 
 interface Viewer3D {
   addModel(data: string, format: string): void;
@@ -34,7 +23,6 @@ interface ThreeDmolApi { createViewer(element: HTMLElement, options: object): Vi
 
 declare global {
   interface Window {
-    __AFWEBGPU_RESULT__?: BrowserResult;
     __AFWEBGPU_PREDICTION__?: {
       meanPlddt: number; ptm: number; elapsedMilliseconds: number; modelLoadMilliseconds: number;
       recycles: readonly {
@@ -539,40 +527,3 @@ async function checkWebGpu(): Promise<void> {
   }
 }
 void checkWebGpu();
-
-// Keep the small, model-free differential kernel diagnostic available for browser/CI checks.
-const diagnosticForm = element<HTMLFormElement>("controls");
-const diagnosticStatus = element<HTMLDivElement>("status");
-const diagnosticResult = element<HTMLPreElement>("result");
-element<HTMLInputElement>("length").value = parameter("length", "8");
-element<HTMLInputElement>("cz").value = parameter("cz", "16");
-element<HTMLInputElement>("hidden").value = parameter("hidden", "16");
-element<HTMLSelectElement>("precision").value = parameter("precision", "f32");
-diagnosticForm.addEventListener("submit", (event) => { event.preventDefault(); void runDiagnostic(); });
-
-async function runDiagnostic(): Promise<void> {
-  diagnosticStatus.dataset.state = "running"; diagnosticStatus.textContent = "Running…";
-  diagnosticResult.textContent = "Requesting a WebGPU adapter.";
-  let device: GPUDevice | undefined;
-  try {
-    if (navigator.gpu === undefined) throw new Error("WebGPU is not available in this browser");
-    const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
-    if (adapter === null) throw new Error("No compatible WebGPU adapter was found");
-    const precision = element<HTMLSelectElement>("precision").value as Precision;
-    if (precision === "f16" && !adapter.features.has("shader-f16")) throw new Error("This adapter does not expose shader-f16");
-    device = await adapter.requestDevice({ requiredFeatures: precision === "f16" ? ["shader-f16"] : [] });
-    const shape = { length: element<HTMLInputElement>("length").valueAsNumber, cZ: element<HTMLInputElement>("cz").valueAsNumber, cHidden: element<HTMLInputElement>("hidden").valueAsNumber };
-    const input = createDeterministicTriangleInput(shape, 29);
-    const expected = triangleMultiplicationOutgoingReference(input);
-    const gpuResult = await new TriangleMultiplicationOutgoingGpu(device).run(input, { precision });
-    const errors = errorMetrics(gpuResult.output, expected);
-    window.__AFWEBGPU_RESULT__ = { elapsedMilliseconds: gpuResult.elapsedMilliseconds, peakBytes: gpuResult.memory.peakBytes, meanAbsoluteError: errors.meanAbsoluteError, maxAbsoluteError: errors.maxAbsoluteError };
-    diagnosticStatus.dataset.state = "passed"; diagnosticStatus.textContent = "Differential test passed";
-    diagnosticResult.textContent = JSON.stringify({ shape, precision, ...window.__AFWEBGPU_RESULT__ }, null, 2);
-  } catch (error) {
-    diagnosticStatus.dataset.state = "failed"; diagnosticStatus.textContent = "Run failed";
-    diagnosticResult.textContent = error instanceof Error ? error.stack ?? error.message : String(error);
-  } finally { device?.destroy(); }
-}
-
-if (parameter("autorun", "0") === "1") void runDiagnostic();

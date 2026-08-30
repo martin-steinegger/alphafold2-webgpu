@@ -117,19 +117,6 @@
         </div>
       </section>
 
-      <details class="diagnostics">
-        <summary>WebGPU kernel diagnostic</summary>
-        <p>Runs the original differential TriangleMultiplicationOutgoing smoke test without model weights.</p>
-        <form id="controls" class="diagnostic-controls">
-          <label>Length<input id="length" type="number" min="1" max="512" value="8" /></label>
-          <label>Pair channels<input id="cz" type="number" min="1" value="16" /></label>
-          <label>Hidden channels<input id="hidden" type="number" min="1" value="16" /></label>
-          <label>Precision<select id="precision"><option value="f32">FP32</option><option value="f16">FP16</option></select></label>
-          <button type="submit">Run kernel</button>
-        </form>
-        <div id="status" data-state="idle">Ready</div><pre id="result">Waiting for a run.</pre>
-      </details>
-
       <section class="reference" aria-labelledby="reference-heading">
         <h2 id="reference-heading">Reference</h2>
         <p>AlphaFold2: Jumper J, Evans R, Pritzel A, et al. <a href="https://doi.org/10.1038/s41586-021-03819-2">Highly accurate protein structure prediction with AlphaFold.</a> Nature, 2021.</p>
