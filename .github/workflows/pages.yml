@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   pages: write
   id-token: write
 
@@ -35,9 +35,20 @@ jobs:
         run: |
           gh release download model1-ptm --pattern afwebgpu-model1-ptm.tar.gz
           tar -xzf afwebgpu-model1-ptm.tar.gz -C dist/web
+      - name: Upgrade legacy model bundle once
+        id: upgrade-model
+        if: ${{ vars.AFWEBGPU_INCLUDE_MODEL == 'true' }}
+        run: npm run upgrade:web-model
       - name: Validate model bundle
         if: ${{ vars.AFWEBGPU_INCLUDE_MODEL == 'true' }}
         run: npm run verify:web-model
+      - name: Replace legacy model release asset
+        if: ${{ steps.upgrade-model.outputs.upgraded == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tar -czf afwebgpu-model1-ptm.tar.gz -C dist/web model
+          gh release upload model1-ptm afwebgpu-model1-ptm.tar.gz --clobber
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

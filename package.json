@@ -9,6 +9,7 @@
     "build:web": "vite build --config vite.browser.config.ts",
     "export:web-model": "tsx tools/export-web-model.ts",
     "verify:web-model": "tsx tools/verify-web-model.ts",
+    "upgrade:web-model": "tsx tools/upgrade-web-model.ts",
     "build:web:standalone": "npm run build:web && npm run export:web-model",
     "dev": "vite --config vite.browser.config.ts",
     "test": "vitest run",
