@@ -25,6 +25,8 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run check
+      - name: Install browser test runtime
+        run: npx playwright install --with-deps chromium
       - run: npm run test:browser
       - name: Add the single model-1 PTM release bundle
         if: ${{ vars.AFWEBGPU_INCLUDE_MODEL == 'true' }}
