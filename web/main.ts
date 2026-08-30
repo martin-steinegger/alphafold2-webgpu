@@ -68,10 +68,20 @@ let viewerLoader: Promise<ThreeDmolApi> | undefined;
 let viewerResizeObserver: ResizeObserver | undefined;
 let sharedPredictionDevice: GPUDevice | undefined;
 
-function unifiedMemoryBudget(adapter: GPUAdapter): number | undefined {
+function browserPlatform(): string {
+  const userAgentData = (navigator as Navigator & { readonly userAgentData?: { readonly platform?: string } })
+    .userAgentData;
+  return userAgentData?.platform ?? navigator.platform ?? "unknown";
+}
+
+function isAppleUnifiedMemory(adapter: GPUAdapter): boolean {
   const identity = `${adapter.info.vendor} ${adapter.info.architecture} ${adapter.info.device} ${adapter.info.description}`
     .toLowerCase();
-  if (!identity.includes("apple")) return undefined;
+  return identity.includes("apple") || /mac/i.test(browserPlatform());
+}
+
+function unifiedMemoryBudget(appleUnifiedMemory: boolean): number | undefined {
+  if (!appleUnifiedMemory) return undefined;
   const deviceMemory = (navigator as Navigator & { readonly deviceMemory?: number }).deviceMemory;
   if (deviceMemory === undefined || !Number.isFinite(deviceMemory) || deviceMemory <= 0) return undefined;
   // Apple GPUs share system RAM. navigator.deviceMemory is privacy-rounded and
@@ -116,7 +126,16 @@ async function predictionDevice(adapter: GPUAdapter, requirements: AlphaFoldDevi
   sharedPredictionDevice = undefined;
   const device = await requestAlphaFoldDevice(adapter, requirements);
   sharedPredictionDevice = device;
-  void device.lost.then(() => { if (sharedPredictionDevice === device) sharedPredictionDevice = undefined; });
+  device.addEventListener("uncapturederror", (event) => {
+    const error = (event as GPUUncapturedErrorEvent).error;
+    log(`WebGPU uncaptured error: ${error.message}`);
+  });
+  void device.lost.then((info) => {
+    if (sharedPredictionDevice === device) sharedPredictionDevice = undefined;
+    if (info.reason !== "destroyed") {
+      log(`WebGPU device lost (${info.reason || "unknown"}): ${info.message || "no driver message"}.`);
+    }
+  });
   return { device, cached: false };
 }
 
@@ -359,8 +378,11 @@ async function runPrediction(): Promise<void> {
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
     if (adapter === null) throw new Error("No compatible WebGPU adapter was found");
     const adapterName = adapter.info.description || adapter.info.device || adapter.info.vendor || "WebGPU adapter";
+    const appleUnifiedMemory = isAppleUnifiedMemory(adapter);
+    const compactMemoryPolicy = appleUnifiedMemory || parameter("compact", "0") === "1";
     stage("device", "active", `${adapterName} · sizing buffers`);
     log(`GPU adapter: ${adapterName}`);
+    log(`Browser platform: ${browserPlatform()}${compactMemoryPolicy ? " · compact memory policy" : ""}.`);
     log(`WebGPU features: ${[...adapter.features].sort().join(", ")}`);
 
     stage("msa", "active", "Preparing input");
@@ -387,15 +409,15 @@ async function runPrediction(): Promise<void> {
     const requestedMaxExtra = element<HTMLInputElement>("max-extra").valueAsNumber;
     const clusteredRows = Math.min(requestedMaxMsa, input.depth);
     const extraRows = Math.max(1, Math.min(requestedMaxExtra, Math.max(0, input.depth - clusteredRows)));
-    const memoryBudget = unifiedMemoryBudget(adapter);
+    const memoryBudget = unifiedMemoryBudget(appleUnifiedMemory);
     const devicePlan = planMonomerDevice(
-      adapter, input.sequence.length, clusteredRows, extraRows, memoryBudget,
+      adapter, input.sequence.length, clusteredRows, extraRows, memoryBudget, compactMemoryPolicy,
     );
     log(`Estimated peak GPU allocations: ${formatMib(devicePlan.memory.estimatedPeakBytes)} `
       + `(${formatMib(devicePlan.memory.persistentBytes)} persistent, `
       + `${formatMib(devicePlan.memory.scratchBytes)} scratch).`);
     if (memoryBudget !== undefined) {
-      log(`Apple unified-memory safety budget: ${formatMib(memoryBudget)}.`);
+      log(`Apple unified-memory safety budget: ${formatMib(memoryBudget)}; bounded transitions and scratch pooling enabled.`);
       if (devicePlan.memory.estimatedPeakBytes > memoryBudget) {
         const suggestion = suggestMonomerRows(
           input.sequence.length, clusteredRows, extraRows, devicePlan.transitionMode, memoryBudget,

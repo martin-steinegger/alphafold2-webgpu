@@ -55,6 +55,10 @@ describe("requestAlphaFoldDevice", () => {
       transitionMode: "chunked",
       requirements: monomerDeviceRequirements(291, 508, 1024),
     });
+    expect(planMonomerDevice(capable, 291, 508, 1024, undefined, true)).toMatchObject({
+      transitionMode: "chunked",
+      requirements: monomerDeviceRequirements(291, 508, 1024),
+    });
   });
 
   it("estimates aggregate memory and suggests explicit MSA row limits", () => {

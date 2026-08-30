@@ -3,6 +3,7 @@ import { create, globals } from "webgpu";
 import { AlphaFoldMonomerGpu, type MonomerModelWeights, type MonomerRecycleFeatures } from "../src/model/monomer.js";
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
+import { COMPACT_GPU_POOL_BYTES } from "../src/runtime/allocator.js";
 import { monomerDeviceRequirements, planMonomerDevice, requestAlphaFoldDevice } from "../src/runtime/device.js";
 
 Object.assign(globalThis, globals);
@@ -52,6 +53,12 @@ const shape = {
   recycles: features.length,
 };
 const gpu = create([]);
+const compactPoolMibValue = process.env.AFWEBGPU_COMPACT_POOL_MIB;
+const compactPoolMib = compactPoolMibValue === undefined ? undefined : Number(compactPoolMibValue);
+if (compactPoolMib !== undefined && (!Number.isSafeInteger(compactPoolMib) || compactPoolMib < 0)) {
+  throw new RangeError("AFWEBGPU_COMPACT_POOL_MIB must be a non-negative integer");
+}
+const compactPoolBytes = compactPoolMib === undefined ? COMPACT_GPU_POOL_BYTES : compactPoolMib * 1024 ** 2;
 
 async function run(mode: "auto" | "compact") {
   const adapter = await gpu.requestAdapter();
@@ -64,6 +71,7 @@ async function run(mode: "auto" | "compact") {
   try {
     const prediction = await new AlphaFoldMonomerGpu(device, {
       compactTransitions: mode === "compact" || automatic.transitionMode === "chunked",
+      ...(mode === "compact" ? { maxPooledBytes: compactPoolBytes } : {}),
     }).predict(features, weights, paeBreaks);
     const recycles = prediction.recycles.map((result, recycle) => {
       const expected = reference[recycle]!;
@@ -81,6 +89,7 @@ async function run(mode: "auto" | "compact") {
     });
     return {
       mode, transitionMode: mode === "compact" ? "chunked" : automatic.transitionMode,
+      ...(mode === "compact" ? { maxPooledBytes: compactPoolBytes } : {}),
       elapsedMilliseconds: prediction.elapsedMilliseconds,
       memory: prediction.memory,
       recycles,

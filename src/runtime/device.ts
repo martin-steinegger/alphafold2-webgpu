@@ -1,3 +1,5 @@
+import { COMPACT_GPU_POOL_BYTES } from "./allocator.js";
+
 const WEBGPU_BASE_MAX_BUFFER_SIZE = 256 * 1024 * 1024;
 const WEBGPU_BASE_MAX_STORAGE_BINDING_SIZE = 128 * 1024 * 1024;
 
@@ -88,10 +90,13 @@ export function estimateMonomerMemory(
   // Pipeline parameters, readbacks, alignment padding, and implementation
   // bookkeeping are deliberately represented by a fixed safety allowance.
   const scratchBytes = operatorScratch + pair + msaSequences * length * 256 * bytes + 64 * 1024 ** 2;
-  // Exact-sized pooling retains buffers needed by successive block shapes.
-  // GB10 full-model qualification measured a 2.31x resident/logical-model
-  // ratio at L=59, so use 2.5x as a conservative implementation allowance.
-  const estimatedPeakBytes = Math.ceil((persistentBytes + scratchBytes) * 2.5);
+  const logicalBytes = persistentBytes + scratchBytes;
+  // Exact-sized unbounded pooling measured a 2.31x resident/model ratio on
+  // GB10. Compact execution bounds idle buffers; its measured live peak needs
+  // a smaller 1.75x allowance plus that explicit pool.
+  const estimatedPeakBytes = transitionMode === "chunked"
+    ? Math.ceil(logicalBytes * 1.75 + COMPACT_GPU_POOL_BYTES)
+    : Math.ceil(logicalBytes * 2.5);
   if (![persistentBytes, scratchBytes, estimatedPeakBytes].every(Number.isSafeInteger)) {
     throw new RangeError("monomer aggregate memory estimate exceeds JavaScript precision");
   }
@@ -164,6 +169,7 @@ export function planMonomerDevice(
   msaSequences: number,
   extraSequences: number,
   memoryBudgetBytes?: number,
+  preferCompact = false,
 ): AlphaFoldDevicePlan {
   if (memoryBudgetBytes !== undefined
     && (!Number.isSafeInteger(memoryBudgetBytes) || memoryBudgetBytes <= 0)) {
@@ -184,7 +190,8 @@ export function planMonomerDevice(
     maxStorageBufferBindingSize: Math.max(compact.maxStorageBufferBindingSize, largestFullTransition),
   };
   const fullMemory = estimateMonomerMemory(length, msaSequences, extraSequences, "full");
-  if (fast.maxBufferSize <= adapter.limits.maxBufferSize
+  if (!preferCompact
+    && fast.maxBufferSize <= adapter.limits.maxBufferSize
     && fast.maxStorageBufferBindingSize <= adapter.limits.maxStorageBufferBindingSize
     && (memoryBudgetBytes === undefined || fullMemory.estimatedPeakBytes <= memoryBudgetBytes)) {
     return { requirements: fast, transitionMode: "full",

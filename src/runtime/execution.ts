@@ -37,6 +37,7 @@ interface PendingTimestampReadback {
 
 export interface WebGpuExecutionOptions {
   readonly transitionBufferLimit?: number;
+  readonly maxPooledBytes?: number;
 }
 
 export class WebGpuExecution {
@@ -51,7 +52,7 @@ export class WebGpuExecution {
 
   constructor(device: GPUDevice, options: WebGpuExecutionOptions = {}) {
     this.device = device;
-    this.allocator = new GpuBufferAllocator(device, true);
+    this.allocator = new GpuBufferAllocator(device, true, options.maxPooledBytes);
     this.pipelines = pipelineCacheForDevice(device);
     this.transitionBufferLimit = Math.min(
       device.limits.maxStorageBufferBindingSize,
