@@ -33,7 +33,13 @@ interface ThreeDmolApi { createViewer(element: HTMLElement, options: object): Vi
 declare global {
   interface Window {
     __AFWEBGPU_RESULT__?: BrowserResult;
-    __AFWEBGPU_PREDICTION__?: { meanPlddt: number; ptm: number; elapsedMilliseconds: number };
+    __AFWEBGPU_PREDICTION__?: {
+      meanPlddt: number; ptm: number; elapsedMilliseconds: number; modelLoadMilliseconds: number;
+      recycles: readonly {
+        elapsedMilliseconds: number; meanPlddt: number; ptm: number;
+        trunkSubmissions: MonomerRecycleResult["trunkSubmissions"];
+      }[];
+    };
     $3Dmol?: ThreeDmolApi;
   }
 }
@@ -57,6 +63,39 @@ let generatedMsa: { readonly key: string; readonly result: Mmseqs2MsaResult } | 
 let lastMsaStatus = "";
 let viewerLoader: Promise<ThreeDmolApi> | undefined;
 let viewerResizeObserver: ResizeObserver | undefined;
+let sharedPredictionDevice: GPUDevice | undefined;
+
+async function loadModelWeights(manifestValue: string) {
+  const store = await HttpTensorStore.open(manifestValue, updateModelProgress);
+  const fixture = AlphaFoldFixture.fromStore(store);
+  return Promise.all([
+    fixture.embeddingWeights(), fixture.templateWeights(), fixture.extraStackWeights(), fixture.mainStackWeights(),
+    fixture.structureWeights(), fixture.confidenceWeights(), fixture.geometryTables(), fixture.queryOnlyFeatureTables(),
+    fixture.tensor("confidencePaeBreaks"),
+  ] as const);
+}
+
+type LoadedModelWeights = Awaited<ReturnType<typeof loadModelWeights>>;
+let cachedModel: { readonly manifestValue: string; readonly promise: Promise<LoadedModelWeights> } | undefined;
+
+function modelWeights(manifestValue: string): {
+  readonly promise: Promise<LoadedModelWeights>; readonly cached: boolean;
+} {
+  if (cachedModel?.manifestValue === manifestValue) return { promise: cachedModel.promise, cached: true };
+  const promise = loadModelWeights(manifestValue);
+  const entry = { manifestValue, promise };
+  cachedModel = entry;
+  void promise.catch(() => { if (cachedModel === entry) cachedModel = undefined; });
+  return { promise, cached: false };
+}
+
+async function predictionDevice(adapter: GPUAdapter): Promise<{ readonly device: GPUDevice; readonly cached: boolean }> {
+  if (sharedPredictionDevice !== undefined) return { device: sharedPredictionDevice, cached: true };
+  const device = await requestAlphaFoldDevice(adapter);
+  sharedPredictionDevice = device;
+  void device.lost.then(() => { if (sharedPredictionDevice === device) sharedPredictionDevice = undefined; });
+  return { device, cached: false };
+}
 
 function stage(stageName: Stage, state: StageState, detail: string): void {
   const item = document.querySelector<HTMLElement>(`[data-stage="${stageName}"]`);
@@ -214,7 +253,8 @@ async function showStructure(pdb: string): Promise<void> {
   }
 }
 
-function showResults(prediction: MonomerPrediction, sequence: string, depth: number, jobName: string, a3m: string): void {
+function showResults(prediction: MonomerPrediction, sequence: string, depth: number, jobName: string, a3m: string,
+  modelLoadMilliseconds: number): void {
   const confidence = prediction.final.confidence;
   currentPdb = predictionToPdb(sequence, prediction.final.structure, confidence.plddt);
   currentScores = confidenceJson(sequence, confidence);
@@ -242,7 +282,14 @@ function showResults(prediction: MonomerPrediction, sequence: string, depth: num
   void showStructure(currentPdb);
   element<HTMLButtonElement>("download-pdb").onclick = () => download(`${jobName}_unrelaxed_model_1.pdb`, currentPdb, "chemical/x-pdb");
   element<HTMLButtonElement>("download-scores").onclick = () => download(`${jobName}_scores.json`, currentScores, "application/json");
-  window.__AFWEBGPU_PREDICTION__ = { meanPlddt: confidence.meanPlddt, ptm: confidence.ptm, elapsedMilliseconds: prediction.elapsedMilliseconds };
+  window.__AFWEBGPU_PREDICTION__ = {
+    meanPlddt: confidence.meanPlddt, ptm: confidence.ptm,
+    elapsedMilliseconds: prediction.elapsedMilliseconds, modelLoadMilliseconds,
+    recycles: prediction.recycles.map((result) => ({
+      elapsedMilliseconds: result.elapsedMilliseconds, meanPlddt: result.confidence.meanPlddt,
+      ptm: result.confidence.ptm, trunkSubmissions: result.trunkSubmissions,
+    })),
+  };
 }
 
 async function predictionInput(): Promise<{ a3m: string; sequence: string; depth: number }> {
@@ -282,33 +329,39 @@ element<HTMLFormElement>("prediction-form").addEventListener("submit", (event) =
 async function runPrediction(): Promise<void> {
   const button = element<HTMLButtonElement>("predict"); button.disabled = true;
   element<HTMLElement>("results-section").hidden = true; resetStages(); log("Starting prediction…", false); lastMsaStatus = "";
-  let device: GPUDevice | undefined;
   try {
     stage("device", "active", "Requesting adapter"); setPredictionStatus("Preparing WebGPU");
     if (navigator.gpu === undefined) throw new Error("WebGPU is unavailable. Use a current Chrome or Edge browser on a supported GPU.");
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
     if (adapter === null) throw new Error("No compatible WebGPU adapter was found");
-    device = await requestAlphaFoldDevice(adapter);
+    const deviceResult = await predictionDevice(adapter);
+    const device = deviceResult.device;
     const adapterName = adapter.info.description || adapter.info.device || adapter.info.vendor || "WebGPU adapter";
-    stage("device", "done", adapterName); log(`GPU: ${adapterName}`);
+    stage("device", "done", `${adapterName}${deviceResult.cached ? " · cached device" : ""}`);
+    log(`GPU: ${adapterName}${deviceResult.cached ? " (reusing device and pipelines)" : ""}`);
+    log(`WebGPU features: ${[...adapter.features].sort().join(", ")}`);
+    log(`WebGPU limits: invocations=${adapter.limits.maxComputeInvocationsPerWorkgroup} `
+      + `workgroupStorage=${adapter.limits.maxComputeWorkgroupStorageSize} `
+      + `storageBinding=${adapter.limits.maxStorageBufferBindingSize} buffer=${adapter.limits.maxBufferSize}`);
 
     stage("msa", "active", "Preparing input");
     stage("model", "active", "Downloading one model"); setPredictionStatus("Preparing alignment and model");
     const manifestValue = element<HTMLInputElement>("model-url").value.trim();
     if (manifestValue === "") throw new Error("A model manifest URL is required");
     localStorage.setItem("afwebgpu.modelUrl", manifestValue);
+    const modelStart = performance.now();
     const inputPromise = predictionInput();
-    const weightsPromise = HttpTensorStore.open(manifestValue, updateModelProgress).then(async (store) => {
-      const fixture = AlphaFoldFixture.fromStore(store);
-      return Promise.all([
-        fixture.embeddingWeights(), fixture.templateWeights(), fixture.extraStackWeights(), fixture.mainStackWeights(),
-        fixture.structureWeights(), fixture.confidenceWeights(), fixture.geometryTables(), fixture.queryOnlyFeatureTables(),
-        fixture.tensor("confidencePaeBreaks"),
-      ] as const);
-    });
-    const [input, weights] = await Promise.all([inputPromise, weightsPromise]);
+    const modelRequest = modelWeights(manifestValue);
+    if (modelRequest.cached) stage("model", "active", "Using in-memory model");
+    const measuredModel = modelRequest.promise.then((weights) => ({
+      weights, elapsedMilliseconds: performance.now() - modelStart,
+    }));
+    const [input, loadedModel] = await Promise.all([inputPromise, measuredModel]);
+    const { weights, elapsedMilliseconds: modelLoadMilliseconds } = loadedModel;
     const [embedding, template, extraStack, mainStack, structure, confidence, geometry, featureTables, paeBreaks] = weights;
-    stage("model", "done", "Model 1 PTM loaded"); log("Loaded the reduced model-1 tensor bundle.");
+    stage("model", "done", `Model 1 PTM · ${modelRequest.cached ? "cached · " : ""}${formatSeconds(modelLoadMilliseconds)}`);
+    log(`${modelRequest.cached ? "Reused" : "Loaded"} the reduced model-1 tensor bundle `
+      + `${modelRequest.cached ? "from memory " : ""}in ${formatSeconds(modelLoadMilliseconds)}.`);
 
     stage("features", "active", "Parsing input"); setPredictionStatus("Building AF2 features");
     const featureOptions = {
@@ -323,16 +376,34 @@ async function runPrediction(): Promise<void> {
     stage("inference", "active", `Recycle 0/${featureOptions.recycles}`); setPredictionStatus("Running AlphaFold2 on WebGPU");
     const reportRecycle = (result: MonomerRecycleResult, recycle: number): void => {
       stage("inference", "active", `Recycle ${recycle}/${featureOptions.recycles} · pLDDT ${result.confidence.meanPlddt.toFixed(1)}`);
-      log(`recycle=${recycle} pLDDT=${result.confidence.meanPlddt.toFixed(1)} pTM=${result.confidence.ptm.toFixed(3)} time=${formatSeconds(result.elapsedMilliseconds)}`);
+      log(`recycle=${recycle} pLDDT=${result.confidence.meanPlddt.toFixed(1)} `
+        + `pTM=${result.confidence.ptm.toFixed(3)} time=${formatSeconds(result.elapsedMilliseconds)} `
+        + `trunkSubmissions=${result.trunkSubmissions.total}`);
+      if (result.gpuProfile !== undefined) {
+        for (const [stack, profile] of [
+          ["extraMsa", result.gpuProfile.extraMsa],
+          ["mainEvoformer", result.gpuProfile.mainEvoformer],
+        ] as const) {
+          const gpuMilliseconds = profile.entries.reduce((sum, entry) => sum + entry.nanoseconds, 0) / 1e6;
+          log(`profile ${stack} block=${profile.block} method=${profile.method} `
+            + `gpu=${gpuMilliseconds.toFixed(3)}ms wall=${profile.wallMilliseconds.toFixed(3)}ms`);
+          for (const entry of profile.entries) log(`  ${entry.label} ${(entry.nanoseconds / 1e6).toFixed(3)}ms`);
+        }
+      }
     };
-    const prediction = await new AlphaFoldMonomerGpu(device).predict(features, {
+    const prediction = await new AlphaFoldMonomerGpu(device, {
+      profile: parameter("profile", "0") === "1",
+      profileRecycle: Number(parameter("profileRecycle", "0")),
+      profileExtraMsaBlock: Number(parameter("profileExtraBlock", "0")),
+      profileMainEvoformerBlock: Number(parameter("profileMainBlock", "0")),
+    }).predict(features, {
       embedding, template, extraStack, mainStack, structure, lddt: confidence.lddt, pae: confidence.pae, geometry,
     }, paeBreaks, reportRecycle);
     stage("inference", "done", formatSeconds(prediction.elapsedMilliseconds));
 
     stage("results", "active", "Rendering"); setPredictionStatus("Preparing results");
     const jobName = safeJobName(element<HTMLInputElement>("job-name").value);
-    showResults(prediction, input.sequence, input.depth, jobName, input.a3m);
+    showResults(prediction, input.sequence, input.depth, jobName, input.a3m, modelLoadMilliseconds);
     stage("results", "done", "Ready"); setPredictionStatus("Prediction complete", "passed");
     log(`Finished in ${formatSeconds(prediction.elapsedMilliseconds)}.`);
     element<HTMLElement>("results-section").scrollIntoView({ behavior: "smooth", block: "start" });
@@ -341,9 +412,7 @@ async function runPrediction(): Promise<void> {
     const active = stageOrder.find((name) => document.querySelector<HTMLElement>(`[data-stage="${name}"]`)?.dataset.state === "active");
     if (active !== undefined) stage(active, "error", "Failed");
     setPredictionStatus("Prediction failed", "failed"); log(error instanceof Error ? error.stack ?? message : message);
-  } finally {
-    device?.destroy(); button.disabled = false;
-  }
+  } finally { button.disabled = false; }
 }
 
 const inputMode = element<HTMLSelectElement>("input-mode");

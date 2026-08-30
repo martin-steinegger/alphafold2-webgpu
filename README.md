@@ -82,6 +82,8 @@ Evoformer blocks are submitted ahead without host waits and alias a pooled set o
 
 The static browser UI supports the one implemented parameter set, `model_1_ptm`, with an MMseqs2-generated MSA, a single sequence, or a custom A3M. Its default mode submits the query to ColabFold's public MMseqs2 API, polls the ticket, extracts and combines the UniRef and environmental A3Ms in the browser, and runs inference locally. It renders a ColabFold-style identity-sorted MSA coverage plot, reports per-recycle pLDDT/pTM, renders pLDDT and PAE plots, displays the unrelaxed structure with 3Dmol, and exports PDB, score JSON, and generated A3M files.
 
+The UI keeps the resolved model tensors, WebGPU device, and device-scoped pipeline cache for the lifetime of the page. Repeating a prediction therefore avoids downloading and parsing the 355 MiB model again while preserving the exact float32 prediction path.
+
 The default MMseqs2 endpoint is `https://api.colabfold.com`; it can be changed under Advanced settings. Selecting this mode sends the protein sequence to that service. Single-sequence and custom-A3M inputs do not leave the browser.
 
 Build the UI alone, or—when the local full-model fixture is available—build a self-contained site with the reduced model bundle:
@@ -119,6 +121,8 @@ npm run test:browser
 ```
 
 GPU tests use Dawn's native Node WebGPU implementation. The suite contains operator-level official AlphaFold differential tests, complete block/stack tests, four-recycle query-only inference, four-recycle A3M inference, and a literal raw-A3M acceptance test.
+
+For browser GPU profiling, append `?profile=1` to the development URL. The selected recycle's first extra-MSA and main Evoformer blocks report every dispatch through `timestamp-query` when available, with synchronized wall-clock block timing as the fallback. `profileRecycle`, `profileExtraBlock`, and `profileMainBlock` query parameters select different zero-based targets.
 
 Small reference fixtures needed by the default test suite are committed. Full Evoformer/model captures can be regenerated with the scripts under `tools/`; they require a ColabFold/AlphaFold JAX environment and official model parameters and are not part of published Git history.
 
