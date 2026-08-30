@@ -19,18 +19,15 @@ describe("float16 encoding", () => {
   });
 
   it("uses round-to-nearest-even for float32 inputs", () => {
-    const native = new Float16Array(1);
-    const nativeBits = new Uint16Array(native.buffer);
-    const values = new Float32Array([
-      -0.748291015625,
-      16.1171875,
-      52.859375,
-      -78.96875,
-      0.000061005353927612305,
-    ]);
-    for (const value of values) {
-      native[0] = value;
-      expect(numberToFloat16(value)).toBe(nativeBits[0]);
+    const cases = [
+      [-0.748291015625, 0xb9fc],
+      [16.1171875, 0x4c08],
+      [52.859375, 0x529c],
+      [-78.96875, 0xd4f0],
+      [0.000061005353927612305, 0x0400],
+    ] as const;
+    for (const [value, expectedBits] of cases) {
+      expect(numberToFloat16(value)).toBe(expectedBits);
     }
   });
 });
