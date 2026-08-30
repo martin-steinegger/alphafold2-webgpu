@@ -4,7 +4,7 @@ import {
   encodeEvoformerBlock, encodeExtraMsaBlock, type EvoformerBlockWeights, type ExtraMsaBlockWeights,
 } from "../evoformer/block.js";
 import { QueryOnlyTemplateGpu, type QueryOnlyTemplateWeights } from "../evoformer/template.js";
-import { WebGpuExecution, type GpuTensor } from "../runtime/execution.js";
+import { WebGpuExecution, type GpuTensor, type GpuTimestampEntry } from "../runtime/execution.js";
 import { StructureModuleGpu, type StructureModuleResult, type StructureModuleWeights } from "../structure/module.js";
 import type { ResidueGeometryTables } from "../structure/geometry.js";
 import { makeA3mFeatures, type A3mFeatureOptions } from "../input/a3m-features.js";
@@ -30,6 +30,8 @@ export interface MonomerRecycleResult {
   readonly msaFirstRow: Float32Array; readonly pair: Float32Array;
   readonly structure: StructureModuleResult; readonly confidence: ConfidenceResult;
   readonly elapsedMilliseconds: number;
+  readonly trunkSubmissions: MonomerTrunkSubmissionCounts;
+  readonly gpuProfile?: MonomerRecycleGpuProfile;
 }
 
 export interface MonomerPrediction {
@@ -37,12 +39,54 @@ export interface MonomerPrediction {
   readonly elapsedMilliseconds: number;
 }
 
+export interface MonomerTrunkSubmissionCounts {
+  readonly embedding: number; readonly extraMsa: number; readonly mainEvoformer: number;
+  readonly readback: number; readonly total: number;
+}
+
+export interface MonomerGpuOptions {
+  /** Profile one extra-MSA and one main Evoformer block in a selected recycle. */
+  readonly profile?: boolean;
+  readonly profileRecycle?: number;
+  readonly profileExtraMsaBlock?: number;
+  readonly profileMainEvoformerBlock?: number;
+}
+
+export interface MonomerBlockGpuProfile {
+  readonly block: number;
+  readonly method: "timestamp-query" | "wall-clock";
+  readonly wallMilliseconds: number;
+  readonly entries: readonly GpuTimestampEntry[];
+}
+
+export interface MonomerRecycleGpuProfile {
+  readonly extraMsa: MonomerBlockGpuProfile;
+  readonly mainEvoformer: MonomerBlockGpuProfile;
+}
+
 export type MonomerRecycleCallback = (result: MonomerRecycleResult, recycle: number) => void;
 
 /** Full monomer model for clustered MSA/A3M inputs, with all learned operations dispatched through WebGPU. */
 export class AlphaFoldMonomerGpu {
   readonly device: GPUDevice;
-  constructor(device: GPUDevice) { this.device = device; }
+  readonly profile: boolean;
+  readonly profileRecycle: number;
+  readonly profileExtraMsaBlock: number;
+  readonly profileMainEvoformerBlock: number;
+  constructor(device: GPUDevice, options: MonomerGpuOptions = {}) {
+    this.device = device;
+    this.profile = options.profile ?? false;
+    this.profileRecycle = options.profileRecycle ?? 0;
+    this.profileExtraMsaBlock = options.profileExtraMsaBlock ?? 0;
+    this.profileMainEvoformerBlock = options.profileMainEvoformerBlock ?? 0;
+    for (const [name, value] of [
+      ["profileRecycle", this.profileRecycle],
+      ["profileExtraMsaBlock", this.profileExtraMsaBlock],
+      ["profileMainEvoformerBlock", this.profileMainEvoformerBlock],
+    ] as const) {
+      if (!Number.isSafeInteger(value) || value < 0) throw new RangeError(`${name} must be a non-negative safe integer`);
+    }
+  }
   async predictA3m(a3mText: string, weights: MonomerModelWeights, featureTables: QueryOnlyFeatureTables,
     options: A3mFeatureOptions = {}, paeBreaks?: Float32Array,
     onRecycle?: MonomerRecycleCallback): Promise<MonomerPrediction> {
@@ -61,6 +105,11 @@ export class AlphaFoldMonomerGpu {
     });
     if (weights.extraStack.length === 0 || weights.mainStack.length === 0) {
       throw new RangeError("AlphaFold monomer requires non-empty extra and main Evoformer stacks");
+    }
+    if (this.profile && (this.profileRecycle >= featuresByRecycle.length
+      || this.profileExtraMsaBlock >= weights.extraStack.length
+      || this.profileMainEvoformerBlock >= weights.mainStack.length)) {
+      throw new RangeError("requested monomer GPU profile block or recycle is out of range");
     }
     const execution = new WebGpuExecution(this.device);
     const results: MonomerRecycleResult[] = [];
@@ -107,14 +156,36 @@ export class AlphaFoldMonomerGpu {
           cOuter: weights.extraStack[0]!.outerProductMean.leftBias.length,
           triangleHidden: weights.extraStack[0]!.triangleMultiplicationOutgoing.linearAPBias.length,
         };
+        const shouldProfileRecycle = this.profile && recycle === this.profileRecycle;
+        const timestampProfile = shouldProfileRecycle && this.device.features.has("timestamp-query");
+        let extraProfile: MonomerBlockGpuProfile | undefined;
+        let extraSubmissions = 0;
         for (let block = 0; block < weights.extraStack.length; block += 1) {
-          const checkpoint = execution.checkpoint();
+          const profileBlock = shouldProfileRecycle ? this.profileExtraMsaBlock : -1;
           const encoder = this.device.createCommandEncoder({ label: `monomer.extra-${recycle}-${block}` });
+          const checkpoint = execution.checkpoint();
+          const profiling = block === profileBlock;
+          if (profiling && timestampProfile) execution.beginTimestampProfile(512);
+          const profileStart = profiling ? performance.now() : 0;
           this.device.pushErrorScope("validation");
           await encodeExtraMsaBlock(execution, encoder, extraShape, weights.extraStack[block]!,
             embedding.extraMsa, embedding.pairWithoutTemplates, extraMsaMask, pairMaskTensor);
+          const pendingProfile = profiling && timestampProfile
+            ? execution.finishTimestampProfile(encoder) : undefined;
           await submit(encoder, `extra-MSA recycle ${recycle} block ${block}`);
+          if (profiling) {
+            const entries = pendingProfile === undefined
+              ? (await this.device.queue.onSubmittedWorkDone(), [{
+                label: `extra-MSA.block-${block}`, nanoseconds: (performance.now() - profileStart) * 1e6,
+              }])
+              : await execution.readTimestampProfile(pendingProfile);
+            extraProfile = {
+              block, method: timestampProfile ? "timestamp-query" : "wall-clock",
+              wallMilliseconds: performance.now() - profileStart, entries,
+            };
+          }
           execution.releaseSince(checkpoint);
+          extraSubmissions += 1;
         }
         releaseTensor(embedding.extraMsa); releaseTensor(extraMsaMask);
 
@@ -124,15 +195,35 @@ export class AlphaFoldMonomerGpu {
           cOuter: weights.mainStack[0]!.outerProductMean.leftBias.length,
           triangleHidden: weights.mainStack[0]!.triangleMultiplicationOutgoing.linearAPBias.length,
         };
+        let mainProfile: MonomerBlockGpuProfile | undefined;
+        let mainSubmissions = 0;
         for (let block = 0; block < weights.mainStack.length; block += 1) {
-          const checkpoint = execution.checkpoint();
+          const profileBlock = shouldProfileRecycle ? this.profileMainEvoformerBlock : -1;
           const encoder = this.device.createCommandEncoder({ label: `monomer.main-${recycle}-${block}` });
+          const checkpoint = execution.checkpoint();
+          const profiling = block === profileBlock;
+          if (profiling && timestampProfile) execution.beginTimestampProfile(512);
+          const profileStart = profiling ? performance.now() : 0;
           this.device.pushErrorScope("validation");
           await encodeEvoformerBlock(execution, encoder, {
             ...mainDescriptor, weights: weights.mainStack[block]!,
           }, embedding.msa, embedding.pairWithoutTemplates, msaMask, pairMaskTensor);
+          const pendingProfile = profiling && timestampProfile
+            ? execution.finishTimestampProfile(encoder) : undefined;
           await submit(encoder, `main Evoformer recycle ${recycle} block ${block}`);
+          if (profiling) {
+            const entries = pendingProfile === undefined
+              ? (await this.device.queue.onSubmittedWorkDone(), [{
+                label: `main-evoformer.block-${block}`, nanoseconds: (performance.now() - profileStart) * 1e6,
+              }])
+              : await execution.readTimestampProfile(pendingProfile);
+            mainProfile = {
+              block, method: timestampProfile ? "timestamp-query" : "wall-clock",
+              wallMilliseconds: performance.now() - profileStart, entries,
+            };
+          }
           execution.releaseSince(checkpoint);
+          mainSubmissions += 1;
         }
 
         const readbackEncoder = this.device.createCommandEncoder({ label: `monomer.readback-${recycle}` });
@@ -162,8 +253,16 @@ export class AlphaFoldMonomerGpu {
         const confidence = await new ConfidenceHeadsGpu(this.device).run(
           structure.finalRepresentation, pair, length, weights.lddt, weights.pae, paeBreaks,
         );
+        const trunkSubmissions = {
+          embedding: 1, extraMsa: extraSubmissions, mainEvoformer: mainSubmissions, readback: 1,
+          total: 2 + extraSubmissions + mainSubmissions,
+        };
+        const gpuProfile = extraProfile === undefined || mainProfile === undefined
+          ? undefined : { extraMsa: extraProfile, mainEvoformer: mainProfile };
         const recycleResult = { msaFirstRow, pair, structure, confidence,
-          elapsedMilliseconds: performance.now() - recycleStart };
+          elapsedMilliseconds: performance.now() - recycleStart, trunkSubmissions,
+          ...(gpuProfile === undefined ? {} : { gpuProfile }),
+        };
         results.push(recycleResult);
         onRecycle?.(recycleResult, recycle);
         previousMsa = embedding.msa;

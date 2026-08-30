@@ -93,7 +93,8 @@ export type {
 } from "./model/query-only.js";
 export { AlphaFoldMonomerGpu } from "./model/monomer.js";
 export type {
-  MonomerModelWeights, MonomerPrediction, MonomerRecycleFeatures, MonomerRecycleResult,
+  MonomerBlockGpuProfile, MonomerGpuOptions, MonomerModelWeights, MonomerPrediction,
+  MonomerRecycleFeatures, MonomerRecycleGpuProfile, MonomerRecycleResult, MonomerTrunkSubmissionCounts,
 } from "./model/monomer.js";
 export { triangleMultiplicationOutgoingReference } from "./triangle/cpu-reference.js";
 export { errorMetrics, validateTriangleInput } from "./triangle/types.js";

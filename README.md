@@ -82,7 +82,7 @@ It is designed to use standards-compliant WebGPU and should run on WebGPU-capabl
 
 ### Why is the first run slow?
 
-The browser must download roughly 355 MiB of float32 model parameters and compile many GPU pipelines. The parameters are split into eight balanced files to avoid hundreds of small HTTP requests. A warm second run is the useful measure of inference performance.
+The browser must download roughly 355 MiB of float32 model parameters and compile many GPU pipelines. The parameters are split into eight balanced files to avoid hundreds of small HTTP requests. The page retains the resolved tensors, WebGPU device, and device-scoped pipeline cache, so repeating a prediction without closing the page avoids downloading and parsing the model again. A warm second run is the useful measure of inference performance.
 
 ### Why is the model download still large?
 
@@ -164,6 +164,8 @@ npm run bench:a3m-model
 ```
 
 GPU tests use Dawn's native Node WebGPU implementation. The suite includes operator-level official AlphaFold differential tests, complete block and stack tests, four-recycle single-sequence inference, four-recycle A3M inference, and a literal raw-A3M acceptance test.
+
+For browser GPU profiling, append `?profile=1` to the development URL. The selected recycle's first extra-MSA and main Evoformer blocks report every dispatch through `timestamp-query` when available, with synchronized wall-clock block timing as the fallback. The `profileRecycle`, `profileExtraBlock`, and `profileMainBlock` query parameters select different zero-based targets.
 
 Small reference fixtures required by the default tests are committed. Full Evoformer and model captures can be regenerated with scripts under `tools/`; they require a ColabFold/AlphaFold JAX environment and official model parameters and are intentionally excluded from published Git history.
 
@@ -267,7 +269,7 @@ mkdir -p artifacts
 tar -C dist/web -czf artifacts/afwebgpu-model1-ptm.tar.gz model
 ```
 
-Create a release tagged `model1-ptm` and attach the archive. It must contain a top-level `model/` directory. Select **Settings → Pages → Source: GitHub Actions** to deploy the site.
+Create a release tagged `model1-ptm` and attach the archive. It must contain a top-level `model/` directory so the Pages workflow can extract it directly into the built site. Select **Settings → Pages → Source: GitHub Actions** to deploy the site. To publish the model with the demo, set the Actions variable `AFWEBGPU_INCLUDE_MODEL` to `true` under **Settings → Secrets and variables → Actions → Variables**. The full Pages artifact is about 356 MiB and remains below GitHub's 1 GiB Pages artifact/site limit.
 
 ## Current scope
 
