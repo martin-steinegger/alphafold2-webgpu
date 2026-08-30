@@ -9,7 +9,6 @@ button, input, select, textarea { font: inherit; }
 a { color: var(--primary); }
 
 .site-header { position: fixed; z-index: 20; inset: 0 0 auto 0; height: 48px; display: flex; align-items: center; padding: 0 16px 0 30px; border-bottom: 1px solid #c9c9c9; background: #fafafa; box-shadow: 0 2px 4px #0003; }
-.menu-mark { width: 38px; color: #555; font-size: 1.2rem; }
 .brand { display: flex; align-items: center; gap: .6rem; color: #242424; text-decoration: none; font-size: 1.25rem; font-weight: 400; }
 .brand-mark { display: grid; place-items: center; width: 31px; height: 31px; border-radius: 50%; background: #e2f0fc; color: var(--primary); font-family: Georgia, serif; font-size: 1.2rem; font-weight: 700; }
 .header-links { display: flex; gap: 2.2rem; margin-left: auto; }
@@ -45,8 +44,6 @@ input:disabled, select:disabled { color: #888; background: #eee; }
 .advanced summary { cursor: pointer; padding: .8rem 1rem; color: #424242; font-size: .8rem; }
 .advanced-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); padding: 0 1rem 1rem; }
 .advanced-grid .wide { grid-column: 1 / -1; }
-.notice { display: grid; grid-template-columns: auto 1fr; gap: .65rem; padding: .75rem .9rem; border-left: 3px solid var(--primary); background: #edf5fc; font-size: .73rem; }
-.notice strong { color: #174f7f; } .notice span { color: #555; }
 .primary, .secondary, .diagnostic-controls button { border: 0; border-radius: 2px; text-transform: uppercase; letter-spacing: .08em; cursor: pointer; box-shadow: 0 2px 3px #0003; }
 .primary { display: flex; justify-content: space-between; width: max-content; min-width: 240px; padding: .9rem 1rem; color: #fff; background: var(--primary); font-weight: 500; }
 .primary:hover { background: var(--primary-dark); } .primary:disabled { color: #999; background: #ddd; cursor: wait; box-shadow: none; }
@@ -74,15 +71,19 @@ input:disabled, select:disabled { color: #888; background: #eee; }
 .score-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; padding: 1px; background: #d5d5d5; box-shadow: 0 2px 3px #0002; }
 .score-grid article { display: grid; gap: .3rem; padding: 1.2rem; background: #fff; }
 .score-grid span, .score-grid small { color: #777; font-size: .7rem; } .score-grid strong { font: 500 1.65rem "Roboto Mono", monospace; }
-.result-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
+.result-grid { display: grid; grid-template-columns: 1fr 1fr; grid-template-areas: "structure structure" "plddt pae" "msa recycle"; gap: 8px; margin-top: 8px; }
 .result-card { padding: 1.2rem; }
-.structure-card, .msa-card { grid-column: 1 / -1; }
+.structure-card { grid-area: structure; }
+.plddt-card { grid-area: plddt; }
+.msa-card { grid-area: msa; }
+.pae-card { grid-area: pae; }
+.recycle-card { grid-area: recycle; }
 .card-title { display: flex; justify-content: space-between; align-items: center; gap: 1rem; padding-bottom: .8rem; border-bottom: 1px solid #ddd; }
 #structure-viewer { position: relative; width: 100%; height: 520px; display: grid; place-items: center; overflow: hidden; margin-top: 1rem; background: radial-gradient(circle, #fff, #eef1f3 72%); color: #777; }
 .quiet { width: auto; margin-left: .4rem; border: 1px solid #999; border-radius: 2px; padding: .45rem .7rem; color: #444; background: #fff; text-transform: uppercase; font-size: .68rem; cursor: pointer; }
 .quiet:hover { color: var(--primary); border-color: var(--primary); }
 #msa-plot, #plddt-plot, #pae-plot { display: block; width: 100%; height: auto; margin-top: 1rem; background: #fff; }
-#msa-plot-summary { color: #777; font: .68rem "Roboto Mono", monospace; }
+#msa-plot-summary { color: #777; font: .68rem "Roboto Mono", monospace; text-align: right; }
 .table-wrap { overflow: auto; margin-top: 1rem; } table { width: 100%; border-collapse: collapse; font: .7rem "Roboto Mono", monospace; }
 th, td { padding: .65rem; border-bottom: 1px solid #ddd; text-align: right; } th:first-child, td:first-child { text-align: left; } th { color: #777; font-weight: 400; }
 .diagnostics { margin-top: 8px; padding: 1.2rem; }
@@ -103,6 +104,6 @@ th, td { padding: .65rem; border-bottom: 1px solid #ddd; text-align: right; } th
 .capability[data-state="failed"] { color: var(--danger); } .capability[data-state="failed"] .capability-dot { background: var(--danger); }
 footer { display: flex; justify-content: space-between; padding: 1.5rem 1rem 2.5rem; color: #888; font-size: .7rem; }
 
-@media (max-width: 900px) { .workspace { grid-template-columns: 1fr; } .result-grid { grid-template-columns: 1fr; } .structure-card, .msa-card { grid-column: auto; } .diagnostic-controls { grid-template-columns: 1fr 1fr; } .about { grid-template-columns: 1fr; } }
-@media (max-width: 680px) { body { padding-left: 0; } .side-rail { display: none; } .site-header { padding-inline: 12px; } .menu-mark { display: none; } .header-links a:not(:first-child) { display: none; } .header-links { gap: .8rem; } main, footer { width: calc(100% - 12px); } .two-columns, .advanced-grid { grid-template-columns: 1fr; } .advanced-grid .wide { grid-column: auto; } .score-grid { grid-template-columns: 1fr 1fr; } .primary { width: 100%; } textarea { min-height: 180px; } }
+@media (max-width: 900px) { .workspace { grid-template-columns: 1fr; } .result-grid { grid-template-columns: 1fr; grid-template-areas: "structure" "plddt" "msa" "pae" "recycle"; } .diagnostic-controls { grid-template-columns: 1fr 1fr; } .about { grid-template-columns: 1fr; } }
+@media (max-width: 680px) { body { padding-left: 0; } .side-rail { display: none; } .site-header { padding-inline: 12px; } .header-links a:not(:first-child) { display: none; } .header-links { gap: .8rem; } main, footer { width: calc(100% - 12px); } .two-columns, .advanced-grid { grid-template-columns: 1fr; } .advanced-grid .wide { grid-column: auto; } .score-grid { grid-template-columns: 1fr 1fr; } .primary { width: 100%; } textarea { min-height: 180px; } }
 @media (max-width: 430px) { .brand { font-size: 1rem; } .score-grid { grid-template-columns: 1fr; } .diagnostic-controls { grid-template-columns: 1fr; } footer { display: grid; gap: .5rem; } #structure-viewer { height: 390px; } }

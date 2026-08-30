@@ -10,7 +10,6 @@
   </head>
   <body>
     <header class="site-header">
-      <span class="menu-mark" aria-hidden="true">☰</span>
       <a class="brand" href="./" aria-label="AlphaFold2 WebGPU home">
         <span class="brand-mark" aria-hidden="true">α</span>
         <span>AlphaFold2 WebGPU</span>
@@ -66,7 +65,6 @@
                 </label>
               </div>
             </details>
-            <div class="notice"><strong>Current scope</strong><span>Monomer model 1 PTM · MMseqs2 UniRef + environmental MSA · no templates · no Amber relaxation · neural operations stay on WebGPU.</span></div>
             <button id="predict" class="primary" type="submit"><span id="predict-label">Generate MSA &amp; predict</span><span aria-hidden="true">⌕</span></button>
           </form>
         </div>
@@ -101,17 +99,17 @@
           <article><span>MSA depth</span><strong id="msa-depth">—</strong><small>Input rows</small></article>
         </div>
         <div class="result-grid">
-          <article class="result-card msa-card">
-            <div class="card-title"><h3>MSA sequence coverage</h3><small id="msa-plot-summary"></small></div>
-            <canvas id="msa-plot" width="900" height="420" aria-label="MSA sequence coverage sorted by identity to the query"></canvas>
-          </article>
           <article class="result-card structure-card">
             <div class="card-title"><h3>3D structure</h3><div><button id="download-pdb" class="quiet" type="button">PDB</button><button id="download-scores" class="quiet" type="button">Scores JSON</button></div></div>
             <div id="structure-viewer"><p>Structure viewer loads after prediction.</p></div>
           </article>
-          <article class="result-card"><h3>Predicted lDDT</h3><canvas id="plddt-plot" width="720" height="300"></canvas></article>
-          <article class="result-card"><h3>Predicted aligned error</h3><canvas id="pae-plot" width="560" height="560"></canvas></article>
-          <article class="result-card"><h3>Recycle summary</h3><div class="table-wrap"><table><thead><tr><th>Pass</th><th>pLDDT</th><th>pTM</th><th>Time</th></tr></thead><tbody id="recycle-results"></tbody></table></div></article>
+          <article class="result-card plddt-card"><h3>Predicted lDDT</h3><canvas id="plddt-plot" width="720" height="300"></canvas></article>
+          <article class="result-card msa-card">
+            <div class="card-title"><h3>MSA sequence coverage</h3><small id="msa-plot-summary"></small></div>
+            <canvas id="msa-plot" width="720" height="260" aria-label="MSA sequence coverage sorted by identity to the query"></canvas>
+          </article>
+          <article class="result-card pae-card"><h3>Predicted aligned error</h3><canvas id="pae-plot" width="560" height="560"></canvas></article>
+          <article class="result-card recycle-card"><h3>Recycle summary</h3><div class="table-wrap"><table><thead><tr><th>Pass</th><th>pLDDT</th><th>pTM</th><th>Time</th></tr></thead><tbody id="recycle-results"></tbody></table></div></article>
         </div>
       </section>
 
