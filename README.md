@@ -12,7 +12,7 @@ AFWebGPU is an independent browser/WebGPU port of AlphaFold2; it does not origin
 
 Please also consult and cite the [official AlphaFold repository](https://github.com/google-deepmind/alphafold) as appropriate. The bundled AlphaFold parameters remain subject to DeepMind's [CC BY 4.0 parameters license](https://github.com/google-deepmind/alphafold/blob/main/WEIGHTS_LICENSE); this repository does not alter their ownership or license.
 
-Remote MSA generation follows the public API client in [ColabFold](https://github.com/sokrypton/ColabFold). Please also cite Mirdita M, Schütze K, Moriwaki Y, et al. *ColabFold: making protein folding accessible to all.* Nature Methods 19, 679–682 (2022). [doi:10.1038/s41592-022-01488-1](https://doi.org/10.1038/s41592-022-01488-1). We thank the MMseqs2, ColabFold, and [MMseqs2-App](https://github.com/soedinglab/MMseqs2-App) developers for making the search infrastructure and interface source available.
+Remote MSA generation follows the public API client in [ColabFold](https://github.com/sokrypton/ColabFold). Please also cite Mirdita M, Schütze K, Moriwaki Y, et al. *ColabFold: making protein folding accessible to all.* Nature Methods 19, 679–682 (2022). [doi:10.1038/s41592-022-01488-1](https://doi.org/10.1038/s41592-022-01488-1). The interface styling uses the open-source [MMseqs2-App](https://github.com/soedinglab/MMseqs2-App) only as a design reference; its upstream developers were not involved in AFWebGPU.
 
 ## Verified reference predictions
 
