@@ -134,13 +134,11 @@ export class WebGpuExecution {
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, this.device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),
-      entries: tensors.map((tensor, binding) => ({ binding, resource: tensor.offsetElements === undefined
-        ? { buffer: tensor.allocation.buffer }
-        : {
-          buffer: tensor.allocation.buffer,
-          offset: tensor.offsetElements * 4,
-          size: tensor.elements * 4,
-        } })),
+      entries: tensors.map((tensor, binding) => ({ binding, resource: {
+        buffer: tensor.allocation.buffer,
+        offset: (tensor.offsetElements ?? 0) * 4,
+        size: tensor.elements * 4,
+      } })),
     }));
     pass.dispatchWorkgroups(x, y, z);
     if (reusable) {

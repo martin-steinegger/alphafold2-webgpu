@@ -10,26 +10,33 @@ export interface AllocationSnapshot {
   readonly bufferCount: number;
 }
 
-// Large enough to retain the repeated AF2 block working set for short inputs,
-// while bounding idle scratch on unified-memory devices for long inputs.
-export const COMPACT_GPU_POOL_BYTES = 576 * 1024 ** 2;
+// Retains more of the repeated AF2 block working set now that compact best-fit
+// reuse lowers its measured resident peak, while keeping idle unified-memory
+// scratch under an explicit safety bound.
+export const COMPACT_GPU_POOL_BYTES = 864 * 1024 ** 2;
 
 interface PooledGpuBuffer {
   readonly buffer: GPUBuffer;
+  /** Physical size of the reusable GPUBuffer. */
   readonly byteLength: number;
+  readonly usage: GPUBufferUsageFlags;
   readonly key: string;
 }
 
 export class AllocatedGpuBuffer {
   readonly buffer: GPUBuffer;
+  /** Logical range requested by the tensor using this buffer. */
   readonly byteLength: number;
   readonly usage: GPUBufferUsageFlags;
+  readonly #allocationByteLength: number;
   #allocator: GpuBufferAllocator | undefined;
 
-  constructor(allocator: GpuBufferAllocator, buffer: GPUBuffer, byteLength: number, usage: GPUBufferUsageFlags) {
+  constructor(allocator: GpuBufferAllocator, buffer: GPUBuffer, byteLength: number,
+    allocationByteLength: number, usage: GPUBufferUsageFlags) {
     this.#allocator = allocator;
     this.buffer = buffer;
     this.byteLength = byteLength;
+    this.#allocationByteLength = allocationByteLength;
     this.usage = usage;
   }
 
@@ -37,7 +44,7 @@ export class AllocatedGpuBuffer {
     const allocator = this.#allocator;
     if (allocator === undefined) return;
     this.#allocator = undefined;
-    allocator.noteRelease(this.buffer, this.byteLength, this.usage);
+    allocator.noteRelease(this.buffer, this.byteLength, this.#allocationByteLength, this.usage);
   }
 }
 
@@ -72,24 +79,41 @@ export class GpuBufferAllocator {
     }
     const byteLength = Math.ceil(requestedBytes / 4) * 4;
     const key = `${byteLength}:${usage}`;
-    const pooled = this.#pool.get(key);
-    const pooledEntry = pooled?.pop();
+    const exactPool = this.#pool.get(key);
+    // Keep the unbounded accelerator path's exact-size behavior unchanged.
+    // Compact execution has a finite resident cap and can use the smallest
+    // compatible idle allocation that covers the requested logical range.
+    let pooledEntry = exactPool?.at(-1);
+    if (pooledEntry === undefined && this.#maxPooledBytes !== Number.POSITIVE_INFINITY) {
+      for (const candidate of this.#pooledLru) {
+        if (candidate.usage === usage && candidate.byteLength >= byteLength
+          && (pooledEntry === undefined || candidate.byteLength <= pooledEntry.byteLength)) {
+          pooledEntry = candidate;
+        }
+      }
+    }
     let buffer = pooledEntry?.buffer;
     if (pooledEntry !== undefined) {
+      const pooled = this.#pool.get(pooledEntry.key);
+      if (pooled === undefined) throw new Error("GPU allocator pool key missing during reuse");
+      const index = pooled.lastIndexOf(pooledEntry);
+      if (index < 0) throw new Error("GPU allocator pool entry missing during reuse");
+      pooled.splice(index, 1);
+      if (pooled.length === 0) this.#pool.delete(pooledEntry.key);
       this.#pooledLru.delete(pooledEntry);
-      this.#pooledBytes -= byteLength;
+      this.#pooledBytes -= pooledEntry.byteLength;
     }
+    const allocationByteLength = pooledEntry?.byteLength ?? byteLength;
     if (buffer === undefined) {
       buffer = this.device.createBuffer({ label, size: byteLength, usage });
       this.#residentBytes += byteLength;
       this.#peakResidentBytes = Math.max(this.#peakResidentBytes, this.#residentBytes);
       this.#bufferCount += 1;
     }
-    if (pooled?.length === 0) this.#pool.delete(key);
     this.#currentBytes += byteLength;
     this.#peakBytes = Math.max(this.#peakBytes, this.#currentBytes);
     this.#allocationCount += 1;
-    return new AllocatedGpuBuffer(this, buffer, byteLength, usage);
+    return new AllocatedGpuBuffer(this, buffer, byteLength, allocationByteLength, usage);
   }
 
   upload(label: string, data: ArrayBufferView, usage: GPUBufferUsageFlags): AllocatedGpuBuffer {
@@ -106,21 +130,22 @@ export class GpuBufferAllocator {
     return allocation;
   }
 
-  noteRelease(buffer: GPUBuffer, byteLength: number, usage: GPUBufferUsageFlags): void {
+  noteRelease(buffer: GPUBuffer, byteLength: number, allocationByteLength: number,
+    usage: GPUBufferUsageFlags): void {
     this.#currentBytes -= byteLength;
     if (this.#currentBytes < 0) throw new Error("GPU allocator accounting underflow");
-    if (this.#pooling && byteLength <= this.#maxPooledBytes) {
-      while (this.#pooledBytes + byteLength > this.#maxPooledBytes) this.#evictOldestPooled();
-      const key = `${byteLength}:${usage}`;
+    if (this.#pooling && allocationByteLength <= this.#maxPooledBytes) {
+      while (this.#pooledBytes + allocationByteLength > this.#maxPooledBytes) this.#evictOldestPooled();
+      const key = `${allocationByteLength}:${usage}`;
       const pooled = this.#pool.get(key) ?? [];
-      const entry = { buffer, byteLength, key };
+      const entry = { buffer, byteLength: allocationByteLength, usage, key };
       pooled.push(entry);
       this.#pool.set(key, pooled);
       this.#pooledLru.add(entry);
-      this.#pooledBytes += byteLength;
+      this.#pooledBytes += allocationByteLength;
     } else {
       buffer.destroy();
-      this.#residentBytes -= byteLength;
+      this.#residentBytes -= allocationByteLength;
     }
   }
 

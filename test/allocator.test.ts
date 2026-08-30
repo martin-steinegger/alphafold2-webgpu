@@ -32,4 +32,42 @@ describe("GPU buffer pooling", () => {
     expect(buffer.destroy).toHaveBeenCalledOnce();
     expect(allocator.snapshot()).toMatchObject({ residentBytes: 0, pooledBytes: 0 });
   });
+
+  it("uses the smallest compatible bounded allocation for a smaller logical tensor", () => {
+    const buffers: { destroy: ReturnType<typeof vi.fn> }[] = [];
+    const device = { createBuffer: vi.fn(() => {
+      const buffer = { destroy: vi.fn() }; buffers.push(buffer); return buffer;
+    }) } as unknown as GPUDevice;
+    const allocator = new GpuBufferAllocator(device, true, 128);
+    const large = allocator.allocate("large", 32, 1);
+    const best = allocator.allocate("best", 24, 1);
+    large.release(); best.release();
+
+    const logical = allocator.allocate("logical", 16, 1);
+    expect(logical.buffer).toBe(buffers[1]);
+    expect(logical.byteLength).toBe(16);
+    expect(device.createBuffer).toHaveBeenCalledTimes(2);
+    expect(allocator.snapshot()).toMatchObject({
+      currentBytes: 16, residentBytes: 56, pooledBytes: 32, bufferCount: 2,
+    });
+    logical.release();
+    expect(allocator.snapshot()).toMatchObject({ currentBytes: 0, residentBytes: 56, pooledBytes: 56 });
+    allocator.destroyPooled();
+  });
+
+  it("does not reuse an incompatible usage or change unbounded exact matching", () => {
+    const buffers: { destroy: ReturnType<typeof vi.fn> }[] = [];
+    const device = { createBuffer: vi.fn(() => {
+      const buffer = { destroy: vi.fn() }; buffers.push(buffer); return buffer;
+    }) } as unknown as GPUDevice;
+    const bounded = new GpuBufferAllocator(device, true, 128);
+    bounded.allocate("storage", 32, 1).release();
+    expect(bounded.allocate("uniform", 16, 2).buffer).toBe(buffers[1]);
+
+    const unbounded = new GpuBufferAllocator(device, true);
+    unbounded.allocate("large", 32, 1).release();
+    expect(unbounded.allocate("small", 16, 1).buffer).toBe(buffers[3]);
+    expect(device.createBuffer).toHaveBeenCalledTimes(4);
+    bounded.destroyPooled(); unbounded.destroyPooled();
+  });
 });

@@ -190,7 +190,7 @@ QKV and gate projections use register-blocked 16x16 tiles, attention output uses
 
 Device limits are negotiated per prediction shape. A capable adapter receives the exact full-transition requirement rounded to a WebGPU capability tier. Constrained adapters retain the same AF2 weights and operations but execute transition rows through aligned storage-buffer windows capped at 96 MiB. The compact path does not fall back to CPU or truncate the MSA silently; if even the persistent MSA or pair tensor exceeds the adapter limit, the application reports the required and available sizes.
 
-Evoformer blocks are submitted ahead without host waits and alias a pooled set of scratch buffers. Final projections commit directly into residual tensors. Embedding, extra-MSA, and main-stack activations stay device-resident across stage and recycle boundaries; only the first MSA row and pair representation required by the current structure API are read back.
+Evoformer blocks are submitted ahead without host waits and alias a pooled set of scratch buffers. Compact execution uses bounded best-fit reuse so a larger physical allocation can serve a smaller logical tensor, while bind groups expose only the tensor's logical range. The unbounded accelerator path retains exact-size pooling. Final projections commit directly into residual tensors. Embedding, extra-MSA, and main-stack activations stay device-resident across stage and recycle boundaries; only the first MSA row and pair representation required by the current structure API are read back.
 
 ## TypeScript API
 
