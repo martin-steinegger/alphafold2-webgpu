@@ -117,6 +117,32 @@ async function measureFlashKernel(device: GPUDevice, headDim: number): Promise<A
   }
 }
 
+/**
+ * Query count from which blocking two queries into one invocation pays off.
+ *
+ * The register kernel reads every key and value once per query it serves, so
+ * holding two queries halves that traffic. Below this many queries the second
+ * slot is mostly out of range and the padding costs more than the sharing
+ * saves: measured on GB10 at 1.17x-1.42x for 128 to 1024 queries, and 0.89x at
+ * 59, which is what row attention runs.
+ */
+export const REGISTER_QUERY_BLOCK_THRESHOLD = 128;
+
+/**
+ * Flash kernel for one attention shape.
+ *
+ * The device measurement chooses the kernel family; the query count then picks
+ * how many queries one invocation should carry.
+ */
+export async function attentionFlashKernelForShape(
+  device: GPUDevice, headDim: number, queries: number,
+): Promise<AttentionFlashKernel> {
+  const calibrated = await calibrateAttentionFlashKernel(device, headDim);
+  if (!calibrated.variant.startsWith("register")) return calibrated;
+  return selectAttentionFlashKernel(device, headDim,
+    queries >= REGISTER_QUERY_BLOCK_THRESHOLD ? "register-2q" : "register");
+}
+
 /** Fastest measured flash kernel for this device and head dimension, measured once. */
 export function calibrateAttentionFlashKernel(device: GPUDevice, headDim: number): Promise<AttentionFlashKernel> {
   let byHeadDim = calibrations.get(device);

@@ -50,7 +50,8 @@ export interface AttentionResult {
   readonly memory: AllocationSnapshot;
 }
 
-export type AttentionFlashVariant = "auto" | "portable" | "register" | "subgroup-4x8"
+export type AttentionFlashVariant = "auto" | "portable" | "register" | "register-2q" | "register-4q"
+  | "subgroup-4x8"
   | "subgroup-key32"
   | "subgroup-8x16" | "subgroup-8x32" | "subgroup-8x64"
   | "subgroup-16x64" | "subgroup-32x64" | "subgroup-64x64";
@@ -357,16 +358,20 @@ fn main(
  * the workgroup barriers and tree reductions from the key loop without relying
  * on subgroup extensions, which Chrome-on-Metal does not currently expose.
  */
-export function createAttentionRegisterFlashShader(headDim: number): string {
+export function createAttentionRegisterFlashShader(headDim: number, queriesPerThread = 1): string {
   if (!Number.isSafeInteger(headDim) || headDim <= 0 || headDim > 32 || headDim % 4 !== 0) {
     throw new RangeError("register attention requires a positive head dimension divisible by four and at most 32");
   }
+  if (![1, 2, 4].includes(queriesPerThread)) {
+    throw new RangeError("register attention supports one, two, or four queries per invocation");
+  }
   const vectors = headDim / 4;
-  const each = (body: (index: number) => string): string => Array.from(
-    { length: vectors }, (_, index) => `    ${body(index)}`,
+  const slots = queriesPerThread;
+  const perSlot = (slot: number, indent: string, body: (index: number) => string): string => Array.from(
+    { length: vectors }, (_, index) => `${indent}${body(index)}`,
   ).join("\n");
-  const declare = (name: string, initial: (index: number) => string): string => Array.from(
-    { length: vectors }, (_, index) => `  var ${name}${index} = ${initial(index)};`,
+  const eachSlot = (indent: string, body: (slot: number) => string): string => Array.from(
+    { length: slots }, (_, slot) => body(slot).split("\n").map((line) => `${indent}${line}`).join("\n"),
   ).join("\n");
   return `${COMMON}
 const HD4: u32 = ${vectors}u;
@@ -385,36 +390,49 @@ fn mask_index(batch: u32, key_index: u32) -> u32 {
 }
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let q_index = id.x;
-  let batch_index = id.y;
-  let head = id.z;
-  if (q_index >= p.queries || batch_index >= p.batch || head >= p.heads) { return; }
-  let q_base = ((batch_index * p.queries + q_index) * p.heads + head) * HD4;
-
-${declare("qv", (index) => `query[q_base + ${index}u]`)}
-${declare("acc", () => "vec4<f32>(0.0)")}
-  var running_max = -1e30;
-  var running_sum = 0.0;
+fn main(
+  @builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>,
+) {
+  let batch_index = group.y;
+  let head = group.z;
+  if (batch_index >= p.batch || head >= p.heads) { return; }
+  // Slots stride by the workgroup width so neighbouring invocations keep
+  // reading neighbouring queries, and one key load serves ${slots} of them.
+  let query_origin = group.x * ${64 * slots}u + local.x;
+${eachSlot("  ", (slot) => `let q_index_${slot} = query_origin + ${slot * 64}u;
+let live_${slot} = q_index_${slot} < p.queries;
+let q_base_${slot} = ((batch_index * p.queries + select(0u, q_index_${slot}, live_${slot})) * p.heads + head) * HD4;
+${perSlot(slot, "", (index) => `var qv_${slot}_${index} = query[q_base_${slot} + ${index}u];`)}
+${perSlot(slot, "", (index) => `var acc_${slot}_${index} = vec4<f32>(0.0);`)}
+var running_max_${slot} = -1e30;
+var running_sum_${slot} = 0.0;`)}
 
   for (var k_index = 0u; k_index < p.queries; k_index += 1u) {
     let k_base = ((batch_index * p.queries + k_index) * p.heads + head) * HD4;
-    var score = 0.0;
-${each((index) => `score += dot(qv${index}, key[k_base + ${index}u]);`)}
-    var logit = score + 1e9 * (mask[mask_index(batch_index, k_index)] - 1.0);
-    if (p.has_pair_bias != 0u) {
-      logit += pair_bias[(head * p.queries + q_index) * p.queries + k_index];
-    }
-    logit = clamp(logit, -1e8, 1e8);
-    let new_max = max(running_max, logit);
-    let previous_scale = exp(running_max - new_max);
-    let weight = exp(logit - new_max);
-    running_sum = running_sum * previous_scale + weight;
-    running_max = new_max;
-${each((index) => `acc${index} = acc${index} * previous_scale + weight * value[k_base + ${index}u];`)}
+${perSlot(0, "    ", (index) => `let kv${index} = key[k_base + ${index}u];`)}
+${perSlot(0, "    ", (index) => `let vv${index} = value[k_base + ${index}u];`)}
+    let masked = 1e9 * (mask[mask_index(batch_index, k_index)] - 1.0);
+${eachSlot("    ", (slot) => `{
+  var score = 0.0;
+${perSlot(slot, "  ", (index) => `score += dot(qv_${slot}_${index}, kv${index});`)}
+  var logit = score + masked;
+  if (p.has_pair_bias != 0u) {
+    logit += pair_bias[(head * p.queries + select(0u, q_index_${slot}, live_${slot})) * p.queries + k_index];
+  }
+  logit = clamp(logit, -1e8, 1e8);
+  let new_max = max(running_max_${slot}, logit);
+  let previous_scale = exp(running_max_${slot} - new_max);
+  let weight = exp(logit - new_max);
+  running_sum_${slot} = running_sum_${slot} * previous_scale + weight;
+  running_max_${slot} = new_max;
+${perSlot(slot, "  ", (index) => `acc_${slot}_${index} = acc_${slot}_${index} * previous_scale + weight * vv${index};`)}
+}`)}
   }
 
-${each((index) => `output[q_base + ${index}u] = (acc${index} / running_sum) * gate[q_base + ${index}u];`)}
+${eachSlot("  ", (slot) => `if (live_${slot}) {
+${perSlot(slot, "  ", (index) => `output[q_base_${slot} + ${index}u] = (acc_${slot}_${index} / running_sum_${slot}) * gate[q_base_${slot} + ${index}u];`)}
+}`)}
 }`;
 }
 
@@ -794,12 +812,13 @@ export function selectAttentionFlashKernel(
       queryTile: 4, variant,
     };
   }
-  if (variant === "register") {
+  if (variant === "register" || variant === "register-2q" || variant === "register-4q") {
     if (headDim % 4 !== 0) throw new Error("register attention requires a head dimension divisible by four");
+    const queriesPerThread = variant === "register-4q" ? 4 : variant === "register-2q" ? 2 : 1;
     return {
-      cacheKey: `attention:flash-registers-${headDim}`,
-      shader: createAttentionRegisterFlashShader(headDim),
-      queryTile: 64,
+      cacheKey: `attention:flash-registers-${headDim}-q${queriesPerThread}`,
+      shader: createAttentionRegisterFlashShader(headDim, queriesPerThread),
+      queryTile: 64 * queriesPerThread,
       variant,
     };
   }

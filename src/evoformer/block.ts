@@ -10,7 +10,7 @@ import {
   type AttentionPairBias,
   type AttentionWeights,
 } from "./attention.js";
-import { calibrateAttentionFlashKernel } from "./attention-calibration.js";
+import { attentionFlashKernelForShape } from "./attention-calibration.js";
 import { createTiledGemmShader, gemmGrid } from "../runtime/gemm.js";
 import {
   createOuterProductMeanParameters,
@@ -390,7 +390,9 @@ async function encodeAttention(
     ...(options.pairBias === undefined ? {} : { pairBias: options.pairBias }),
   };
   const packed = packAttentionWeights(descriptor);
-  const flashKernel = await calibrateAttentionFlashKernel(execution.device, options.channels / options.heads);
+  const flashKernel = await attentionFlashKernelForShape(
+    execution.device, options.channels / options.heads, options.queries,
+  );
   const [normalize, project, pairProject, flash, outputProject] = await Promise.all([
     execution.pipelines.get("block:attention:normalize", ATTENTION_NORMALIZE_SHADER),
     execution.pipelines.get("block:attention:project", ATTENTION_PROJECT_SHADER),

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
-  attentionFlashCandidates, calibrateAttentionFlashKernel, presetAttentionFlashKernel,
+  attentionFlashCandidates, attentionFlashKernelForShape, calibrateAttentionFlashKernel,
+  presetAttentionFlashKernel, REGISTER_QUERY_BLOCK_THRESHOLD,
 } from "../src/evoformer/attention-calibration.js";
 import { recordSubgroupRange } from "../src/runtime/subgroups.js";
 
@@ -56,5 +57,29 @@ describe("flash attention calibration", () => {
     // is attempted, and every allocation throws.
     const device = fakeDevice(true);
     expect((await calibrateAttentionFlashKernel(device, 32)).variant).toBe("subgroup-key32");
+  });
+
+  it("blocks two queries per invocation only when there are enough of them", async () => {
+    const device = fakeDevice(false);
+    const threshold = REGISTER_QUERY_BLOCK_THRESHOLD;
+    // Column attention runs hundreds of sequences; row attention runs one chain length.
+    expect((await attentionFlashKernelForShape(device, 32, 512)).variant).toBe("register-2q");
+    expect((await attentionFlashKernelForShape(device, 32, threshold)).variant).toBe("register-2q");
+    expect((await attentionFlashKernelForShape(device, 32, threshold - 1)).variant).toBe("register");
+    expect((await attentionFlashKernelForShape(device, 32, 59)).variant).toBe("register");
+  });
+
+  it("covers every query with the tile it reports", async () => {
+    for (const queries of [59, 128, 256, 508, 512]) {
+      const kernel = await attentionFlashKernelForShape(fakeDevice(false), 32, queries);
+      const covered = Math.ceil(queries / kernel.queryTile) * kernel.queryTile;
+      expect(covered).toBeGreaterThanOrEqual(queries);
+    }
+  });
+
+  it("leaves a subgroup verdict alone", async () => {
+    const device = fakeDevice(true);
+    presetAttentionFlashKernel(device, 32, "subgroup-key32");
+    expect((await attentionFlashKernelForShape(device, 32, 512)).variant).toBe("subgroup-key32");
   });
 });
