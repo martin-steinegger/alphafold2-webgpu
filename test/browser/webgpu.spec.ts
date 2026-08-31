@@ -21,6 +21,7 @@ test("auto-detects monomers and multimers and switches to custom A3M", async ({ 
   await expect(page.locator("#predict-label")).toHaveText("Generate complex MSA & predict");
   await expect(page.locator("#recycles")).toHaveValue("20");
   await expect(page.locator("#max-msa")).toBeEnabled();
+  await expect(page.locator("#max-extra")).toHaveValue("2048");
   await page.locator("#input-mode").selectOption("single");
   await expect(page.locator("#predict-label")).toHaveText("Run Multimer-v3");
   await expect(page.locator("#max-msa")).toBeDisabled();

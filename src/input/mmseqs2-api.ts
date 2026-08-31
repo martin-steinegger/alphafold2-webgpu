@@ -2,6 +2,8 @@ import { parseA3m } from "./a3m.js";
 
 const DEFAULT_API_URL = "https://api.colabfold.com";
 const QUERY_ID = 101;
+const MULTIMER_MSA_CROP_SIZE = 2048;
+const MULTIMER_PAIRED_MSA_CROP_SIZE = MULTIMER_MSA_CROP_SIZE / 2;
 const TRANSIENT_SUBMISSION = new Set(["UNKNOWN", "RATELIMIT"]);
 const TRANSIENT_JOB = new Set(["UNKNOWN", "PENDING", "RUNNING", "RATELIMIT"]);
 
@@ -308,11 +310,13 @@ export function assembleComplexA3m(
   };
 
   const pairedSequenceSets = uniqueSequences.map(() => new Set<string>());
+  const pairedDepth = paired === undefined ? 0 : Math.min(paired[0]!.depth, MULTIMER_PAIRED_MSA_CROP_SIZE);
   if (paired !== undefined) {
     for (let row = 0; row < paired[0]!.depth; row += 1) {
       for (let entity = 0; entity < uniqueSequences.length; entity += 1) {
         pairedSequenceSets[entity]!.add(paired[entity]!.sequences[row]!);
       }
+      if (row >= pairedDepth) continue;
       append(`paired_${row}`,
         entityForChain.map((entity) => paired[entity]!.sequences[row]!),
         entityForChain.map((entity) => paired[entity]!.deletionMatrix[row]!),
@@ -322,14 +326,21 @@ export function assembleComplexA3m(
 
   for (let entity = 0; entity < uniqueSequences.length; entity += 1) {
     const alignment = unpaired[entity]!;
+    const pairedRowsForEntity = paired === undefined ? 0
+      : paired[entity]!.sequences.slice(0, pairedDepth)
+        .filter((sequence) => [...sequence].some((residue) => residue !== "-")).length;
+    const unpairedLimit = MULTIMER_MSA_CROP_SIZE - pairedRowsForEntity;
+    let unpairedRows = 0;
     for (let row = 0; row < alignment.depth; row += 1) {
       if (paired !== undefined && pairedSequenceSets[entity]!.has(alignment.sequences[row]!)) continue;
+      if (unpairedRows >= unpairedLimit) break;
       append(`unpaired_${entity}_${row}`,
         chains.map((chain, chainIndex) => entityForChain[chainIndex] === entity
           ? alignment.sequences[row]! : "-".repeat(chain.length)),
         chains.map((chain, chainIndex) => entityForChain[chainIndex] === entity
           ? alignment.deletionMatrix[row]! : new Array(chain.length).fill(0)),
         chains.map((chain, chainIndex) => new Array(chain.length).fill(entityForChain[chainIndex] === entity ? 1 : 0)));
+      unpairedRows += 1;
     }
   }
   if (sequences.length === 0 || sequences[0] !== chains.join("")) {

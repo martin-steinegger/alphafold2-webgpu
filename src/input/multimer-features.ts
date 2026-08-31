@@ -241,7 +241,11 @@ export function makeMultimerA3mFeatures(
   if (alignmentMask.length !== alignment.depth * alignment.length) {
     throw new RangeError("complex MSA mask must have shape [depth, total residues]");
   }
-  return makeA3mFeatures(a3mText, tables, { ...options, alignmentMask }).map((features) => ({
+  return makeA3mFeatures(a3mText, tables, {
+    maxExtraSequences: 2048,
+    ...options,
+    alignmentMask,
+  }).map((features) => ({
     ...features,
     targetFeatures: sequence.targetFeatures.slice(),
     residueIndex: sequence.residueIndex.slice(),

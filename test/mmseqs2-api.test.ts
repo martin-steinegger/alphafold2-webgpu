@@ -82,6 +82,29 @@ describe("MMseqs2 API", () => {
     expect([...assembled.mask]).toEqual(new Array(12).fill(1));
   });
 
+  it("preserves input order while cropping a homomer MSA to ColabFold's 2,048 rows", () => {
+    const rows = Array.from({ length: 2050 }, (_, row) => `>row_${row}\n${row % 2 === 0 ? "AC" : "A-"}\n`).join("");
+    const assembled = assembleComplexA3m(["AC", "AC"], ["AC"], [rows]);
+    const parsed = parseA3m(assembled.a3m);
+    expect(assembled.depth).toBe(2048);
+    expect(parsed.descriptions[0]).toBe("unpaired_0_0");
+    expect(parsed.descriptions.at(-1)).toBe("unpaired_0_2047");
+  });
+
+  it("crops heteromer rows per entity so every chain keeps its unpaired MSA", () => {
+    const unpairedA = `>query\nAC\n${Array.from({ length: 2050 }, (_, row) => `>a_${row}\nA-\n`).join("")}`;
+    const unpairedB = `>query\nGG\n${Array.from({ length: 2050 }, (_, row) => `>b_${row}\nG-\n`).join("")}`;
+    const assembled = assembleComplexA3m(
+      ["AC", "GG"], ["AC", "GG"], [unpairedA, unpairedB], [">query\nAC\n", ">query\nGG\n"],
+    );
+    const parsed = parseA3m(assembled.a3m);
+    expect(assembled.depth).toBe(1 + 2047 + 2047);
+    expect(parsed.descriptions[0]).toBe("paired_0");
+    expect(parsed.descriptions[2047]).toBe("unpaired_0_2047");
+    expect(parsed.descriptions[2048]).toBe("unpaired_1_1");
+    expect(parsed.descriptions.at(-1)).toBe("unpaired_1_2047");
+  });
+
   it("runs ColabFold unpaired and greedy-paired searches for heteromers", async () => {
     const unpairedTar = tar({
       "uniref.a3m": ">101\nAC\n>uA\nA-\n\0>102\nGG\n>uB\nG-\n\0",
