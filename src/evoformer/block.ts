@@ -12,6 +12,7 @@ import {
 } from "./attention.js";
 import { attentionFlashKernelForShape } from "./attention-calibration.js";
 import { createTiledGemmShader, gemmGrid } from "../runtime/gemm.js";
+import { releaseScratch } from "./execution-scratch.js";
 import {
   createOuterProductMeanParameters,
   OUTER_PRODUCT_MEAN_TILE_INTERMEDIATE_SHADER,
@@ -330,6 +331,7 @@ async function encodeTransition(
       [hidden, weights, secondParams, output],
       Math.ceil(channels / TRANSITION_TILE_COLUMNS), Math.ceil(rows / TRANSITION_TILE_ROWS), 1,
       `${label}.second`);
+    releaseScratch([normalized, hidden], output);
     return output;
   }
   const normalized = execution.allocate(`${label}.normalized-chunk`, chunkRows * channels);
@@ -456,6 +458,7 @@ async function encodeAttention(
   execution.dispatch(encoder, outputProject, [weighted, weights, params, output],
     outputGrid[0], outputGrid[1], 1,
     `${options.label}.output`);
+  releaseScratch([normalized, normalizedPair, pairBias, query, key, value, gate, weighted], output);
   return output;
 }
 
@@ -518,6 +521,7 @@ async function encodeGlobalAttention(
   const outputGrid = gemmGrid(shape.sequences * shape.length, shape.cM);
   execution.dispatch(encoder, outputPipeline, [normalized, attended, weights, parameters, output],
     outputGrid[0], outputGrid[1], 1, `${label}.output`);
+  releaseScratch([normalized, keys, values, query, attended], output);
   return output;
 }
 
@@ -600,6 +604,7 @@ async function encodeOuterProductMean(
     execution.dispatch(encoder, finalizePipeline, [msaMask, weights, params, output],
       outputGrid[0], outputGrid[1], 1, "opm.finalize");
   }
+  releaseScratch([normalized, left, right, intermediate, pairCount], output);
   return output;
 }
 

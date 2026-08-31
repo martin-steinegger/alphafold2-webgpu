@@ -80,11 +80,12 @@ export class GpuBufferAllocator {
     const byteLength = Math.ceil(requestedBytes / 4) * 4;
     const key = `${byteLength}:${usage}`;
     const exactPool = this.#pool.get(key);
-    // Keep the unbounded accelerator path's exact-size behavior unchanged.
-    // Compact execution has a finite resident cap and can use the smallest
-    // compatible idle allocation that covers the requested logical range.
+    // An exact match is always preferred. Failing that, the smallest idle
+    // allocation that covers the request is reused rather than creating another
+    // buffer: AlphaFold cycles through a handful of large but unequal shapes,
+    // and exact-size-only pooling kept one retired buffer per distinct shape.
     let pooledEntry = exactPool?.at(-1);
-    if (pooledEntry === undefined && this.#maxPooledBytes !== Number.POSITIVE_INFINITY) {
+    if (pooledEntry === undefined) {
       for (const candidate of this.#pooledLru) {
         if (candidate.usage === usage && candidate.byteLength >= byteLength
           && (pooledEntry === undefined || candidate.byteLength <= pooledEntry.byteLength)) {

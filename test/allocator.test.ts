@@ -55,19 +55,38 @@ describe("GPU buffer pooling", () => {
     allocator.destroyPooled();
   });
 
-  it("does not reuse an incompatible usage or change unbounded exact matching", () => {
+  it("never reuses an allocation whose usage flags differ", () => {
     const buffers: { destroy: ReturnType<typeof vi.fn> }[] = [];
     const device = { createBuffer: vi.fn(() => {
       const buffer = { destroy: vi.fn() }; buffers.push(buffer); return buffer;
     }) } as unknown as GPUDevice;
-    const bounded = new GpuBufferAllocator(device, true, 128);
-    bounded.allocate("storage", 32, 1).release();
-    expect(bounded.allocate("uniform", 16, 2).buffer).toBe(buffers[1]);
+    for (const allocator of [new GpuBufferAllocator(device, true, 128), new GpuBufferAllocator(device, true)]) {
+      const before = (device.createBuffer as ReturnType<typeof vi.fn>).mock.calls.length;
+      allocator.allocate("storage", 32, 1).release();
+      allocator.allocate("uniform", 16, 2);
+      expect((device.createBuffer as ReturnType<typeof vi.fn>).mock.calls.length).toBe(before + 2);
+      allocator.destroyPooled();
+    }
+  });
 
-    const unbounded = new GpuBufferAllocator(device, true);
-    unbounded.allocate("large", 32, 1).release();
-    expect(unbounded.allocate("small", 16, 1).buffer).toBe(buffers[3]);
-    expect(device.createBuffer).toHaveBeenCalledTimes(4);
-    bounded.destroyPooled(); unbounded.destroyPooled();
+  it("reuses the smallest idle allocation that covers the request", () => {
+    const buffers: { destroy: ReturnType<typeof vi.fn> }[] = [];
+    const device = { createBuffer: vi.fn(() => {
+      const buffer = { destroy: vi.fn() }; buffers.push(buffer); return buffer;
+    }) } as unknown as GPUDevice;
+    const allocator = new GpuBufferAllocator(device, true);
+    const large = allocator.allocate("large", 64, 1);
+    const medium = allocator.allocate("medium", 32, 1);
+    large.release();
+    medium.release();
+    // The 32-byte allocation covers the request and wastes less than the 64.
+    const reused = allocator.allocate("small", 16, 1);
+    expect(reused.buffer).toBe(buffers[1]);
+    expect(reused.byteLength).toBe(16);
+    expect(device.createBuffer).toHaveBeenCalledTimes(2);
+    // Releasing returns the physical size to the pool, not the logical one.
+    reused.release();
+    expect(allocator.snapshot()).toMatchObject({ currentBytes: 0, residentBytes: 96, pooledBytes: 96 });
+    allocator.destroyPooled();
   });
 });
