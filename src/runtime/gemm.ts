@@ -38,14 +38,14 @@ export interface TiledGemmShader {
   readonly tileColumns?: number;
 }
 
-/** Output tile width one workgroup covers for a given column count. */
-export function gemmTileColumns(columns: number): number {
-  return columns >= GEMM_TILE_COLUMNS ? GEMM_TILE_COLUMNS : 64;
-}
-
-/** Workgroup counts for a tiled GEMM dispatch. */
+/**
+ * Workgroup counts for a tiled GEMM dispatch.
+ *
+ * `tileColumns` must match the tile the shader was generated with; a grid
+ * computed from a narrower tile silently leaves output columns unwritten.
+ */
 export function gemmGrid(
-  rows: number, columns: number, tileColumns = gemmTileColumns(columns),
+  rows: number, columns: number, tileColumns: number = GEMM_TILE_COLUMNS,
 ): readonly [number, number] {
   if (![rows, columns].every((value) => Number.isSafeInteger(value) && value > 0)) {
     throw new RangeError("GEMM dispatch dimensions must be positive safe integers");

@@ -11,13 +11,14 @@ import {
   type AttentionWeights,
 } from "./attention.js";
 import { calibrateAttentionFlashKernel } from "./attention-calibration.js";
-import { gemmGrid } from "../runtime/gemm.js";
+import { createTiledGemmShader, gemmGrid } from "../runtime/gemm.js";
 import {
   createOuterProductMeanParameters,
   OUTER_PRODUCT_MEAN_TILE_INTERMEDIATE_SHADER,
   OUTER_PRODUCT_MEAN_TILE_ACCUMULATE_SHADER,
   OUTER_PRODUCT_MEAN_FINALIZE_SHADER,
   OUTER_PRODUCT_MEAN_CONTRACT_SHADER,
+  OUTER_PRODUCT_MEAN_PAIR_COUNT_SHADER,
   OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_SHADER,
   OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_RESIDUAL_SHADER,
   OUTER_PRODUCT_MEAN_NORMALIZE_SHADER,
@@ -231,36 +232,51 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   }
 }`;
 
-const GLOBAL_ATTENTION_OUTPUT_SHADER = `${GLOBAL_ATTENTION_COMMON}
+/**
+ * Gated output projection for global column attention.
+ *
+ * The gate for one row and one projected channel is a full contraction over
+ * the input channels, and it does not depend on the output channel. Computing
+ * it inside the output loop, as a straightforward transcription does, repeats
+ * that contraction once per output channel and made this the most expensive
+ * kernel in the extra-MSA block by a wide margin. Expressing the projection as
+ * a tiled GEMM whose A element is the gated attention value evaluates each gate
+ * exactly once, because the extra-MSA channel count is one column tile wide.
+ */
+function createGlobalAttentionOutputShader(residual: boolean): string {
+  return createTiledGemmShader({
+    preamble: `${GLOBAL_ATTENTION_COMMON}
 @group(0) @binding(0) var<storage, read> normalized: array<f32>;
 @group(0) @binding(1) var<storage, read> attended: array<f32>;
 @group(0) @binding(2) var<storage, read> weights: array<f32>;
 @group(0) @binding(3) var<uniform> p: Parameters;
 @group(0) @binding(4) var<storage, read_write> output: array<f32>;
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x + id.y * GRID_WIDTH * 64u;
-  if (index >= p.sequences * p.length * p.channels) { return; }
-  let c_out = index % p.channels; let row = index / p.channels;
-  let column = row % p.length; let sequence = row / p.length;
+
+// Row is sequence-major; the normalized activations are column-major.
+fn gated_attention(row: u32, projected_channel: u32) -> f32 {
+  let column = row % p.length;
+  let sequence = row / p.length;
   let normalized_row = column * p.sequences + sequence;
-  var result = weights[p.output_bias + c_out];
-  for (var head = 0u; head < p.heads; head += 1u) {
-    for (var d = 0u; d < p.head_dim; d += 1u) {
-      var gate = weights[p.gating_bias + head * p.head_dim + d];
-      for (var c = 0u; c < p.channels; c += 1u) {
-        gate += normalized[normalized_row * p.channels + c]
-          * weights[p.gating_weight + (c * p.heads + head) * p.head_dim + d];
-      }
-      let gated = attended[(column * p.heads + head) * p.head_dim + d] / (1.0 + exp(-gate));
-      result += gated * weights[p.output_weight + (head * p.head_dim + d) * p.channels + c_out];
-    }
+  let projected = p.heads * p.head_dim;
+  var gate = weights[p.gating_bias + projected_channel];
+  for (var c = 0u; c < p.channels; c += 1u) {
+    gate += normalized[normalized_row * p.channels + c]
+      * weights[p.gating_weight + c * projected + projected_channel];
   }
-  output[index] = result;
-}`;
-const GLOBAL_ATTENTION_OUTPUT_RESIDUAL_SHADER = GLOBAL_ATTENTION_OUTPUT_SHADER.replace(
-  "output[index] = result;", "output[index] += result;",
-);
+  return attended[column * projected + projected_channel] / (1.0 + exp(-gate));
+}`,
+    rows: "p.sequences * p.length",
+    inner: "p.heads * p.head_dim",
+    columns: "p.channels",
+    sourceElement: "gated_attention(row, k)",
+    weightElement: "weights[p.output_weight + k * p.channels + column]",
+    store: `output[row * p.channels + column] ${residual ? "+=" : "="}
+          element + weights[p.output_bias + column];`,
+  });
+}
+
+const GLOBAL_ATTENTION_OUTPUT_SHADER = createGlobalAttentionOutputShader(false);
+const GLOBAL_ATTENTION_OUTPUT_RESIDUAL_SHADER = createGlobalAttentionOutputShader(true);
 
 function uniform(execution: WebGpuExecution, label: string, data: ArrayBufferView): GpuTensor {
   return execution.upload(label, data, GPUBufferUsage.UNIFORM);
@@ -497,9 +513,9 @@ async function encodeGlobalAttention(
     grid[0], grid[1], 1, `${label}.query`);
   execution.dispatch(encoder, flashPipeline, [query, keys, values, mask, parameters, attended],
     shape.length, w.heads, 1, `${label}.flash`);
-  grid = execution.linearGrid(shape.sequences * shape.length * shape.cM);
+  const outputGrid = gemmGrid(shape.sequences * shape.length, shape.cM);
   execution.dispatch(encoder, outputPipeline, [normalized, attended, weights, parameters, output],
-    grid[0], grid[1], 1, `${label}.output`);
+    outputGrid[0], outputGrid[1], 1, `${label}.output`);
   return output;
 }
 
@@ -520,13 +536,14 @@ async function encodeOuterProductMean(
   const packed = packOuterProductMeanWeights(descriptor);
   const outerFirst = useOuterFirstContraction(descriptor);
   const [normalize, project, intermediatePipeline, accumulatePipeline, finalizePipeline,
-    contractPipeline, projectOutputPipeline] = await Promise.all([
+    contractPipeline, pairCountPipeline, projectOutputPipeline] = await Promise.all([
     execution.pipelines.get("block:opm:normalize", OUTER_PRODUCT_MEAN_NORMALIZE_SHADER),
     execution.pipelines.get("block:opm:project", OUTER_PRODUCT_MEAN_PROJECT_SHADER),
     execution.pipelines.get("block:opm:tile-intermediate", OUTER_PRODUCT_MEAN_TILE_INTERMEDIATE_SHADER),
     execution.pipelines.get("block:opm:tile-accumulate", OUTER_PRODUCT_MEAN_TILE_ACCUMULATE_SHADER),
     execution.pipelines.get("block:opm:finalize", OUTER_PRODUCT_MEAN_FINALIZE_SHADER),
     execution.pipelines.get("block:opm:contract", OUTER_PRODUCT_MEAN_CONTRACT_SHADER),
+    execution.pipelines.get("block:opm:pair-count", OUTER_PRODUCT_MEAN_PAIR_COUNT_SHADER),
     execution.pipelines.get(
       outerFirst && residualTarget !== undefined
         ? "block:opm:project-output-residual" : "block:opm:project-output",
@@ -546,6 +563,7 @@ async function encodeOuterProductMean(
     ? input.length * input.length * input.cOuter * input.cOuter
     : tileCapacity * input.length * input.cOuter * input.cZ;
   const intermediate = execution.allocate("opm.intermediate", intermediateElements);
+  const pairCount = execution.allocate("opm.pair-count", input.length * input.length);
   const output = outerFirst && residualTarget !== undefined ? residualTarget
     : execution.allocate("opm.output", pairElements, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
   let grid = execution.linearGrid(rows, 1);
@@ -556,11 +574,15 @@ async function encodeOuterProductMean(
     "opm.project");
   const outputGrid = execution.linearGrid(pairElements);
   if (outerFirst) {
-    grid = execution.linearGrid(intermediateElements);
+    grid = execution.linearGrid(input.length * input.length);
+    execution.dispatch(encoder, pairCountPipeline, [msaMask, params, pairCount],
+      grid[0], grid[1], 1, "opm.pair-count");
+    const contractGrid = gemmGrid(input.length * input.cOuter, input.length * input.cOuter);
     execution.dispatch(encoder, contractPipeline, [left, right, params, intermediate],
-      grid[0], grid[1], 1, "opm.contract");
-    execution.dispatch(encoder, projectOutputPipeline, [intermediate, msaMask, weights, params, output],
-      outputGrid[0], outputGrid[1], 1, "opm.project-output");
+      contractGrid[0], contractGrid[1], 1, "opm.contract");
+    const projectOutputGrid = gemmGrid(input.length * input.length, input.cZ);
+    execution.dispatch(encoder, projectOutputPipeline, [intermediate, pairCount, weights, params, output],
+      projectOutputGrid[0], projectOutputGrid[1], 1, "opm.project-output");
   } else {
     execution.endComputePass(encoder);
     encoder.clearBuffer(output.allocation.buffer);

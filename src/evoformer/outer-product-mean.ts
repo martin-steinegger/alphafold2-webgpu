@@ -1,5 +1,6 @@
 import { GpuBufferAllocator, type AllocatedGpuBuffer, type AllocationSnapshot } from "../runtime/allocator.js";
 import { pipelineCacheForDevice, type ComputePipelineCache } from "../runtime/pipeline-cache.js";
+import { createTiledGemmShader, gemmGrid } from "../runtime/gemm.js";
 
 export interface OuterProductMeanWeights {
   readonly layerNormScale: Float32Array;
@@ -292,62 +293,87 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
 // Algebraically identical to AF2's original einsum order: first contract the
 // MSA sequence axis into [L, L, c_outer, c_outer], then apply output_w once.
-export const OUTER_PRODUCT_MEAN_CONTRACT_SHADER = `${COMMON}
-@group(0) @binding(0) var<storage, read> left: array<f32>;
-@group(0) @binding(1) var<storage, read> right: array<f32>;
-@group(0) @binding(2) var<uniform> p: Parameters;
-@group(0) @binding(3) var<storage, read_write> outer: array<f32>;
+/**
+ * Masked pair overlap, shared by every output channel of a pair.
+ *
+ * The normalizer for pair (i, j) is a reduction over sequences that does not
+ * depend on the output channel, so it is computed once here instead of once
+ * per channel inside the output projection.
+ */
+export const OUTER_PRODUCT_MEAN_PAIR_COUNT_SHADER = `${COMMON}
+@group(0) @binding(0) var<storage, read> mask: array<f32>;
+@group(0) @binding(1) var<uniform> p: Parameters;
+@group(0) @binding(2) var<storage, read_write> pair_count: array<f32>;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let index = id.x + id.y * GRID_WIDTH * 64u;
-  let elements = p.length * p.length * p.c_outer * p.c_outer;
-  if (index >= elements) { return; }
-  let outer_right = index % p.c_outer;
-  let outer_left = (index / p.c_outer) % p.c_outer;
-  let pair = index / (p.c_outer * p.c_outer);
-  let i = pair / p.length;
-  let j = pair % p.length;
-  var value = 0.0;
-  for (var sequence = 0u; sequence < p.sequences; sequence += 1u) {
-    value += left[(sequence * p.length + i) * p.c_outer + outer_left]
-      * right[(sequence * p.length + j) * p.c_outer + outer_right];
-  }
-  outer[index] = value;
-}`;
-
-export const OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_SHADER = `${COMMON}
-@group(0) @binding(0) var<storage, read> outer: array<f32>;
-@group(0) @binding(1) var<storage, read> mask: array<f32>;
-@group(0) @binding(2) var<storage, read> weights: array<f32>;
-@group(0) @binding(3) var<uniform> p: Parameters;
-@group(0) @binding(4) var<storage, read_write> output: array<f32>;
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x + id.y * GRID_WIDTH * 64u;
-  if (index >= p.length * p.length * p.c_z) { return; }
-  let z = index % p.c_z;
-  let pair = index / p.c_z;
-  let i = pair / p.length;
-  let j = pair % p.length;
-  var value = weights[p.output_bias + z];
-  for (var outer_left = 0u; outer_left < p.c_outer; outer_left += 1u) {
-    for (var outer_right = 0u; outer_right < p.c_outer; outer_right += 1u) {
-      let outer_index = (pair * p.c_outer + outer_left) * p.c_outer + outer_right;
-      let weight_index = (outer_left * p.c_outer + outer_right) * p.c_z + z;
-      value += outer[outer_index] * weights[p.output_weight + weight_index];
-    }
-  }
+  if (index >= p.length * p.length) { return; }
+  let i = index / p.length;
+  let j = index % p.length;
   var count = 0.0;
   for (var sequence = 0u; sequence < p.sequences; sequence += 1u) {
     count += mask[sequence * p.length + i] * mask[sequence * p.length + j];
   }
-  output[index] = value / (p.normalization_epsilon + count);
+  pair_count[index] = count;
 }`;
 
-export const OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_RESIDUAL_SHADER = OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_SHADER.replace(
-  "output[index] = value / (p.normalization_epsilon + count);",
-  "output[index] += value / (p.normalization_epsilon + count);",
-);
+/**
+ * The outer-product contraction, as one GEMM.
+ *
+ * outer[i][j][a][b] = sum_s left[s][i][a] * right[s][j][b] is left-transpose
+ * times right once the residue and outer-channel axes are folded into a single
+ * index: both operands are already stored sequence-major, so the contraction
+ * reads them contiguously. Only the store has to unfold (i, a) and (j, b) back
+ * into the layout the output projection expects.
+ */
+export const OUTER_PRODUCT_MEAN_CONTRACT_SHADER = createTiledGemmShader({
+  preamble: `${COMMON}
+@group(0) @binding(0) var<storage, read> left: array<f32>;
+@group(0) @binding(1) var<storage, read> right: array<f32>;
+@group(0) @binding(2) var<uniform> p: Parameters;
+@group(0) @binding(3) var<storage, read_write> outer: array<f32>;`,
+  rows: "p.length * p.c_outer",
+  inner: "p.sequences",
+  columns: "p.length * p.c_outer",
+  sourceElement: "left[k * p.length * p.c_outer + row]",
+  weightElement: "right[k * p.length * p.c_outer + column]",
+  store: `let i = row / p.c_outer;
+          let outer_left = row % p.c_outer;
+          let j = column / p.c_outer;
+          let outer_right = column % p.c_outer;
+          outer[((i * p.length + j) * p.c_outer + outer_left) * p.c_outer + outer_right] = element;`,
+});
+
+/**
+ * Output projection of the contracted outer product.
+ *
+ * The contraction axis is the flattened outer-channel pair, which the layout
+ * above already makes contiguous per residue pair, so this is a plain GEMM
+ * followed by the shared pair normalizer.
+ */
+function createOuterProductMeanProjectOutputShader(residual: boolean): string {
+  return createTiledGemmShader({
+    preamble: `${COMMON}
+@group(0) @binding(0) var<storage, read> outer: array<f32>;
+@group(0) @binding(1) var<storage, read> pair_count: array<f32>;
+@group(0) @binding(2) var<storage, read> weights: array<f32>;
+@group(0) @binding(3) var<uniform> p: Parameters;
+@group(0) @binding(4) var<storage, read_write> output: array<f32>;`,
+    rows: "p.length * p.length",
+    inner: "p.c_outer * p.c_outer",
+    columns: "p.c_z",
+    sourceElement: "outer[row * p.c_outer * p.c_outer + k]",
+    weightElement: "weights[p.output_weight + k * p.c_z + column]",
+    store: `let projected = element + weights[p.output_bias + column];
+          output[row * p.c_z + column] ${residual ? "+=" : "="}
+            projected / (p.normalization_epsilon + pair_count[row]);`,
+  });
+}
+
+export const OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_SHADER = createOuterProductMeanProjectOutputShader(false);
+
+export const OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_RESIDUAL_SHADER =
+  createOuterProductMeanProjectOutputShader(true);
 
 const OUTER_FIRST_LIMIT_BYTES = 64 * 1024 * 1024;
 export const OUTER_PRODUCT_MEAN_TILE_SEQUENCES = 32;
@@ -388,13 +414,14 @@ export class OuterProductMeanGpu {
     const packed = packOuterProductMeanWeights(input);
     const outerFirst = useOuterFirstContraction(input);
     const [normalize, project, intermediatePipeline, accumulatePipeline, finalizePipeline,
-      contractPipeline, projectOutputPipeline] = await Promise.all([
+      contractPipeline, pairCountPipeline, projectOutputPipeline] = await Promise.all([
       this.pipelines.get("opm:normalize", OUTER_PRODUCT_MEAN_NORMALIZE_SHADER),
       this.pipelines.get("opm:project", OUTER_PRODUCT_MEAN_PROJECT_SHADER),
       this.pipelines.get("opm:tile-intermediate", OUTER_PRODUCT_MEAN_TILE_INTERMEDIATE_SHADER),
       this.pipelines.get("opm:tile-accumulate", OUTER_PRODUCT_MEAN_TILE_ACCUMULATE_SHADER),
       this.pipelines.get("opm:finalize", OUTER_PRODUCT_MEAN_FINALIZE_SHADER),
       this.pipelines.get("opm:contract", OUTER_PRODUCT_MEAN_CONTRACT_SHADER),
+      this.pipelines.get("opm:pair-count", OUTER_PRODUCT_MEAN_PAIR_COUNT_SHADER),
       this.pipelines.get("opm:project-output", OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_SHADER),
     ]);
     const storage = GPUBufferUsage.STORAGE;
@@ -421,6 +448,7 @@ export class OuterProductMeanGpu {
         ? input.length * input.length * input.cOuter * input.cOuter
         : tileCapacity * input.length * input.cOuter * input.cZ;
       const intermediate = keep(this.allocator.allocate("opm.intermediate", intermediateElements * 4, storage));
+      const pairCount = keep(this.allocator.allocate("opm.pair-count", input.length * input.length * 4, storage));
       const output = keep(this.allocator.allocate(
         "opm.output", pairElements * 4, storage | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
       ));
@@ -447,11 +475,15 @@ export class OuterProductMeanGpu {
         projectGrid[0], projectGrid[1]);
       const outputGrid = linearGrid(pairElements);
       if (outerFirst) {
-        const outerGrid = linearGrid(intermediateElements);
+        const pairCountGrid = linearGrid(input.length * input.length);
+        pass(pairCountPipeline, [mask.buffer, params.buffer, pairCount.buffer],
+          pairCountGrid[0], pairCountGrid[1]);
+        const outerGrid = gemmGrid(input.length * input.cOuter, input.length * input.cOuter);
         pass(contractPipeline, [left.buffer, right.buffer, params.buffer, intermediate.buffer],
           outerGrid[0], outerGrid[1]);
-        pass(projectOutputPipeline, [intermediate.buffer, mask.buffer, weights.buffer, params.buffer, output.buffer],
-          outputGrid[0], outputGrid[1]);
+        const projectGrid2 = gemmGrid(input.length * input.length, input.cZ);
+        pass(projectOutputPipeline, [intermediate.buffer, pairCount.buffer, weights.buffer, params.buffer, output.buffer],
+          projectGrid2[0], projectGrid2[1]);
       } else {
         encoder.clearBuffer(output.buffer);
         for (let offset = 0; offset < input.sequences; offset += tileCapacity) {
