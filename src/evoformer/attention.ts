@@ -1,6 +1,7 @@
 import { GpuBufferAllocator, type AllocatedGpuBuffer, type AllocationSnapshot } from "../runtime/allocator.js";
 import { pipelineCacheForDevice, type ComputePipelineCache } from "../runtime/pipeline-cache.js";
 import { subgroupRange } from "../runtime/subgroups.js";
+import { createTiledGemmShader, gemmGrid } from "../runtime/gemm.js";
 
 export interface AttentionWeights {
   readonly queryNormScale: Float32Array;
@@ -221,7 +222,17 @@ struct Parameters {
 const GRID_WIDTH: u32 = 32768u;
 `;
 
-export const ATTENTION_PROJECT_SHADER = `${COMMON}
+/**
+ * Query, key, value, and gate in one projection.
+ *
+ * The four matrices share the source rows, so they are contracted as a single
+ * A x W of width 4 * projected and split apart in the epilogue: the column
+ * index selects both which weight block to read and which output tensor to
+ * write. Each invocation's four columns always fall inside one matrix because
+ * every AlphaFold projection width is a multiple of four.
+ */
+export const ATTENTION_PROJECT_SHADER = createTiledGemmShader({
+  preamble: `${COMMON}
 @group(0) @binding(0) var<storage, read> source: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> p: Parameters;
@@ -229,108 +240,30 @@ export const ATTENTION_PROJECT_SHADER = `${COMMON}
 @group(0) @binding(4) var<storage, read_write> key: array<f32>;
 @group(0) @binding(5) var<storage, read_write> value: array<f32>;
 @group(0) @binding(6) var<storage, read_write> gate: array<f32>;
-var<workgroup> tile_source: array<f32, 128>;
-var<workgroup> tile_query_weight: array<f32, 128>;
-var<workgroup> tile_key_weight: array<f32, 128>;
-var<workgroup> tile_value_weight: array<f32, 128>;
-var<workgroup> tile_gate_weight: array<f32, 128>;
 
-@compute @workgroup_size(8, 8, 1)
-fn main(
-  @builtin(local_invocation_id) local: vec3<u32>,
-  @builtin(workgroup_id) group: vec3<u32>,
-) {
-  let projected = p.heads * p.head_dim;
-  let rows = p.batch * p.queries;
-  let row = group.y * 16u + local.y;
-  let second_row = row + 8u;
-  let hd = group.x * 16u + local.x;
-  let second_hd = hd + 8u;
-  let tile_index = local.y * 8u + local.x;
-  var q_00 = 0.0; var k_00 = 0.0; var v_00 = 0.0; var g_00 = 0.0;
-  var q_01 = 0.0; var k_01 = 0.0; var v_01 = 0.0; var g_01 = 0.0;
-  var q_10 = 0.0; var k_10 = 0.0; var v_10 = 0.0; var g_10 = 0.0;
-  var q_11 = 0.0; var k_11 = 0.0; var v_11 = 0.0; var g_11 = 0.0;
-  if (hd < projected) {
-    g_00 = weights[p.gating_bias + hd];
-    g_10 = g_00;
-  }
-  if (second_hd < projected) {
-    g_01 = weights[p.gating_bias + second_hd];
-    g_11 = g_01;
-  }
-  for (var c0 = 0u; c0 < p.channels; c0 += 8u) {
-    let source_c = c0 + local.x;
-    let weight_c = c0 + local.y;
-    tile_source[tile_index] = 0.0;
-    tile_source[tile_index + 64u] = 0.0;
-    if (row < rows && source_c < p.channels) {
-      tile_source[tile_index] = source[row * p.channels + source_c];
-    }
-    if (second_row < rows && source_c < p.channels) {
-      tile_source[tile_index + 64u] = source[second_row * p.channels + source_c];
-    }
-    for (var column_block = 0u; column_block < 2u; column_block += 1u) {
-      let tile_offset = tile_index + column_block * 64u;
-      let output_hd = hd + column_block * 8u;
-      tile_query_weight[tile_offset] = 0.0;
-      tile_key_weight[tile_offset] = 0.0;
-      tile_value_weight[tile_offset] = 0.0;
-      tile_gate_weight[tile_offset] = 0.0;
-      if (output_hd < projected && weight_c < p.channels) {
-        let weight_index = weight_c * projected + output_hd;
-        tile_query_weight[tile_offset] = weights[p.query_weight + weight_index];
-        tile_key_weight[tile_offset] = weights[p.key_weight + weight_index];
-        tile_value_weight[tile_offset] = weights[p.value_weight + weight_index];
-        tile_gate_weight[tile_offset] = weights[p.gating_weight + weight_index];
-      }
-    }
-    workgroupBarrier();
-    for (var c = 0u; c < 8u; c += 1u) {
-      let x_0 = tile_source[local.y * 8u + c];
-      let x_1 = tile_source[local.y * 8u + c + 64u];
-      let weight_index_0 = c * 8u + local.x;
-      let weight_index_1 = weight_index_0 + 64u;
-      q_00 += x_0 * tile_query_weight[weight_index_0];
-      k_00 += x_0 * tile_key_weight[weight_index_0];
-      v_00 += x_0 * tile_value_weight[weight_index_0];
-      g_00 += x_0 * tile_gate_weight[weight_index_0];
-      q_01 += x_0 * tile_query_weight[weight_index_1];
-      k_01 += x_0 * tile_key_weight[weight_index_1];
-      v_01 += x_0 * tile_value_weight[weight_index_1];
-      g_01 += x_0 * tile_gate_weight[weight_index_1];
-      q_10 += x_1 * tile_query_weight[weight_index_0];
-      k_10 += x_1 * tile_key_weight[weight_index_0];
-      v_10 += x_1 * tile_value_weight[weight_index_0];
-      g_10 += x_1 * tile_gate_weight[weight_index_0];
-      q_11 += x_1 * tile_query_weight[weight_index_1];
-      k_11 += x_1 * tile_key_weight[weight_index_1];
-      v_11 += x_1 * tile_value_weight[weight_index_1];
-      g_11 += x_1 * tile_gate_weight[weight_index_1];
-    }
-    workgroupBarrier();
-  }
-  if (row < rows && hd < projected) {
-    let index = row * projected + hd;
-    query[index] = q_00 * inverseSqrt(f32(p.head_dim));
-    key[index] = k_00; value[index] = v_00; gate[index] = 1.0 / (1.0 + exp(-g_00));
-  }
-  if (row < rows && second_hd < projected) {
-    let index = row * projected + second_hd;
-    query[index] = q_01 * inverseSqrt(f32(p.head_dim));
-    key[index] = k_01; value[index] = v_01; gate[index] = 1.0 / (1.0 + exp(-g_01));
-  }
-  if (second_row < rows && hd < projected) {
-    let index = second_row * projected + hd;
-    query[index] = q_10 * inverseSqrt(f32(p.head_dim));
-    key[index] = k_10; value[index] = v_10; gate[index] = 1.0 / (1.0 + exp(-g_10));
-  }
-  if (second_row < rows && second_hd < projected) {
-    let index = second_row * projected + second_hd;
-    query[index] = q_11 * inverseSqrt(f32(p.head_dim));
-    key[index] = k_11; value[index] = v_11; gate[index] = 1.0 / (1.0 + exp(-g_11));
-  }
-}`;
+fn projection_weight_offset(matrix: u32) -> u32 {
+  if (matrix == 0u) { return p.query_weight; }
+  if (matrix == 1u) { return p.key_weight; }
+  if (matrix == 2u) { return p.value_weight; }
+  return p.gating_weight;
+}`,
+  rows: "p.batch * p.queries",
+  inner: "p.channels",
+  columns: "4u * p.heads * p.head_dim",
+  sourceElement: "source[row * p.channels + k]",
+  weightElement: `weights[projection_weight_offset(column / (p.heads * p.head_dim))
+        + k * p.heads * p.head_dim + column % (p.heads * p.head_dim)]`,
+  store: `let projected = p.heads * p.head_dim;
+          let matrix = column / projected;
+          let index = row * projected + column % projected;
+          if (matrix == 0u) { query[index] = element * inverseSqrt(f32(p.head_dim)); }
+          else if (matrix == 1u) { key[index] = element; }
+          else if (matrix == 2u) { value[index] = element; }
+          else {
+            let biased = element + weights[p.gating_bias + column % projected];
+            gate[index] = 1.0 / (1.0 + exp(-biased));
+          }`,
+});
 
 export const ATTENTION_PAIR_BIAS_SHADER = `${COMMON}
 @group(0) @binding(0) var<storage, read> pair: array<f32>;
@@ -873,90 +806,29 @@ export function selectAttentionFlashKernel(
   return { cacheKey: "attention:flash", shader: ATTENTION_FLASH_SHADER, queryTile: 1, variant };
 }
 
-export const ATTENTION_OUTPUT_SHADER = `${COMMON}
+function createAttentionOutputShader(residual: boolean): string {
+  return createTiledGemmShader({
+    preamble: `${COMMON}
 @group(0) @binding(0) var<storage, read> source: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> p: Parameters;
-@group(0) @binding(3) var<storage, read_write> output: array<f32>;
-var<workgroup> tile_source: array<f32, 128>;
-var<workgroup> tile_weight: array<f32, 256>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;`,
+    rows: "p.batch * p.queries",
+    inner: "p.heads * p.head_dim",
+    columns: "p.channels",
+    sourceElement: "source[row * p.heads * p.head_dim + k]",
+    weightElement: "weights[p.output_weight + k * p.channels + column]",
+    // Column attention consumes a transposed view, so the result row is remapped.
+    store: `let output_row = select(row, (row % p.queries) * p.batch + row / p.queries, p.transpose != 0u);
+          output[output_row * p.channels + column] ${residual ? "+=" : "="}
+            element + weights[p.output_bias + column];`,
+  });
+}
 
-@compute @workgroup_size(8, 8, 1)
-fn main(
-  @builtin(local_invocation_id) local: vec3<u32>,
-  @builtin(workgroup_id) group: vec3<u32>,
-) {
-  let rows = p.batch * p.queries;
-  let projected = p.heads * p.head_dim;
-  let canonical_row = group.y * 16u + local.y;
-  let second_row = canonical_row + 8u;
-  let channel = group.x * 32u + local.x;
-  let tile_index = local.y * 8u + local.x;
-  var result_00 = 0.0; var result_01 = 0.0; var result_02 = 0.0; var result_03 = 0.0;
-  var result_10 = 0.0; var result_11 = 0.0; var result_12 = 0.0; var result_13 = 0.0;
-  for (var k0 = 0u; k0 < projected; k0 += 8u) {
-    let source_k = k0 + local.x;
-    let weight_k = k0 + local.y;
-    tile_source[tile_index] = 0.0;
-    tile_source[tile_index + 64u] = 0.0;
-    if (canonical_row < rows && source_k < projected) {
-      tile_source[tile_index] = source[canonical_row * projected + source_k];
-    }
-    if (second_row < rows && source_k < projected) {
-      tile_source[tile_index + 64u] = source[second_row * projected + source_k];
-    }
-    for (var column_block = 0u; column_block < 4u; column_block += 1u) {
-      let tile_column = local.x + column_block * 8u;
-      let output_channel = channel + column_block * 8u;
-      let weight_index = local.y * 32u + tile_column;
-      tile_weight[weight_index] = 0.0;
-      if (output_channel < p.channels && weight_k < projected) {
-        tile_weight[weight_index] = weights[p.output_weight + weight_k * p.channels + output_channel];
-      }
-    }
-    workgroupBarrier();
-    for (var k = 0u; k < 8u; k += 1u) {
-      let x_0 = tile_source[local.y * 8u + k];
-      let x_1 = tile_source[local.y * 8u + k + 64u];
-      result_00 += x_0 * tile_weight[k * 32u + local.x];
-      result_01 += x_0 * tile_weight[k * 32u + local.x + 8u];
-      result_02 += x_0 * tile_weight[k * 32u + local.x + 16u];
-      result_03 += x_0 * tile_weight[k * 32u + local.x + 24u];
-      result_10 += x_1 * tile_weight[k * 32u + local.x];
-      result_11 += x_1 * tile_weight[k * 32u + local.x + 8u];
-      result_12 += x_1 * tile_weight[k * 32u + local.x + 16u];
-      result_13 += x_1 * tile_weight[k * 32u + local.x + 24u];
-    }
-    workgroupBarrier();
-  }
-  for (var row_block = 0u; row_block < 2u; row_block += 1u) {
-    let row = canonical_row + row_block * 8u;
-    if (row < rows) {
-      let b = row / p.queries; let q = row % p.queries;
-      let output_row = select(row, q * p.batch + b, p.transpose != 0u);
-      for (var column_block = 0u; column_block < 4u; column_block += 1u) {
-        let output_channel = channel + column_block * 8u;
-        if (output_channel < p.channels) {
-          var result = select(result_00, result_01, column_block == 1u);
-          result = select(result, result_02, column_block == 2u);
-          result = select(result, result_03, column_block == 3u);
-          if (row_block == 1u) {
-            result = select(result_10, result_11, column_block == 1u);
-            result = select(result, result_12, column_block == 2u);
-            result = select(result, result_13, column_block == 3u);
-          }
-          output[output_row * p.channels + output_channel] = result + weights[p.output_bias + output_channel];
-        }
-      }
-    }
-  }
-}`;
+export const ATTENTION_OUTPUT_SHADER = createAttentionOutputShader(false);
 
 /** Same projection as ATTENTION_OUTPUT_SHADER, but commits directly into an existing residual tensor. */
-export const ATTENTION_OUTPUT_RESIDUAL_SHADER = ATTENTION_OUTPUT_SHADER.replace(
-  "output[output_row * p.channels + output_channel] = result + weights[p.output_bias + output_channel];",
-  "output[output_row * p.channels + output_channel] += result + weights[p.output_bias + output_channel];",
-);
+export const ATTENTION_OUTPUT_RESIDUAL_SHADER = createAttentionOutputShader(true);
 
 export class AttentionGpu {
   readonly device: GPUDevice;
@@ -1061,13 +933,15 @@ export class AttentionGpu {
         pass(pairProject, [pairNormalized.buffer, weights.buffer, params.buffer, pairBias.buffer],
           pairGrid[0], pairGrid[1]);
       }
+      const projectGrid = gemmGrid(rows, 4 * input.channels);
       pass(project, [normalized.buffer, weights.buffer, params.buffer, query.buffer, key.buffer, value.buffer, gate.buffer],
-        ceilDivide(input.channels, 16), ceilDivide(rows, 16));
+        projectGrid[0], projectGrid[1]);
       pass(flash, [query.buffer, key.buffer, value.buffer, gate.buffer, mask.buffer, pairBias.buffer, params.buffer,
         weighted.buffer], ceilDivide(input.queryLength, flashKernel.queryTile),
         input.batch, input.heads);
+      const outputGrid = gemmGrid(rows, input.channels);
       pass(outputProject, [weighted.buffer, weights.buffer, params.buffer, output.buffer],
-        ceilDivide(input.channels, 32), ceilDivide(rows, 16));
+        outputGrid[0], outputGrid[1]);
       encoder.copyBufferToBuffer(output.buffer, 0, readback.buffer, 0, tensorBytes);
       const start = performance.now();
       this.device.queue.submit([encoder.finish()]);

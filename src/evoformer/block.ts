@@ -11,6 +11,7 @@ import {
   type AttentionWeights,
 } from "./attention.js";
 import { calibrateAttentionFlashKernel } from "./attention-calibration.js";
+import { gemmGrid } from "../runtime/gemm.js";
 import {
   createOuterProductMeanParameters,
   OUTER_PRODUCT_MEAN_TILE_INTERMEDIATE_SHADER,
@@ -426,14 +427,16 @@ async function encodeAttention(
     execution.dispatch(encoder, pairProject, [normalizedPair, weights, params, pairBias], grid[0], grid[1], 1,
       `${options.label}.pair-bias`);
   }
+  const projectGrid = gemmGrid(rows, 4 * options.channels);
   execution.dispatch(encoder, project, [normalized, weights, params, query, key, value, gate],
-    Math.ceil(options.channels / 16), Math.ceil(rows / 16), 1,
+    projectGrid[0], projectGrid[1], 1,
     `${options.label}.project`);
   execution.dispatch(encoder, flash, [query, key, value, gate, options.mask, pairBias, params, weighted],
     Math.ceil(options.queries / flashKernel.queryTile),
     options.batch, options.heads, `${options.label}.flash`);
+  const outputGrid = gemmGrid(rows, options.channels);
   execution.dispatch(encoder, outputProject, [weighted, weights, params, output],
-    Math.ceil(options.channels / 32), Math.ceil(rows / 16), 1,
+    outputGrid[0], outputGrid[1], 1,
     `${options.label}.output`);
   return output;
 }
