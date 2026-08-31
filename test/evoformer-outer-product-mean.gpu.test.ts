@@ -56,7 +56,7 @@ describe.skipIf(!enabled)("OuterProductMean WebGPU", () => {
       outputWeight: await parameter("outer_product_mean", "output_w"),
       outputBias: await parameter("outer_product_mean", "output_b"),
     };
-    const result = await new OuterProductMeanGpu(device).run({
+    const descriptor = {
       activations,
       mask: await store.tensor("blockMsaMask"),
       sequences: inputShape[0]!,
@@ -65,11 +65,20 @@ describe.skipIf(!enabled)("OuterProductMean WebGPU", () => {
       cOuter: store.shape(outerBiasName)[0]!,
       cZ: outputShape[2]!,
       weights,
-    });
+    };
+    const result = await new OuterProductMeanGpu(device).run(descriptor);
     const metrics = errorMetrics(result.output, expected);
     expect(metrics.meanAbsoluteError).toBeLessThan(1e-5);
     // The bounded-memory contraction first combines output_w with the left
     // projection, changing FP32 summation order relative to JAX's einsums.
     expect(metrics.maxAbsoluteError).toBeLessThan(2e-4);
+
+    // Longer chains chunk the contraction over the first residue axis. That
+    // path never runs at 59 residues, so force it and require the same answer:
+    // blocking partitions the output and must not change any value.
+    for (const rowBlockResidues of [1, 7, 32]) {
+      const blocked = await new OuterProductMeanGpu(device).run({ ...descriptor, rowBlockResidues });
+      expect(errorMetrics(blocked.output, result.output).maxAbsoluteError).toBe(0);
+    }
   });
 });

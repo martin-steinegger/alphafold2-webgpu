@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { outerProductMeanTileCapacity } from "../src/evoformer/outer-product-mean.js";
+import {
+  OUTER_PRODUCT_BLOCK_LIMIT_BYTES, outerProductMeanRowBlock,
+} from "../src/evoformer/outer-product-mean.js";
 import { transitionChunkRows } from "../src/evoformer/transition.js";
 
 describe("bounded model scratch tensors", () => {
@@ -16,9 +18,22 @@ describe("bounded model scratch tensors", () => {
     expect(transitionChunkRows(rows, 256, 1024, 128 * 1024 ** 2, 256)).toBe(rows);
   });
 
-  it("adapts the outer-product tile to the selected binding limit", () => {
-    const input = { sequences: 1024, length: 291, cOuter: 32, cZ: 128 };
-    expect(outerProductMeanTileCapacity(input, 256 * 1024 ** 2)).toBe(32);
-    expect(outerProductMeanTileCapacity(input, 64 * 1024 ** 2)).toBe(14);
+  it("contracts the whole outer product at once when it fits the budget", () => {
+    // 59 residues needs 14 MiB, so the block covers every residue.
+    expect(outerProductMeanRowBlock(59, 32)).toBe(59);
+  });
+
+  it("blocks the outer-product contraction to stay inside the budget", () => {
+    for (const length of [256, 291, 384, 512]) {
+      const block = outerProductMeanRowBlock(length, 32);
+      expect(block).toBeGreaterThan(0);
+      expect(block * length * 32 * 32 * 4).toBeLessThanOrEqual(OUTER_PRODUCT_BLOCK_LIMIT_BYTES);
+      // One more residue would exceed it, so the block is as large as it can be.
+      expect((block + 1) * length * 32 * 32 * 4).toBeGreaterThan(OUTER_PRODUCT_BLOCK_LIMIT_BYTES);
+    }
+  });
+
+  it("never reports a zero-residue block, however long the chain", () => {
+    expect(outerProductMeanRowBlock(65_536, 32)).toBe(1);
   });
 });

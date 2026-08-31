@@ -208,13 +208,13 @@ ${Array.from({ length: registerRows }, (_, index) => `      if (r == ${index}u) 
 }
 
 const CANDIDATES: readonly Candidate[] = [
-  { name: "current-16x64", shader: CURRENT, tileRows: 16, tileColumns: 64 },
-  { name: "tiled-32x64k16", shader: tiledGemm(32, 64, 16), tileRows: 32, tileColumns: 64 },
-  { name: "tiled-64x64k16", shader: tiledGemm(64, 64, 16), tileRows: 64, tileColumns: 64 },
-  { name: "tiled-128x64k8", shader: tiledGemm(128, 64, 8), tileRows: 128, tileColumns: 64 },
-  { name: "tiled-64x128k8", shader: tiledGemm(64, 128, 8), tileRows: 64, tileColumns: 128 },
-  { name: "tiled-64x32k16", shader: tiledGemm(64, 32, 16), tileRows: 64, tileColumns: 32 },
-  { name: "tiled-128x32k8", shader: tiledGemm(128, 32, 8), tileRows: 128, tileColumns: 32 },
+  { name: "current-64x128k8", shader: tiledGemm(64, 128, 8), tileRows: 64, tileColumns: 128 },
+  { name: "tiled-128x128k8", shader: tiledGemm(128, 128, 8), tileRows: 128, tileColumns: 128 },
+  { name: "tiled-128x128k16", shader: tiledGemm(128, 128, 16), tileRows: 128, tileColumns: 128 },
+  { name: "tiled-64x128k16", shader: tiledGemm(64, 128, 16), tileRows: 64, tileColumns: 128 },
+  { name: "tiled-96x128k8", shader: tiledGemm(96, 128, 8), tileRows: 96, tileColumns: 128 },
+  { name: "tiled-128x256k8", shader: tiledGemm(128, 256, 8), tileRows: 128, tileColumns: 256 },
+  { name: "tiled-256x128k8", shader: tiledGemm(256, 128, 8), tileRows: 256, tileColumns: 128 },
 ];
 
 interface Shape { readonly name: string; readonly rows: number; readonly inner: number; readonly columns: number; }
@@ -301,7 +301,7 @@ for (const shape of SHAPES) {
     console.log(`  ${candidate.name.padEnd(16)} ${best.toFixed(3)} ms  ${(gflops / 1000).toFixed(2)} TFLOP/s`);
   }
   const fastest = timings.sort((a, b) => a[1] - b[1])[0]!;
-  const baseline = timings.find(([name]) => name === "current-16x64");
+  const baseline = timings.find(([name]) => name === "current-64x128k8");
   if (baseline !== undefined) {
     console.log(`  -> fastest ${fastest[0]} (${(baseline[1] / fastest[1]).toFixed(2)}x over current)`);
   }

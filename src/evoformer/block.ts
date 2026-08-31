@@ -15,18 +15,14 @@ import { createTiledGemmShader, gemmGrid } from "../runtime/gemm.js";
 import { releaseScratch } from "./execution-scratch.js";
 import {
   createOuterProductMeanParameters,
-  OUTER_PRODUCT_MEAN_TILE_INTERMEDIATE_SHADER,
-  OUTER_PRODUCT_MEAN_TILE_ACCUMULATE_SHADER,
-  OUTER_PRODUCT_MEAN_FINALIZE_SHADER,
   OUTER_PRODUCT_MEAN_CONTRACT_SHADER,
   OUTER_PRODUCT_MEAN_PAIR_COUNT_SHADER,
+  outerProductMeanRowBlock,
   OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_SHADER,
   OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_RESIDUAL_SHADER,
   OUTER_PRODUCT_MEAN_NORMALIZE_SHADER,
   OUTER_PRODUCT_MEAN_PROJECT_SHADER,
-  outerProductMeanTileCapacity,
   packOuterProductMeanWeights,
-  useOuterFirstContraction,
   type OuterProductMeanWeights,
 } from "./outer-product-mean.js";
 import {
@@ -173,49 +169,98 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   keys[index] = key; values[index] = value;
 }`;
 
-const GLOBAL_ATTENTION_QUERY_SHADER = `${GLOBAL_ATTENTION_COMMON}
+/**
+ * Mask-weighted mean over sequences, shared by every query channel.
+ *
+ * Global column attention derives its single query per column from the masked
+ * mean of that column's sequences. The mean does not depend on the head or the
+ * head channel, so it is computed once here rather than once per projected
+ * channel inside the query projection.
+ */
+const GLOBAL_ATTENTION_COLUMN_MEAN_SHADER = `${GLOBAL_ATTENTION_COMMON}
 @group(0) @binding(0) var<storage, read> normalized: array<f32>;
 @group(0) @binding(1) var<storage, read> mask: array<f32>;
-@group(0) @binding(2) var<storage, read> weights: array<f32>;
-@group(0) @binding(3) var<uniform> p: Parameters;
-@group(0) @binding(4) var<storage, read_write> query: array<f32>;
+@group(0) @binding(2) var<uniform> p: Parameters;
+@group(0) @binding(3) var<storage, read_write> means: array<f32>;
+var<workgroup> column_denominator: array<f32, 1>;
+
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x + id.y * GRID_WIDTH * 64u;
-  if (index >= p.length * p.heads * p.head_dim) { return; }
-  let d = index % p.head_dim; let head = (index / p.head_dim) % p.heads; let column = index / (p.head_dim * p.heads);
-  var denominator = 1e-10; var result = 0.0;
-  for (var sequence = 0u; sequence < p.sequences; sequence += 1u) { denominator += mask[sequence * p.length + column]; }
-  for (var c = 0u; c < p.channels; c += 1u) {
-    var average = 0.0;
+fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) group: vec3<u32>) {
+  let column = group.x + group.y * GRID_WIDTH;
+  if (column >= p.length) { return; }
+  if (local.x == 0u) {
+    var denominator = 1e-10;
     for (var sequence = 0u; sequence < p.sequences; sequence += 1u) {
-      average += normalized[(column * p.sequences + sequence) * p.channels + c]
+      denominator += mask[sequence * p.length + column];
+    }
+    column_denominator[0] = denominator;
+  }
+  workgroupBarrier();
+  let inverse_denominator = 1.0 / column_denominator[0];
+  for (var c = local.x; c < p.channels; c += 64u) {
+    var total = 0.0;
+    for (var sequence = 0u; sequence < p.sequences; sequence += 1u) {
+      total += normalized[(column * p.sequences + sequence) * p.channels + c]
         * mask[sequence * p.length + column];
     }
-    result += average / denominator * weights[p.query_weight + (c * p.heads + head) * p.head_dim + d];
+    means[column * p.channels + c] = total * inverse_denominator;
   }
-  query[index] = result * inverseSqrt(f32(p.head_dim));
 }`;
 
+/** Projects the per-column mean into every head's query. */
+const GLOBAL_ATTENTION_QUERY_SHADER = createTiledGemmShader({
+  preamble: `${GLOBAL_ATTENTION_COMMON}
+@group(0) @binding(0) var<storage, read> means: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<f32>;
+@group(0) @binding(2) var<uniform> p: Parameters;
+@group(0) @binding(3) var<storage, read_write> query: array<f32>;`,
+  rows: "p.length",
+  inner: "p.channels",
+  columns: "p.heads * p.head_dim",
+  sourceElement: "means[row * p.channels + k]",
+  weightElement: "weights[p.query_weight + k * p.heads * p.head_dim + column]",
+  store: `query[row * p.heads * p.head_dim + column] = element * inverseSqrt(f32(p.head_dim));`,
+});
+
+/**
+ * Global column attention over the sequence axis.
+ *
+ * One query attends to every sequence of a column, so the whole reduction used
+ * to run on a single invocation per column and head: 472 invocations for the
+ * extra-MSA stack, which left the device idle. Each workgroup now splits the
+ * sequences across 64 invocations that each keep a partial online softmax, and
+ * combines them pairwise with the standard rescaling.
+ */
 const GLOBAL_ATTENTION_FLASH_SHADER = `${GLOBAL_ATTENTION_COMMON}
+const LANES: u32 = 64u;
+const MAX_HEAD_DIM: u32 = 32u;
 @group(0) @binding(0) var<storage, read> query: array<f32>;
 @group(0) @binding(1) var<storage, read> keys: array<f32>;
 @group(0) @binding(2) var<storage, read> values: array<f32>;
 @group(0) @binding(3) var<storage, read> mask: array<f32>;
 @group(0) @binding(4) var<uniform> p: Parameters;
 @group(0) @binding(5) var<storage, read_write> output: array<f32>;
-@compute @workgroup_size(1)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let column = id.x; let head = id.y;
+var<workgroup> partial_accumulated: array<f32, 2048>;
+var<workgroup> partial_maximum: array<f32, LANES>;
+var<workgroup> partial_sum: array<f32, LANES>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) group: vec3<u32>) {
+  let column = group.x;
+  let head = group.y;
   if (column >= p.length || head >= p.heads) { return; }
-  var maximum = -1e30; var denominator = 0.0;
-  var accumulated: array<f32, 32>;
-  for (var d = 0u; d < p.head_dim; d += 1u) { accumulated[d] = 0.0; }
-  for (var sequence = 0u; sequence < p.sequences; sequence += 1u) {
+  let lane = local.x;
+  let accumulated_base = lane * MAX_HEAD_DIM;
+  let query_base = (column * p.heads + head) * p.head_dim;
+  var maximum = -1e30;
+  var denominator = 0.0;
+  for (var d = 0u; d < p.head_dim; d += 1u) { partial_accumulated[accumulated_base + d] = 0.0; }
+
+  for (var sequence = lane; sequence < p.sequences; sequence += LANES) {
+    let key_base = (column * p.sequences + sequence) * p.head_dim;
     var logit = 0.0;
     for (var d = 0u; d < p.head_dim; d += 1u) {
-      logit += query[(column * p.heads + head) * p.head_dim + d]
-        * keys[(column * p.sequences + sequence) * p.head_dim + d];
+      logit += query[query_base + d] * keys[key_base + d];
     }
     if (mask[sequence * p.length + column] == 0.0) { logit = -1e9; }
     let next_maximum = max(maximum, logit);
@@ -223,13 +268,34 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let weight = exp(logit - next_maximum);
     denominator = denominator * previous_scale + weight;
     for (var d = 0u; d < p.head_dim; d += 1u) {
-      accumulated[d] = accumulated[d] * previous_scale
-        + weight * values[(column * p.sequences + sequence) * p.head_dim + d];
+      partial_accumulated[accumulated_base + d] = partial_accumulated[accumulated_base + d] * previous_scale
+        + weight * values[key_base + d];
     }
     maximum = next_maximum;
   }
-  for (var d = 0u; d < p.head_dim; d += 1u) {
-    output[(column * p.heads + head) * p.head_dim + d] = accumulated[d] / denominator;
+  partial_maximum[lane] = maximum;
+  partial_sum[lane] = denominator;
+  workgroupBarrier();
+
+  for (var stride = LANES / 2u; stride > 0u; stride /= 2u) {
+    if (lane < stride) {
+      let other = lane + stride;
+      let merged_maximum = max(partial_maximum[lane], partial_maximum[other]);
+      let scale_self = exp(partial_maximum[lane] - merged_maximum);
+      let scale_other = exp(partial_maximum[other] - merged_maximum);
+      partial_sum[lane] = partial_sum[lane] * scale_self + partial_sum[other] * scale_other;
+      partial_maximum[lane] = merged_maximum;
+      let other_base = other * MAX_HEAD_DIM;
+      for (var d = 0u; d < p.head_dim; d += 1u) {
+        partial_accumulated[accumulated_base + d] = partial_accumulated[accumulated_base + d] * scale_self
+          + partial_accumulated[other_base + d] * scale_other;
+      }
+    }
+    workgroupBarrier();
+  }
+
+  for (var d = lane; d < p.head_dim; d += LANES) {
+    output[query_base + d] = partial_accumulated[d] / partial_sum[0];
   }
 }`;
 
@@ -485,9 +551,10 @@ async function encodeGlobalAttention(
     shape.length, shape.sequences, shape.cM, w.heads, headDim,
     offsets[2]!, offsets[3]!, offsets[4]!, offsets[5]!, offsets[6]!, offsets[7]!, offsets[8]!,
   ]);
-  const [normalize, kvPipeline, queryPipeline, flashPipeline, outputPipeline] = await Promise.all([
+  const [normalize, kvPipeline, columnMeanPipeline, queryPipeline, flashPipeline, outputPipeline] = await Promise.all([
     execution.pipelines.get("block:global-attention:normalize", ATTENTION_NORMALIZE_SHADER),
     execution.pipelines.get("block:global-attention:kv", GLOBAL_ATTENTION_KV_SHADER),
+    execution.pipelines.get("block:global-attention:column-mean", GLOBAL_ATTENTION_COLUMN_MEAN_SHADER),
     execution.pipelines.get("block:global-attention:query", GLOBAL_ATTENTION_QUERY_SHADER),
     execution.pipelines.get("block:global-attention:flash", GLOBAL_ATTENTION_FLASH_SHADER),
     execution.pipelines.get(
@@ -513,15 +580,19 @@ async function encodeGlobalAttention(
   grid = execution.linearGrid(shape.length * shape.sequences * headDim);
   execution.dispatch(encoder, kvPipeline, [normalized, weights, parameters, keys, values],
     grid[0], grid[1], 1, `${label}.kv`);
-  grid = execution.linearGrid(shape.length * w.heads * headDim);
-  execution.dispatch(encoder, queryPipeline, [normalized, mask, weights, parameters, query],
-    grid[0], grid[1], 1, `${label}.query`);
+  const means = execution.allocate(`${label}.column-means`, shape.length * shape.cM);
+  grid = execution.linearGrid(shape.length, 1);
+  execution.dispatch(encoder, columnMeanPipeline, [normalized, mask, parameters, means],
+    grid[0], grid[1], 1, `${label}.column-mean`);
+  const queryGrid = gemmGrid(shape.length, w.heads * headDim);
+  execution.dispatch(encoder, queryPipeline, [means, weights, parameters, query],
+    queryGrid[0], queryGrid[1], 1, `${label}.query`);
   execution.dispatch(encoder, flashPipeline, [query, keys, values, mask, parameters, attended],
     shape.length, w.heads, 1, `${label}.flash`);
   const outputGrid = gemmGrid(shape.sequences * shape.length, shape.cM);
   execution.dispatch(encoder, outputPipeline, [normalized, attended, weights, parameters, output],
     outputGrid[0], outputGrid[1], 1, `${label}.output`);
-  releaseScratch([normalized, keys, values, query, attended], output);
+  releaseScratch([normalized, means, keys, values, query, attended], output);
   return output;
 }
 
@@ -540,71 +611,47 @@ async function encodeOuterProductMean(
     weights: weightsValue,
   };
   const packed = packOuterProductMeanWeights(descriptor);
-  const outerFirst = useOuterFirstContraction(descriptor);
-  const [normalize, project, intermediatePipeline, accumulatePipeline, finalizePipeline,
-    contractPipeline, pairCountPipeline, projectOutputPipeline] = await Promise.all([
+  const [normalize, project, contractPipeline, pairCountPipeline, projectOutputPipeline] = await Promise.all([
     execution.pipelines.get("block:opm:normalize", OUTER_PRODUCT_MEAN_NORMALIZE_SHADER),
     execution.pipelines.get("block:opm:project", OUTER_PRODUCT_MEAN_PROJECT_SHADER),
-    execution.pipelines.get("block:opm:tile-intermediate", OUTER_PRODUCT_MEAN_TILE_INTERMEDIATE_SHADER),
-    execution.pipelines.get("block:opm:tile-accumulate", OUTER_PRODUCT_MEAN_TILE_ACCUMULATE_SHADER),
-    execution.pipelines.get("block:opm:finalize", OUTER_PRODUCT_MEAN_FINALIZE_SHADER),
     execution.pipelines.get("block:opm:contract", OUTER_PRODUCT_MEAN_CONTRACT_SHADER),
     execution.pipelines.get("block:opm:pair-count", OUTER_PRODUCT_MEAN_PAIR_COUNT_SHADER),
     execution.pipelines.get(
-      outerFirst && residualTarget !== undefined
-        ? "block:opm:project-output-residual" : "block:opm:project-output",
-      outerFirst && residualTarget !== undefined
+      residualTarget !== undefined ? "block:opm:project-output-residual" : "block:opm:project-output",
+      residualTarget !== undefined
         ? OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_RESIDUAL_SHADER : OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_SHADER,
     ),
   ]);
   const rows = input.sequences * input.length;
-  const pairElements = input.length * input.length * input.cZ;
   const weights = execution.upload("opm.weights", packed.data);
   const params = uniform(execution, "opm.parameters", createOuterProductMeanParameters(descriptor, packed.offsets));
   const normalized = execution.allocate("opm.normalized", rows * input.cM);
   const left = execution.allocate("opm.left", rows * input.cOuter);
   const right = execution.allocate("opm.right", rows * input.cOuter);
-  const tileCapacity = outerProductMeanTileCapacity(input, execution.device.limits.maxStorageBufferBindingSize);
-  const intermediateElements = outerFirst
-    ? input.length * input.length * input.cOuter * input.cOuter
-    : tileCapacity * input.length * input.cOuter * input.cZ;
-  const intermediate = execution.allocate("opm.intermediate", intermediateElements);
+  const rowBlock = outerProductMeanRowBlock(input.length, input.cOuter);
+  const outer = execution.allocate("opm.outer", rowBlock * input.length * input.cOuter * input.cOuter);
   const pairCount = execution.allocate("opm.pair-count", input.length * input.length);
-  const output = outerFirst && residualTarget !== undefined ? residualTarget
-    : execution.allocate("opm.output", pairElements, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+  const output = residualTarget ?? execution.allocate("opm.output", input.length * input.length * input.cZ);
   let grid = execution.linearGrid(rows, 1);
   execution.dispatch(encoder, normalize, [msa, weights, params, normalized],
     grid[0], grid[1], 1, "opm.normalize");
   grid = execution.linearGrid(rows * input.cOuter);
   execution.dispatch(encoder, project, [normalized, msaMask, weights, params, left, right], grid[0], grid[1], 1,
     "opm.project");
-  const outputGrid = execution.linearGrid(pairElements);
-  if (outerFirst) {
-    grid = execution.linearGrid(input.length * input.length);
-    execution.dispatch(encoder, pairCountPipeline, [msaMask, params, pairCount],
-      grid[0], grid[1], 1, "opm.pair-count");
-    const contractGrid = gemmGrid(input.length * input.cOuter, input.length * input.cOuter);
-    execution.dispatch(encoder, contractPipeline, [left, right, params, intermediate],
+  grid = execution.linearGrid(input.length * input.length);
+  execution.dispatch(encoder, pairCountPipeline, [msaMask, params, pairCount],
+    grid[0], grid[1], 1, "opm.pair-count");
+  for (let offset = 0; offset < input.length; offset += rowBlock) {
+    const count = Math.min(rowBlock, input.length - offset);
+    const tile = uniform(execution, `opm.block-${offset}`, new Uint32Array([offset, count, 0, 0]));
+    const contractGrid = gemmGrid(count * input.cOuter, input.length * input.cOuter);
+    execution.dispatch(encoder, contractPipeline, [left, right, params, tile, outer],
       contractGrid[0], contractGrid[1], 1, "opm.contract");
-    const projectOutputGrid = gemmGrid(input.length * input.length, input.cZ);
-    execution.dispatch(encoder, projectOutputPipeline, [intermediate, pairCount, weights, params, output],
+    const projectOutputGrid = gemmGrid(count * input.length, input.cZ);
+    execution.dispatch(encoder, projectOutputPipeline, [outer, pairCount, weights, params, tile, output],
       projectOutputGrid[0], projectOutputGrid[1], 1, "opm.project-output");
-  } else {
-    execution.endComputePass(encoder);
-    encoder.clearBuffer(output.allocation.buffer);
-    for (let offset = 0; offset < input.sequences; offset += tileCapacity) {
-      const count = Math.min(tileCapacity, input.sequences - offset);
-      const tileParams = uniform(execution, `opm.tile-${offset}`, new Uint32Array([offset, count, 0, 0]));
-      grid = execution.linearGrid(count * input.length * input.cOuter * input.cZ);
-      execution.dispatch(encoder, intermediatePipeline, [left, weights, params, tileParams, intermediate],
-        grid[0], grid[1], 1, `opm.intermediate-${offset}`);
-      execution.dispatch(encoder, accumulatePipeline, [right, intermediate, params, tileParams, output],
-        outputGrid[0], outputGrid[1], 1, `opm.accumulate-${offset}`);
-    }
-    execution.dispatch(encoder, finalizePipeline, [msaMask, weights, params, output],
-      outputGrid[0], outputGrid[1], 1, "opm.finalize");
   }
-  releaseScratch([normalized, left, right, intermediate, pairCount], output);
+  releaseScratch([normalized, left, right, outer, pairCount], output);
   return output;
 }
 
