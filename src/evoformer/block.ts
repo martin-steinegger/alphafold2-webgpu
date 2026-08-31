@@ -484,7 +484,6 @@ async function encodeAttention(
   const key = execution.allocate(`${options.label}.key`, elements);
   const value = execution.allocate(`${options.label}.value`, elements);
   const gate = execution.allocate(`${options.label}.gate`, elements);
-  const weighted = execution.allocate(`${options.label}.weighted`, elements);
   const output = options.residualTarget ?? execution.allocate(`${options.label}.output`, elements);
   let grid = execution.linearGrid(rows, 1);
   execution.dispatch(encoder, normalize, [options.source, weights, normParams, normalized],
@@ -517,6 +516,11 @@ async function encodeAttention(
   execution.dispatch(encoder, project, [normalized, weights, params, query, key, value, gate],
     projectGrid[0], projectGrid[1], 1,
     `${options.label}.project`);
+  // Nothing reads the normalized activations after the projection, and the
+  // attention result is the same shape, so it reuses that allocation. The pair
+  // bias is still live: the flash dispatch below reads it.
+  releaseScratch([normalized, normalizedPair], output);
+  const weighted = execution.allocate(`${options.label}.weighted`, elements);
   execution.dispatch(encoder, flash, [query, key, value, gate, options.mask, pairBias, params, weighted],
     Math.ceil(options.queries / flashKernel.queryTile),
     options.batch, options.heads, `${options.label}.flash`);
@@ -524,7 +528,7 @@ async function encodeAttention(
   execution.dispatch(encoder, outputProject, [weighted, weights, params, output],
     outputGrid[0], outputGrid[1], 1,
     `${options.label}.output`);
-  releaseScratch([normalized, normalizedPair, pairBias, query, key, value, gate, weighted], output);
+  releaseScratch([pairBias, query, key, value, gate, weighted], output);
   return output;
 }
 
