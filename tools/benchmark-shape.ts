@@ -53,6 +53,17 @@ const gpu = create([]);
 const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
 if (adapter === null) throw new Error("no WebGPU adapter");
 const device = await requestAlphaFoldDevice(adapter);
+const tally = new Map<string, { bytes: number; count: number }>();
+if (process.env.AFWEBGPU_MEMORY === "1") {
+  const original = device.createBuffer.bind(device);
+  (device as { createBuffer: GPUDevice["createBuffer"] }).createBuffer = (descriptor: GPUBufferDescriptor) => {
+    const label = (descriptor.label ?? "unlabelled").replace(/-?\d+$/, "");
+    const entry = tally.get(label) ?? { bytes: 0, count: 0 };
+    entry.bytes += descriptor.size; entry.count += 1;
+    tally.set(label, entry);
+    return original(descriptor);
+  };
+}
 try {
   const profile = process.env.AFWEBGPU_PROFILE === "1";
   const prediction = await new AlphaFoldMonomerGpu(device, profile ? { profile: true } : {}).predict(features, {
@@ -67,6 +78,13 @@ try {
     peakConcurrentMiB: Math.round(prediction.memory.peakBytes / 1024 ** 2),
     meanPlddt: Number(prediction.final.confidence.meanPlddt.toFixed(3)),
   }));
+  if (tally.size > 0) {
+    const total = [...tally.values()].reduce((sum, entry) => sum + entry.bytes, 0);
+    console.error(`\nGPU buffers created (total ${(total / 1024 ** 2).toFixed(0)} MiB):`);
+    for (const [label, entry] of [...tally].sort((a, b) => b[1].bytes - a[1].bytes).slice(0, 14)) {
+      console.error(`  ${(entry.bytes / 1024 ** 2).toFixed(1).padStart(8)} MiB  x${String(entry.count).padStart(3)}  ${label}`);
+    }
+  }
   const gpuProfile = prediction.final.gpuProfile;
   if (gpuProfile !== undefined) {
     for (const [name, block, blocks] of [

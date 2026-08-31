@@ -2,19 +2,32 @@ import { describe, expect, it } from "vitest";
 import {
   OUTER_PRODUCT_BLOCK_LIMIT_BYTES, outerProductMeanRowBlock,
 } from "../src/evoformer/outer-product-mean.js";
-import { transitionChunkRows } from "../src/evoformer/transition.js";
+import {
+  TRANSITION_CHUNK_TARGET_BYTES, TRANSITION_TILE_ROWS, transitionChunkRows,
+} from "../src/evoformer/transition.js";
 
 describe("bounded model scratch tensors", () => {
   it("keeps transition views aligned and below the scratch budget", () => {
     const totalRows = 508 * 291;
     const chunkRows = transitionChunkRows(totalRows, 256, 1024, 256 * 1024 ** 2, 256);
-    expect(chunkRows).toBe(24_576);
+    expect(chunkRows * 1024 * 4).toBeLessThanOrEqual(TRANSITION_CHUNK_TARGET_BYTES);
+    // Chunk starts must land on a valid binding offset and a whole GEMM tile.
     expect(chunkRows * 256 * 4 % 256).toBe(0);
-    expect(chunkRows * 1024 * 4).toBeLessThanOrEqual(96 * 1024 ** 2);
+    expect(chunkRows % TRANSITION_TILE_ROWS).toBe(0);
+    // Still hundreds of GEMM row tiles, so chunking costs dispatches, not efficiency.
+    expect(chunkRows / TRANSITION_TILE_ROWS).toBeGreaterThan(64);
   });
 
-  it("uses the full transition when the exact tensor fits", () => {
-    const rows = 508 * 59;
+  it("bounds the window by the budget even when the device would allow more", () => {
+    const totalRows = 508 * 291;
+    const generous = transitionChunkRows(totalRows, 256, 1024, 2048 * 1024 ** 2, 256);
+    const modest = transitionChunkRows(totalRows, 256, 1024, 256 * 1024 ** 2, 256);
+    expect(generous).toBe(modest);
+  });
+
+  it("uses the full transition when the exact tensor fits the budget", () => {
+    const rows = 64 * 59;
+    expect(rows * 1024 * 4).toBeLessThanOrEqual(TRANSITION_CHUNK_TARGET_BYTES);
     expect(transitionChunkRows(rows, 256, 1024, 128 * 1024 ** 2, 256)).toBe(rows);
   });
 

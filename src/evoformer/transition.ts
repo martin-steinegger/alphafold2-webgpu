@@ -35,7 +35,16 @@ const ceilDivide = (value: number, divisor: number): number => Math.ceil(value /
 /** Output tile one workgroup of the shared projection covers. */
 export const TRANSITION_TILE_COLUMNS = GEMM_TILE_COLUMNS;
 export const TRANSITION_TILE_ROWS = GEMM_TILE_ROWS;
-export const TRANSITION_CHUNK_TARGET_BYTES = 96 * 1024 * 1024;
+/**
+ * Scratch budget for one transition chunk.
+ *
+ * The hidden activation is four times the width of the input, so an unchunked
+ * transition is the largest single tensor in the model: 268 MB for 256 residues
+ * over 256 clustered rows. Chunking costs only extra dispatches, each still
+ * hundreds of GEMM tiles tall, so the window is bounded by this budget rather
+ * than by whatever binding size the device happens to allow.
+ */
+export const TRANSITION_CHUNK_TARGET_BYTES = 32 * 1024 * 1024;
 
 const gcd = (left: number, right: number): number => {
   let a = left; let b = right;
@@ -56,8 +65,9 @@ export function transitionChunkRows(
     throw new RangeError("transition chunk dimensions and limits must be positive safe integers");
   }
   const rowBytes = Math.max(channels, hiddenChannels) * Float32Array.BYTES_PER_ELEMENT;
-  if (rows * rowBytes <= maxStorageBufferBindingSize) return rows;
-  const capacity = Math.floor(Math.min(maxStorageBufferBindingSize, TRANSITION_CHUNK_TARGET_BYTES) / rowBytes);
+  const budget = Math.min(maxStorageBufferBindingSize, TRANSITION_CHUNK_TARGET_BYTES);
+  if (rows * rowBytes <= budget) return rows;
+  const capacity = Math.floor(budget / rowBytes);
   if (capacity < 1) throw new RangeError("WebGPU storage binding is too small for one transition row");
   const sourceRowBytes = channels * Float32Array.BYTES_PER_ELEMENT;
   const offsetRowAlignment = minStorageBufferOffsetAlignment / gcd(sourceRowBytes, minStorageBufferOffsetAlignment);
