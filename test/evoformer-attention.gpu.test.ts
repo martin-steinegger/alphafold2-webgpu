@@ -50,6 +50,7 @@ const CASES: readonly Case[] = [
 
 const RUNS: ReadonlyArray<Case & { readonly variant: AttentionFlashVariant }> = CASES.flatMap(
   (testCase) => [
+    { ...testCase, variant: "register" },
     { ...testCase, variant: "auto" },
     { ...testCase, variant: "subgroup-key32" },
     { ...testCase, variant: "subgroup-64x64" },
@@ -76,7 +77,7 @@ describe.skipIf(!enabled)("Evoformer attention WebGPU", () => {
   afterAll(() => device?.destroy());
 
   it.each(RUNS)("matches official $stage using $variant", async (testCase) => {
-    if (testCase.variant !== "auto" && !supportsAttentionSubgroup64x64(device)) return;
+    if (testCase.variant.startsWith("subgroup-") && !supportsAttentionSubgroup64x64(device)) return;
     const modules = manifest.evoformerBlock.parameters;
     const stage = manifest.evoformerBlock.referenceStages[testCase.stage];
     if (stage === undefined) throw new Error(`missing ${testCase.stage} reference stage`);

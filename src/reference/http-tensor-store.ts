@@ -1,4 +1,5 @@
 import type { BinaryTensorManifest, BinaryTensorShard } from "./tensor-store.js";
+import { readTensor, tensorByteLength, tensorElements } from "./dtype.js";
 
 const MAX_CONCURRENT_DOWNLOADS = 8;
 const MAX_MODEL_BYTES = 1024 ** 3;
@@ -48,19 +49,21 @@ function validateManifest(manifest: BinaryTensorManifest): void {
   if (records.length === 0 || records.length > 10_000) throw new Error("model manifest has an invalid tensor count");
   let totalBytes = 0;
   for (const [name, record] of records) {
-    if (record === null || record.dtype !== "float32" || typeof record.file !== "string" || record.file === "") {
+    if (record === null || !["float32", "float16", "int8"].includes(record.dtype)
+      || typeof record.file !== "string" || record.file === "") {
       throw new Error(`model tensor ${name} has an invalid record`);
     }
     if (!Array.isArray(record.shape) || !record.shape.every(
       (value) => Number.isSafeInteger(value) && value > 0,
     )) throw new Error(`model tensor ${name} has an invalid shape`);
-    const elements = record.shape.reduce((product, dimension) => product * dimension, 1);
-    const bytes = elements * Float32Array.BYTES_PER_ELEMENT;
+    const elements = tensorElements(record);
+    const bytes = tensorByteLength(record);
     const offset = record.byteOffset ?? 0;
-    if (!Number.isSafeInteger(bytes) || !Number.isSafeInteger(offset) || offset < 0 || offset % 4 !== 0) {
+    const alignment = record.dtype === "float32" ? 4 : record.dtype === "float16" ? 2 : 1;
+    if (!Number.isSafeInteger(bytes) || !Number.isSafeInteger(offset) || offset < 0 || offset % alignment !== 0) {
       throw new Error(`model tensor ${name} has an invalid byte range`);
     }
-    totalBytes += bytes;
+    totalBytes += elements * 4;
     if (!Number.isSafeInteger(totalBytes) || totalBytes > MAX_MODEL_BYTES) {
       throw new Error("model manifest exceeds the 1 GiB browser model limit");
     }
@@ -101,12 +104,12 @@ export class HttpTensorStore {
     this.manifestUrl = manifestUrl; this.manifest = manifest; this.#onProgress = onProgress;
     const records = Object.values(manifest.tensors);
     this.#totalTensors = records.length;
-    this.#totalBytes = records.reduce(
-      (sum, record) => sum + record.shape.reduce((product, dimension) => product * dimension, 1) * 4, 0,
+    const tensorBytes = records.reduce(
+      (sum, record) => sum + tensorByteLength(record), 0,
     );
+    this.#totalBytes = manifest.bundle?.files?.reduce((sum, file) => sum + file.bytes, 0) ?? tensorBytes;
     for (const record of records) {
-      const elements = record.shape.reduce((product, dimension) => product * dimension, 1);
-      const end = (record.byteOffset ?? 0) + elements * 4;
+      const end = (record.byteOffset ?? 0) + tensorByteLength(record);
       this.#fileByteLengths.set(record.file, Math.max(this.#fileByteLengths.get(record.file) ?? 0, end));
     }
     for (const shard of manifest.bundle?.files ?? []) this.#shards.set(shard.file, shard);
@@ -136,22 +139,21 @@ export class HttpTensorStore {
   }
   async #load(name: string): Promise<Float32Array> {
     const record = this.manifest.tensors[name];
-    if (record === undefined || record.dtype !== "float32") throw new Error(`missing float32 tensor ${name}`);
+    if (record === undefined) throw new Error(`missing tensor ${name}`);
     let pendingFile = this.#fileCache.get(record.file);
     if (pendingFile === undefined) {
       pendingFile = this.#scheduleDownload(record.file, name);
       this.#fileCache.set(record.file, pendingFile);
     }
     const buffer = await pendingFile;
-    const elements = record.shape.reduce((product, value) => product * value, 1);
     const byteOffset = record.byteOffset ?? 0;
-    const byteLength = elements * 4;
+    const byteLength = tensorByteLength(record);
     if (!Number.isSafeInteger(byteOffset) || byteOffset < 0 || byteOffset + byteLength > buffer.byteLength) {
       throw new Error(`${name} points outside ${record.file}`);
     }
     this.#loadedTensors += 1;
     this.#reportProgress(name);
-    return new Float32Array(buffer, byteOffset, elements);
+    return readTensor(record, buffer, byteOffset);
   }
   async #scheduleDownload(file: string, tensorName: string): Promise<ArrayBuffer> {
     return new Promise<ArrayBuffer>((resolve, reject) => {

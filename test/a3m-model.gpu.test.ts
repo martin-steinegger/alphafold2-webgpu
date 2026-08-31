@@ -7,7 +7,8 @@ import { requestAlphaFoldDevice } from "../src/runtime/device.js";
 
 const enabled = process.env.AFWEBGPU_GPU_TESTS === "1";
 const A3M_MANIFEST = "test/fixtures/evoformer/model1-a3m-59-stack/manifest.json";
-const WEIGHT_MANIFEST = "test/fixtures/evoformer/model1-query-59-stack/manifest.json";
+const WEIGHT_MANIFEST = process.env.AFWEBGPU_QUANTIZED_MANIFEST
+  ?? "test/fixtures/evoformer/model1-query-59-stack/manifest.json";
 interface Manifest { readonly referencePrediction: { readonly recycleMetrics: readonly {
   readonly meanPlddt: number; readonly ptm: number;
 }[] } }

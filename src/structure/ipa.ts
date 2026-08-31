@@ -37,6 +37,7 @@ export interface InvariantPointAttentionInput {
   readonly pointQk: number;
   readonly pointV: number;
   readonly weights: InvariantPointAttentionWeights;
+  readonly prepared?: PreparedInvariantPointAttention;
 }
 
 export interface InvariantPointAttentionResult {
@@ -279,6 +280,87 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   features[query * p.feature_channels + offset + head * p.pair_channels + channel] = result;
 }`;
 
+const GRID_WIDTH = 32_768;
+
+interface PreparedFields {
+  readonly pipelines: readonly GPUComputePipeline[];
+  readonly weights: AllocatedGpuBuffer;
+  readonly params: AllocatedGpuBuffer;
+  readonly mask: AllocatedGpuBuffer;
+  readonly pair: AllocatedGpuBuffer;
+  readonly queryScalarColumns: number;
+  readonly kvScalarColumns: number;
+  readonly queryPointColumns: number;
+  readonly kvPointColumns: number;
+  readonly featureChannels: number;
+  readonly qScalarParams: AllocatedGpuBuffer;
+  readonly kvScalarParams: AllocatedGpuBuffer;
+  readonly qPointParams: AllocatedGpuBuffer;
+  readonly kvPointParams: AllocatedGpuBuffer;
+  readonly qPointTransformParams: AllocatedGpuBuffer;
+  readonly kvPointTransformParams: AllocatedGpuBuffer;
+  readonly outputParams: AllocatedGpuBuffer;
+}
+
+/** Device-resident IPA state shared by the eight structure iterations. */
+export class PreparedInvariantPointAttention implements PreparedFields {
+  readonly pipelines!: readonly GPUComputePipeline[];
+  readonly weights!: AllocatedGpuBuffer;
+  readonly params!: AllocatedGpuBuffer;
+  readonly mask!: AllocatedGpuBuffer;
+  readonly pair!: AllocatedGpuBuffer;
+  readonly queryScalarColumns!: number;
+  readonly kvScalarColumns!: number;
+  readonly queryPointColumns!: number;
+  readonly kvPointColumns!: number;
+  readonly featureChannels!: number;
+  readonly qScalarParams!: AllocatedGpuBuffer;
+  readonly kvScalarParams!: AllocatedGpuBuffer;
+  readonly qPointParams!: AllocatedGpuBuffer;
+  readonly kvPointParams!: AllocatedGpuBuffer;
+  readonly qPointTransformParams!: AllocatedGpuBuffer;
+  readonly kvPointTransformParams!: AllocatedGpuBuffer;
+  readonly outputParams!: AllocatedGpuBuffer;
+  readonly #device: GPUDevice;
+  readonly #shape: readonly number[];
+  readonly #pairSource: Float32Array;
+  readonly #maskSource: Float32Array;
+  readonly #weightSource: InvariantPointAttentionWeights;
+  readonly #allocations: AllocatedGpuBuffer[];
+  #released = false;
+
+  constructor(device: GPUDevice, input: InvariantPointAttentionInput, fields: PreparedFields,
+    allocations: AllocatedGpuBuffer[]) {
+    this.#device = device;
+    this.#shape = [input.length, input.channels, input.pairChannels, input.heads,
+      input.scalarQk, input.scalarV, input.pointQk, input.pointV];
+    this.#pairSource = input.pair;
+    this.#maskSource = input.mask;
+    this.#weightSource = input.weights;
+    this.#allocations = allocations;
+    Object.assign(this, fields);
+  }
+
+  assertCompatible(device: GPUDevice, input: InvariantPointAttentionInput): void {
+    if (this.#released) throw new Error("prepared invariant point attention state has been released");
+    const shape = [input.length, input.channels, input.pairChannels, input.heads,
+      input.scalarQk, input.scalarV, input.pointQk, input.pointV];
+    if (device !== this.#device || shape.some((value, index) => value !== this.#shape[index])
+      || input.pair !== this.#pairSource || input.mask !== this.#maskSource || input.weights !== this.#weightSource) {
+      throw new Error("prepared invariant point attention state does not match this input");
+    }
+  }
+
+  release(): void {
+    if (this.#released) return;
+    this.#released = true;
+    for (let index = this.#allocations.length - 1; index >= 0; index -= 1) {
+      this.#allocations[index]!.release();
+    }
+    this.#allocations.length = 0;
+  }
+}
+
 export class InvariantPointAttentionGpu {
   readonly device: GPUDevice;
   readonly allocator: GpuBufferAllocator;
@@ -289,8 +371,7 @@ export class InvariantPointAttentionGpu {
     this.pipelines = pipelineCacheForDevice(device);
   }
 
-  async run(input: InvariantPointAttentionInput): Promise<InvariantPointAttentionResult> {
-    const packed = packWeights(input);
+  async prepare(input: InvariantPointAttentionInput): Promise<PreparedInvariantPointAttention> {
     const pipelines = await Promise.all([
       this.pipelines.get("ipa:normalize", ATTENTION_NORMALIZE_SHADER),
       this.pipelines.get("ipa:linear", LINEAR_SHADER),
@@ -301,6 +382,91 @@ export class InvariantPointAttentionGpu {
       this.pipelines.get("ipa:point-feature", POINT_FEATURE_SHADER),
       this.pipelines.get("ipa:pair-feature", PAIR_FEATURE_SHADER),
     ]);
+    const packed = packWeights(input);
+    const allocations: AllocatedGpuBuffer[] = [];
+    const keep = (value: AllocatedGpuBuffer): AllocatedGpuBuffer => { allocations.push(value); return value; };
+    const upload = (label: string, value: ArrayBufferView, usage = GPUBufferUsage.STORAGE): AllocatedGpuBuffer =>
+      keep(this.allocator.upload(label, value, usage));
+    const allocate = (label: string, elements: number, usage = GPUBufferUsage.STORAGE): AllocatedGpuBuffer =>
+      keep(this.allocator.allocate(label, elements * 4, usage));
+    const queryScalarColumns = input.heads * input.scalarQk;
+    const kvScalarColumns = input.heads * (input.scalarQk + input.scalarV);
+    const queryPointColumns = input.heads * 3 * input.pointQk;
+    const kvPointColumns = input.heads * 3 * (input.pointQk + input.pointV);
+    const featureChannels = input.weights.outputWeight.length / input.channels;
+    let prepared: PreparedInvariantPointAttention | undefined;
+    try {
+      const weights = upload("ipa.weights", packed.data);
+      const params = upload("ipa.parameters", parameters(input, packed.offsets), GPUBufferUsage.UNIFORM);
+      const mask = upload("ipa.mask", input.mask);
+      const pair = allocate("ipa.pair-normalized", input.length * input.length * input.pairChannels);
+      const linearParams = (label: string, columns: number, weight: number, bias: number): AllocatedGpuBuffer =>
+        upload(label, new Uint32Array([input.length, input.channels, columns, weight, bias, 0, 0, 0]),
+          GPUBufferUsage.UNIFORM);
+      prepared = new PreparedInvariantPointAttention(this.device, input, {
+        pipelines, weights, params, mask, pair,
+        queryScalarColumns, kvScalarColumns, queryPointColumns, kvPointColumns, featureChannels,
+        qScalarParams: linearParams("ipa.q-scalar-params", queryScalarColumns, packed.offsets[2]!, packed.offsets[3]!),
+        kvScalarParams: linearParams("ipa.kv-scalar-params", kvScalarColumns, packed.offsets[4]!, packed.offsets[5]!),
+        qPointParams: linearParams("ipa.q-point-params", queryPointColumns, packed.offsets[6]!, packed.offsets[7]!),
+        kvPointParams: linearParams("ipa.kv-point-params", kvPointColumns, packed.offsets[8]!, packed.offsets[9]!),
+        qPointTransformParams: upload("ipa.q-point-transform-params", new Uint32Array([
+          input.length, input.heads, input.pointQk, 0,
+        ]), GPUBufferUsage.UNIFORM),
+        kvPointTransformParams: upload("ipa.kv-point-transform-params", new Uint32Array([
+          input.length, input.heads, input.pointQk + input.pointV, 0,
+        ]), GPUBufferUsage.UNIFORM),
+        outputParams: upload("ipa.output-params", new Uint32Array([
+          input.length, featureChannels, input.channels, packed.offsets[13]!, packed.offsets[14]!, 0, 0, 0,
+        ]), GPUBufferUsage.UNIFORM),
+      }, allocations);
+      let pairSource: AllocatedGpuBuffer | undefined;
+      let pairNormParams: AllocatedGpuBuffer | undefined;
+      try {
+        pairSource = this.allocator.upload("ipa.pair", input.pair, GPUBufferUsage.STORAGE);
+        pairNormParams = this.allocator.upload("ipa.pair-norm-parameters", createAttentionNormParameters(
+          input.length * input.length, input.pairChannels, packed.offsets[0]!, packed.offsets[1]!,
+          false, 1, input.length * input.length, 1e-5,
+        ), GPUBufferUsage.UNIFORM);
+        const encoder = this.device.createCommandEncoder({ label: "ipa.prepare" });
+        const compute = encoder.beginComputePass();
+        compute.setPipeline(pipelines[0]!);
+        compute.setBindGroup(0, this.device.createBindGroup({
+          layout: pipelines[0]!.getBindGroupLayout(0),
+          entries: [pairSource, weights, pairNormParams, pair].map((buffer, binding) =>
+            ({ binding, resource: { buffer: buffer.buffer } })),
+        }));
+        const rows = input.length * input.length;
+        compute.dispatchWorkgroups(Math.min(rows, GRID_WIDTH), Math.ceil(rows / GRID_WIDTH));
+        compute.end();
+        this.device.pushErrorScope("validation");
+        this.device.queue.submit([encoder.finish()]);
+        const error = await this.device.popErrorScope();
+        if (error !== null) throw new Error(`WebGPU IPA preparation failed: ${error.message}`);
+        await this.device.queue.onSubmittedWorkDone();
+      } finally {
+        pairNormParams?.release();
+        pairSource?.release();
+      }
+      return prepared;
+    } catch (error) {
+      if (prepared === undefined) {
+        for (let index = allocations.length - 1; index >= 0; index -= 1) allocations[index]!.release();
+      } else {
+        prepared.release();
+      }
+      throw error;
+    }
+  }
+
+  async run(input: InvariantPointAttentionInput): Promise<InvariantPointAttentionResult> {
+    const shared = input.prepared ?? await this.prepare(input);
+    const ownsShared = input.prepared === undefined;
+    shared.assertCompatible(this.device, input);
+    const {
+      pipelines, weights, params, mask, pair, featureChannels,
+      queryScalarColumns, kvScalarColumns, queryPointColumns, kvPointColumns,
+    } = shared;
     const allocations: AllocatedGpuBuffer[] = [];
     const keep = (value: AllocatedGpuBuffer): AllocatedGpuBuffer => { allocations.push(value); return value; };
     const upload = (label: string, value: ArrayBufferView, usage = GPUBufferUsage.STORAGE): AllocatedGpuBuffer =>
@@ -309,20 +475,7 @@ export class InvariantPointAttentionGpu {
       keep(this.allocator.allocate(label, elements * 4, usage));
     try {
       const source = upload("ipa.source", input.activations);
-      const pairSource = upload("ipa.pair", input.pair);
-      const mask = upload("ipa.mask", input.mask);
       const affine = upload("ipa.affine", input.affine);
-      const weights = upload("ipa.weights", packed.data);
-      const params = upload("ipa.parameters", parameters(input, packed.offsets), GPUBufferUsage.UNIFORM);
-      const pairNormParams = upload("ipa.pair-norm-parameters", createAttentionNormParameters(
-        input.length * input.length, input.pairChannels, packed.offsets[0]!, packed.offsets[1]!,
-        false, 1, input.length * input.length, 1e-5,
-      ), GPUBufferUsage.UNIFORM);
-      const pair = allocate("ipa.pair-normalized", input.length * input.length * input.pairChannels);
-      const queryScalarColumns = input.heads * input.scalarQk;
-      const kvScalarColumns = input.heads * (input.scalarQk + input.scalarV);
-      const queryPointColumns = input.heads * 3 * input.pointQk;
-      const kvPointColumns = input.heads * 3 * (input.pointQk + input.pointV);
       const queryScalar = allocate("ipa.query-scalar", input.length * queryScalarColumns);
       const kvScalar = allocate("ipa.kv-scalar", input.length * kvScalarColumns);
       const queryPointLocal = allocate("ipa.query-point-local", input.length * queryPointColumns);
@@ -334,25 +487,8 @@ export class InvariantPointAttentionGpu {
       const attentionElements = input.heads * input.length * input.length;
       const logits = allocate("ipa.logits", attentionElements);
       const attention = allocate("ipa.attention", attentionElements);
-      const featureChannels = input.weights.outputWeight.length / input.channels;
       const features = allocate("ipa.features", input.length * featureChannels);
       const output = allocate("ipa.output", input.length * input.channels, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
-      const linearParams = (label: string, columns: number, weight: number, bias: number): AllocatedGpuBuffer =>
-        upload(label, new Uint32Array([input.length, input.channels, columns, weight, bias, 0, 0, 0]),
-          GPUBufferUsage.UNIFORM);
-      const qScalarParams = linearParams("ipa.q-scalar-params", queryScalarColumns, packed.offsets[2]!, packed.offsets[3]!);
-      const kvScalarParams = linearParams("ipa.kv-scalar-params", kvScalarColumns, packed.offsets[4]!, packed.offsets[5]!);
-      const qPointParams = linearParams("ipa.q-point-params", queryPointColumns, packed.offsets[6]!, packed.offsets[7]!);
-      const kvPointParams = linearParams("ipa.kv-point-params", kvPointColumns, packed.offsets[8]!, packed.offsets[9]!);
-      const qPointTransformParams = upload("ipa.q-point-transform-params", new Uint32Array([
-        input.length, input.heads, input.pointQk, 0,
-      ]), GPUBufferUsage.UNIFORM);
-      const kvPointTransformParams = upload("ipa.kv-point-transform-params", new Uint32Array([
-        input.length, input.heads, input.pointQk + input.pointV, 0,
-      ]), GPUBufferUsage.UNIFORM);
-      const outputParams = upload("ipa.output-params", new Uint32Array([
-        input.length, featureChannels, input.channels, packed.offsets[13]!, packed.offsets[14]!, 0, 0, 0,
-      ]), GPUBufferUsage.UNIFORM);
       const encoder = this.device.createCommandEncoder({ label: "invariant-point-attention" });
       this.device.pushErrorScope("validation");
       const pass = (pipeline: GPUComputePipeline, buffers: readonly AllocatedGpuBuffer[], x: number, y = 1): void => {
@@ -369,20 +505,18 @@ export class InvariantPointAttentionGpu {
         const groups = Math.ceil(elements / workgroupSize);
         return [Math.min(groups, 32_768), Math.ceil(groups / 32_768)];
       };
-      let dispatch = grid(input.length * input.length, 1);
-      pass(pipelines[0]!, [pairSource, weights, pairNormParams, pair], dispatch[0], dispatch[1]);
       const linear = (paramsValue: AllocatedGpuBuffer, result: AllocatedGpuBuffer, columns: number): void =>
         pass(pipelines[1]!, [source, weights, paramsValue, result],
           Math.ceil(columns / TRANSITION_TILE_COLUMNS), Math.ceil(input.length / TRANSITION_TILE_ROWS));
-      linear(qScalarParams, queryScalar, queryScalarColumns);
-      linear(kvScalarParams, kvScalar, kvScalarColumns);
-      linear(qPointParams, queryPointLocal, queryPointColumns);
-      linear(kvPointParams, kvPointLocal, kvPointColumns);
-      pass(pipelines[2]!, [queryPointLocal, affine, qPointTransformParams, queryPoint],
+      linear(shared.qScalarParams, queryScalar, queryScalarColumns);
+      linear(shared.kvScalarParams, kvScalar, kvScalarColumns);
+      linear(shared.qPointParams, queryPointLocal, queryPointColumns);
+      linear(shared.kvPointParams, kvPointLocal, kvPointColumns);
+      pass(pipelines[2]!, [queryPointLocal, affine, shared.qPointTransformParams, queryPoint],
         Math.ceil(queryPoint.byteLength / 4 / 3 / 64));
-      pass(pipelines[2]!, [kvPointLocal, affine, kvPointTransformParams, kvPoint],
+      pass(pipelines[2]!, [kvPointLocal, affine, shared.kvPointTransformParams, kvPoint],
         Math.ceil(kvPoint.byteLength / 4 / 3 / 64));
-      dispatch = grid(attentionElements);
+      const dispatch = grid(attentionElements);
       pass(pipelines[3]!, [queryScalar, kvScalar, queryPoint, kvPoint, pair, mask, weights, params, logits],
         dispatch[0], dispatch[1]);
       pass(pipelines[4]!, [logits, params, attention], input.heads * input.length);
@@ -392,7 +526,7 @@ export class InvariantPointAttentionGpu {
         Math.ceil(input.length * input.heads * input.pointV / 64));
       pass(pipelines[7]!, [attention, pair, params, features],
         Math.ceil(input.length * input.heads * input.pairChannels / 64));
-      pass(pipelines[1]!, [features, weights, outputParams, output],
+      pass(pipelines[1]!, [features, weights, shared.outputParams, output],
         Math.ceil(input.channels / TRANSITION_TILE_COLUMNS), Math.ceil(input.length / TRANSITION_TILE_ROWS));
       const outputElements = output.byteLength / 4;
       const readback = allocate("ipa.readback", outputElements, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
@@ -407,6 +541,7 @@ export class InvariantPointAttentionGpu {
       return { output: result, elapsedMilliseconds: performance.now() - start, memory: this.allocator.snapshot() };
     } finally {
       for (let index = allocations.length - 1; index >= 0; index -= 1) allocations[index]!.release();
+      if (ownsShared) shared.release();
     }
   }
 }

@@ -59,6 +59,24 @@ describe("HttpTensorStore", () => {
     expect(downloads).toBe(1);
   });
 
+  it("decodes block-int8 tensors from a mixed model shard", async () => {
+    const shard = new Uint8Array(10);
+    new Int8Array(shard.buffer, 0, 5).set([1, -2, 3, -4, 5]);
+    new Uint16Array(shard.buffer, 6, 2).set([0x3800, 0x4000]);
+    vi.stubGlobal("fetch", vi.fn(async (input: URL | RequestInfo) => {
+      if (String(input).endsWith("manifest.json")) return new Response(JSON.stringify({
+        bundle: { version: 1, id: "q8-test", files: [{ file: "weights.v1.q8.bin", bytes: 10 }] },
+        tensors: { value: {
+          file: "weights.v1.q8.bin", dtype: "int8", shape: [5], byteOffset: 0,
+          block: 4, scaleOffset: 6,
+        } },
+      }));
+      return new Response(shard);
+    }));
+    const store = await HttpTensorStore.open(new URL("https://example.test/model/manifest.json"));
+    expect([...await store.tensor("value")]).toEqual([0.5, -1, 1.5, -2, 10]);
+  });
+
   it("validates versioned shards and reuses the persistent cache", async () => {
     const shard = Float32Array.of(3, 5);
     const manifest = { bundle: { version: 1, id: "test", files: [

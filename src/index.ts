@@ -49,7 +49,7 @@ export {
 export type {
   AlphaFoldDevicePlan, AlphaFoldDeviceRequirements, MonomerMemoryEstimate, MonomerRowSuggestion,
 } from "./runtime/device.js";
-export { InvariantPointAttentionGpu } from "./structure/ipa.js";
+export { InvariantPointAttentionGpu, PreparedInvariantPointAttention } from "./structure/ipa.js";
 export type {
   InvariantPointAttentionInput,
   InvariantPointAttentionResult,

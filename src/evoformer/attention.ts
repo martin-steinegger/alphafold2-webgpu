@@ -48,7 +48,7 @@ export interface AttentionResult {
   readonly memory: AllocationSnapshot;
 }
 
-export type AttentionFlashVariant = "auto" | "portable" | "subgroup-4x8"
+export type AttentionFlashVariant = "auto" | "portable" | "register" | "subgroup-4x8"
   | "subgroup-key32"
   | "subgroup-8x16" | "subgroup-8x32" | "subgroup-8x64"
   | "subgroup-16x64" | "subgroup-32x64" | "subgroup-64x64";
@@ -415,6 +415,75 @@ fn main(
   }
 }`;
 
+/**
+ * Portable flash attention with one complete head owned by each invocation.
+ *
+ * AlphaFold's attention head dimensions are 32 and 8, so the query and online
+ * softmax accumulator fit in eight or two named vec4 registers. This removes
+ * the workgroup barriers and tree reductions from the key loop without relying
+ * on subgroup extensions, which Chrome-on-Metal does not currently expose.
+ */
+export function createAttentionRegisterFlashShader(headDim: number): string {
+  if (!Number.isSafeInteger(headDim) || headDim <= 0 || headDim > 32 || headDim % 4 !== 0) {
+    throw new RangeError("register attention requires a positive head dimension divisible by four and at most 32");
+  }
+  const vectors = headDim / 4;
+  const each = (body: (index: number) => string): string => Array.from(
+    { length: vectors }, (_, index) => `    ${body(index)}`,
+  ).join("\n");
+  const declare = (name: string, initial: (index: number) => string): string => Array.from(
+    { length: vectors }, (_, index) => `  var ${name}${index} = ${initial(index)};`,
+  ).join("\n");
+  return `${COMMON}
+const HD4: u32 = ${vectors}u;
+@group(0) @binding(0) var<storage, read> query: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> key: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> value: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read> gate: array<vec4<f32>>;
+@group(0) @binding(4) var<storage, read> mask: array<f32>;
+@group(0) @binding(5) var<storage, read> pair_bias: array<f32>;
+@group(0) @binding(6) var<uniform> p: Parameters;
+@group(0) @binding(7) var<storage, read_write> output: array<vec4<f32>>;
+
+fn mask_index(batch: u32, key_index: u32) -> u32 {
+  if (p.transpose == 0u) { return batch * p.queries + key_index; }
+  return key_index * p.batch + batch;
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let q_index = id.x;
+  let batch_index = id.y;
+  let head = id.z;
+  if (q_index >= p.queries || batch_index >= p.batch || head >= p.heads) { return; }
+  let q_base = ((batch_index * p.queries + q_index) * p.heads + head) * HD4;
+
+${declare("qv", (index) => `query[q_base + ${index}u]`)}
+${declare("acc", () => "vec4<f32>(0.0)")}
+  var running_max = -1e30;
+  var running_sum = 0.0;
+
+  for (var k_index = 0u; k_index < p.queries; k_index += 1u) {
+    let k_base = ((batch_index * p.queries + k_index) * p.heads + head) * HD4;
+    var score = 0.0;
+${each((index) => `score += dot(qv${index}, key[k_base + ${index}u]);`)}
+    var logit = score + 1e9 * (mask[mask_index(batch_index, k_index)] - 1.0);
+    if (p.has_pair_bias != 0u) {
+      logit += pair_bias[(head * p.queries + q_index) * p.queries + k_index];
+    }
+    logit = clamp(logit, -1e8, 1e8);
+    let new_max = max(running_max, logit);
+    let previous_scale = exp(running_max - new_max);
+    let weight = exp(logit - new_max);
+    running_sum = running_sum * previous_scale + weight;
+    running_max = new_max;
+${each((index) => `acc${index} = acc${index} * previous_scale + weight * value[k_base + ${index}u];`)}
+  }
+
+${each((index) => `output[q_base + ${index}u] = (acc${index} / running_sum) * gate[q_base + ${index}u];`)}
+}`;
+}
+
 // Fast path for devices that guarantee one 32-lane subgroup. All lanes keep
 // identical online-softmax state, eliminating workgroup barriers in the key loop.
 export const ATTENTION_SUBGROUP_FLASH_SHADER = `enable subgroups;
@@ -743,7 +812,7 @@ export function selectAttentionFlashKernel(
   const subgroup = supportsAttentionSubgroups(device, headDim);
   const subgroup64 = supportsAttentionSubgroup64x64(device, headDim);
   const variant = requested === "auto"
-    ? (subgroup64 ? "subgroup-key32" : subgroup ? "subgroup-4x8" : "portable")
+    ? (subgroup64 ? "subgroup-key32" : subgroup ? "subgroup-4x8" : "register")
     : requested;
   if (variant.startsWith("subgroup-") && variant !== "subgroup-4x8" && !subgroup64) {
     throw new Error(`the ${variant} attention kernel is unsupported by this device`);
@@ -780,6 +849,15 @@ export function selectAttentionFlashKernel(
     return {
       cacheKey: "attention:flash-subgroup4x8", shader: ATTENTION_SUBGROUP_FLASH_SHADER,
       queryTile: 4, variant,
+    };
+  }
+  if (variant === "register") {
+    if (headDim % 4 !== 0) throw new Error("register attention requires a head dimension divisible by four");
+    return {
+      cacheKey: `attention:flash-registers-${headDim}`,
+      shader: createAttentionRegisterFlashShader(headDim),
+      queryTile: 64,
+      variant,
     };
   }
   return { cacheKey: "attention:flash", shader: ATTENTION_FLASH_SHADER, queryTile: 1, variant };

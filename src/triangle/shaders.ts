@@ -152,30 +152,33 @@ fn main(
     }
     workgroupBarrier();
   }
+  // Store the contraction inputs channel-major. The contraction consumes one
+  // complete h slice at a time, so this makes adjacent lanes read adjacent
+  // addresses instead of cache lines spread across the entire pair tensor.
   if (row < PAIRS && h < CH) {
-    let index = row * CH + h; let pair_mask = mask[row];
+    let index = h * PAIRS + row; let pair_mask = mask[row];
     a[index] = pair_mask * ap_00 * logistic(ag_00); b[index] = pair_mask * bp_00 * logistic(bg_00);
   }
   if (row < PAIRS && second_h < CH) {
-    let index = row * CH + second_h; let pair_mask = mask[row];
+    let index = second_h * PAIRS + row; let pair_mask = mask[row];
     a[index] = pair_mask * ap_01 * logistic(ag_01); b[index] = pair_mask * bp_01 * logistic(bg_01);
   }
   if (second_row < PAIRS && h < CH) {
-    let index = second_row * CH + h; let pair_mask = mask[second_row];
+    let index = h * PAIRS + second_row; let pair_mask = mask[second_row];
     a[index] = pair_mask * ap_10 * logistic(ag_10); b[index] = pair_mask * bp_10 * logistic(bg_10);
   }
   if (second_row < PAIRS && second_h < CH) {
-    let index = second_row * CH + second_h; let pair_mask = mask[second_row];
+    let index = second_h * PAIRS + second_row; let pair_mask = mask[second_row];
     a[index] = pair_mask * ap_11 * logistic(ag_11); b[index] = pair_mask * bp_11 * logistic(bg_11);
   }
 }`;
 
   const loadATile = direction === "outgoing"
-    ? "a[(i * L + a_k) * CH + h]"
-    : "b[(a_k * L + i) * CH + h]";
+    ? "a[h * PAIRS + i * L + a_k]"
+    : "b[h * PAIRS + a_k * L + i]";
   const loadBTile = direction === "outgoing"
-    ? "b[(j * L + b_k) * CH + h]"
-    : "a[(b_k * L + j) * CH + h]";
+    ? "b[h * PAIRS + j * L + b_k]"
+    : "a[h * PAIRS + b_k * L + j]";
   const contract = `${common}
 @group(0) @binding(0) var<storage, read> a: array<f32>;
 @group(0) @binding(1) var<storage, read> b: array<f32>;
@@ -214,7 +217,7 @@ fn main(
   }
 
   if (i < L && j < L) {
-    output[(i * L + j) * CH + h] = sum;
+    output[h * PAIRS + i * L + j] = sum;
   }
 }`;
 
@@ -229,16 +232,16 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   if (row >= PAIRS) { return; }
   let base = row * CH;
   var mean = 0.0;
-  for (var h = 0u; h < CH; h += 1u) { mean += source[base + h]; }
+  for (var h = 0u; h < CH; h += 1u) { mean += source[h * PAIRS + row]; }
   mean /= f32(CH);
   var variance = 0.0;
   for (var h = 0u; h < CH; h += 1u) {
-    let centered = source[base + h] - mean;
+    let centered = source[h * PAIRS + row] - mean;
     variance += centered * centered;
   }
   let inverse_std = inverseSqrt(variance / f32(CH) + EPSILON);
   for (var h = 0u; h < CH; h += 1u) {
-    var value = (source[base + h] - mean) * inverse_std;
+    var value = (source[h * PAIRS + row] - mean) * inverse_std;
     value = value * ${read(precision, "weights[W_LAYERNORMOUTWEIGHT + h]")}
       + ${read(precision, "weights[W_LAYERNORMOUTBIAS + h]")};
     normalized[base + h] = value;

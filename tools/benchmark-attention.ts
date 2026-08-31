@@ -12,7 +12,7 @@ import { errorMetrics } from "../src/triangle/types.js";
 
 const MANIFEST = "test/fixtures/evoformer/model1-a3m-59-stack/manifest.json";
 const VARIANTS: readonly AttentionFlashVariant[] = [
-  "portable", "auto", "subgroup-4x8", "subgroup-key32", "subgroup-8x16", "subgroup-8x32", "subgroup-8x64",
+  "portable", "register", "auto", "subgroup-4x8", "subgroup-key32", "subgroup-8x16", "subgroup-8x32", "subgroup-8x64",
   "subgroup-16x64", "subgroup-32x64", "subgroup-64x64",
 ];
 

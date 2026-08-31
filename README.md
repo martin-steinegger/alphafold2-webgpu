@@ -39,7 +39,7 @@ Only the AlphaFold2 `model_1_ptm` parameter set is supported. Keeping a single m
 5. Inspect the MSA coverage, per-recycle confidence, pLDDT, PAE, and interactive 3D structure.
 6. Download the predicted PDB, scores JSON, and generated A3M.
 
-The first prediction downloads approximately 355 MiB of model parameters and compiles WebGPU pipelines. Versioned model shards are byte-length validated and retained in the browser's persistent cache when storage policy permits. Later predictions can be much faster; **Clear downloaded model** under Advanced settings removes both persistent and in-memory copies.
+The first prediction downloads the selected model bundle and compiles WebGPU pipelines. The mixed q8 bundle is approximately 97 MiB; the reference float32 bundle is 355 MiB. Versioned model shards are byte-length validated and retained in the browser's persistent cache when storage policy permits. Later predictions can be much faster; **Clear downloaded model** under Advanced settings removes both persistent and in-memory copies.
 
 ## Input modes and privacy
 
@@ -82,11 +82,11 @@ It is designed to use standards-compliant WebGPU and should run on WebGPU-capabl
 
 ### Why is the first run slow?
 
-The browser must download roughly 355 MiB of float32 model parameters and compile many GPU pipelines. The parameters are split into eight balanced files to avoid hundreds of small HTTP requests. The page retains the resolved tensors, WebGPU device, and device-scoped pipeline cache, so repeating a prediction without closing the page avoids downloading and parsing the model again. A warm second run is the useful measure of inference performance.
+The browser must download model parameters and compile many GPU pipelines. The q8 and float32 bundles are both split into eight balanced files to avoid hundreds of small HTTP requests. The page retains the resolved tensors, WebGPU device, and device-scoped pipeline cache, so repeating a prediction without closing the page avoids downloading and parsing the model again. A warm second run is the useful measure of inference performance.
 
-### Why is the model download still large?
+### How are the model weights stored?
 
-The application uses the original float32 `model_1_ptm` parameters. Quantization or float16 storage would reduce the download, but can change numerical behavior and is not enabled silently.
+The loader accepts the original float32 `model_1_ptm` bundle and a mixed q8 bundle. The latter uses symmetric int8 weights with one float16 scale per 64-value block, while the structure module, residue geometry, and PAE bin boundaries remain float32. It reduces 355.3 MiB to 97.3 MiB. A four-recycle differential qualification compares q8 and float32 pLDDT, pTM, PAE, and atom coordinates before a quantized bundle is published.
 
 ### What is the maximum sequence length?
 
@@ -184,13 +184,13 @@ Small reference fixtures required by the default tests are committed. Full Evofo
 
 Implemented components include input and recycling embeddings, mock-template pair embedding for model 1, MSA row and column attention, extra-MSA global column attention, transitions, OuterProductMean, both triangle multiplication directions, both triangle attention orientations, invariant point attention, backbone updates, sidechain torsions, atom14/atom37 geometry, pLDDT, PAE, and pTM.
 
-Attention uses online softmax and never materializes attention-logit cubes. When `subgroups` and `subgroup-size-control` are available, eight 32-lane subgroups process eight queries while sharing a 32-key K/V tile. Other devices use the portable workgroup kernel. Earlier lane-per-channel variants remain selectable for differential benchmarking.
+Attention uses online softmax and never materializes attention-logit cubes. When `subgroups` and `subgroup-size-control` are available, eight 32-lane subgroups process eight queries while sharing a 32-key K/V tile. Other devices, including Chrome-on-Metal, use a register-resident kernel in which one invocation owns a complete 8- or 32-channel head and requires no workgroup barriers in the key loop. The original portable workgroup kernel remains selectable as an independent differential baseline.
 
-QKV and gate projections use register-blocked 16x16 tiles, attention output uses 16x32 tiles, and transition GEMMs use 16x64 tiles. Triangle multiplication uses cooperative 16x16 joint tiles for split A/B projection, gates, output projection, and output gate. It never materializes an `O(L³)` tensor. For deep, short MSAs, OuterProductMean uses AlphaFold2's canonical outer-first contraction; a bounded path is available when the temporary would exceed 64 MiB.
+QKV and gate projections use register-blocked 16x16 tiles, attention output uses 16x32 tiles, and transition GEMMs use 16x64 tiles. Triangle multiplication uses cooperative 16x16 joint tiles for split A/B projection, gates, output projection, and output gate. Its contraction intermediates are channel-major so each hidden-channel slice is contiguous, and it never materializes an `O(L³)` tensor. For deep, short MSAs, OuterProductMean uses AlphaFold2's canonical outer-first contraction; a bounded path is available when the temporary would exceed 64 MiB.
 
 Device limits are negotiated per prediction shape. A capable adapter receives the exact full-transition requirement rounded to a WebGPU capability tier. Constrained adapters retain the same AF2 weights and operations but execute transition rows through aligned storage-buffer windows capped at 96 MiB. The compact path does not fall back to CPU or truncate the MSA silently; if even the persistent MSA or pair tensor exceeds the adapter limit, the application reports the required and available sizes.
 
-Evoformer blocks are submitted ahead without host waits and alias a pooled set of scratch buffers. Compact execution uses bounded best-fit reuse so a larger physical allocation can serve a smaller logical tensor, while bind groups expose only the tensor's logical range. The unbounded accelerator path retains exact-size pooling. Final projections commit directly into residual tensors. Embedding, extra-MSA, and main-stack activations stay device-resident across stage and recycle boundaries; only the first MSA row and pair representation required by the current structure API are read back.
+Evoformer blocks are submitted ahead without host waits and alias a pooled set of scratch buffers. Compact execution uses bounded best-fit reuse so a larger physical allocation can serve a smaller logical tensor, while bind groups expose only the tensor's logical range. The unbounded accelerator path retains exact-size pooling. Final projections commit directly into residual tensors. Embedding, extra-MSA, and main-stack activations stay device-resident across stage and recycle boundaries. The structure module uploads and normalizes its invariant pair representation once for all eight IPA iterations.
 
 ## TypeScript API
 
@@ -259,7 +259,7 @@ console.log(
 
 For A3M input, load `extraStackWeights()` and call `AlphaFoldMonomerGpu.predictA3m(...)`. `makeA3mFeatures(...)` is exported for applications that want preprocessing and inference as separate steps.
 
-The manifest is a JSON tensor table referencing little-endian float32 binary files. `HttpTensorStore` fetches tensors lazily and caches them. `FileTensorStore` provides the equivalent Node test and development loader.
+The manifest is a JSON tensor table referencing versioned little-endian shards. Records may be float32, float16, or symmetric block-int8 with explicit scale offsets; every representation is decoded to validated float32 tensors before inference. `HttpTensorStore` fetches tensors lazily and caches them. `FileTensorStore` provides the equivalent Node test and development loader.
 
 ## Building and deploying the browser application
 
@@ -270,7 +270,17 @@ npm run build:web
 npm run build:web:standalone
 ```
 
-The exporter copies only the 335 tensors required for inference and discards captured activations and reference outputs. It packs the tensors into eight balanced binary shards. The model-1 PTM download is approximately 355 MiB, compared with 419 MiB for the query reference fixture and 1.1 GiB for the A3M reference fixture. It remains float32 to avoid silently changing predictions.
+The exporter copies only the 335 tensors required for inference and discards captured activations and reference outputs. It packs the tensors into eight balanced binary shards. `build:web:standalone` produces the 355.3 MiB float32 reference bundle. To produce and qualify the 97.3 MiB mixed q8 bundle:
+
+```bash
+npm run export:web-model -- test/fixtures/evoformer/model1-query-59-stack/manifest.json /tmp/afwebgpu-model-f32
+npm run quantize:web-model -- /tmp/afwebgpu-model-f32 dist/web/model --format=int8
+npm run verify:web-model -- dist/web/model/manifest.json
+AFWEBGPU_GPU_TESTS=1 AFWEBGPU_QUANTIZED_MANIFEST=dist/web/model/manifest.json \
+  npx vitest run test/quantized-model.gpu.test.ts
+```
+
+The quantized qualification is deliberately separate from the float32 reference tests: it compares four-recycle pLDDT and pTM, final per-residue confidence, PAE, and atom coordinates against a float32 run without changing any existing reference tensor or tolerance.
 
 Full-model captures are excluded from source history. The reduced browser model is stored in the repository's `model1-ptm` GitHub Release as `afwebgpu-model1-ptm.tar.gz`. The Pages workflow downloads that asset and constructs the deployment artifact.
 
@@ -286,10 +296,10 @@ Create a release tagged `model1-ptm` and attach the archive. It must contain a t
 
 ## Current scope
 
-- Monomer `model_1_ptm`, float32 inference, mock templates, and fixed model channel sizes are supported.
+- Monomer `model_1_ptm`, float32 and mixed block-int8 model storage, mock templates, and fixed model channel sizes are supported. Neural-network arithmetic remains float32 after one-time weight decoding.
 - A3M sampling and clustering are implemented in TypeScript with a deterministic application PRNG. They are distribution-equivalent to AlphaFold preprocessing but do not reproduce TensorFlow's private RNG stream unless exact masked-MSA codes are supplied.
-- Multimer models, real template hits, other AlphaFold2 parameter sets, weight quantization, and result relaxation are not supported.
-- Structure-module residency, weight-layout specialization, and Apple-GPU profiling remain opportunities to improve speed and peak memory without changing model semantics.
+- Multimer models, real template hits, other AlphaFold2 parameter sets, sub-eight-bit weight formats, and result relaxation are not supported.
+- Holding pair state on the GPU through confidence and recycle boundaries, plus renewed Apple-GPU profiling after the kernel rewrites, remain opportunities to improve speed and peak memory.
 
 ## Acknowledgments and citation
 
