@@ -23,6 +23,9 @@
     "bench:attention": "tsx tools/benchmark-attention.ts",
     "bench:a3m-stack": "tsx tools/benchmark-a3m-stack.ts",
     "bench:a3m-model": "tsx tools/benchmark-a3m-model.ts",
+    "bench:shape": "tsx tools/benchmark-shape.ts",
+    "bench:gemm": "tsx tools/benchmark-gemm.ts",
+    "profile:a3m-model": "tsx tools/profile-a3m-model.ts",
     "qualify:hardware": "tsx tools/qualify-hardware.ts",
     "qualify:multimer": "tsx tools/qualify-multimer-model.ts",
     "check": "npm run build && npm run build:web && npm run test"
