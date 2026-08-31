@@ -31,8 +31,13 @@ export interface TransitionGpuOptions {
 }
 
 const ceilDivide = (value: number, divisor: number): number => Math.ceil(value / divisor);
-export const TRANSITION_TILE_COLUMNS = 64;
-export const TRANSITION_TILE_ROWS = 16;
+const LINEAR_THREADS = 256;
+const LINEAR_TILE_INNER = 8;
+/** Output tile one workgroup of the shared projection covers. */
+export const TRANSITION_TILE_COLUMNS = 128;
+export const TRANSITION_TILE_ROWS = 64;
+const LINEAR_TILE_COLUMNS = TRANSITION_TILE_COLUMNS;
+const LINEAR_TILE_ROWS = TRANSITION_TILE_ROWS;
 export const TRANSITION_CHUNK_TARGET_BYTES = 96 * 1024 * 1024;
 
 const gcd = (left: number, right: number): number => {
@@ -66,6 +71,134 @@ export function transitionChunkRows(
     throw new RangeError("WebGPU storage binding cannot hold one aligned transition chunk");
   }
   return Math.min(rows, Math.floor(capacity / rowAlignment) * rowAlignment);
+}
+
+/**
+ * The dense projection shared by every AlphaFold module.
+ *
+ * Row-major A[rows, inner] x row-major W[inner, columns] + bias, with an
+ * optional ReLU and an optional accumulate-into-output form. One workgroup of
+ * 256 invocations covers a TILE_ROWS x TILE_COLUMNS output tile; each
+ * invocation keeps eight contiguous rows by four columns in registers, so a
+ * single k step costs three vector reads from workgroup memory and 32 fused
+ * multiply-adds. A is staged k-major, which makes both its global loads and
+ * its shared loads contiguous.
+ *
+ * Measured against the previous 16x64 tiling on GB10: 1.6x at the Evoformer
+ * projection and transition shapes, at 6 KiB of workgroup storage, well inside
+ * the 16 KiB every WebGPU device guarantees.
+ */
+export function createLinearShader(residual: boolean): string {
+  const rowsPerThread = LINEAR_TILE_ROWS / (LINEAR_THREADS / (LINEAR_TILE_COLUMNS / 4));
+  const columnThreads = LINEAR_TILE_COLUMNS / 4;
+  const sourceVectors = (LINEAR_TILE_ROWS * LINEAR_TILE_INNER) / 4;
+  const weightVectors = (LINEAR_TILE_INNER * LINEAR_TILE_COLUMNS) / 4;
+  const vectorsPerThread = rowsPerThread / 4;
+  const lines = (count: number, body: (index: number) => string): string =>
+    Array.from({ length: count }, (_, index) => body(index)).join("\n");
+  const store = residual
+    ? (target: string, value: string) => `output[${target}] += ${value};`
+    : (target: string, value: string) => `output[${target}] = ${value};`;
+  return `
+struct MatmulParameters {
+  rows: u32,
+  inner: u32,
+  columns: u32,
+  weight_offset: u32,
+  bias_offset: u32,
+  activation: u32,
+  padding: vec2<u32>,
+};
+@group(0) @binding(0) var<storage, read> source: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<f32>;
+@group(0) @binding(2) var<uniform> parameters: MatmulParameters;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+
+// Staged k-major as tile_source[k][row] so one k step reads this invocation's
+// rows as ${vectorsPerThread} aligned vectors.
+var<workgroup> tile_source: array<vec4<f32>, ${sourceVectors}>;
+var<workgroup> tile_weight: array<vec4<f32>, ${weightVectors}>;
+
+@compute @workgroup_size(${LINEAR_THREADS}, 1, 1)
+fn main(
+  @builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>,
+) {
+  let thread = local.x;
+  let column_thread = thread % ${columnThreads}u;
+  let row_thread = thread / ${columnThreads}u;
+  let row_origin = group.y * ${LINEAR_TILE_ROWS}u + row_thread * ${rowsPerThread}u;
+  let column_origin = group.x * ${LINEAR_TILE_COLUMNS}u;
+  let column = column_origin + column_thread * 4u;
+${lines(rowsPerThread, (row) => `  var acc${row} = vec4<f32>(0.0);`)}
+
+  for (var k0 = 0u; k0 < parameters.inner; k0 += ${LINEAR_TILE_INNER}u) {
+    for (var item = thread; item < ${LINEAR_TILE_ROWS * LINEAR_TILE_INNER}u; item += ${LINEAR_THREADS}u) {
+      let load_row = item / ${LINEAR_TILE_INNER}u;
+      let load_k = item % ${LINEAR_TILE_INNER}u;
+      let source_row = group.y * ${LINEAR_TILE_ROWS}u + load_row;
+      let source_k = k0 + load_k;
+      var value = 0.0;
+      if (source_row < parameters.rows && source_k < parameters.inner) {
+        value = source[source_row * parameters.inner + source_k];
+      }
+      let slot = load_k * ${LINEAR_TILE_ROWS}u + load_row;
+      tile_source[slot / 4u][slot % 4u] = value;
+    }
+    for (var item = thread; item < ${weightVectors}u; item += ${LINEAR_THREADS}u) {
+      let load_k = item / ${columnThreads}u;
+      let load_column = column_origin + (item % ${columnThreads}u) * 4u;
+      let weight_k = k0 + load_k;
+      var value = vec4<f32>(0.0);
+      if (weight_k < parameters.inner) {
+        let base = parameters.weight_offset + weight_k * parameters.columns + load_column;
+        if (load_column + 3u < parameters.columns) {
+          value = vec4<f32>(weights[base], weights[base + 1u], weights[base + 2u], weights[base + 3u]);
+        } else {
+          for (var lane = 0u; lane < 4u; lane += 1u) {
+            if (load_column + lane < parameters.columns) { value[lane] = weights[base + lane]; }
+          }
+        }
+      }
+      tile_weight[item] = value;
+    }
+    workgroupBarrier();
+    for (var k = 0u; k < ${LINEAR_TILE_INNER}u; k += 1u) {
+      let w = tile_weight[k * ${columnThreads}u + column_thread];
+      let a_base = (k * ${LINEAR_TILE_ROWS}u + row_thread * ${rowsPerThread}u) / 4u;
+${lines(vectorsPerThread, (vector) => `      let a${vector} = tile_source[a_base + ${vector}u];`)}
+${lines(rowsPerThread, (row) => `      acc${row} += a${Math.floor(row / 4)}[${row % 4}u] * w;`)}
+    }
+    workgroupBarrier();
+  }
+
+  var bias = vec4<f32>(0.0);
+  if (column + 3u < parameters.columns) {
+    let base = parameters.bias_offset + column;
+    bias = vec4<f32>(weights[base], weights[base + 1u], weights[base + 2u], weights[base + 3u]);
+  } else {
+    for (var lane = 0u; lane < 4u; lane += 1u) {
+      if (column + lane < parameters.columns) { bias[lane] = weights[parameters.bias_offset + column + lane]; }
+    }
+  }
+${lines(rowsPerThread, (row) => `
+  {
+    let row = row_origin + ${row}u;
+    if (row < parameters.rows) {
+      var value = acc${row} + bias;
+      if (parameters.activation == 1u) { value = max(value, vec4<f32>(0.0)); }
+      let base = row * parameters.columns + column;
+      if (column + 3u < parameters.columns) {
+        ${store("base", "value.x")} ${store("base + 1u", "value.y")}
+        ${store("base + 2u", "value.z")} ${store("base + 3u", "value.w")}
+      } else {
+        for (var lane = 0u; lane < 4u; lane += 1u) {
+          if (column + lane < parameters.columns) { ${store("base + lane", "value[lane]")} }
+        }
+      }
+    }
+  }`)}
+}`;
 }
 
 function validate(input: TransitionInput): void {
@@ -167,114 +300,7 @@ fn main(
       * weights[parameters.scale_offset + c] + weights[parameters.offset_offset + c];
   }
 }`;
-  // One register-blocked projection serves both dense layers. A workgroup
-  // computes a 16x64 output tile: every invocation retains sixteen accumulators,
-  // so the source tile is loaded once for 64 columns instead of eight times by
-  // separate 8x8 workgroups. The k loop order is unchanged from the reference.
-  const linear = `
-struct MatmulParameters {
-  rows: u32,
-  inner: u32,
-  columns: u32,
-  weight_offset: u32,
-  bias_offset: u32,
-  activation: u32,
-  padding: vec2<u32>,
-};
-@group(0) @binding(0) var<storage, read> source: array<f32>;
-@group(0) @binding(1) var<storage, read> weights: array<f32>;
-@group(0) @binding(2) var<uniform> parameters: MatmulParameters;
-@group(0) @binding(3) var<storage, read_write> output: array<f32>;
-
-var<workgroup> tile_source: array<f32, 128>;
-var<workgroup> tile_weight: array<f32, 512>;
-
-@compute @workgroup_size(8, 8, 1)
-fn main(
-  @builtin(local_invocation_id) local: vec3<u32>,
-  @builtin(workgroup_id) group: vec3<u32>,
-) {
-  let row = group.y * 16u + local.y;
-  let second_row = row + 8u;
-  let column = group.x * 64u + local.x;
-  let tile_index = local.y * 8u + local.x;
-  var value_low = vec4<f32>(0.0);
-  var value_high = vec4<f32>(0.0);
-  var second_value_low = vec4<f32>(0.0);
-  var second_value_high = vec4<f32>(0.0);
-
-  for (var k0 = 0u; k0 < parameters.inner; k0 += 8u) {
-    let source_k = k0 + local.x;
-    let weight_k = k0 + local.y;
-    tile_source[tile_index] = 0.0;
-    tile_source[tile_index + 64u] = 0.0;
-    if (row < parameters.rows && source_k < parameters.inner) {
-      tile_source[tile_index] = source[row * parameters.inner + source_k];
-    }
-    if (second_row < parameters.rows && source_k < parameters.inner) {
-      tile_source[tile_index + 64u] = source[second_row * parameters.inner + source_k];
-    }
-    for (var column_block = 0u; column_block < 8u; column_block += 1u) {
-      let tile_column = local.x + column_block * 8u;
-      let output_column = column + column_block * 8u;
-      let weight_index = local.y * 64u + tile_column;
-      tile_weight[weight_index] = 0.0;
-      if (output_column < parameters.columns && weight_k < parameters.inner) {
-        tile_weight[weight_index] = weights[
-          parameters.weight_offset + weight_k * parameters.columns + output_column
-        ];
-      }
-    }
-    workgroupBarrier();
-    for (var k = 0u; k < 8u; k += 1u) {
-      let source_value = tile_source[local.y * 8u + k];
-      let second_source_value = tile_source[local.y * 8u + k + 64u];
-      let weight_base = k * 64u + local.x;
-      let weight_low = vec4<f32>(tile_weight[weight_base], tile_weight[weight_base + 8u],
-        tile_weight[weight_base + 16u], tile_weight[weight_base + 24u]);
-      let weight_high = vec4<f32>(tile_weight[weight_base + 32u], tile_weight[weight_base + 40u],
-        tile_weight[weight_base + 48u], tile_weight[weight_base + 56u]);
-      value_low += source_value * weight_low;
-      value_high += source_value * weight_high;
-      second_value_low += second_source_value * weight_low;
-      second_value_high += second_source_value * weight_high;
-    }
-    workgroupBarrier();
-  }
-
-  if (row < parameters.rows) {
-    for (var column_block = 0u; column_block < 8u; column_block += 1u) {
-      let output_column = column + column_block * 8u;
-      if (output_column < parameters.columns) {
-        let values = select(value_low, value_high, column_block >= 4u);
-        var value = values[column_block % 4u];
-        value += weights[parameters.bias_offset + output_column];
-        if (parameters.activation == 1u) { value = max(value, 0.0); }
-        output[row * parameters.columns + output_column] = value;
-      }
-    }
-  }
-  if (second_row < parameters.rows) {
-    for (var column_block = 0u; column_block < 8u; column_block += 1u) {
-      let output_column = column + column_block * 8u;
-      if (output_column < parameters.columns) {
-        let values = select(second_value_low, second_value_high, column_block >= 4u);
-        var value = values[column_block % 4u];
-        value += weights[parameters.bias_offset + output_column];
-        if (parameters.activation == 1u) { value = max(value, 0.0); }
-        output[second_row * parameters.columns + output_column] = value;
-      }
-    }
-  }
-}`;
-  const linearResidual = linear.replace(
-    "output[row * parameters.columns + output_column] = value;",
-    "output[row * parameters.columns + output_column] += value;",
-  ).replace(
-    "output[second_row * parameters.columns + output_column] = value;",
-    "output[second_row * parameters.columns + output_column] += value;",
-  );
-  return [normalize, linear, linearResidual];
+  return [normalize, createLinearShader(false), createLinearShader(true)];
 }
 
 export function createTransitionNormalizeParameters(input: TransitionInput, offsets: readonly number[]): Uint8Array {
