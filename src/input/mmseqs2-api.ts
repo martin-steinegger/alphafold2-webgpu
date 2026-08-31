@@ -309,13 +309,9 @@ export function assembleComplexA3m(
     descriptions.push(description); sequences.push(sequence); deletions.push(deletion); masks.push(mask);
   };
 
-  const pairedSequenceSets = uniqueSequences.map(() => new Set<string>());
   const pairedDepth = paired === undefined ? 0 : Math.min(paired[0]!.depth, MULTIMER_PAIRED_MSA_CROP_SIZE);
   if (paired !== undefined) {
     for (let row = 0; row < paired[0]!.depth; row += 1) {
-      for (let entity = 0; entity < uniqueSequences.length; entity += 1) {
-        pairedSequenceSets[entity]!.add(paired[entity]!.sequences[row]!);
-      }
       if (row >= pairedDepth) continue;
       append(`paired_${row}`,
         entityForChain.map((entity) => paired[entity]!.sequences[row]!),
@@ -332,7 +328,6 @@ export function assembleComplexA3m(
     const unpairedLimit = MULTIMER_MSA_CROP_SIZE - pairedRowsForEntity;
     let unpairedRows = 0;
     for (let row = 0; row < alignment.depth; row += 1) {
-      if (paired !== undefined && pairedSequenceSets[entity]!.has(alignment.sequences[row]!)) continue;
       if (unpairedRows >= unpairedLimit) break;
       append(`unpaired_${entity}_${row}`,
         chains.map((chain, chainIndex) => entityForChain[chainIndex] === entity

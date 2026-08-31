@@ -41,7 +41,7 @@ Run the qualification in current stable Chrome on the target Mac as well as thro
 - Peak resident allocator memory.
 - A 59-residue reference run and manual browser runs near 180 and 291 residues.
 
-For the longer browser checks, use the sequences documented in the project issue or release checklist, MMseqs2 MSA mode, 508 clustered rows, 1,024 extra rows, and three recycles. Save the scores JSON and the browser run log. A release must not claim support for a Mac generation that has not completed these checks.
+For the longer browser checks, use the sequences documented in the project issue or release checklist, MMseqs2 MSA mode, 508 clustered rows, 2,048 extra rows for Multimer (1,024 for monomer), and three recycles. Save the scores JSON and the browser run log. A release must not claim support for a Mac generation that has not completed these checks.
 
 The run log must say `compact memory policy`, request bounded WebGPU limits, and report `Transition memory mode: chunked`. If macOS identification is unavailable in an experimental browser, append `?compact=1` to the URL.
 

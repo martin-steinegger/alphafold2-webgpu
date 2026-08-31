@@ -113,6 +113,21 @@ export interface GlobalAttentionWeights {
   readonly heads: number;
 }
 
+export interface GlobalAttentionInput {
+  readonly activations: Float32Array;
+  readonly mask: Float32Array;
+  readonly sequences: number;
+  readonly length: number;
+  readonly channels: number;
+  readonly weights: GlobalAttentionWeights;
+}
+
+export interface GlobalAttentionResult {
+  readonly output: Float32Array;
+  readonly elapsedMilliseconds: number;
+  readonly memory: AllocationSnapshot;
+}
+
 export interface ExtraMsaBlockWeights extends EvoformerPairBlockWeights {
   readonly msaRowAttention: RowAttentionModuleWeights;
   readonly msaColumnGlobalAttention: GlobalAttentionWeights;
@@ -132,6 +147,7 @@ struct Parameters {
   query_weight: u32, key_weight: u32, value_weight: u32, gating_weight: u32,
   gating_bias: u32, output_weight: u32, output_bias: u32,
 };
+const GRID_WIDTH: u32 = 32768u;
 `;
 
 const GLOBAL_ATTENTION_KV_SHADER = `${GLOBAL_ATTENTION_COMMON}
@@ -142,7 +158,7 @@ const GLOBAL_ATTENTION_KV_SHADER = `${GLOBAL_ATTENTION_COMMON}
 @group(0) @binding(4) var<storage, read_write> values: array<f32>;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x;
+  let index = id.x + id.y * GRID_WIDTH * 64u;
   if (index >= p.length * p.sequences * p.head_dim) { return; }
   let d = index % p.head_dim; let row = index / p.head_dim;
   var key = 0.0; var value = 0.0;
@@ -162,7 +178,7 @@ const GLOBAL_ATTENTION_QUERY_SHADER = `${GLOBAL_ATTENTION_COMMON}
 @group(0) @binding(4) var<storage, read_write> query: array<f32>;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x;
+  let index = id.x + id.y * GRID_WIDTH * 64u;
   if (index >= p.length * p.heads * p.head_dim) { return; }
   let d = index % p.head_dim; let head = (index / p.head_dim) % p.heads; let column = index / (p.head_dim * p.heads);
   var denominator = 1e-10; var result = 0.0;
@@ -215,7 +231,6 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }`;
 
 const GLOBAL_ATTENTION_OUTPUT_SHADER = `${GLOBAL_ATTENTION_COMMON}
-const GRID_WIDTH: u32 = 32768u;
 @group(0) @binding(0) var<storage, read> normalized: array<f32>;
 @group(0) @binding(1) var<storage, read> attended: array<f32>;
 @group(0) @binding(2) var<storage, read> weights: array<f32>;
@@ -874,6 +889,64 @@ export class EvoformerBlockGpu {
       return {
         msa: msaOutput,
         pair: pairOutput,
+        elapsedMilliseconds: performance.now() - start,
+        memory: execution.snapshot(),
+      };
+    } finally {
+      execution.release();
+    }
+  }
+}
+
+/** Standalone runner used to differentially qualify the extra-MSA global-attention kernel. */
+export class GlobalAttentionGpu {
+  readonly device: GPUDevice;
+
+  constructor(device: GPUDevice) { this.device = device; }
+
+  async run(input: GlobalAttentionInput): Promise<GlobalAttentionResult> {
+    const { sequences, length, channels, weights } = input;
+    if (![sequences, length, channels].every((value) => Number.isSafeInteger(value) && value > 0)) {
+      throw new RangeError("global-attention dimensions must be positive safe integers");
+    }
+    if (input.activations.length !== sequences * length * channels
+      || input.mask.length !== sequences * length) {
+      throw new RangeError("global-attention activation or mask shape mismatch");
+    }
+    if (!Number.isSafeInteger(weights.heads) || weights.heads <= 0
+      || weights.gatingBias.length % weights.heads !== 0) {
+      throw new RangeError("global-attention head dimensions are invalid");
+    }
+    const headDim = weights.gatingBias.length / weights.heads;
+    const expectedWeights: ReadonlyArray<readonly [string, Float32Array, number]> = [
+      ["query norm scale", weights.queryNormScale, channels],
+      ["query norm offset", weights.queryNormOffset, channels],
+      ["query weight", weights.queryWeight, channels * weights.heads * headDim],
+      ["key weight", weights.keyWeight, channels * headDim],
+      ["value weight", weights.valueWeight, channels * headDim],
+      ["gating weight", weights.gatingWeight, channels * weights.heads * headDim],
+      ["output weight", weights.outputWeight, weights.heads * headDim * channels],
+      ["output bias", weights.outputBias, channels],
+    ];
+    for (const [name, value, expected] of expectedWeights) {
+      if (value.length !== expected) throw new RangeError(`${name} has ${value.length} values; expected ${expected}`);
+    }
+    const execution = new WebGpuExecution(this.device);
+    try {
+      const source = execution.upload("global-attention.source", input.activations);
+      const mask = execution.upload("global-attention.mask", input.mask);
+      const encoder = this.device.createCommandEncoder({ label: "global-attention" });
+      this.device.pushErrorScope("validation");
+      const output = await encodeGlobalAttention(execution, encoder, source, mask, {
+        sequences, length, cM: channels, cZ: 1, cOuter: 1, triangleHidden: 1,
+      }, weights, "global-attention");
+      const readback = execution.createReadback("global-attention.readback", output, encoder);
+      const start = performance.now();
+      this.device.queue.submit([encoder.finish()]);
+      const validationError = await this.device.popErrorScope();
+      if (validationError !== null) throw new Error(`WebGPU validation failed: ${validationError.message}`);
+      return {
+        output: await execution.mapFloat32(readback),
         elapsedMilliseconds: performance.now() - start,
         memory: execution.snapshot(),
       };

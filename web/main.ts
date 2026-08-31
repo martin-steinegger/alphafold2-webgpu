@@ -7,6 +7,7 @@ import {
   makeMultimerA3mFeatures, makeMultimerQueryOnlyFeatures, type MultimerRecycleFeatures,
 } from "../src/input/multimer-features.js";
 import { parseA3m } from "../src/input/a3m.js";
+import { parseColabFoldComplexA3m } from "../src/input/colabfold-complex-a3m.js";
 import { parseSequenceExpression } from "../src/input/sequence-expression.js";
 import {
   generateMmseqs2ComplexMsa, generateMmseqs2Msa, type Mmseqs2ComplexMsaResult,
@@ -53,8 +54,9 @@ const element = <T extends HTMLElement>(id: string): T => {
 
 const parameter = (name: string, fallback: string): string => new URLSearchParams(location.search).get(name) ?? fallback;
 const normalizedSequence = (): string => element<HTMLTextAreaElement>("sequence").value.replace(/\s+/g, "").toUpperCase();
-const inputUsesMultimer = (): boolean => element<HTMLSelectElement>("input-mode").value !== "custom"
-  && normalizedSequence().includes(":");
+let customA3mUsesMultimer = false;
+const inputUsesMultimer = (): boolean => element<HTMLSelectElement>("input-mode").value === "custom"
+  ? customA3mUsesMultimer : normalizedSequence().includes(":");
 const formatSeconds = (milliseconds: number): string => `${(milliseconds / 1000).toFixed(2)} s`;
 const formatMib = (bytes: number): string => `${(bytes / 1024 ** 2).toFixed(0)} MiB`;
 const stageOrder = ["device", "msa", "model", "features", "inference", "results"] as const;
@@ -402,7 +404,17 @@ async function predictionInput(): Promise<PredictionInput> {
   }
   const file = element<HTMLInputElement>("a3m-file").files?.[0];
   if (file === undefined) throw new Error("Choose a custom A3M file first");
-  const a3m = await file.text(); const parsed = parseA3m(a3m);
+  const a3m = await file.text();
+  const complex = parseColabFoldComplexA3m(a3m);
+  if (complex !== undefined) {
+    const sequence = complex.chains.join("");
+    stage("msa", "done", `${complex.depth} uploaded complex rows`);
+    return {
+      a3m: complex.a3m, alignmentMask: complex.mask, sequence, depth: complex.depth,
+      multimer: true, chains: complex.chains,
+    };
+  }
+  const parsed = parseA3m(a3m);
   stage("msa", "done", `${parsed.depth} uploaded rows`);
   return { a3m, sequence: parsed.query, depth: parsed.depth, multimer: false };
 }
@@ -428,14 +440,15 @@ async function runPrediction(): Promise<void> {
 
     stage("msa", "active", "Preparing input");
     stage("model", "active", "Downloading one model"); setPredictionStatus("Preparing alignment and model");
-    const expectedMultimer = inputUsesMultimer();
+    const inputPromise = predictionInput();
+    const expectedMultimer = element<HTMLSelectElement>("input-mode").value === "custom"
+      ? (await inputPromise).multimer : inputUsesMultimer();
     const modelUrlId = expectedMultimer ? "multimer-model-url" : "monomer-model-url";
     const manifestValue = element<HTMLInputElement>(modelUrlId).value.trim();
     if (manifestValue === "") throw new Error("A model manifest URL is required");
     try { localStorage.setItem(`afwebgpu.${expectedMultimer ? "multimer" : "monomer"}ModelUrl`, manifestValue); }
     catch { /* storage may be unavailable */ }
     const modelStart = performance.now();
-    const inputPromise = predictionInput();
     const modelRequest = modelWeights(manifestValue);
     if (modelRequest.cached) stage("model", "active", "Using in-memory model");
     const measuredModel = modelRequest.promise.then((weights) => ({
@@ -447,7 +460,7 @@ async function runPrediction(): Promise<void> {
       confidence, geometry, featureTables, paeBreaks } = weights;
     if (input.multimer !== multimerModel) {
       throw new Error(input.multimer
-        ? "Colon-separated chains require an alphafold2_multimer_v3 model manifest"
+        ? "Complex input requires an alphafold2_multimer_v3 model manifest"
         : "This is a Multimer-v3 manifest, but the current input is a monomer");
     }
     stage("model", "done", `${multimerModel ? "Multimer-v3" : "Model 1 PTM"} · `
@@ -585,9 +598,9 @@ function updateInputMode(): void {
   element<HTMLElement>("predict-label").textContent = multimer && remote ? "Generate complex MSA & predict"
     : multimer ? "Run Multimer-v3"
     : remote ? "Generate MSA & predict" : "Run prediction";
-  element<HTMLInputElement>("max-msa").disabled = multimer && !remote;
+  element<HTMLInputElement>("max-msa").disabled = multimer && inputMode.value === "single";
   const maxExtra = element<HTMLInputElement>("max-extra");
-  maxExtra.disabled = multimer && !remote;
+  maxExtra.disabled = multimer && inputMode.value === "single";
   maxExtra.max = multimer ? "2048" : "1024";
   if (multimer && maxExtra.value === "1024") maxExtra.value = "2048";
   else if (!multimer && maxExtra.valueAsNumber > 1024) maxExtra.value = "1024";
@@ -599,8 +612,16 @@ inputMode.addEventListener("change", updateInputMode);
 element<HTMLTextAreaElement>("sequence").addEventListener("input", () => { generatedMsa = undefined;
   element<HTMLButtonElement>("download-msa").hidden = true; updateInputMode(); });
 element<HTMLInputElement>("a3m-file").addEventListener("change", (event) => {
-  const file = (event.currentTarget as HTMLInputElement).files?.[0];
+  const input = event.currentTarget as HTMLInputElement;
+  const file = input.files?.[0];
   element<HTMLElement>("a3m-file-name").textContent = file?.name ?? "Choose an A3M file";
+  void (async () => {
+    customA3mUsesMultimer = file !== undefined
+      && /^#[1-9][0-9]*(?:,[1-9][0-9]*)*\t[1-9][0-9]*(?:,[1-9][0-9]*)*/.test(
+        (await file.slice(0, 256).text()).replace(/\r/g, "").trimStart(),
+      );
+    if (input.files?.[0] === file) updateInputMode();
+  })();
 });
 try {
   const legacy = localStorage.getItem("afwebgpu.modelUrl");

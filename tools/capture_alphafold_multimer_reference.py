@@ -24,6 +24,8 @@ def main() -> None:
     parser.add_argument("--paired-a3m", type=Path, nargs="+")
     parser.add_argument("--max-msa-sequences", type=int, default=1)
     parser.add_argument("--max-extra-sequences", type=int, default=1)
+    parser.add_argument("--features-only", action="store_true",
+                        help="store only recycle-dependent processed feature tensors")
     args = parser.parse_args()
     chains = [chain.strip().upper() for chain in args.chains.split(":")]
     if len(chains) < 2 or any(not chain for chain in chains):
@@ -271,6 +273,8 @@ def main() -> None:
         parameter_records.setdefault("pair_layer_norm", {})[name] = tensor_name
 
     args.output.mkdir(parents=True, exist_ok=True)
+    if args.features_only:
+        captured = {name: value for name, value in captured.items() if name.startswith("feature_")}
     records: dict[str, dict[str, Any]] = {}
     for name, value in captured.items():
         array = np.asarray(value, dtype="<f4", order="C")

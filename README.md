@@ -23,7 +23,7 @@ Open the hosted application:
 
 | Application | Monomers | Complexes | MMseqs2 MSA | Custom A3M | Templates | Relaxation |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| [AlphaFold2 WebGPU](https://martin-steinegger.github.io/alphafold2-webgpu/) | Yes | Yes | Yes | Monomer | No | No |
+| [AlphaFold2 WebGPU](https://martin-steinegger.github.io/alphafold2-webgpu/) | Yes | Yes | Yes | Yes | No | No |
 
 The browser uses `model_1_ptm` for a single chain and `model_1_multimer_v3` for two or more colon-separated chains. Models 2–5 are intentionally not shipped. Separate manifest settings allow both bundles to remain available without manual switching.
 
@@ -34,7 +34,7 @@ The browser uses `model_1_ptm` for a single chain and `model_1_multimer_v3` for 
 3. Choose an alignment mode:
    - **MMseqs2 MSA** searches for related sequences through the public ColabFold API and normally produces the best predictions.
    - **Single sequence** runs without a remote search and is useful for testing, but confidence can be substantially lower.
-   - **Custom monomer A3M** uses an alignment that you provide for a single chain.
+   - **Custom A3M** uses a monomer alignment or a ColabFold serialized complex A3M that you provide.
    Colon-separated sequences are detected as complexes. MMseqs2 mode generates ColabFold-style paired and unpaired complex MSAs; single-sequence mode creates a query-only complex input.
 4. Choose the number of recycles and press **Fold protein**.
 5. Inspect the MSA coverage, per-recycle confidence, pLDDT, PAE, and interactive 3D structure.
@@ -56,13 +56,13 @@ Single-sequence mode creates an alignment containing only the query. Neither the
 
 ### Custom A3M
 
-Paste or upload A3M text. The first FASTA entry must be the ungapped query sequence. Custom A3M input and model inference stay on the device.
+Upload A3M text. An ordinary A3M uses its first ungapped FASTA entry as a monomer query. A ColabFold serialized complex A3M with a `#lengths<TAB>cardinalities` header is split back into its paired and unpaired per-chain alignments, cropped, and merged through the same Multimer path as a live MMseqs2 result. Custom A3M input and model inference stay on the device.
 
 ### Multimer-v3
 
 Separate chains with colons, for example `ACDE:FGHI`. In MMseqs2 mode the browser requests both paired and unpaired per-entity alignments, then merges paired rows densely and unpaired rows block-diagonally as ColabFold does. Repeated homomer chains share the dense unpaired alignment and do not require a redundant pairing request. In single-sequence mode the complex is query-only and stays local.
 
-Chain-relative, entity, and symmetry features follow the official Multimer-v3 encoding. The structure module uses native Multimer-v3 Q/K/V projections, a position scale of 20, ipTM, and the `0.8 × ipTM + 0.2 × pTM` ranking score.
+Chain-relative, entity, and symmetry features follow the official Multimer-v3 encoding. Multimer MSA sampling, masked-MSA augmentation, nearest-neighbor clustering, and recycling keys reproduce ColabFold/AlphaFold's JAX `process_features` path, including partitionable Threefry keys. The structure module uses native Multimer-v3 Q/K/V projections, a position scale of 20, ipTM, and the `0.8 × ipTM + 0.2 × pTM` ranking score.
 
 ## Results
 
@@ -105,7 +105,7 @@ This is expected for many proteins. For the 59-residue acceptance sequence below
 
 ### Are complexes, templates, or Amber relaxation supported?
 
-No-template AlphaFold-Multimer-v3 model 1 complexes are supported with ColabFold paired/unpaired MMseqs2 MSAs or query-only input. Real template hits, models 2–5, Amber relaxation, and custom complex A3M upload are not supported.
+No-template AlphaFold-Multimer-v3 model 1 complexes are supported with ColabFold paired/unpaired MMseqs2 MSAs, ColabFold serialized complex A3Ms, or query-only input. Real template hits, models 2–5, and Amber relaxation are not supported.
 
 ### Is this the same as ColabFold?
 
@@ -301,7 +301,7 @@ npm run quantize:web-model -- /tmp/afwebgpu-multimer-model1-f32-v2 \
 npm run verify:web-model -- /tmp/model-multimer/manifest.json --require-sha256
 ```
 
-The browser automatically uses `./model-multimer/manifest.json` for colon-separated input. Official differential captures can be regenerated with `tools/capture_alphafold_multimer_reference.py`; pass one `--unpaired-a3m` and `--paired-a3m` file per unique entity to capture a paired/unpaired case. Qualification accepts comma-separated captures through `AFWEBGPU_MULTIMER_REFERENCES`, plus `AFWEBGPU_MULTIMER_F32_MANIFEST` and `AFWEBGPU_MULTIMER_COMPRESSED_MANIFEST`. It compares official JAX to WebGPU float32, then mixed-f16 to WebGPU float32 without changing reference data or tolerances.
+The browser automatically uses `./model-multimer/manifest.json` for colon-separated input and serialized ColabFold complex A3Ms. Official differential captures can be regenerated with `tools/capture_alphafold_multimer_reference.py`; pass one `--unpaired-a3m` and `--paired-a3m` file per unique entity to capture a paired/unpaired case. Qualification accepts comma-separated captures through `AFWEBGPU_MULTIMER_REFERENCES`, plus `AFWEBGPU_MULTIMER_F32_MANIFEST` and `AFWEBGPU_MULTIMER_COMPRESSED_MANIFEST`. It compares official JAX to WebGPU float32, then mixed-f16 to WebGPU float32 without changing reference data or tolerances.
 
 Full-model captures are excluded from source history. The monomer bundle is stored in the `model1-ptm` GitHub Release. The Multimer mixed-f16 bundle is stored separately under tag `model1-multimer-v3-f16-v1` as `afwebgpu-model1-multimer-v3-f16-v1.tar.gz`. The Pages workflow downloads the enabled assets and constructs the deployment artifact.
 
@@ -318,8 +318,8 @@ Create a release tagged `model1-ptm` and attach the archive. For Multimer, archi
 ## Current scope
 
 - Monomer `model_1_ptm` and no-template `model_1_multimer_v3` are supported with fixed model channel sizes. Monomer accepts float32 and qualified mixed block-int8 storage; Multimer accepts float32 and the qualified mixed-f16 bundle. Neural-network arithmetic remains float32 after one-time weight decoding.
-- A3M sampling and clustering are implemented in TypeScript with a deterministic application PRNG. They are distribution-equivalent to AlphaFold preprocessing but do not reproduce TensorFlow's private RNG stream unless exact masked-MSA codes are supplied.
-- ColabFold paired/unpaired Multimer MSA preprocessing is supported. Searched/custom Multimer templates, custom complex A3M upload, models 2–5, sub-eight-bit weight formats, and result relaxation are not supported; ColabFold's learned no-search mock-template path is included.
+- Multimer A3M sampling, masking, and clustering reproduce the JAX/ColabFold `process_features` keys and ordering. The monomer A3M path uses a deterministic application PRNG and remains distribution-equivalent rather than reproducing TensorFlow's private RNG stream.
+- ColabFold paired/unpaired Multimer MSA preprocessing and serialized complex A3M upload are supported. Searched/custom Multimer templates, models 2–5, sub-eight-bit weight formats, and result relaxation are not supported; ColabFold's learned no-search mock-template path is included.
 - Holding pair state on the GPU through confidence and recycle boundaries, plus renewed Apple-GPU profiling after the kernel rewrites, remain opportunities to improve speed and peak memory.
 
 ## Acknowledgments and citation

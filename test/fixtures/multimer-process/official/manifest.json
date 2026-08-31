@@ -1,0 +1,508 @@
+{
+  "formatVersion": 1,
+  "source": "official AlphaFold-Multimer-v3 JAX float32 inference",
+  "model": {
+    "name": "model_1",
+    "type": "alphafold2_multimer_v3",
+    "number": 1
+  },
+  "chains": [
+    "ACDE",
+    "GHIK"
+  ],
+  "uniqueChains": [
+    "ACDE",
+    "GHIK"
+  ],
+  "cardinalities": [
+    1,
+    1
+  ],
+  "recycles": 3,
+  "recycleIteration": 3,
+  "reference": {
+    "meanPlddt": 55.375,
+    "ptm": 0.011199951171875,
+    "iptm": 0.001873016357421875,
+    "rankingConfidence": 55.375,
+    "multimerRankingConfidence": 0.0037384033203125,
+    "recycleMetrics": [
+      {
+        "recycle": 0,
+        "meanPlddt": 52.90625,
+        "ptm": 0.01203155517578125,
+        "iptm": 0.001987457275390625,
+        "rankingConfidence": 0.0039962768554687505
+      },
+      {
+        "recycle": 1,
+        "meanPlddt": 50.90625,
+        "ptm": 0.01123809814453125,
+        "iptm": 0.002208709716796875,
+        "rankingConfidence": 0.00401458740234375
+      },
+      {
+        "recycle": 2,
+        "meanPlddt": 50.78125,
+        "ptm": 0.01126861572265625,
+        "iptm": 0.00215911865234375,
+        "rankingConfidence": 0.0039810180664062505
+      },
+      {
+        "recycle": 3,
+        "meanPlddt": 55.375,
+        "ptm": 0.011199951171875,
+        "iptm": 0.001873016357421875,
+        "rankingConfidence": 0.0037384033203125
+      }
+    ]
+  },
+  "msaInput": {
+    "maxMsaSequences": 3,
+    "maxExtraSequences": 4,
+    "unpairedSha256": [
+      "3c5f267b0bb7288d6a15f2ae945494ae0b716a253392df7c895eab4d37039874",
+      "770d8ea41411b8994911b6602f1fb05750b17115fe683db1d72ceffc6b47db6b"
+    ],
+    "pairedSha256": [
+      "6fbb10cc794c7031460ac6b79f3ec161079ff1e9ff1dfc25017a5a132a16c739",
+      "31c8a73053a5506be100ff7fdf6137ef35f3204ef533e21429d16caa5a3d6db0"
+    ]
+  },
+  "ipaParameters": {
+    "": {
+      "trainable_point_weights": "ipaParameter_000_trainable_point_weights"
+    },
+    "attention_2d": {
+      "bias": "ipaParameter_001_bias",
+      "weights": "ipaParameter_002_weights"
+    },
+    "k_point_projection/point_projection": {
+      "bias": "ipaParameter_003_bias",
+      "weights": "ipaParameter_004_weights"
+    },
+    "k_scalar_projection": {
+      "weights": "ipaParameter_005_weights"
+    },
+    "output_projection": {
+      "bias": "ipaParameter_006_bias",
+      "weights": "ipaParameter_007_weights"
+    },
+    "q_point_projection/point_projection": {
+      "bias": "ipaParameter_008_bias",
+      "weights": "ipaParameter_009_weights"
+    },
+    "q_scalar_projection": {
+      "weights": "ipaParameter_010_weights"
+    },
+    "v_point_projection/point_projection": {
+      "bias": "ipaParameter_011_bias",
+      "weights": "ipaParameter_012_weights"
+    },
+    "v_scalar_projection": {
+      "weights": "ipaParameter_013_weights"
+    },
+    "pair_layer_norm": {
+      "scale": "pairNorm_scale",
+      "offset": "pairNorm_offset"
+    }
+  },
+  "tensors": {
+    "feature_msa_feat_recycle0": {
+      "file": "feature_msa_feat_recycle0.f32.bin",
+      "shape": [
+        3,
+        8,
+        49
+      ],
+      "dtype": "float32"
+    },
+    "feature_msa_mask_recycle0": {
+      "file": "feature_msa_mask_recycle0.f32.bin",
+      "shape": [
+        3,
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_msa_mask_recycle0": {
+      "file": "feature_extra_msa_mask_recycle0.f32.bin",
+      "shape": [
+        4,
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_msa_feat_recycle1": {
+      "file": "feature_msa_feat_recycle1.f32.bin",
+      "shape": [
+        3,
+        8,
+        49
+      ],
+      "dtype": "float32"
+    },
+    "feature_msa_mask_recycle1": {
+      "file": "feature_msa_mask_recycle1.f32.bin",
+      "shape": [
+        3,
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_msa_mask_recycle1": {
+      "file": "feature_extra_msa_mask_recycle1.f32.bin",
+      "shape": [
+        4,
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_msa_feat_recycle2": {
+      "file": "feature_msa_feat_recycle2.f32.bin",
+      "shape": [
+        3,
+        8,
+        49
+      ],
+      "dtype": "float32"
+    },
+    "feature_msa_mask_recycle2": {
+      "file": "feature_msa_mask_recycle2.f32.bin",
+      "shape": [
+        3,
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_msa_mask_recycle2": {
+      "file": "feature_extra_msa_mask_recycle2.f32.bin",
+      "shape": [
+        4,
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_msa_feat_recycle3": {
+      "file": "feature_msa_feat_recycle3.f32.bin",
+      "shape": [
+        3,
+        8,
+        49
+      ],
+      "dtype": "float32"
+    },
+    "feature_msa_mask_recycle3": {
+      "file": "feature_msa_mask_recycle3.f32.bin",
+      "shape": [
+        3,
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_msa_mask_recycle3": {
+      "file": "feature_extra_msa_mask_recycle3.f32.bin",
+      "shape": [
+        4,
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_aatype_recycle0": {
+      "file": "feature_aatype_recycle0.f32.bin",
+      "shape": [
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_aatype_recycle1": {
+      "file": "feature_aatype_recycle1.f32.bin",
+      "shape": [
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_aatype_recycle2": {
+      "file": "feature_aatype_recycle2.f32.bin",
+      "shape": [
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_aatype_recycle3": {
+      "file": "feature_aatype_recycle3.f32.bin",
+      "shape": [
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_seq_mask_recycle0": {
+      "file": "feature_seq_mask_recycle0.f32.bin",
+      "shape": [
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_seq_mask_recycle1": {
+      "file": "feature_seq_mask_recycle1.f32.bin",
+      "shape": [
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_seq_mask_recycle2": {
+      "file": "feature_seq_mask_recycle2.f32.bin",
+      "shape": [
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_seq_mask_recycle3": {
+      "file": "feature_seq_mask_recycle3.f32.bin",
+      "shape": [
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_residue_index_recycle0": {
+      "file": "feature_residue_index_recycle0.f32.bin",
+      "shape": [
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_residue_index_recycle1": {
+      "file": "feature_residue_index_recycle1.f32.bin",
+      "shape": [
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_residue_index_recycle2": {
+      "file": "feature_residue_index_recycle2.f32.bin",
+      "shape": [
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_residue_index_recycle3": {
+      "file": "feature_residue_index_recycle3.f32.bin",
+      "shape": [
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_asym_id_recycle0": {
+      "file": "feature_asym_id_recycle0.f32.bin",
+      "shape": [
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_asym_id_recycle1": {
+      "file": "feature_asym_id_recycle1.f32.bin",
+      "shape": [
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_asym_id_recycle2": {
+      "file": "feature_asym_id_recycle2.f32.bin",
+      "shape": [
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_asym_id_recycle3": {
+      "file": "feature_asym_id_recycle3.f32.bin",
+      "shape": [
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_entity_id_recycle0": {
+      "file": "feature_entity_id_recycle0.f32.bin",
+      "shape": [
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_entity_id_recycle1": {
+      "file": "feature_entity_id_recycle1.f32.bin",
+      "shape": [
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_entity_id_recycle2": {
+      "file": "feature_entity_id_recycle2.f32.bin",
+      "shape": [
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_entity_id_recycle3": {
+      "file": "feature_entity_id_recycle3.f32.bin",
+      "shape": [
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_sym_id_recycle0": {
+      "file": "feature_sym_id_recycle0.f32.bin",
+      "shape": [
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_sym_id_recycle1": {
+      "file": "feature_sym_id_recycle1.f32.bin",
+      "shape": [
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_sym_id_recycle2": {
+      "file": "feature_sym_id_recycle2.f32.bin",
+      "shape": [
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_sym_id_recycle3": {
+      "file": "feature_sym_id_recycle3.f32.bin",
+      "shape": [
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_target_feat_recycle0": {
+      "file": "feature_target_feat_recycle0.f32.bin",
+      "shape": [
+        8,
+        21
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_msa_recycle0": {
+      "file": "feature_extra_msa_recycle0.f32.bin",
+      "shape": [
+        4,
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_has_deletion_recycle0": {
+      "file": "feature_extra_has_deletion_recycle0.f32.bin",
+      "shape": [
+        4,
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_deletion_value_recycle0": {
+      "file": "feature_extra_deletion_value_recycle0.f32.bin",
+      "shape": [
+        4,
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_target_feat_recycle1": {
+      "file": "feature_target_feat_recycle1.f32.bin",
+      "shape": [
+        8,
+        21
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_msa_recycle1": {
+      "file": "feature_extra_msa_recycle1.f32.bin",
+      "shape": [
+        4,
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_has_deletion_recycle1": {
+      "file": "feature_extra_has_deletion_recycle1.f32.bin",
+      "shape": [
+        4,
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_deletion_value_recycle1": {
+      "file": "feature_extra_deletion_value_recycle1.f32.bin",
+      "shape": [
+        4,
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_target_feat_recycle2": {
+      "file": "feature_target_feat_recycle2.f32.bin",
+      "shape": [
+        8,
+        21
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_msa_recycle2": {
+      "file": "feature_extra_msa_recycle2.f32.bin",
+      "shape": [
+        4,
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_has_deletion_recycle2": {
+      "file": "feature_extra_has_deletion_recycle2.f32.bin",
+      "shape": [
+        4,
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_deletion_value_recycle2": {
+      "file": "feature_extra_deletion_value_recycle2.f32.bin",
+      "shape": [
+        4,
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_target_feat_recycle3": {
+      "file": "feature_target_feat_recycle3.f32.bin",
+      "shape": [
+        8,
+        21
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_msa_recycle3": {
+      "file": "feature_extra_msa_recycle3.f32.bin",
+      "shape": [
+        4,
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_has_deletion_recycle3": {
+      "file": "feature_extra_has_deletion_recycle3.f32.bin",
+      "shape": [
+        4,
+        8
+      ],
+      "dtype": "float32"
+    },
+    "feature_extra_deletion_value_recycle3": {
+      "file": "feature_extra_deletion_value_recycle3.f32.bin",
+      "shape": [
+        4,
+        8
+      ],
+      "dtype": "float32"
+    }
+  }
+}

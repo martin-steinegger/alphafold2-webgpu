@@ -88,6 +88,8 @@ export type {
 } from "./heads/confidence.js";
 export { parseA3m } from "./input/a3m.js";
 export type { A3mAlignment } from "./input/a3m.js";
+export { parseColabFoldComplexA3m } from "./input/colabfold-complex-a3m.js";
+export type { ColabFoldComplexA3m } from "./input/colabfold-complex-a3m.js";
 export { makeQueryOnlyFeatures } from "./input/query-only-features.js";
 export type { QueryOnlyFeatureOptions, QueryOnlyFeatureTables } from "./input/query-only-features.js";
 export { makeA3mFeatures } from "./input/a3m-features.js";

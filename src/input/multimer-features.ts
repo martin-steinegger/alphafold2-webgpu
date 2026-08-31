@@ -243,6 +243,7 @@ export function makeMultimerA3mFeatures(
   }
   return makeA3mFeatures(a3mText, tables, {
     maxExtraSequences: 2048,
+    colabFoldMultimerProcess: true,
     ...options,
     alignmentMask,
   }).map((features) => ({

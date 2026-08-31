@@ -64,12 +64,14 @@ describe("MMseqs2 API", () => {
       [">101\nAC\n>uA\nA-\n", ">102\nGG\n>uB\nG-\n"],
       [">101\nAC\n>p\n-C\n", ">102\nGG\n>p\n-G\n"],
     );
-    expect(parseA3m(assembled.a3m).sequences).toEqual(["ACGG", "-C-G", "A---", "--G-"]);
-    expect(assembled.depth).toBe(4);
+    expect(parseA3m(assembled.a3m).sequences).toEqual(["ACGG", "-C-G", "AC--", "A---", "--GG", "--G-"]);
+    expect(assembled.depth).toBe(6);
     expect([...assembled.mask]).toEqual([
       1, 1, 1, 1,
       1, 1, 1, 1,
       1, 1, 0, 0,
+      1, 1, 0, 0,
+      0, 0, 1, 1,
       0, 0, 1, 1,
     ]);
   });
@@ -100,9 +102,9 @@ describe("MMseqs2 API", () => {
     const parsed = parseA3m(assembled.a3m);
     expect(assembled.depth).toBe(1 + 2047 + 2047);
     expect(parsed.descriptions[0]).toBe("paired_0");
-    expect(parsed.descriptions[2047]).toBe("unpaired_0_2047");
-    expect(parsed.descriptions[2048]).toBe("unpaired_1_1");
-    expect(parsed.descriptions.at(-1)).toBe("unpaired_1_2047");
+    expect(parsed.descriptions[2047]).toBe("unpaired_0_2046");
+    expect(parsed.descriptions[2048]).toBe("unpaired_1_0");
+    expect(parsed.descriptions.at(-1)).toBe("unpaired_1_2046");
   });
 
   it("runs ColabFold unpaired and greedy-paired searches for heteromers", async () => {
@@ -131,7 +133,7 @@ describe("MMseqs2 API", () => {
     });
     expect(result.unpairedTicket).toBe("msa");
     expect(result.pairedTicket).toBe("pair");
-    expect(result.depth).toBe(4);
+    expect(result.depth).toBe(6);
     expect(submissions.map((entry) => entry.endpoint).sort()).toEqual(["msa", "pair"]);
     expect(submissions.find((entry) => entry.endpoint === "msa")!.body).toContain("mode=all");
     expect(submissions.find((entry) => entry.endpoint === "pair")!.body).toContain("mode=pairgreedy");
