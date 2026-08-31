@@ -2,17 +2,30 @@
 
 The browser models are release assets rather than Git objects. GitHub Pages downloads the monomer bundle when `AFWEBGPU_INCLUDE_MODEL=true` and the Multimer bundle when `AFWEBGPU_INCLUDE_MULTIMER_MODEL=true`.
 
-## Monomer model 1 PTM
+## Monomer model 1 PTM q8
 
-Build and validate the current bundle:
+Export the official float32 tensors with the weights license, verify them, and produce the qualified mixed-q8
+browser bundle:
 
 ```bash
-npm run build:web:standalone
-npm run verify:web-model -- dist/web/model/manifest.json
-tar -czf afwebgpu-model1-ptm.tar.gz -C dist/web model
+npm run export:web-model -- \
+  test/fixtures/evoformer/model1-query-59-stack/manifest.json \
+  /tmp/afwebgpu-monomer-model1-f32-v2 \
+  --weights-license="$HOME/.cache/colabfold/params/LICENSE"
+npm run verify:web-model -- \
+  /tmp/afwebgpu-monomer-model1-f32-v2/manifest.json --require-sha256 --require-license
+npm run quantize:web-model -- \
+  /tmp/afwebgpu-monomer-model1-f32-v2 /tmp/model --format=int8
+npm run verify:web-model -- \
+  /tmp/model/manifest.json --require-sha256 --require-license
+tar -C /tmp -czf afwebgpu-model1-ptm-f32-v2.tar.gz afwebgpu-monomer-model1-f32-v2
+tar -C /tmp -czf afwebgpu-model1-ptm-q8-v1.tar.gz model
 ```
 
-Upload the archive to the `model1-ptm` release. It must contain `model/manifest.json` and its sibling shards. The workflow retains a compatibility migration for the legacy monomer bundle, then validates it before deployment.
+Qualify q8 against float32 for both the fixed four-recycle query-only case and the deep-MSA case without changing
+the fixed thresholds. Upload the final q8 archive to release `model1-ptm-q8-v1`; it must contain
+`model/manifest.json`, `model/WEIGHTS_LICENSE.txt`, and its sibling shards. Keep the old `model1-ptm` float32
+release unchanged as a rollback asset.
 
 ## AlphaFold-Multimer-v3 model 1
 
@@ -47,7 +60,12 @@ npx vitest run test/multimer-model-official.gpu.test.ts
 
 This first compares WebGPU float32 with official JAX outputs, then mixed-f16 with WebGPU float32. It covers pLDDT, pTM, ipTM, ranking confidence, PAE, and atom coordinates with fixed thresholds. The release workflow runs these comparisons in Chrome, plus the 118-residue homodimer smoke test, on macOS Apple Silicon before the Pages bundle is enabled.
 
-For repeatable Apple Silicon qualification, create a draft release tagged `model1-multimer-v3-qualification-v1` containing `afwebgpu-model1-multimer-v3-f32-v2.tar.gz`, `afwebgpu-model1-multimer-v3-f16-v1.tar.gz`, and `afwebgpu-multimer-references-v2.tar.gz`. Dispatch **Qualify Multimer on Apple Silicon**; the manual workflow runs Chrome against both query-only and paired references and the homodimer smoke case on GitHub's `macos-15` Apple Silicon runner without deploying Pages. Promote the f16 asset only after that workflow succeeds.
+For repeatable Apple Silicon qualification, create a draft release tagged `model1-multimer-v3-qualification-v1`
+containing both monomer archives, both Multimer archives, `afwebgpu-multimer-references-v2.tar.gz`, and
+`afwebgpu-browser-acceptance-v1.tar.gz`. Dispatch **Qualify models on Apple Silicon**, or follow
+[the notebook-agent procedure](APPLE_NOTEBOOK_RELEASE_CHECK.md). The gate runs stable Chrome against monomer
+q8/float32 query-only and deep-MSA cases, Multimer official query-only and paired references, the homodimer and
+homotrimer, and the supplied complex A3M. Promote the compressed assets only after every check succeeds.
 
 Upload the archive to release tag `model1-multimer-v3-f16-v1` as `afwebgpu-model1-multimer-v3-f16-v1.tar.gz`. Its top-level directory must be `model-multimer/` so the default browser URL resolves to `./model-multimer/manifest.json`.
 

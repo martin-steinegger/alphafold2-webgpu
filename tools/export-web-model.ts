@@ -1,15 +1,20 @@
-import { mkdir, open, readFile, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, open, readFile, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { dirname, relative, resolve } from "node:path";
 
 interface TensorRecord { readonly file: string; readonly dtype: string; readonly shape: readonly number[];
   readonly [metadata: string]: unknown; }
 interface SourceManifest { readonly tensors: Readonly<Record<string, TensorRecord>>; readonly [key: string]: unknown; }
 
-const [, , sourceValue = "test/fixtures/evoformer/model1-query-59-stack/manifest.json", outputValue = "dist/web/model"] = process.argv;
+const positional = process.argv.slice(2).filter((value) => !value.startsWith("--"));
+const sourceValue = positional[0] ?? "test/fixtures/evoformer/model1-query-59-stack/manifest.json";
+const outputValue = positional[1] ?? "dist/web/model";
+const weightsLicenseValue = process.argv.find((value) => value.startsWith("--weights-license="))?.slice(18);
 const sourceManifestPath = resolve(sourceValue);
 const sourceDirectory = dirname(sourceManifestPath);
 const outputDirectory = resolve(outputValue);
 if (outputDirectory === sourceDirectory || outputDirectory === resolve("/")) throw new Error("unsafe output directory");
+await mkdir(outputDirectory, { recursive: true });
 
 const manifest = JSON.parse(await readFile(sourceManifestPath, "utf8")) as SourceManifest;
 const section = <T>(name: string): T => {
@@ -35,6 +40,19 @@ const reduced: Record<string, unknown> = {
   residueGeometry: section("residueGeometry"),
   confidenceHeads: { parameters: confidence.parameters },
 };
+if (weightsLicenseValue !== undefined) {
+  const weightsLicensePath = resolve(weightsLicenseValue);
+  if ((await readFile(weightsLicensePath)).byteLength === 0) throw new Error("weights license is empty");
+  await copyFile(weightsLicensePath, resolve(outputDirectory, "WEIGHTS_LICENSE.txt"));
+  reduced.weightsLicense = {
+    spdx: "CC-BY-4.0",
+    file: "WEIGHTS_LICENSE.txt",
+    source: "AlphaFold model parameters",
+    url: "https://github.com/google-deepmind/alphafold",
+    modified: true,
+    modifications: ["repacked into versioned browser shards"],
+  };
+}
 
 const names = new Set([
   "geometryDefaultFrames", "geometryAtom14ToGroup", "geometryAtom14Positions", "geometryAtom14Mask",
@@ -50,7 +68,6 @@ collect(reduced);
 const SHARDS = 8;
 interface TensorEntry { readonly name: string; readonly record: TensorRecord; readonly source: string; readonly bytes: number; }
 const entries: TensorEntry[] = [];
-await mkdir(outputDirectory, { recursive: true });
 for (const name of [...names].sort()) {
   const record = manifest.tensors[name];
   if (record === undefined) throw new Error(`required tensor ${name} is missing`);
@@ -65,9 +82,9 @@ for (const entry of entries.sort((left, right) => right.bytes - left.bytes || le
   shard.entries.push(entry); shard.bytes += entry.bytes;
 }
 const tensors: Record<string, TensorRecord> = {};
-const files: { file: string; bytes: number }[] = [];
+const files: { file: string; bytes: number; sha256: string }[] = [];
 for (const shard of shards) {
-  const file = `weights-${String(shard.index).padStart(2, "0")}.v1.f32.bin`;
+  const file = `weights-${String(shard.index).padStart(2, "0")}.v2.f32.bin`;
   const handle = await open(resolve(outputDirectory, file), "w");
   let byteOffset = 0;
   try {
@@ -79,13 +96,14 @@ for (const shard of shards) {
       byteOffset += data.byteLength;
     }
   } finally { await handle.close(); }
-  files.push({ file, bytes: byteOffset });
+  const sha256 = createHash("sha256").update(await readFile(resolve(outputDirectory, file))).digest("hex");
+  files.push({ file, bytes: byteOffset, sha256 });
 }
 const bytes = entries.reduce((sum, entry) => sum + entry.bytes, 0);
 reduced.tensors = tensors;
 const bundle = reduced.bundle as Record<string, unknown>;
 bundle.version = 1;
-bundle.id = "model_1_ptm-f32-v1";
+bundle.id = "model_1_ptm-f32-v2";
 bundle.tensors = names.size;
 bundle.bytes = bytes;
 bundle.shards = SHARDS;

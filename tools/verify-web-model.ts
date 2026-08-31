@@ -5,11 +5,26 @@ import type { BinaryTensorManifest, BinaryTensorShard } from "../src/reference/t
 import { tensorByteLength } from "../src/reference/dtype.js";
 
 const requireSha256 = process.argv.includes("--require-sha256");
+const requireLicense = process.argv.includes("--require-license");
 const manifestArgument = process.argv.slice(2).find((value) => !value.startsWith("--"));
 const manifestPath = resolve(manifestArgument ?? "dist/web/model/manifest.json");
 const directory = dirname(manifestPath);
 const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as BinaryTensorManifest;
 if (manifest.tensors === undefined) throw new Error("model bundle has no tensor table");
+if (requireLicense) {
+  const license = (manifest as { readonly weightsLicense?: {
+    readonly spdx?: unknown; readonly file?: unknown; readonly modified?: unknown;
+    readonly modifications?: unknown;
+  } }).weightsLicense;
+  if (license?.spdx !== "CC-BY-4.0" || typeof license.file !== "string" || license.file === ""
+    || license.modified !== true || !Array.isArray(license.modifications) || license.modifications.length === 0) {
+    throw new Error("model bundle has incomplete CC BY 4.0 weights-license metadata");
+  }
+  const licensePath = resolve(directory, license.file);
+  if (relative(directory, licensePath).startsWith("..")) throw new Error("weights license escapes the model directory");
+  const licenseText = await readFile(licensePath, "utf8");
+  if (licenseText.trim() === "") throw new Error("model bundle has an empty weights-license file");
+}
 const requiredBytes = new Map<string, number>();
 for (const [name, tensor] of Object.entries(manifest.tensors)) {
   const end = (tensor.byteOffset ?? 0) + tensorByteLength(tensor);

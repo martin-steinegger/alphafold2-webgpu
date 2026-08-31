@@ -40,7 +40,12 @@ The browser uses `model_1_ptm` for a single chain and `model_1_multimer_v3` for 
 5. Inspect the MSA coverage, per-recycle confidence, pLDDT, PAE, and interactive 3D structure.
 6. Download the predicted PDB, scores JSON, and generated A3M.
 
-The first prediction downloads the selected model bundle and compiles WebGPU pipelines. The qualified Multimer mixed-f16 bundle is approximately 182 MiB; its reference float32 bundle is 356 MiB. Versioned model shards are byte-length validated and retained in the browser's persistent cache when storage policy permits. Later predictions can be much faster; **Clear downloaded model** under Advanced settings removes both persistent and in-memory copies.
+The first prediction downloads the selected model bundle and compiles WebGPU pipelines. The qualified monomer
+mixed-q8 bundle is approximately 97 MiB, and the Multimer mixed-f16 bundle is approximately 182 MiB. Their
+float32 qualification bundles are approximately 355 and 356 MiB respectively. Versioned model shards are
+byte-length and SHA-256 validated and retained in the browser's persistent cache when storage policy permits.
+Later predictions can be much faster; **Clear downloaded model** under Advanced settings removes both persistent
+and in-memory copies.
 
 ## Input modes and privacy
 
@@ -93,7 +98,7 @@ The browser must download model parameters and compile many GPU pipelines. Model
 
 ### How are the model weights stored?
 
-The loader accepts float32, float16, and mixed q8 bundles; neural-network arithmetic remains float32 after one-time decoding. Multimer model 1 is 355.5 MiB in float32 and 181.6 MiB in the qualified mixed-f16 form (structure tensors remain float32). Pure int8 failed the fixed paired-MSA pLDDT envelope and is not a release format. Every published shard has a declared SHA-256 digest, and the loader verifies it before use or persistent caching. The official parameters remain under DeepMind's CC BY 4.0 weights license, which is copied into each exported bundle.
+The loader accepts float32, float16, and mixed q8 bundles; neural-network arithmetic remains float32 after one-time decoding. Monomer model 1 is 355.3 MiB in float32 and 97.3 MiB in the qualified mixed-q8 form. Multimer model 1 is 355.5 MiB in float32 and 181.6 MiB in the qualified mixed-f16 form; its structure tensors remain float32. Multimer q8 failed the fixed paired-MSA pLDDT envelope and is not a release format. Every published shard has a declared SHA-256 digest, and the loader verifies it before use or persistent caching. The official parameters remain under DeepMind's CC BY 4.0 weights license, which is copied into each exported bundle.
 
 ### What is the maximum sequence length?
 
@@ -280,9 +285,11 @@ npm run build:web:standalone
 The monomer exporter can produce and qualify its mixed-q8 bundle:
 
 ```bash
-npm run export:web-model -- test/fixtures/evoformer/model1-query-59-stack/manifest.json /tmp/afwebgpu-model-f32
+npm run export:web-model -- test/fixtures/evoformer/model1-query-59-stack/manifest.json \
+  /tmp/afwebgpu-model-f32 --weights-license="$HOME/.cache/colabfold/params/LICENSE"
+npm run verify:web-model -- /tmp/afwebgpu-model-f32/manifest.json --require-sha256 --require-license
 npm run quantize:web-model -- /tmp/afwebgpu-model-f32 dist/web/model --format=int8
-npm run verify:web-model -- dist/web/model/manifest.json
+npm run verify:web-model -- dist/web/model/manifest.json --require-sha256 --require-license
 AFWEBGPU_GPU_TESTS=1 AFWEBGPU_QUANTIZED_MANIFEST=dist/web/model/manifest.json \
   npx vitest run test/quantized-model.gpu.test.ts
 ```
@@ -303,17 +310,24 @@ npm run verify:web-model -- /tmp/model-multimer/manifest.json --require-sha256
 
 The browser automatically uses `./model-multimer/manifest.json` for colon-separated input and serialized ColabFold complex A3Ms. Official differential captures can be regenerated with `tools/capture_alphafold_multimer_reference.py`; pass one `--unpaired-a3m` and `--paired-a3m` file per unique entity to capture a paired/unpaired case. Qualification accepts comma-separated captures through `AFWEBGPU_MULTIMER_REFERENCES`, plus `AFWEBGPU_MULTIMER_F32_MANIFEST` and `AFWEBGPU_MULTIMER_COMPRESSED_MANIFEST`. It compares official JAX to WebGPU float32, then mixed-f16 to WebGPU float32 without changing reference data or tolerances.
 
-Full-model captures are excluded from source history. The monomer bundle is stored in the `model1-ptm` GitHub Release. The Multimer mixed-f16 bundle is stored separately under tag `model1-multimer-v3-f16-v1` as `afwebgpu-model1-multimer-v3-f16-v1.tar.gz`. The Pages workflow downloads the enabled assets and constructs the deployment artifact.
+Full-model captures are excluded from source history. The qualified monomer q8 bundle is stored under release tag
+`model1-ptm-q8-v1`, while the previous `model1-ptm` float32 release is retained for rollback. The Multimer
+mixed-f16 bundle is stored separately under tag `model1-multimer-v3-f16-v1`. The Pages workflow downloads the
+enabled immutable assets and constructs the deployment artifact.
 
 To prepare the release asset from a checkout containing the full fixture:
 
 ```bash
-npm run build:web:standalone
+npm run build:web
 mkdir -p artifacts
-tar -C dist/web -czf artifacts/afwebgpu-model1-ptm.tar.gz model
+tar -C /tmp -czf artifacts/afwebgpu-model1-ptm-q8-v1.tar.gz model
 ```
 
-Create a release tagged `model1-ptm` and attach the archive. For Multimer, archive the f16 directory as top-level `model-multimer/`, attach it to tag `model1-multimer-v3-f16-v1`, and set `AFWEBGPU_INCLUDE_MULTIMER_MODEL=true`. `AFWEBGPU_INCLUDE_MODEL=true` independently enables the monomer bundle. The workflow verifies manifests, shard hashes, byte ranges, and a conservative 900 MiB site-size ceiling before upload.
+Create a release tagged `model1-ptm-q8-v1` and attach the q8 archive. For Multimer, archive the f16 directory as
+top-level `model-multimer/`, attach it to tag `model1-multimer-v3-f16-v1`, and set
+`AFWEBGPU_INCLUDE_MULTIMER_MODEL=true`. `AFWEBGPU_INCLUDE_MODEL=true` independently enables the q8 monomer
+bundle. The workflow verifies manifests, licenses, shard hashes, byte ranges, and a conservative 900 MiB
+site-size ceiling before upload.
 
 ## Current scope
 

@@ -29,20 +29,16 @@ jobs:
       - name: Install browser test runtime
         run: npx playwright install --with-deps chromium
       - run: npm run test:browser
-      - name: Add the single model-1 PTM release bundle
+      - name: Add the qualified q8 model-1 PTM release bundle
         if: ${{ vars.AFWEBGPU_INCLUDE_MODEL == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download model1-ptm --pattern afwebgpu-model1-ptm.tar.gz
-          tar -xzf afwebgpu-model1-ptm.tar.gz -C dist/web
-      - name: Upgrade legacy model bundle once
-        id: upgrade-model
-        if: ${{ vars.AFWEBGPU_INCLUDE_MODEL == 'true' }}
-        run: npm run upgrade:web-model
+          gh release download model1-ptm-q8-v1 --pattern afwebgpu-model1-ptm-q8-v1.tar.gz
+          tar -xzf afwebgpu-model1-ptm-q8-v1.tar.gz -C dist/web
       - name: Validate model bundle
         if: ${{ vars.AFWEBGPU_INCLUDE_MODEL == 'true' }}
-        run: npm run verify:web-model
+        run: npm run verify:web-model -- dist/web/model/manifest.json --require-sha256 --require-license
       - name: Add AlphaFold-Multimer-v3 model 1 f16 bundle
         if: ${{ vars.AFWEBGPU_INCLUDE_MULTIMER_MODEL == 'true' }}
         env:
@@ -52,14 +48,7 @@ jobs:
           tar -xzf afwebgpu-model1-multimer-v3-f16-v1.tar.gz -C dist/web
       - name: Validate Multimer model bundle
         if: ${{ vars.AFWEBGPU_INCLUDE_MULTIMER_MODEL == 'true' }}
-        run: npm run verify:web-model -- dist/web/model-multimer/manifest.json --require-sha256
-      - name: Replace legacy model release asset
-        if: ${{ steps.upgrade-model.outputs.upgraded == 'true' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          tar -czf afwebgpu-model1-ptm.tar.gz -C dist/web model
-          gh release upload model1-ptm afwebgpu-model1-ptm.tar.gz --clobber
+        run: npm run verify:web-model -- dist/web/model-multimer/manifest.json --require-sha256 --require-license
       - uses: actions/configure-pages@v5
       - name: Validate Pages artifact size
         run: npm run verify:pages-size
