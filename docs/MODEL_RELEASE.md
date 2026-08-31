@@ -56,3 +56,5 @@ Upload the archive to release tag `model1-multimer-v3-q8-v1` as `afwebgpu-model1
 Shard filenames include the bundle version and are persistently cached by exact URL. Increment the bundle version and filename suffix whenever model bytes or packing rules change. Never replace a released shard with different bytes under the same versioned filename.
 
 The Pages workflow validates each enabled manifest and calls `npm run verify:pages-size` before upload. The verifier rejects a site over 900 MiB, leaving margin below GitHub's 1 GiB Pages limit. Keep monomer and Multimer release variables independent so a Pages deployment without the new Multimer release continues to work.
+
+Push-triggered deployment is additionally gated by `AFWEBGPU_AUTO_DEPLOY=true`. A manual Pages dispatch always runs. Keep automatic deployment disabled while qualifying a new model so pushing its workflow cannot alter the current live site; enable it only after qualification and smoke testing.
