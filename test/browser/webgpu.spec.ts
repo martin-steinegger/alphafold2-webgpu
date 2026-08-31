@@ -1,5 +1,9 @@
 import { expect, test } from "@playwright/test";
 
+const HOMODIMER = [
+  "PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK",
+  "PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK",
+].join(":");
 
 test("shows monomer and multimer input modes and switches to custom A3M", async ({ page }) => {
   await page.goto("/");
@@ -16,6 +20,8 @@ test("shows monomer and multimer input modes and switches to custom A3M", async 
   await expect(page.locator("#predict-label")).toHaveText("Run Multimer-v3");
   await expect(page.locator("#recycles")).toHaveValue("20");
   await expect(page.locator("#max-msa")).toBeDisabled();
+  await page.locator("#sequence").fill(HOMODIMER);
+  await expect(page.locator("#sequence-length")).toHaveText("118 residues · 2 chains");
   await page.locator("#input-mode").selectOption("custom");
   await expect(page.locator("#a3m-field")).toBeVisible();
   await expect(page.locator("#sequence-field")).toBeHidden();
