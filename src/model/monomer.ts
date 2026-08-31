@@ -11,6 +11,7 @@ import { makeA3mFeatures, type A3mFeatureOptions } from "../input/a3m-features.j
 import type { QueryOnlyFeatureTables } from "../input/query-only-features.js";
 import { TRANSITION_CHUNK_TARGET_BYTES } from "../evoformer/transition.js";
 import { COMPACT_GPU_POOL_BYTES, type AllocationSnapshot } from "../runtime/allocator.js";
+import { multimerRecycleDistanceRms } from "./multimer-recycling.js";
 
 export interface MonomerRecycleFeatures {
   readonly targetFeatures: Float32Array; readonly msaFeatures: Float32Array; readonly msaMask: Float32Array;
@@ -19,6 +20,9 @@ export interface MonomerRecycleFeatures {
   readonly seqMask: Float32Array; readonly atom37ToAtom14: Float32Array; readonly atom37Mask: Float32Array;
   readonly msaSequences: number; readonly extraSequences: number;
   readonly targetChannels: number; readonly msaFeatureChannels: number;
+  readonly chainRelative?: {
+    readonly asymId: Float32Array; readonly entityId: Float32Array; readonly symId: Float32Array;
+  };
 }
 
 export interface MonomerModelWeights {
@@ -27,6 +31,11 @@ export interface MonomerModelWeights {
   readonly structure: StructureModuleWeights; readonly lddt: PredictedLddtWeights;
   readonly pae: PredictedAlignedErrorWeights; readonly geometry: ResidueGeometryTables;
 }
+
+export type MultimerCompatibleModelWeights = Omit<MonomerModelWeights, "template"> & {
+  /** Multimer-v3 currently implements the official no-template inference path. */
+  readonly template?: never;
+};
 
 export interface MonomerRecycleResult {
   readonly msaFirstRow: Float32Array; readonly pair: Float32Array;
@@ -57,6 +66,10 @@ export interface MonomerGpuOptions {
   readonly compactTransitions?: boolean;
   /** Caps reusable scratch retained between blocks; compact mode uses the bounded shared default. */
   readonly maxPooledBytes?: number;
+  /** Internal model architecture selector used by AlphaFoldMultimerGpu. */
+  readonly multimer?: boolean;
+  /** Multimer CA-distance RMS threshold; negative disables early stopping. */
+  readonly recycleEarlyStopTolerance?: number;
 }
 
 export interface MonomerBlockGpuProfile {
@@ -82,6 +95,8 @@ export class AlphaFoldMonomerGpu {
   readonly profileMainEvoformerBlock: number;
   readonly compactTransitions: boolean;
   readonly maxPooledBytes: number | undefined;
+  readonly multimer: boolean;
+  readonly recycleEarlyStopTolerance: number;
   constructor(device: GPUDevice, options: MonomerGpuOptions = {}) {
     this.device = device;
     this.profile = options.profile ?? false;
@@ -91,6 +106,11 @@ export class AlphaFoldMonomerGpu {
     this.compactTransitions = options.compactTransitions ?? false;
     this.maxPooledBytes = options.maxPooledBytes
       ?? (this.compactTransitions ? COMPACT_GPU_POOL_BYTES : undefined);
+    this.multimer = options.multimer ?? false;
+    this.recycleEarlyStopTolerance = options.recycleEarlyStopTolerance ?? -1;
+    if (!Number.isFinite(this.recycleEarlyStopTolerance)) {
+      throw new RangeError("recycleEarlyStopTolerance must be finite");
+    }
     for (const [name, value] of [
       ["profileRecycle", this.profileRecycle],
       ["profileExtraMsaBlock", this.profileExtraMsaBlock],
@@ -104,7 +124,8 @@ export class AlphaFoldMonomerGpu {
     onRecycle?: MonomerRecycleCallback): Promise<MonomerPrediction> {
     return this.predict(makeA3mFeatures(a3mText, featureTables, options), weights, paeBreaks, onRecycle);
   }
-  async predict(featuresByRecycle: readonly MonomerRecycleFeatures[], weights: MonomerModelWeights,
+  async predict(featuresByRecycle: readonly MonomerRecycleFeatures[],
+    weights: MonomerModelWeights | MultimerCompatibleModelWeights,
     paeBreaks?: Float32Array, onRecycle?: MonomerRecycleCallback): Promise<MonomerPrediction> {
     if (featuresByRecycle.length === 0) throw new RangeError("at least one feature set is required");
     const length = featuresByRecycle[0]!.aatype.length;
@@ -112,9 +133,21 @@ export class AlphaFoldMonomerGpu {
     for (let i = 0; i < length; i += 1) for (let j = 0; j < length; j += 1) {
       pairMask[i * length + j] = featuresByRecycle[0]!.seqMask[i]! * featuresByRecycle[0]!.seqMask[j]!;
     }
-    const template = await new QueryOnlyTemplateGpu(this.device).run({
-      length, templateChannels: 64, pairChannels: 128, pairMask, weights: weights.template,
-    });
+    if (this.multimer) {
+      for (const features of featuresByRecycle) {
+        if (features.targetChannels !== 21 || features.msaFeatureChannels !== 49
+          || features.chainRelative === undefined) {
+          throw new RangeError("Multimer-v3 requires 21 target channels, 49 MSA channels, and chain identifiers");
+        }
+      }
+    }
+    const templateUpdateValue = this.multimer
+      ? new Float32Array(length * length * 128)
+      : weights.template === undefined
+        ? (() => { throw new Error("AlphaFold monomer weights require a template module"); })()
+        : (await new QueryOnlyTemplateGpu(this.device).run({
+          length, templateChannels: 64, pairChannels: 128, pairMask, weights: weights.template,
+        })).pairUpdate;
     if (weights.extraStack.length === 0 || weights.mainStack.length === 0) {
       throw new RangeError("AlphaFold monomer requires non-empty extra and main Evoformer stacks");
     }
@@ -137,13 +170,14 @@ export class AlphaFoldMonomerGpu {
     };
     const releaseTensor = (tensor: GpuTensor): void => tensor.allocation.release();
     try {
-      const templateUpdate = execution.upload("monomer.template-update", template.pairUpdate);
+      const templateUpdate = execution.upload("monomer.template-update", templateUpdateValue);
       const pairMaskTensor = execution.upload("monomer.pair-mask", pairMask);
       let previousMsa = execution.upload("monomer.recycle-msa-zero", new Float32Array(length * 256));
       let previousPair = execution.upload("monomer.recycle-pair-zero", new Float32Array(length * length * 128));
       let previousPositions = execution.upload(
         "monomer.recycle-positions-zero", new Float32Array(length * 37 * 3),
       );
+      let stopAfterRecycle = Number.POSITIVE_INFINITY;
 
       for (let recycle = 0; recycle < featuresByRecycle.length; recycle += 1) {
         const features = featuresByRecycle[recycle]!;
@@ -158,6 +192,7 @@ export class AlphaFoldMonomerGpu {
           previousMsaFirstRow: new Float32Array(0), previousPair: new Float32Array(0),
           previousPositions: new Float32Array(0), length,
           msaChannels: 256, pairChannels: 128, extraMsaChannels: 64, weights: weights.embedding,
+          ...(features.chainRelative === undefined ? {} : { chainRelative: features.chainRelative }),
         }, previousMsa, previousPair, previousPositions);
         await execution.addInPlace(
           embeddingEncoder, embedding.pairWithoutTemplates, templateUpdate, `monomer.template-residual-${recycle}`,
@@ -264,6 +299,7 @@ export class AlphaFoldMonomerGpu {
           msaFirstRow, pair, mask: features.seqMask, aatype: features.aatype,
           atom37ToAtom14: features.atom37ToAtom14, atom37Mask: features.atom37Mask,
           length, weights: weights.structure, geometry: weights.geometry,
+          ...(this.multimer ? { multimer: true } : {}),
         });
         const confidence = await new ConfidenceHeadsGpu(this.device).run(
           structure.finalRepresentation, pair, length, weights.lddt, weights.pae, paeBreaks,
@@ -283,6 +319,14 @@ export class AlphaFoldMonomerGpu {
         previousMsa = embedding.msa;
         previousPair = embedding.pairWithoutTemplates;
         previousPositions = execution.upload(`monomer.recycle-positions-${recycle}`, structure.atom37);
+        if (this.multimer && recycle > 0 && this.recycleEarlyStopTolerance >= 0
+          && stopAfterRecycle === Number.POSITIVE_INFINITY) {
+          const rms = multimerRecycleDistanceRms(
+            results[recycle - 1]!.structure.atom37, structure.atom37, features.seqMask,
+          );
+          if (rms <= this.recycleEarlyStopTolerance) stopAfterRecycle = recycle + 1;
+        }
+        if (recycle >= stopAfterRecycle) break;
       }
       return {
         recycles: results, final: results[results.length - 1]!, elapsedMilliseconds: performance.now() - start,

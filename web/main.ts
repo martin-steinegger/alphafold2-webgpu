@@ -1,5 +1,11 @@
 import { AlphaFoldMonomerGpu, type MonomerPrediction, type MonomerRecycleResult } from "../src/model/monomer.js";
+import {
+  AlphaFoldMultimerGpu, type MultimerPrediction, type MultimerRecycleResult,
+} from "../src/model/multimer.js";
 import { makeA3mFeatures } from "../src/input/a3m-features.js";
+import {
+  makeMultimerQueryOnlyFeatures, type MultimerRecycleFeatures,
+} from "../src/input/multimer-features.js";
 import { parseA3m } from "../src/input/a3m.js";
 import { generateMmseqs2Msa, type Mmseqs2MsaProgress, type Mmseqs2MsaResult } from "../src/input/mmseqs2-api.js";
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
@@ -81,11 +87,17 @@ function unifiedMemoryBudget(appleUnifiedMemory: boolean): number | undefined {
 async function loadModelWeights(manifestValue: string) {
   const store = await HttpTensorStore.open(manifestValue, updateModelProgress);
   const fixture = AlphaFoldFixture.fromStore(store);
-  return Promise.all([
-    fixture.embeddingWeights(), fixture.templateWeights(), fixture.extraStackWeights(), fixture.mainStackWeights(),
-    fixture.structureWeights(), fixture.confidenceWeights(), fixture.geometryTables(), fixture.queryOnlyFeatureTables(),
+  const manifestModel = store.manifest.model as { readonly type?: string } | undefined;
+  const multimer = manifestModel?.type === "alphafold2_multimer_v3";
+  const [embedding, extraStack, mainStack, structure, confidence, geometry, featureTables, paeBreaks] = await Promise.all([
+    multimer ? fixture.multimerEmbeddingWeights() : fixture.embeddingWeights(),
+    fixture.extraStackWeights(), fixture.mainStackWeights(),
+    multimer ? fixture.multimerStructureWeights() : fixture.structureWeights(),
+    fixture.confidenceWeights(), fixture.geometryTables(), fixture.queryOnlyFeatureTables(),
     fixture.tensor("confidencePaeBreaks"),
   ] as const);
+  const template = multimer ? undefined : await fixture.templateWeights();
+  return { multimer, embedding, template, extraStack, mainStack, structure, confidence, geometry, featureTables, paeBreaks };
 }
 
 type LoadedModelWeights = Awaited<ReturnType<typeof loadModelWeights>>;
@@ -283,15 +295,18 @@ async function showStructure(pdb: string): Promise<void> {
   }
 }
 
-function showResults(prediction: MonomerPrediction, sequence: string, depth: number, jobName: string, a3m: string,
-  modelLoadMilliseconds: number): void {
+function showResults(prediction: MonomerPrediction | MultimerPrediction, sequence: string, depth: number,
+  jobName: string, a3m: string, modelLoadMilliseconds: number, chainLengths?: readonly number[]): void {
   const confidence = prediction.final.confidence;
-  currentPdb = predictionToPdb(sequence, prediction.final.structure, confidence.plddt);
+  currentPdb = predictionToPdb(sequence, prediction.final.structure, confidence.plddt, chainLengths);
   currentScores = confidenceJson(sequence, confidence);
   element<HTMLElement>("results-section").hidden = false;
   element<HTMLElement>("mean-plddt").textContent = confidence.meanPlddt.toFixed(1);
   element<HTMLElement>("plddt-label").textContent = confidenceLabel(confidence.meanPlddt);
   element<HTMLElement>("ptm").textContent = confidence.ptm.toFixed(3);
+  const multimerConfidence = confidence as typeof confidence & { readonly iptm?: number };
+  element<HTMLElement>("iptm-card").hidden = multimerConfidence.iptm === undefined;
+  if (multimerConfidence.iptm !== undefined) element<HTMLElement>("iptm").textContent = multimerConfidence.iptm.toFixed(3);
   element<HTMLElement>("result-length").textContent = String(sequence.length);
   element<HTMLElement>("msa-depth").textContent = String(depth);
   element<HTMLElement>("total-time").textContent = `WebGPU inference ${formatSeconds(prediction.elapsedMilliseconds)}`;
@@ -322,13 +337,28 @@ function showResults(prediction: MonomerPrediction, sequence: string, depth: num
   };
 }
 
-async function predictionInput(): Promise<{ a3m: string; sequence: string; depth: number }> {
+interface PredictionInput {
+  readonly a3m: string; readonly sequence: string; readonly depth: number;
+  readonly multimer: boolean; readonly chains?: readonly string[];
+}
+
+async function predictionInput(): Promise<PredictionInput> {
   const mode = element<HTMLSelectElement>("input-mode").value;
+  if (mode === "multimer") {
+    const chains = element<HTMLTextAreaElement>("sequence").value.split(":")
+      .map((chain) => chain.replace(/\s+/g, "").toUpperCase());
+    if (chains.length < 2 || chains.some((chain) => !/^[ARNDCQEGHILKMFPSTWYVX]+$/.test(chain))) {
+      throw new Error("Multimer input requires at least two valid chains separated by colons");
+    }
+    const sequence = chains.join("");
+    stage("msa", "done", `${chains.length} query-only chains`);
+    return { a3m: `>query\n${sequence}\n`, sequence, depth: 1, multimer: true, chains };
+  }
   if (mode === "single") {
     const sequence = normalizedSequence();
     if (!/^[ARNDCQEGHILKMFPSTWYVX]+$/.test(sequence)) throw new Error("Sequence must contain only standard amino-acid letters or X");
     stage("msa", "done", "Single sequence");
-    return { a3m: `>query\n${sequence}\n`, sequence, depth: 1 };
+    return { a3m: `>query\n${sequence}\n`, sequence, depth: 1, multimer: false };
   }
   if (mode === "mmseqs2") {
     const sequence = normalizedSequence();
@@ -338,20 +368,20 @@ async function predictionInput(): Promise<{ a3m: string; sequence: string; depth
     const key = `${apiUrl}\n${sequence}`;
     if (generatedMsa?.key === key) {
       stage("msa", "done", `${generatedMsa.result.depth} rows · cached`); log("Reusing the generated MMseqs2 alignment.");
-      return { a3m: generatedMsa.result.a3m, sequence, depth: generatedMsa.result.depth };
+      return { a3m: generatedMsa.result.a3m, sequence, depth: generatedMsa.result.depth, multimer: false };
     }
     const result = await generateMmseqs2Msa(sequence, { apiUrl, onProgress: updateMsaProgress });
     generatedMsa = { key, result };
     stage("msa", "done", `${result.depth} rows · ${formatSeconds(result.elapsedMilliseconds)}`);
     const downloadButton = element<HTMLButtonElement>("download-msa"); downloadButton.hidden = false;
     downloadButton.onclick = () => download(`${safeJobName(element<HTMLInputElement>("job-name").value)}.a3m`, result.a3m, "text/plain");
-    return { a3m: result.a3m, sequence, depth: result.depth };
+    return { a3m: result.a3m, sequence, depth: result.depth, multimer: false };
   }
   const file = element<HTMLInputElement>("a3m-file").files?.[0];
   if (file === undefined) throw new Error("Choose a custom A3M file first");
   const a3m = await file.text(); const parsed = parseA3m(a3m);
   stage("msa", "done", `${parsed.depth} uploaded rows`);
-  return { a3m, sequence: parsed.query, depth: parsed.depth };
+  return { a3m, sequence: parsed.query, depth: parsed.depth, multimer: false };
 }
 
 element<HTMLFormElement>("prediction-form").addEventListener("submit", (event) => { event.preventDefault(); void runPrediction(); });
@@ -387,9 +417,16 @@ async function runPrediction(): Promise<void> {
     }));
     const [input, loadedModel] = await Promise.all([inputPromise, measuredModel]);
     const { weights, elapsedMilliseconds: modelLoadMilliseconds } = loadedModel;
-    const [embedding, template, extraStack, mainStack, structure, confidence, geometry, featureTables, paeBreaks] = weights;
-    stage("model", "done", `Model 1 PTM · ${modelRequest.cached ? "cached · " : ""}${formatSeconds(modelLoadMilliseconds)}`);
-    log(`${modelRequest.cached ? "Reused" : "Loaded"} the reduced model-1 tensor bundle `
+    const { multimer: multimerModel, embedding, template, extraStack, mainStack, structure,
+      confidence, geometry, featureTables, paeBreaks } = weights;
+    if (input.multimer !== multimerModel) {
+      throw new Error(input.multimer
+        ? "Multimer mode requires an alphafold2_multimer_v3 model manifest"
+        : "This is a Multimer-v3 manifest; choose Multimer-v3 input mode or a monomer manifest");
+    }
+    stage("model", "done", `${multimerModel ? "Multimer-v3" : "Model 1 PTM"} · `
+      + `${modelRequest.cached ? "cached · " : ""}${formatSeconds(modelLoadMilliseconds)}`);
+    log(`${modelRequest.cached ? "Reused" : "Loaded"} the reduced ${multimerModel ? "Multimer-v3" : "model-1"} tensor bundle `
       + `${modelRequest.cached ? "from memory " : ""}in ${formatSeconds(modelLoadMilliseconds)}.`);
 
     stage("features", "active", "Parsing input"); setPredictionStatus("Building AF2 features");
@@ -432,14 +469,19 @@ async function runPrediction(): Promise<void> {
       maxMsaSequences: requestedMaxMsa,
       maxExtraSequences: requestedMaxExtra,
     };
-    const features = makeA3mFeatures(input.a3m, featureTables, featureOptions);
-    stage("features", "done", `${input.sequence.length} aa · ${input.depth} rows`); log(`Features: ${input.sequence.length} residues, A3M depth ${input.depth}.`);
+    const features = input.multimer
+      ? makeMultimerQueryOnlyFeatures(input.chains!, featureTables, featureOptions)
+      : makeA3mFeatures(input.a3m, featureTables, featureOptions);
+    stage("features", "done", `${input.sequence.length} aa · ${input.depth} rows`);
+    log(`Features: ${input.sequence.length} residues, ${input.multimer ? `${input.chains!.length} chains` : `A3M depth ${input.depth}`}.`);
 
     stage("inference", "active", `Recycle 0/${featureOptions.recycles}`); setPredictionStatus("Running AlphaFold2 on WebGPU");
-    const reportRecycle = (result: MonomerRecycleResult, recycle: number): void => {
+    const reportRecycle = (result: MonomerRecycleResult | MultimerRecycleResult, recycle: number): void => {
       stage("inference", "active", `Recycle ${recycle}/${featureOptions.recycles} · pLDDT ${result.confidence.meanPlddt.toFixed(1)}`);
+      const multimerResult = result as MultimerRecycleResult;
       log(`recycle=${recycle} pLDDT=${result.confidence.meanPlddt.toFixed(1)} `
-        + `pTM=${result.confidence.ptm.toFixed(3)} time=${formatSeconds(result.elapsedMilliseconds)} `
+        + `pTM=${result.confidence.ptm.toFixed(3)}${multimerResult.confidence.iptm === undefined
+          ? "" : ` ipTM=${multimerResult.confidence.iptm.toFixed(3)}`} time=${formatSeconds(result.elapsedMilliseconds)} `
         + `trunkSubmissions=${result.trunkSubmissions.total}`);
       if (result.gpuProfile !== undefined) {
         for (const [stack, profile] of [
@@ -453,22 +495,31 @@ async function runPrediction(): Promise<void> {
         }
       }
     };
-    const prediction = await new AlphaFoldMonomerGpu(device, {
+    const modelOptions = {
       compactTransitions: devicePlan.transitionMode === "chunked",
       profile: parameter("profile", "0") === "1",
       profileRecycle: Number(parameter("profileRecycle", "0")),
       profileExtraMsaBlock: Number(parameter("profileExtraBlock", "0")),
       profileMainEvoformerBlock: Number(parameter("profileMainBlock", "0")),
-    }).predict(features, {
-      embedding, template, extraStack, mainStack, structure, lddt: confidence.lddt, pae: confidence.pae, geometry,
-    }, paeBreaks, reportRecycle);
+    } as const;
+    const commonWeights = {
+      embedding, extraStack, mainStack, structure, lddt: confidence.lddt, pae: confidence.pae, geometry,
+    };
+    const prediction: MonomerPrediction | MultimerPrediction = input.multimer
+      ? await new AlphaFoldMultimerGpu(device, modelOptions).predict(
+        features as readonly MultimerRecycleFeatures[], commonWeights, paeBreaks, reportRecycle,
+      )
+      : await new AlphaFoldMonomerGpu(device, modelOptions).predict(features, {
+        ...commonWeights, template: template!,
+      }, paeBreaks, reportRecycle);
     stage("inference", "done", formatSeconds(prediction.elapsedMilliseconds));
     log(`Measured allocator peak: ${formatMib(prediction.memory.peakResidentBytes)} resident `
       + `(${prediction.memory.bufferCount} GPU buffers).`);
 
     stage("results", "active", "Rendering"); setPredictionStatus("Preparing results");
     const jobName = safeJobName(element<HTMLInputElement>("job-name").value);
-    showResults(prediction, input.sequence, input.depth, jobName, input.a3m, modelLoadMilliseconds);
+    showResults(prediction, input.sequence, input.depth, jobName, input.a3m, modelLoadMilliseconds,
+      input.chains?.map((chain) => chain.length));
     stage("results", "done", "Ready"); setPredictionStatus("Prediction complete", "passed");
     log(`Finished in ${formatSeconds(prediction.elapsedMilliseconds)}.`);
     element<HTMLElement>("results-section").scrollIntoView({ behavior: "smooth", block: "start" });
@@ -488,12 +539,25 @@ async function runPrediction(): Promise<void> {
 const inputMode = element<HTMLSelectElement>("input-mode");
 function updateInputMode(): void {
   const custom = inputMode.value === "custom"; const remote = inputMode.value === "mmseqs2";
+  const multimer = inputMode.value === "multimer";
   element<HTMLElement>("sequence-field").hidden = custom; element<HTMLElement>("a3m-field").hidden = !custom;
-  element<HTMLElement>("sequence-length").textContent = custom ? "A3M input" : `${normalizedSequence().length} residues`;
+  const raw = element<HTMLTextAreaElement>("sequence").value.replace(/\s+/g, "").toUpperCase();
+  const chainCount = raw === "" ? 0 : raw.split(":").length;
+  element<HTMLElement>("sequence-length").textContent = custom ? "A3M input"
+    : multimer ? `${raw.replaceAll(":", "").length} residues · ${chainCount} chains`
+      : `${normalizedSequence().length} residues`;
   element<HTMLElement>("sequence-hint").textContent = remote
     ? "One monomer. MMseqs2 mode sends this sequence to the public ColabFold MSA server."
-    : "One monomer, using the 20 standard amino acids or X. This input stays on the device.";
-  element<HTMLElement>("predict-label").textContent = remote ? "Generate MSA & predict" : "Run prediction";
+    : multimer
+      ? "Separate two or more chains with colons (for example ACDE:FGHI). Uses local query-only Multimer-v3."
+      : "One monomer, using the 20 standard amino acids or X. This input stays on the device.";
+  element<HTMLElement>("predict-label").textContent = remote ? "Generate MSA & predict"
+    : multimer ? "Run Multimer-v3" : "Run prediction";
+  element<HTMLInputElement>("max-msa").disabled = multimer;
+  element<HTMLInputElement>("max-extra").disabled = multimer;
+  const recycleSelect = element<HTMLSelectElement>("recycles");
+  if (multimer && recycleSelect.value === "3") recycleSelect.value = "20";
+  else if (!multimer && recycleSelect.value === "20") recycleSelect.value = "3";
 }
 inputMode.addEventListener("change", updateInputMode);
 element<HTMLTextAreaElement>("sequence").addEventListener("input", () => { generatedMsa = undefined;

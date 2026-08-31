@@ -16,6 +16,7 @@ export interface StructureCoreInput {
   readonly channels: number;
   readonly pairChannels: number;
   readonly iterations?: number;
+  readonly multimer?: boolean;
   readonly ipaWeights: InvariantPointAttentionWeights;
   readonly postAttentionWeights: StructurePostAttentionWeights;
 }
@@ -53,6 +54,7 @@ export class StructureCoreGpu {
       scalarV: 16,
       pointQk: 4,
       pointV: 8,
+      ...(input.multimer === undefined ? {} : { multimer: input.multimer }),
       weights: input.ipaWeights,
     } as const;
     const prepared = await ipa.prepare(geometry);

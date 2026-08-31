@@ -14,6 +14,10 @@ import type { QueryOnlyTemplateWeights } from "../evoformer/template.js";
 import type { TransitionWeights } from "../evoformer/transition.js";
 import type { TriangleMultiplicationWeights } from "../triangle/types.js";
 import type { StructureModuleWeights } from "../structure/module.js";
+import {
+  adaptMultimerInvariantPointAttentionWeights,
+  type MultimerInvariantPointAttentionWeights,
+} from "../structure/ipa.js";
 import type { ResidueGeometryTables } from "../structure/geometry.js";
 import type { PredictedAlignedErrorWeights, PredictedLddtWeights } from "../heads/confidence.js";
 import type { QueryOnlyFeatureTables } from "../input/query-only-features.js";
@@ -299,6 +303,31 @@ export class AlphaFoldFixture {
     };
   }
 
+  async multimerEmbeddingWeights(): Promise<InputEmbedderWeights> {
+    const p = this.manifest.embedding.parameters;
+    const parameter = (module: string, name: string): Promise<Float32Array> => this.#parameter(p, module, name);
+    return {
+      preprocess1dWeight: await parameter("preprocess_1d", "weights"),
+      preprocess1dBias: await parameter("preprocess_1d", "bias"),
+      preprocessMsaWeight: await parameter("preprocess_msa", "weights"),
+      preprocessMsaBias: await parameter("preprocess_msa", "bias"),
+      leftSingleWeight: await parameter("left_single", "weights"),
+      leftSingleBias: await parameter("left_single", "bias"),
+      rightSingleWeight: await parameter("right_single", "weights"),
+      rightSingleBias: await parameter("right_single", "bias"),
+      previousPositionWeight: await parameter("prev_pos_linear", "weights"),
+      previousPositionBias: await parameter("prev_pos_linear", "bias"),
+      previousMsaNormScale: await parameter("prev_msa_first_row_norm", "scale"),
+      previousMsaNormOffset: await parameter("prev_msa_first_row_norm", "offset"),
+      previousPairNormScale: await parameter("prev_pair_norm", "scale"),
+      previousPairNormOffset: await parameter("prev_pair_norm", "offset"),
+      relativePositionWeight: await parameter("~_relative_encoding/position_activations", "weights"),
+      relativePositionBias: await parameter("~_relative_encoding/position_activations", "bias"),
+      extraMsaWeight: await parameter("extra_msa_activations", "weights"),
+      extraMsaBias: await parameter("extra_msa_activations", "bias"),
+    };
+  }
+
   async templateWeights(): Promise<QueryOnlyTemplateWeights> {
     const p = this.manifest.templateEmbedding.parameters;
     const blocks = 2;
@@ -376,6 +405,71 @@ export class AlphaFoldFixture {
         transitionNormOffset: await parameter(`${root}/transition_layer_norm`, "offset"),
         affineWeight: await parameter(`${root}/affine_update`, "weights"),
         affineBias: await parameter(`${root}/affine_update`, "bias"),
+      },
+      sidechain: {
+        inputWeight: await parameter(`${sidechain}/input_projection`, "weights"),
+        inputBias: await parameter(`${sidechain}/input_projection`, "bias"),
+        initialInputWeight: await parameter(`${sidechain}/input_projection_1`, "weights"),
+        initialInputBias: await parameter(`${sidechain}/input_projection_1`, "bias"),
+        residual1Weights: [await parameter(`${sidechain}/resblock1`, "weights"),
+          await parameter(`${sidechain}/resblock2`, "weights")],
+        residual1Biases: [await parameter(`${sidechain}/resblock1`, "bias"),
+          await parameter(`${sidechain}/resblock2`, "bias")],
+        residual2Weights: [await parameter(`${sidechain}/resblock1_1`, "weights"),
+          await parameter(`${sidechain}/resblock2_1`, "weights")],
+        residual2Biases: [await parameter(`${sidechain}/resblock1_1`, "bias"),
+          await parameter(`${sidechain}/resblock2_1`, "bias")],
+        angleWeight: await parameter(`${sidechain}/unnormalized_angles`, "weights"),
+        angleBias: await parameter(`${sidechain}/unnormalized_angles`, "bias"),
+      },
+    };
+  }
+
+  async multimerStructureWeights(): Promise<StructureModuleWeights> {
+    const p = this.manifest.structureModule.parameters;
+    const parameter = (module: string, name: string): Promise<Float32Array> => this.#parameter(p, module, name);
+    const root = "fold_iteration";
+    const ipa = `${root}/invariant_point_attention`;
+    const sidechain = `${root}/rigid_sidechain`;
+    const nativeIpa: MultimerInvariantPointAttentionWeights = {
+      pairNormScale: await parameter("pair_layer_norm", "scale"),
+      pairNormOffset: await parameter("pair_layer_norm", "offset"),
+      queryScalarWeight: await parameter(`${ipa}/q_scalar_projection`, "weights"),
+      keyScalarWeight: await parameter(`${ipa}/k_scalar_projection`, "weights"),
+      valueScalarWeight: await parameter(`${ipa}/v_scalar_projection`, "weights"),
+      queryPointWeight: await parameter(`${ipa}/q_point_projection/point_projection`, "weights"),
+      queryPointBias: await parameter(`${ipa}/q_point_projection/point_projection`, "bias"),
+      keyPointWeight: await parameter(`${ipa}/k_point_projection/point_projection`, "weights"),
+      keyPointBias: await parameter(`${ipa}/k_point_projection/point_projection`, "bias"),
+      valuePointWeight: await parameter(`${ipa}/v_point_projection/point_projection`, "weights"),
+      valuePointBias: await parameter(`${ipa}/v_point_projection/point_projection`, "bias"),
+      trainablePointWeights: await parameter(ipa, "trainable_point_weights"),
+      attention2dWeight: await parameter(`${ipa}/attention_2d`, "weights"),
+      attention2dBias: await parameter(`${ipa}/attention_2d`, "bias"),
+      outputWeight: await parameter(`${ipa}/output_projection`, "weights"),
+      outputBias: await parameter(`${ipa}/output_projection`, "bias"),
+    };
+    return {
+      initialize: {
+        singleProjectionWeight: await this.#parameter(this.manifest.embedding.parameters, "single_activations", "weights"),
+        singleProjectionBias: await this.#parameter(this.manifest.embedding.parameters, "single_activations", "bias"),
+        singleNormScale: await parameter("single_layer_norm", "scale"),
+        singleNormOffset: await parameter("single_layer_norm", "offset"),
+        initialProjectionWeight: await parameter("initial_projection", "weights"),
+        initialProjectionBias: await parameter("initial_projection", "bias"),
+      },
+      ipa: adaptMultimerInvariantPointAttentionWeights(nativeIpa, 384, 128, 12, 16, 16, 4, 8),
+      postAttention: {
+        attentionNormScale: await parameter(`${root}/attention_layer_norm`, "scale"),
+        attentionNormOffset: await parameter(`${root}/attention_layer_norm`, "offset"),
+        transitionWeights: [await parameter(`${root}/transition`, "weights"),
+          await parameter(`${root}/transition_1`, "weights"), await parameter(`${root}/transition_2`, "weights")],
+        transitionBiases: [await parameter(`${root}/transition`, "bias"),
+          await parameter(`${root}/transition_1`, "bias"), await parameter(`${root}/transition_2`, "bias")],
+        transitionNormScale: await parameter(`${root}/transition_layer_norm`, "scale"),
+        transitionNormOffset: await parameter(`${root}/transition_layer_norm`, "offset"),
+        affineWeight: await parameter(`${root}/quat_rigid/rigid`, "weights"),
+        affineBias: await parameter(`${root}/quat_rigid/rigid`, "bias"),
       },
       sidechain: {
         inputWeight: await parameter(`${sidechain}/input_projection`, "weights"),

@@ -124,7 +124,9 @@ for (const [sourceFile, entries] of [...byShard].sort(([left], [right]) => left.
 
 const bytes = files.reduce((sum, file) => sum + file.bytes, 0);
 const encoding = format === "int8" ? "mixed-q8-f16-scale-le" : "mixed-f16-le";
-const id = `model_1_ptm-${format === "int8" ? "q8" : "f16"}-v1`;
+const modelId = typeof manifest.bundle?.model === "string" && manifest.bundle.model !== ""
+  ? manifest.bundle.model : "alphafold-model";
+const id = `${modelId}-${format === "int8" ? "q8" : "f16"}-v1`;
 const output: BinaryTensorManifest = {
   ...manifest,
   bundle: {

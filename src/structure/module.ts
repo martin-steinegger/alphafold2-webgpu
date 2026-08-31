@@ -25,6 +25,7 @@ export interface StructureModuleInput {
   readonly pairChannels?: number;
   readonly weights: StructureModuleWeights;
   readonly geometry: ResidueGeometryTables;
+  readonly multimer?: boolean;
 }
 
 export interface StructureModuleResult {
@@ -61,6 +62,7 @@ export class StructureModuleGpu {
       pairChannels,
       ipaWeights: input.weights.ipa,
       postAttentionWeights: input.weights.postAttention,
+      ...(input.multimer === undefined ? {} : { multimer: input.multimer }),
     });
     const sidechain = await new SidechainAnglesGpu(this.device).run(
       core.activations, initialized.initialRepresentation, input.length, structureChannels, 128, input.weights.sidechain,
@@ -72,6 +74,7 @@ export class StructureModuleGpu {
       atom37ToAtom14: input.atom37ToAtom14,
       atom37Mask: input.atom37Mask,
       length: input.length,
+      positionScale: input.multimer === true ? 20 : 10,
       tables: input.geometry,
     });
     return {

@@ -97,6 +97,53 @@ export function predictedTmScore(logits: Float32Array, length: number, breaks: F
   return score;
 }
 
+/** Official AlphaFold-Multimer interface TM score: only inter-chain residue pairs contribute. */
+export function predictedInterfaceTmScore(
+  logits: Float32Array,
+  length: number,
+  breaks: Float32Array,
+  asymId: Float32Array,
+): number {
+  const bins = breaks.length + 1;
+  if (logits.length !== length * length * bins) throw new RangeError("invalid PAE logits shape");
+  if (asymId.length !== length || asymId.some((value) => !Number.isSafeInteger(value) || value <= 0)) {
+    throw new RangeError("asymId must contain one positive integer chain identifier per residue");
+  }
+  const centers = paeCenters(breaks);
+  const effectiveLength = Math.max(length, 19);
+  const d0 = 1.24 * Math.cbrt(effectiveLength - 15) - 1.8;
+  const tmPerBin = centers.map((center) => 1 / (1 + center * center / (d0 * d0)));
+  let score = 0;
+  for (let anchor = 0; anchor < length; anchor += 1) {
+    let alignment = 0;
+    let partners = 0;
+    for (let residue = 0; residue < length; residue += 1) {
+      if (asymId[anchor] === asymId[residue]) continue;
+      const base = (anchor * length + residue) * bins;
+      let maximum = -Infinity;
+      for (let bin = 0; bin < bins; bin += 1) maximum = Math.max(maximum, logits[base + bin]!);
+      let denominator = 0;
+      let numerator = 0;
+      for (let bin = 0; bin < bins; bin += 1) {
+        const probability = Math.exp(logits[base + bin]! - maximum);
+        denominator += probability;
+        numerator += probability * tmPerBin[bin]!;
+      }
+      alignment += numerator / denominator;
+      partners += 1;
+    }
+    if (partners > 0) score = Math.max(score, alignment / partners);
+  }
+  return score;
+}
+
+export function multimerRankingConfidence(ptm: number, iptm: number): number {
+  if (![ptm, iptm].every((value) => Number.isFinite(value) && value >= 0 && value <= 1)) {
+    throw new RangeError("pTM and ipTM must be finite scores between zero and one");
+  }
+  return 0.2 * ptm + 0.8 * iptm;
+}
+
 export class ConfidenceHeadsGpu {
   readonly device: GPUDevice;
   readonly allocator: GpuBufferAllocator;

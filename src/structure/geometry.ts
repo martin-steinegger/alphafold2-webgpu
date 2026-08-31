@@ -15,6 +15,8 @@ export interface AtomGeometryInput {
   readonly atom37ToAtom14: Float32Array;
   readonly atom37Mask: Float32Array;
   readonly length: number;
+  /** Backbone translation scale. AlphaFold monomer uses 10 and Multimer-v3 uses 20. */
+  readonly positionScale?: number;
   readonly tables: ResidueGeometryTables;
 }
 
@@ -135,6 +137,10 @@ export class AtomGeometryGpu {
     this.device = device; this.allocator = new GpuBufferAllocator(device); this.pipelines = pipelineCacheForDevice(device);
   }
   async run(input: AtomGeometryInput): Promise<AtomGeometryResult> {
+    const positionScale = input.positionScale ?? 10;
+    if (!Number.isFinite(positionScale) || positionScale <= 0) {
+      throw new RangeError("positionScale must be a positive finite number");
+    }
     const allocations: AllocatedGpuBuffer[] = [];
     const keep = (value: AllocatedGpuBuffer): AllocatedGpuBuffer => { allocations.push(value); return value; };
     const upload = (label: string, value: ArrayBufferView) => keep(this.allocator.upload(label, value, GPUBufferUsage.STORAGE));
@@ -144,7 +150,17 @@ export class AtomGeometryGpu {
       const [atom14Pipeline, atom37Pipeline] = await Promise.all([
         this.pipelines.get("geometry:atom14", ATOM14_SHADER), this.pipelines.get("geometry:atom37", ATOM37_SHADER),
       ]);
-      const affine = upload("geometry.affine", input.affine); const angles = upload("geometry.angles", input.angles);
+      const scaledAffine = positionScale === 10 ? input.affine : input.affine.slice();
+      if (positionScale !== 10) {
+        const ratio = positionScale / 10;
+        for (let residue = 0; residue < input.length; residue += 1) {
+          const base = residue * 7 + 4;
+          scaledAffine[base] = scaledAffine[base]! * ratio;
+          scaledAffine[base + 1] = scaledAffine[base + 1]! * ratio;
+          scaledAffine[base + 2] = scaledAffine[base + 2]! * ratio;
+        }
+      }
+      const affine = upload("geometry.affine", scaledAffine); const angles = upload("geometry.angles", input.angles);
       const aatype = upload("geometry.aatype", input.aatype);
       const frames = upload("geometry.frames", input.tables.defaultFrames);
       const groups = upload("geometry.groups", input.tables.atom14ToGroup);

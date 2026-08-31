@@ -44,6 +44,12 @@ export interface InputEmbedderInput {
   readonly pairChannels: number;
   readonly extraMsaChannels: number;
   readonly weights: InputEmbedderWeights;
+  /** Enables AlphaFold-Multimer's 73-channel chain-relative position encoding. */
+  readonly chainRelative?: {
+    readonly asymId: Float32Array;
+    readonly entityId: Float32Array;
+    readonly symId: Float32Array;
+  };
 }
 
 export interface InputEmbedderResult {
@@ -87,6 +93,7 @@ function parameters(input: InputEmbedderInput, offsets: readonly number[]): Uint
   [...dimensions, ...offsets].forEach((value, index) => view.setUint32(index * 4, value!, true));
   view.setFloat32(116, 3.25, true);
   view.setFloat32(120, 20.75, true);
+  view.setUint32(124, input.chainRelative === undefined ? 0 : 1, true);
   return new Uint8Array(buffer);
 }
 
@@ -103,7 +110,7 @@ struct Parameters {
   previous_pair_scale: u32, previous_pair_offset: u32,
   relative_weight: u32, relative_bias: u32,
   extra_weight: u32, extra_bias: u32,
-  min_bin: f32, max_bin: f32, padding: u32,
+  min_bin: f32, max_bin: f32, chain_relative: u32,
 };
 const GRID_WIDTH: u32 = 32768u;
 `;
@@ -163,9 +170,10 @@ const PAIR_SHADER = `${COMMON}
 @group(0) @binding(2) var<storage, read> previous_positions: array<f32>;
 @group(0) @binding(3) var<storage, read> aatype: array<f32>;
 @group(0) @binding(4) var<storage, read> residue_index: array<f32>;
-@group(0) @binding(5) var<storage, read> weights: array<f32>;
-@group(0) @binding(6) var<uniform> p: Parameters;
-@group(0) @binding(7) var<storage, read_write> output: array<f32>;
+@group(0) @binding(5) var<storage, read> chain_ids: array<f32>;
+@group(0) @binding(6) var<storage, read> weights: array<f32>;
+@group(0) @binding(7) var<uniform> p: Parameters;
+@group(0) @binding(8) var<storage, read_write> output: array<f32>;
 
 fn pseudo_beta_coordinate(residue: u32, coordinate: u32) -> f32 {
   let atom = select(3u, 1u, u32(aatype[residue]) == 7u);
@@ -200,12 +208,52 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
   }
   result += previous_pair[index];
+  result += weights[p.relative_bias + channel];
   let raw_offset = i32(residue_index[i]) - i32(residue_index[j]) + i32(p.max_relative);
-  let relative = u32(clamp(raw_offset, 0, i32(2u * p.max_relative)));
-  result += weights[p.relative_bias + channel]
-    + weights[p.relative_weight + relative * p.pair_channels + channel];
+  var relative = u32(clamp(raw_offset, 0, i32(2u * p.max_relative)));
+  if (p.chain_relative != 0u) {
+    let same_chain = u32(chain_ids[i]) == u32(chain_ids[j]);
+    if (!same_chain) { relative = 2u * p.max_relative + 1u; }
+    result += weights[p.relative_weight + relative * p.pair_channels + channel];
+    let same_entity = u32(chain_ids[p.length + i]) == u32(chain_ids[p.length + j]);
+    if (same_entity) { result += weights[p.relative_weight + 66u * p.pair_channels + channel]; }
+    var relative_chain = 5u;
+    if (same_entity) {
+      relative_chain = u32(clamp(i32(chain_ids[2u * p.length + i])
+        - i32(chain_ids[2u * p.length + j]) + 2, 0, 4));
+    }
+    result += weights[p.relative_weight + (67u + relative_chain) * p.pair_channels + channel];
+  } else {
+    result += weights[p.relative_weight + relative * p.pair_channels + channel];
+  }
   output[index] = result;
 }`;
+
+function validateChainRelative(input: InputEmbedderInput): void {
+  const chain = input.chainRelative;
+  const relativeChannels = chain === undefined ? 65 : 73;
+  if (input.weights.relativePositionWeight.length !== relativeChannels * input.pairChannels) {
+    throw new RangeError(`relative position weights must have shape [${relativeChannels}, pairChannels]`);
+  }
+  if (chain === undefined) return;
+  for (const [name, values] of [
+    ["asymId", chain.asymId], ["entityId", chain.entityId], ["symId", chain.symId],
+  ] as const) {
+    if (values.length !== input.length || values.some((value) => !Number.isSafeInteger(value) || value <= 0)) {
+      throw new RangeError(`${name} must contain one positive integer per residue`);
+    }
+  }
+}
+
+function packedChainIdentifiers(input: InputEmbedderInput): Float32Array {
+  const output = new Float32Array(input.length * 3);
+  if (input.chainRelative !== undefined) {
+    output.set(input.chainRelative.asymId);
+    output.set(input.chainRelative.entityId, input.length);
+    output.set(input.chainRelative.symId, input.length * 2);
+  }
+  return output;
+}
 
 export interface EncodedInputEmbedder {
   readonly msa: GpuTensor;
@@ -224,6 +272,7 @@ export async function encodeInputEmbedder(
   previousPair: GpuTensor,
   previousPositions: GpuTensor,
 ): Promise<EncodedInputEmbedder> {
+  validateChainRelative(input);
   const expectedPreviousMsa = input.length * input.msaChannels;
   const expectedPreviousPair = input.length * input.length * input.pairChannels;
   const expectedPreviousPositions = input.length * 37 * 3;
@@ -252,6 +301,7 @@ export async function encodeInputEmbedder(
   const deletionValue = temporaryUpload("embed.extra-deletion-value", input.extraDeletionValue);
   const residueIndex = temporaryUpload("embed.residue-index", input.residueIndex);
   const aatype = temporaryUpload("embed.aatype", input.aatype);
+  const chainIds = temporaryUpload("embed.chain-identifiers", packedChainIdentifiers(input));
   const weights = temporaryUpload("embed.weights", packed.data);
   const params = temporaryUpload("embed.parameters", parameters(input, packed.offsets), GPUBufferUsage.UNIFORM);
   const previousMsaNormParams = temporaryUpload("embed.previous-msa-norm-params", createAttentionNormParameters(
@@ -281,7 +331,8 @@ export async function encodeInputEmbedder(
     grid[0], grid[1]);
   grid = execution.linearGrid(pairElements);
   execution.dispatch(encoder, pairPipeline,
-    [target, previousPairNormalized, previousPositions, aatype, residueIndex, weights, params, pair], grid[0], grid[1]);
+    [target, previousPairNormalized, previousPositions, aatype, residueIndex, chainIds,
+      weights, params, pair], grid[0], grid[1]);
   grid = execution.linearGrid(extraElements);
   execution.dispatch(encoder, extraPipeline, [extraMsaInput, hasDeletion, deletionValue, weights, params, extra],
     grid[0], grid[1]);
@@ -299,6 +350,7 @@ export class InputEmbedderGpu {
   }
 
   async run(input: InputEmbedderInput): Promise<InputEmbedderResult> {
+    validateChainRelative(input);
     const packed = packWeights(input);
     const [normalize, msaPipeline, pairPipeline, extraPipeline] = await Promise.all([
       this.pipelines.get("embed:normalize", ATTENTION_NORMALIZE_SHADER),
@@ -327,6 +379,7 @@ export class InputEmbedderGpu {
       const deletionValue = upload("embed.extra-deletion-value", input.extraDeletionValue);
       const residueIndex = upload("embed.residue-index", input.residueIndex);
       const aatype = upload("embed.aatype", input.aatype);
+      const chainIds = upload("embed.chain-identifiers", packedChainIdentifiers(input));
       const previousMsa = upload("embed.previous-msa", input.previousMsaFirstRow);
       const previousPair = upload("embed.previous-pair", input.previousPair);
       const previousPositions = upload("embed.previous-positions", input.previousPositions);
@@ -374,8 +427,8 @@ export class InputEmbedderGpu {
       dispatch = grid(msaElements);
       pass(msaPipeline, [target, msaFeatures, previousMsaNormalized, weights, params, msa], dispatch[0], dispatch[1]);
       dispatch = grid(pairElements);
-      pass(pairPipeline, [target, previousPairNormalized, previousPositions, aatype, residueIndex, weights, params, pair],
-        dispatch[0], dispatch[1]);
+      pass(pairPipeline, [target, previousPairNormalized, previousPositions, aatype, residueIndex,
+        chainIds, weights, params, pair], dispatch[0], dispatch[1]);
       dispatch = grid(extraElements);
       pass(extraPipeline, [extraMsaInput, hasDeletion, deletionValue, weights, params, extra], dispatch[0], dispatch[1]);
       encoder.copyBufferToBuffer(msa.buffer, 0, msaReadback.buffer, 0, msaElements * 4);

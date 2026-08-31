@@ -41,6 +41,10 @@ export type {
   QueryOnlyTemplateResult,
   QueryOnlyTemplateWeights,
 } from "./evoformer/template.js";
+export { MultimerRelativePositionGpu } from "./evoformer/multimer-relative.js";
+export type {
+  MultimerRelativePositionInput, MultimerRelativePositionResult,
+} from "./evoformer/multimer-relative.js";
 export { ElementwiseAddGpu } from "./runtime/elementwise.js";
 export {
   estimateMonomerMemory, monomerDeviceRequirements, planMonomerDevice, requestAlphaFoldDevice,
@@ -49,11 +53,14 @@ export {
 export type {
   AlphaFoldDevicePlan, AlphaFoldDeviceRequirements, MonomerMemoryEstimate, MonomerRowSuggestion,
 } from "./runtime/device.js";
-export { InvariantPointAttentionGpu, PreparedInvariantPointAttention } from "./structure/ipa.js";
+export {
+  adaptMultimerInvariantPointAttentionWeights, InvariantPointAttentionGpu, PreparedInvariantPointAttention,
+} from "./structure/ipa.js";
 export type {
   InvariantPointAttentionInput,
   InvariantPointAttentionResult,
   InvariantPointAttentionWeights,
+  MultimerInvariantPointAttentionWeights,
 } from "./structure/ipa.js";
 export { StructurePostAttentionGpu } from "./structure/iteration.js";
 export type {
@@ -71,7 +78,9 @@ export { AtomGeometryGpu } from "./structure/geometry.js";
 export type { AtomGeometryInput, AtomGeometryResult, ResidueGeometryTables } from "./structure/geometry.js";
 export { StructureModuleGpu } from "./structure/module.js";
 export type { StructureModuleInput, StructureModuleResult, StructureModuleWeights } from "./structure/module.js";
-export { ConfidenceHeadsGpu, predictedTmScore } from "./heads/confidence.js";
+export {
+  ConfidenceHeadsGpu, multimerRankingConfidence, predictedInterfaceTmScore, predictedTmScore,
+} from "./heads/confidence.js";
 export type {
   ConfidenceResult,
   PredictedAlignedErrorWeights,
@@ -83,6 +92,13 @@ export { makeQueryOnlyFeatures } from "./input/query-only-features.js";
 export type { QueryOnlyFeatureOptions, QueryOnlyFeatureTables } from "./input/query-only-features.js";
 export { makeA3mFeatures } from "./input/a3m-features.js";
 export type { A3mFeatureOptions } from "./input/a3m-features.js";
+export {
+  MULTIMER_MAX_RELATIVE_CHAIN, MULTIMER_MAX_RELATIVE_INDEX, MULTIMER_RELATIVE_CHANNELS,
+  makeMultimerQueryOnlyFeatures, makeMultimerSequenceFeatures, multimerChainIdentifiers, multimerRelativeFeatures,
+} from "./input/multimer-features.js";
+export type {
+  MultimerFeatureOptions, MultimerRecycleFeatures, MultimerSequenceFeatures,
+} from "./input/multimer-features.js";
 export { extractMmseqs2A3m, generateMmseqs2Msa, readTarFiles } from "./input/mmseqs2-api.js";
 export type {
   Mmseqs2MsaOptions, Mmseqs2MsaPhase, Mmseqs2MsaProgress, Mmseqs2MsaResult,
@@ -102,6 +118,12 @@ export type {
   MonomerBlockGpuProfile, MonomerGpuOptions, MonomerModelWeights, MonomerPrediction,
   MonomerRecycleFeatures, MonomerRecycleGpuProfile, MonomerRecycleResult, MonomerTrunkSubmissionCounts,
 } from "./model/monomer.js";
+export { AlphaFoldMultimerGpu } from "./model/multimer.js";
+export { multimerRecycleDistanceRms } from "./model/multimer-recycling.js";
+export type {
+  MultimerConfidenceResult, MultimerModelWeights, MultimerPrediction,
+  MultimerRecycleCallback, MultimerRecycleResult,
+} from "./model/multimer.js";
 export { triangleMultiplicationOutgoingReference } from "./triangle/cpu-reference.js";
 export { errorMetrics, validateTriangleInput } from "./triangle/types.js";
 export type {

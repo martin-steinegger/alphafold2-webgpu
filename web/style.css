@@ -33,7 +33,7 @@ h2 { font-size: 1.25rem; } h3 { font-size: 1rem; }
 .two-columns { grid-template-columns: 1fr 1fr; }
 label { display: grid; gap: .42rem; color: #555; font-size: .78rem; font-weight: 500; }
 input, select, textarea { width: 100%; border: 1px solid #aaa; border-radius: 2px; outline: 0; padding: .7rem .8rem; color: #222; background: #fff; transition: border-color .15s, box-shadow .15s; }
-textarea { resize: vertical; min-height: 160px; border-width: 0 0 1px; padding: 12px 0; font: .86rem/1.65 "Roboto Mono", monospace; text-transform: uppercase; }
+textarea { resize: vertical; min-height: 112px; border-width: 0 0 1px; padding: 10px 0; font: .86rem/1.55 "Roboto Mono", monospace; text-transform: uppercase; }
 input:focus, select:focus, textarea:focus { border-color: var(--primary); box-shadow: 0 1px 0 var(--primary); }
 input:disabled, select:disabled { color: #888; background: #eee; }
 .hint { color: #7c7c7c; font-size: .7rem; font-weight: 400; line-height: 1.45; }
@@ -70,7 +70,7 @@ input:disabled, select:disabled { color: #888; background: #eee; }
 .run-log { max-height: 190px; margin-top: .7rem; margin-bottom: 18px; padding: 0; white-space: pre-wrap; overflow: auto; background: transparent; color: #777; font: .64rem/1.6 "Roboto Mono", monospace; }
 
 .results { padding-top: 8px; }
-.score-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; padding: 1px; background: #d5d5d5; box-shadow: 0 2px 3px #0002; }
+.score-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1px; padding: 1px; background: #d5d5d5; box-shadow: 0 2px 3px #0002; }
 .score-grid article { display: grid; gap: .3rem; padding: 1.2rem; background: #fff; }
 .score-grid span, .score-grid small { color: #777; font-size: .7rem; } .score-grid strong { font: 500 1.65rem "Roboto Mono", monospace; }
 .result-grid { display: grid; grid-template-columns: 1fr 1fr; grid-template-areas: "structure structure" "plddt pae" "msa recycle"; gap: 8px; margin-top: 8px; }
@@ -101,5 +101,5 @@ th, td { padding: .65rem; border-bottom: 1px solid #ddd; text-align: right; } th
 footer { display: flex; justify-content: space-between; padding: 1.5rem 1rem 2.5rem; color: #888; font-size: .7rem; }
 
 @media (max-width: 900px) { .workspace { grid-template-columns: 1fr; } .result-grid { grid-template-columns: 1fr; grid-template-areas: "structure" "plddt" "msa" "pae" "recycle"; } .about { grid-template-columns: 1fr; } }
-@media (max-width: 680px) { body { padding-left: 0; } .side-rail { display: none; } .site-header { padding-inline: 12px; } .header-links a:not(:first-child) { display: none; } .header-links { gap: .8rem; } main, footer { width: calc(100% - 12px); } .two-columns, .advanced-grid { grid-template-columns: 1fr; } .advanced-grid .wide { grid-column: auto; } .score-grid { grid-template-columns: 1fr 1fr; } .primary { width: 100%; } textarea { min-height: 140px; } }
+@media (max-width: 680px) { body { padding-left: 0; } .side-rail { display: none; } .site-header { padding-inline: 12px; } .header-links a:not(:first-child) { display: none; } .header-links { gap: .8rem; } main, footer { width: calc(100% - 12px); } .two-columns, .advanced-grid { grid-template-columns: 1fr; } .advanced-grid .wide { grid-column: auto; } .score-grid { grid-template-columns: 1fr 1fr; } .primary { width: 100%; } textarea { min-height: 104px; } }
 @media (max-width: 430px) { .brand { font-size: 1rem; } .score-grid { grid-template-columns: 1fr; } footer { display: grid; gap: .5rem; } #structure-viewer { height: 390px; } }

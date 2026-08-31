@@ -23,6 +23,148 @@ export interface InvariantPointAttentionWeights {
   readonly outputBias: Float32Array;
 }
 
+/** Native AlphaFold-Multimer IPA parameters before conversion to the fused WebGPU layout. */
+export interface MultimerInvariantPointAttentionWeights {
+  readonly pairNormScale: Float32Array;
+  readonly pairNormOffset: Float32Array;
+  readonly queryScalarWeight: Float32Array;
+  readonly keyScalarWeight: Float32Array;
+  readonly valueScalarWeight: Float32Array;
+  readonly queryPointWeight: Float32Array;
+  readonly queryPointBias: Float32Array;
+  readonly keyPointWeight: Float32Array;
+  readonly keyPointBias: Float32Array;
+  readonly valuePointWeight: Float32Array;
+  readonly valuePointBias: Float32Array;
+  readonly trainablePointWeights: Float32Array;
+  readonly attention2dWeight: Float32Array;
+  readonly attention2dBias: Float32Array;
+  readonly outputWeight: Float32Array;
+  readonly outputBias: Float32Array;
+}
+
+function checkedLength(name: string, value: Float32Array, expected: number): void {
+  if (value.length !== expected || value.byteLength !== expected * 4) {
+    throw new RangeError(`${name} must contain exactly ${expected} float32 values`);
+  }
+}
+
+/**
+ * Convert Multimer-v3's separate, head-major Q/K/V tensors to the fused,
+ * coordinate-major layout consumed by the WebGPU IPA kernels. This is a
+ * lossless permutation/concatenation; no parameter values are approximated.
+ */
+export function adaptMultimerInvariantPointAttentionWeights(
+  weights: MultimerInvariantPointAttentionWeights,
+  channels: number,
+  pairChannels: number,
+  heads: number,
+  scalarQk: number,
+  scalarV: number,
+  pointQk: number,
+  pointV: number,
+): InvariantPointAttentionWeights {
+  const dimensions = [channels, pairChannels, heads, scalarQk, scalarV, pointQk, pointV];
+  if (!dimensions.every((value) => Number.isSafeInteger(value) && value > 0)) {
+    throw new RangeError("multimer IPA dimensions must be positive safe integers");
+  }
+  checkedLength("queryScalarWeight", weights.queryScalarWeight, channels * heads * scalarQk);
+  checkedLength("keyScalarWeight", weights.keyScalarWeight, channels * heads * scalarQk);
+  checkedLength("valueScalarWeight", weights.valueScalarWeight, channels * heads * scalarV);
+  checkedLength("queryPointWeight", weights.queryPointWeight, channels * heads * 3 * pointQk);
+  checkedLength("queryPointBias", weights.queryPointBias, heads * 3 * pointQk);
+  checkedLength("keyPointWeight", weights.keyPointWeight, channels * heads * 3 * pointQk);
+  checkedLength("keyPointBias", weights.keyPointBias, heads * 3 * pointQk);
+  checkedLength("valuePointWeight", weights.valuePointWeight, channels * heads * 3 * pointV);
+  checkedLength("valuePointBias", weights.valuePointBias, heads * 3 * pointV);
+  checkedLength("pairNormScale", weights.pairNormScale, pairChannels);
+  checkedLength("pairNormOffset", weights.pairNormOffset, pairChannels);
+  checkedLength("trainablePointWeights", weights.trainablePointWeights, heads);
+  checkedLength("attention2dWeight", weights.attention2dWeight, pairChannels * heads);
+  checkedLength("attention2dBias", weights.attention2dBias, heads);
+  const featureChannels = heads * (scalarV + 4 * pointV + pairChannels);
+  checkedLength("outputWeight", weights.outputWeight, featureChannels * channels);
+  checkedLength("outputBias", weights.outputBias, channels);
+
+  const queryScalarBias = new Float32Array(heads * scalarQk);
+  const keyValueScalarWeight = new Float32Array(channels * heads * (scalarQk + scalarV));
+  const keyValueScalarBias = new Float32Array(heads * (scalarQk + scalarV));
+  for (let input = 0; input < channels; input += 1) {
+    for (let head = 0; head < heads; head += 1) {
+      const outputBase = (input * heads + head) * (scalarQk + scalarV);
+      const keyBase = (input * heads + head) * scalarQk;
+      const valueBase = (input * heads + head) * scalarV;
+      keyValueScalarWeight.set(weights.keyScalarWeight.subarray(keyBase, keyBase + scalarQk), outputBase);
+      keyValueScalarWeight.set(
+        weights.valueScalarWeight.subarray(valueBase, valueBase + scalarV), outputBase + scalarQk,
+      );
+    }
+  }
+
+  const reorderPointProjection = (
+    source: Float32Array, inputChannels: number, points: number,
+  ): Float32Array => {
+    const output = new Float32Array(inputChannels * heads * 3 * points);
+    for (let input = 0; input < inputChannels; input += 1) {
+      for (let coordinate = 0; coordinate < 3; coordinate += 1) {
+        for (let head = 0; head < heads; head += 1) {
+          for (let point = 0; point < points; point += 1) {
+            const sourceIndex = ((input * heads + head) * 3 + coordinate) * points + point;
+            const outputIndex = ((input * 3 + coordinate) * heads + head) * points + point;
+            output[outputIndex] = source[sourceIndex]!;
+          }
+        }
+      }
+    }
+    return output;
+  };
+  const queryPointWeight = reorderPointProjection(weights.queryPointWeight, channels, pointQk);
+  const queryPointBias = reorderPointProjection(weights.queryPointBias, 1, pointQk);
+  const keyPoint = reorderPointProjection(weights.keyPointWeight, channels, pointQk);
+  const valuePoint = reorderPointProjection(weights.valuePointWeight, channels, pointV);
+  const keyPointBias = reorderPointProjection(weights.keyPointBias, 1, pointQk);
+  const valuePointBias = reorderPointProjection(weights.valuePointBias, 1, pointV);
+  const keyValuePointWeight = new Float32Array(channels * 3 * heads * (pointQk + pointV));
+  const keyValuePointBias = new Float32Array(3 * heads * (pointQk + pointV));
+  for (let input = 0; input < channels; input += 1) {
+    for (let coordinate = 0; coordinate < 3; coordinate += 1) {
+      for (let head = 0; head < heads; head += 1) {
+        const outputBase = ((input * 3 + coordinate) * heads + head) * (pointQk + pointV);
+        const keyBase = ((input * 3 + coordinate) * heads + head) * pointQk;
+        const valueBase = ((input * 3 + coordinate) * heads + head) * pointV;
+        keyValuePointWeight.set(keyPoint.subarray(keyBase, keyBase + pointQk), outputBase);
+        keyValuePointWeight.set(valuePoint.subarray(valueBase, valueBase + pointV), outputBase + pointQk);
+      }
+    }
+  }
+  for (let coordinate = 0; coordinate < 3; coordinate += 1) {
+    for (let head = 0; head < heads; head += 1) {
+      const outputBase = (coordinate * heads + head) * (pointQk + pointV);
+      const keyBase = (coordinate * heads + head) * pointQk;
+      const valueBase = (coordinate * heads + head) * pointV;
+      keyValuePointBias.set(keyPointBias.subarray(keyBase, keyBase + pointQk), outputBase);
+      keyValuePointBias.set(valuePointBias.subarray(valueBase, valueBase + pointV), outputBase + pointQk);
+    }
+  }
+  return {
+    pairNormScale: weights.pairNormScale,
+    pairNormOffset: weights.pairNormOffset,
+    queryScalarWeight: weights.queryScalarWeight,
+    queryScalarBias,
+    keyValueScalarWeight,
+    keyValueScalarBias,
+    queryPointWeight,
+    queryPointBias,
+    keyValuePointWeight,
+    keyValuePointBias,
+    trainablePointWeights: weights.trainablePointWeights,
+    attention2dWeight: weights.attention2dWeight,
+    attention2dBias: weights.attention2dBias,
+    outputWeight: weights.outputWeight,
+    outputBias: weights.outputBias,
+  };
+}
+
 export interface InvariantPointAttentionInput {
   readonly activations: Float32Array;
   readonly pair: Float32Array;
@@ -37,6 +179,8 @@ export interface InvariantPointAttentionInput {
   readonly pointQk: number;
   readonly pointV: number;
   readonly weights: InvariantPointAttentionWeights;
+  /** Apply the Multimer-v3 convention that scales the mask with all three logit terms. */
+  readonly multimer?: boolean;
   readonly prepared?: PreparedInvariantPointAttention;
 }
 
@@ -47,6 +191,43 @@ export interface InvariantPointAttentionResult {
 }
 
 const LINEAR_SHADER = createTransitionShaders({} as TransitionInput, [])[1]!;
+
+function validateInput(input: InvariantPointAttentionInput): void {
+  const dimensions = [input.length, input.channels, input.pairChannels, input.heads,
+    input.scalarQk, input.scalarV, input.pointQk, input.pointV];
+  if (!dimensions.every((value) => Number.isSafeInteger(value) && value > 0)) {
+    throw new RangeError("IPA dimensions must be positive safe integers");
+  }
+  const featureChannels = input.heads * (input.scalarV + 4 * input.pointV + input.pairChannels);
+  const expected = [
+    ["activations", input.activations, input.length * input.channels],
+    ["pair", input.pair, input.length * input.length * input.pairChannels],
+    ["mask", input.mask, input.length],
+    ["affine", input.affine, input.length * 7],
+    ["pairNormScale", input.weights.pairNormScale, input.pairChannels],
+    ["pairNormOffset", input.weights.pairNormOffset, input.pairChannels],
+    ["queryScalarWeight", input.weights.queryScalarWeight, input.channels * input.heads * input.scalarQk],
+    ["queryScalarBias", input.weights.queryScalarBias, input.heads * input.scalarQk],
+    ["keyValueScalarWeight", input.weights.keyValueScalarWeight,
+      input.channels * input.heads * (input.scalarQk + input.scalarV)],
+    ["keyValueScalarBias", input.weights.keyValueScalarBias, input.heads * (input.scalarQk + input.scalarV)],
+    ["queryPointWeight", input.weights.queryPointWeight, input.channels * input.heads * 3 * input.pointQk],
+    ["queryPointBias", input.weights.queryPointBias, input.heads * 3 * input.pointQk],
+    ["keyValuePointWeight", input.weights.keyValuePointWeight,
+      input.channels * input.heads * 3 * (input.pointQk + input.pointV)],
+    ["keyValuePointBias", input.weights.keyValuePointBias, input.heads * 3 * (input.pointQk + input.pointV)],
+    ["trainablePointWeights", input.weights.trainablePointWeights, input.heads],
+    ["attention2dWeight", input.weights.attention2dWeight, input.pairChannels * input.heads],
+    ["attention2dBias", input.weights.attention2dBias, input.heads],
+    ["outputWeight", input.weights.outputWeight, featureChannels * input.channels],
+    ["outputBias", input.weights.outputBias, input.channels],
+  ] as const;
+  for (const [name, value, elements] of expected) {
+    if (!(value instanceof Float32Array) || value.length !== elements || value.byteLength !== elements * 4) {
+      throw new RangeError(`${name} must contain exactly ${elements} float32 values`);
+    }
+  }
+}
 
 function packWeights(input: InvariantPointAttentionInput): { data: Float32Array; offsets: readonly number[] } {
   const w = input.weights;
@@ -82,6 +263,7 @@ function parameters(input: InvariantPointAttentionInput, offsets: readonly numbe
   view.setFloat32(96, Math.sqrt(1 / (3 * input.scalarQk)), true);
   view.setFloat32(100, Math.sqrt(1 / (3 * input.pointQk * 4.5)), true);
   view.setFloat32(104, Math.sqrt(1 / 3), true);
+  view.setFloat32(108, input.multimer === true ? Math.sqrt(1 / 3) : 1, true);
   return new Uint8Array(buffer);
 }
 
@@ -97,8 +279,8 @@ struct Parameters {
   trainable_point_weights: u32,
   attention_2d_weight: u32, attention_2d_bias: u32,
   output_weight: u32, output_bias: u32,
-  scalar_factor: f32, point_factor: f32, attention_2d_factor: f32,
-  padding_0: u32, padding_1: u32, padding_2: u32, padding_3: u32, padding_4: u32,
+  scalar_factor: f32, point_factor: f32, attention_2d_factor: f32, mask_factor: f32,
+  padding_0: u32, padding_1: u32, padding_2: u32, padding_3: u32,
 };
 `;
 
@@ -179,7 +361,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     pair_bias += pair[pair_base + c] * weights[p.attention_2d_weight + c * p.heads + head];
   }
   result += p.attention_2d_factor * pair_bias;
-  result -= 1e5 * (1.0 - mask[query] * mask[key_index]);
+  result -= p.mask_factor * 1e5 * (1.0 - mask[query] * mask[key_index]);
   output[index] = result;
 }`;
 
@@ -333,7 +515,7 @@ export class PreparedInvariantPointAttention implements PreparedFields {
     allocations: AllocatedGpuBuffer[]) {
     this.#device = device;
     this.#shape = [input.length, input.channels, input.pairChannels, input.heads,
-      input.scalarQk, input.scalarV, input.pointQk, input.pointV];
+      input.scalarQk, input.scalarV, input.pointQk, input.pointV, input.multimer === true ? 1 : 0];
     this.#pairSource = input.pair;
     this.#maskSource = input.mask;
     this.#weightSource = input.weights;
@@ -344,7 +526,7 @@ export class PreparedInvariantPointAttention implements PreparedFields {
   assertCompatible(device: GPUDevice, input: InvariantPointAttentionInput): void {
     if (this.#released) throw new Error("prepared invariant point attention state has been released");
     const shape = [input.length, input.channels, input.pairChannels, input.heads,
-      input.scalarQk, input.scalarV, input.pointQk, input.pointV];
+      input.scalarQk, input.scalarV, input.pointQk, input.pointV, input.multimer === true ? 1 : 0];
     if (device !== this.#device || shape.some((value, index) => value !== this.#shape[index])
       || input.pair !== this.#pairSource || input.mask !== this.#maskSource || input.weights !== this.#weightSource) {
       throw new Error("prepared invariant point attention state does not match this input");
@@ -372,6 +554,7 @@ export class InvariantPointAttentionGpu {
   }
 
   async prepare(input: InvariantPointAttentionInput): Promise<PreparedInvariantPointAttention> {
+    validateInput(input);
     const pipelines = await Promise.all([
       this.pipelines.get("ipa:normalize", ATTENTION_NORMALIZE_SHADER),
       this.pipelines.get("ipa:linear", LINEAR_SHADER),
@@ -460,6 +643,7 @@ export class InvariantPointAttentionGpu {
   }
 
   async run(input: InvariantPointAttentionInput): Promise<InvariantPointAttentionResult> {
+    validateInput(input);
     const shared = input.prepared ?? await this.prepare(input);
     const ownsShared = input.prepared === undefined;
     shared.assertCompatible(this.device, input);
