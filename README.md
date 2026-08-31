@@ -301,7 +301,7 @@ npm run quantize:web-model -- /tmp/afwebgpu-multimer-model1-f32-v1 \
 npm run verify:web-model -- /tmp/afwebgpu-multimer-model1-q8-v1/manifest.json --require-sha256
 ```
 
-The browser automatically uses `./model-multimer/manifest.json` for colon-separated input. Official differential captures can be regenerated with `tools/capture_alphafold_multimer_reference.py`. The optional end-to-end test uses `AFWEBGPU_MULTIMER_REFERENCE`, `AFWEBGPU_MULTIMER_F32_MANIFEST`, and `AFWEBGPU_MULTIMER_Q8_MANIFEST`; it compares official JAX to WebGPU float32, then q8 to WebGPU float32 without changing reference data or tolerances.
+The browser automatically uses `./model-multimer/manifest.json` for colon-separated input. Official differential captures can be regenerated with `tools/capture_alphafold_multimer_reference.py`; pass one `--unpaired-a3m` and `--paired-a3m` file per unique entity to capture a paired/unpaired case. The optional end-to-end test accepts comma-separated query-only and paired capture manifests through `AFWEBGPU_MULTIMER_REFERENCES`, plus `AFWEBGPU_MULTIMER_F32_MANIFEST` and `AFWEBGPU_MULTIMER_Q8_MANIFEST`. It compares official JAX to WebGPU float32, then q8 to WebGPU float32 without changing reference data or tolerances.
 
 Full-model captures are excluded from source history. The monomer bundle is stored in the `model1-ptm` GitHub Release. The Multimer q8 bundle is stored separately under tag `model1-multimer-v3-q8-v1` as `afwebgpu-model1-multimer-v3-q8-v1.tar.gz`. The Pages workflow downloads the enabled assets and constructs the deployment artifact.
 

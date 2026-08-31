@@ -8,7 +8,9 @@ import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
 import { errorMetrics } from "../src/triangle/types.js";
 
-const referenceManifest = process.env.AFWEBGPU_MULTIMER_REFERENCE;
+const referenceManifests = (process.env.AFWEBGPU_MULTIMER_REFERENCES
+  ?? process.env.AFWEBGPU_MULTIMER_REFERENCE ?? "")
+  .split(",").map((value) => value.trim()).filter((value) => value !== "");
 const float32Manifest = process.env.AFWEBGPU_MULTIMER_F32_MANIFEST;
 const q8Manifest = process.env.AFWEBGPU_MULTIMER_Q8_MANIFEST;
 const gpuEnabled = process.env.AFWEBGPU_GPU_TESTS === "1";
@@ -83,8 +85,10 @@ async function predict(
   );
 }
 
+for (const referenceManifest of referenceManifests.length > 0 ? referenceManifests : [undefined]) {
+  const referenceLabel = referenceManifest?.split("/").at(-2) ?? "missing reference";
 describe.skipIf(!(gpuEnabled && referenceManifest !== undefined && float32Manifest !== undefined))(
-  "official AlphaFold-Multimer-v3 model-1 end-to-end reference",
+  `official AlphaFold-Multimer-v3 model-1 end-to-end reference (${referenceLabel})`,
   () => {
     let device: GPUDevice;
     let reference: FileTensorStore;
@@ -121,7 +125,7 @@ describe.skipIf(!(gpuEnabled && referenceManifest !== undefined && float32Manife
 
 describe.skipIf(!(gpuEnabled && referenceManifest !== undefined
   && float32Manifest !== undefined && q8Manifest !== undefined))(
-  "quantized AlphaFold-Multimer-v3 model 1",
+  `quantized AlphaFold-Multimer-v3 model 1 (${referenceLabel})`,
   () => {
     let device: GPUDevice;
     let reference: FileTensorStore;
@@ -155,3 +159,4 @@ describe.skipIf(!(gpuEnabled && referenceManifest !== undefined
     }, 600_000);
   },
 );
+}

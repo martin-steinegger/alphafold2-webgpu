@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 from types import GeneratorType
@@ -19,12 +20,39 @@ def main() -> None:
     parser.add_argument("--data-dir", type=Path, default=Path.home() / ".cache" / "colabfold")
     parser.add_argument("--model-number", type=int, choices=(1,), default=1)
     parser.add_argument("--recycles", type=int, default=0)
+    parser.add_argument("--unpaired-a3m", type=Path, nargs="+")
+    parser.add_argument("--paired-a3m", type=Path, nargs="+")
+    parser.add_argument("--max-msa-sequences", type=int, default=1)
+    parser.add_argument("--max-extra-sequences", type=int, default=1)
     args = parser.parse_args()
     chains = [chain.strip().upper() for chain in args.chains.split(":")]
     if len(chains) < 2 or any(not chain for chain in chains):
         raise SystemExit("--chains requires at least two non-empty colon-separated chains")
     if args.recycles < 0:
         raise SystemExit("--recycles must be non-negative")
+    if args.max_msa_sequences < 1 or args.max_extra_sequences < 1:
+        raise SystemExit("MSA row limits must be positive")
+
+    unique_chains: list[str] = []
+    cardinalities: list[int] = []
+    for chain in chains:
+        if chain in unique_chains:
+            cardinalities[unique_chains.index(chain)] += 1
+        else:
+            unique_chains.append(chain)
+            cardinalities.append(1)
+
+    def load_a3ms(paths: list[Path] | None, label: str) -> list[str]:
+        if paths is None:
+            return [f">{101 + index}\n{chain}\n" for index, chain in enumerate(unique_chains)]
+        if len(paths) != len(unique_chains):
+            raise SystemExit(
+                f"--{label}-a3m requires one file per unique chain ({len(unique_chains)} expected)"
+            )
+        return [path.read_text() for path in paths]
+
+    unpaired_a3ms = load_a3ms(args.unpaired_a3m, "unpaired")
+    paired_a3ms = load_a3ms(args.paired_a3m, "paired")
 
     original_sum = np.sum
 
@@ -37,15 +65,16 @@ def main() -> None:
     from colabfold.batch import generate_input_feature, mk_mock_template
     from alphafold.model import folding_multimer, modules_multimer
 
-    a3ms = [f">101\n{chain}\n" for chain in chains]
     raw_features, _ = generate_input_feature(
-        chains, [1] * len(chains), a3ms, a3ms,
-        [mk_mock_template(chain) for chain in chains], True, "alphafold2_multimer_v3", 1,
+        unique_chains, cardinalities, unpaired_a3ms, paired_a3ms,
+        [mk_mock_template(chain) for chain in unique_chains], True, "alphafold2_multimer_v3",
+        args.max_msa_sequences,
     )
     model_name, runner, params = load_models_and_params(
         num_models=1, use_templates=False, num_recycles=args.recycles, recycle_early_stop_tolerance=-1,
         num_ensemble=1, model_order=[args.model_number], model_type="alphafold2_multimer_v3",
-        data_dir=args.data_dir, max_seq=1, max_extra_seq=1, use_fuse=False,
+        data_dir=args.data_dir, max_seq=args.max_msa_sequences,
+        max_extra_seq=args.max_extra_sequences, use_fuse=False,
         use_bfloat16=False, use_dropout=False, save_all=True,
     )[0]
     processed = runner.process_features(raw_features, random_seed=0)
@@ -221,6 +250,8 @@ def main() -> None:
         "source": "official AlphaFold-Multimer-v3 JAX float32 inference",
         "model": {"name": model_name, "type": "alphafold2_multimer_v3", "number": args.model_number},
         "chains": chains,
+        "uniqueChains": unique_chains,
+        "cardinalities": cardinalities,
         "recycles": args.recycles,
         "recycleIteration": int(recycle_iteration),
         "reference": {
@@ -228,6 +259,12 @@ def main() -> None:
             "iptm": float(prediction["iptm"]), "rankingConfidence": float(prediction["ranking_confidence"]),
             "multimerRankingConfidence": 0.2 * float(prediction["ptm"]) + 0.8 * float(prediction["iptm"]),
             "recycleMetrics": recycle_metrics,
+        },
+        "msaInput": {
+            "maxMsaSequences": args.max_msa_sequences,
+            "maxExtraSequences": args.max_extra_sequences,
+            "unpairedSha256": [hashlib.sha256(value.encode()).hexdigest() for value in unpaired_a3ms],
+            "pairedSha256": [hashlib.sha256(value.encode()).hexdigest() for value in paired_a3ms],
         },
         "ipaParameters": parameter_records,
         "tensors": records,

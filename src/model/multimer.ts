@@ -52,7 +52,8 @@ function withInterfaceConfidence(
 /**
  * AlphaFold-Multimer-v3 inference with chain-aware embeddings, native multimer
  * structure-module semantics, ipTM, and official multimer ranking confidence.
- * The current public feature builder is the official no-template/no-MSA path.
+ * Query-only and paired/unpaired MSA feature builders both use this shared
+ * allocator, compact-transition, scratch-pool, and recycling implementation.
  */
 export class AlphaFoldMultimerGpu {
   readonly device: GPUDevice;

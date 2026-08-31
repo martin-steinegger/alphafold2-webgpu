@@ -39,7 +39,7 @@ Before release, run the end-to-end differential qualification against an indepen
 
 ```bash
 AFWEBGPU_GPU_TESTS=1 \
-AFWEBGPU_MULTIMER_REFERENCE=/path/to/reference/manifest.json \
+AFWEBGPU_MULTIMER_REFERENCES=/path/to/query/manifest.json,/path/to/paired/manifest.json \
 AFWEBGPU_MULTIMER_F32_MANIFEST=/tmp/afwebgpu-multimer-model1-f32-v1/manifest.json \
 AFWEBGPU_MULTIMER_Q8_MANIFEST=/tmp/model-multimer/manifest.json \
 npx vitest run test/multimer-model-official.gpu.test.ts
