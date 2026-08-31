@@ -4,7 +4,7 @@ import {
   multimerChainIdentifiers, multimerRelativeFeatures,
 } from "../src/input/multimer-features.js";
 
-const HOMODIMER_CHAIN = "PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK";
+const HOMOMER_CHAIN = "PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK";
 
 describe("AlphaFold-Multimer sequence features", () => {
   it("preserves both copies and chain boundaries for the 59-residue homodimer", () => {
@@ -12,11 +12,11 @@ describe("AlphaFold-Multimer sequence features", () => {
       atom37ToAtom14: Float32Array.from({ length: 21 * 37 }, (_, index) => index % 14),
       atom37Mask: new Float32Array(21 * 37).fill(1),
     };
-    const features = makeMultimerSequenceFeatures(`${HOMODIMER_CHAIN}:${HOMODIMER_CHAIN}`, tables);
+    const features = makeMultimerSequenceFeatures(`${HOMOMER_CHAIN}:${HOMOMER_CHAIN}`, tables);
 
-    expect(features.chains).toEqual([HOMODIMER_CHAIN, HOMODIMER_CHAIN]);
+    expect(features.chains).toEqual([HOMOMER_CHAIN, HOMOMER_CHAIN]);
     expect(features.chainLengths).toEqual([59, 59]);
-    expect(features.sequence).toBe(HOMODIMER_CHAIN.repeat(2));
+    expect(features.sequence).toBe(HOMOMER_CHAIN.repeat(2));
     expect(features.targetFeatures).toHaveLength(118 * 21);
     expect([...features.asymId.subarray(0, 59)]).toEqual(new Array(59).fill(1));
     expect([...features.asymId.subarray(59)]).toEqual(new Array(59).fill(2));
@@ -29,6 +29,29 @@ describe("AlphaFold-Multimer sequence features", () => {
     expect([...features.residueIndex.subarray(59)]).toEqual(
       Array.from({ length: 59 }, (_, index) => index),
     );
+  });
+
+  it("assigns three asymmetric chains and symmetry copies to the 59-residue homotrimer", () => {
+    const tables = {
+      atom37ToAtom14: Float32Array.from({ length: 21 * 37 }, (_, index) => index % 14),
+      atom37Mask: new Float32Array(21 * 37).fill(1),
+    };
+    const features = makeMultimerSequenceFeatures(new Array(3).fill(HOMOMER_CHAIN), tables);
+
+    expect(features.chains).toEqual(new Array(3).fill(HOMOMER_CHAIN));
+    expect(features.chainLengths).toEqual([59, 59, 59]);
+    expect(features.sequence).toBe(HOMOMER_CHAIN.repeat(3));
+    expect(features.targetFeatures).toHaveLength(177 * 21);
+    expect([...features.entityId]).toEqual(new Array(177).fill(1));
+    for (let copy = 0; copy < 3; copy += 1) {
+      const start = copy * 59;
+      const end = start + 59;
+      expect([...features.asymId.subarray(start, end)]).toEqual(new Array(59).fill(copy + 1));
+      expect([...features.symId.subarray(start, end)]).toEqual(new Array(59).fill(copy + 1));
+      expect([...features.residueIndex.subarray(start, end)]).toEqual(
+        Array.from({ length: 59 }, (_, index) => index),
+      );
+    }
   });
 
   it("assigns asym, entity and symmetry identifiers to heteromers and homomers", () => {
