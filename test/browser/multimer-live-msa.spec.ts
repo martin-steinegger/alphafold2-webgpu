@@ -7,7 +7,11 @@ const HETERODIMER = [
   "MKLVRFLMKLTNETVSIELKNGTIVHGTITSVDMQMNTHLKAVKMTVKGREPVPVETLSIRGNNIRYYILPDSLPLDTLLIDDSTKPKQKKKEVVRGRGRGRGRGTRGRGRGASRG",
 ].join(":");
 
-async function prepareLivePrediction(page: import("@playwright/test").Page, sequence: string): Promise<void> {
+async function prepareLivePrediction(
+  page: import("@playwright/test").Page,
+  sequence: string,
+  recycles = 1,
+): Promise<void> {
   page.on("console", (message) => console.log(`browser: ${message.text()}`));
   await page.goto("/");
   await page.getByText("Advanced settings").click();
@@ -15,8 +19,9 @@ async function prepareLivePrediction(page: import("@playwright/test").Page, sequ
     "/qualification-assets/model-multimer/manifest.json",
   );
   await page.locator("#input-mode").selectOption("mmseqs2");
-  await page.locator("#recycles").selectOption("1");
   await page.locator("#sequence").fill(sequence);
+  await page.locator("#recycles").selectOption(String(recycles));
+  await expect(page.locator("#recycles")).toHaveValue(String(recycles));
   await page.locator("#predict").click();
   await expect(page.locator("#results-section")).toBeVisible({ timeout: 30 * 60_000 });
 }
@@ -35,7 +40,7 @@ test("predicts the acceptance homodimer with a ColabFold MMseqs2 MSA", async ({ 
 
 test("predicts a heterodimer with paired and unpaired ColabFold MSAs", async ({ page }) => {
   test.setTimeout(30 * 60_000);
-  await prepareLivePrediction(page, HETERODIMER);
+  await prepareLivePrediction(page, HETERODIMER, 3);
   await expect(page.locator("#result-length")).toHaveText("209");
   await expect(page.locator("#run-log")).toContainText("MMseqs2: Paired: Alignment ready");
   await expect(page.locator("#run-log")).toContainText("MMseqs2: Unpaired: Alignment ready");
