@@ -1,5 +1,6 @@
 import type { Precision, TriangleShape } from "./types.js";
 import type { WeightOffsets } from "./weights.js";
+import { createTiledGemmShader } from "../runtime/gemm.js";
 
 export interface TriangleShaders {
   readonly normalizeInput: string;
@@ -179,47 +180,27 @@ fn main(
   const loadBTile = direction === "outgoing"
     ? "b[h * PAIRS + j * L + b_k]"
     : "a[h * PAIRS + b_k * L + j]";
-  const contract = `${common}
+  // out[h][i][j] = sum_k A[h][i][k] * B[h][j][k], one independent matrix per
+  // hidden channel, dispatched along z. The shared tiling gives each invocation
+  // eight rows by four columns, against one output element per invocation
+  // before, which raises it from half a multiply-add per shared read to almost
+  // three.
+  const contract = createTiledGemmShader({
+    preamble: `${common}
 @group(0) @binding(0) var<storage, read> a: array<f32>;
 @group(0) @binding(1) var<storage, read> b: array<f32>;
-@group(0) @binding(2) var<storage, read_write> output: array<f32>;
-
-var<workgroup> tile_a: array<f32, 64>;
-var<workgroup> tile_b: array<f32, 64>;
-
-@compute @workgroup_size(8, 8, 1)
-fn main(
-  @builtin(local_invocation_id) local: vec3<u32>,
-  @builtin(workgroup_id) group: vec3<u32>,
-) {
-  let i = group.y * 8u + local.y;
-  let j = group.x * 8u + local.x;
-  let h = group.z;
-  let tile_index = local.y * 8u + local.x;
-  var sum = 0.0;
-
-  for (var k0 = 0u; k0 < L; k0 += 8u) {
-    let a_k = k0 + local.x;
-    let b_k = k0 + local.y;
-    tile_a[tile_index] = 0.0;
-    tile_b[tile_index] = 0.0;
-    if (i < L && a_k < L) {
-      tile_a[tile_index] = ${loadATile};
-    }
-    if (j < L && b_k < L) {
-      tile_b[tile_index] = ${loadBTile};
-    }
-    workgroupBarrier();
-    for (var k = 0u; k < 8u; k += 1u) {
-      sum += tile_a[local.y * 8u + k] * tile_b[k * 8u + local.x];
-    }
-    workgroupBarrier();
-  }
-
-  if (i < L && j < L) {
-    output[h * PAIRS + i * L + j] = sum;
-  }
-}`;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;`,
+    rows: "L",
+    inner: "L",
+    columns: "L",
+    sourceElement: direction === "outgoing"
+      ? "a[group.z * PAIRS + row * L + k]"
+      : "b[group.z * PAIRS + k * L + row]",
+    weightElement: direction === "outgoing"
+      ? "b[group.z * PAIRS + column * L + k]"
+      : "a[group.z * PAIRS + k * L + column]",
+    store: "output[group.z * PAIRS + row * L + column] = element;",
+  });
 
   const normalizeHidden = `${common}
 @group(0) @binding(0) var<storage, read> source: array<f32>;

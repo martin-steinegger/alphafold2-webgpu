@@ -5,6 +5,7 @@ import { createTriangleShaders, type TriangleDirection } from "./shaders.js";
 import type { Precision, TriangleMultiplicationInput } from "./types.js";
 import { validateTriangleInput } from "./types.js";
 import { packWeights } from "./weights.js";
+import { gemmGrid } from "../runtime/gemm.js";
 
 export interface TriangleGpuOptions {
   readonly precision?: Precision;
@@ -120,8 +121,9 @@ class TriangleMultiplicationGpu {
       runPass("project-ab", projectAB,
         [zNormalized.buffer, mask.buffer, weights.buffer, a.buffer, b.buffer],
         ceilDivide(cHidden, 16), ceilDivide(pairCount, 16));
+      const contractGrid = gemmGrid(length, length);
       runPass("contract", contract, [a.buffer, b.buffer, contracted.buffer],
-        ceilDivide(length, 8), ceilDivide(length, 8), cHidden);
+        contractGrid[0], contractGrid[1], cHidden);
       runPass("normalize-hidden", normalizeHidden,
         [contracted.buffer, weights.buffer, xNormalized.buffer], ceilDivide(pairCount, 64));
       runPass("project-output", projectOutput,

@@ -699,8 +699,9 @@ async function encodeTriangleMultiplication(
   execution.dispatch(encoder, projectAB, [normalized, pairMask, weights, a, b],
     Math.ceil(input.triangleHidden / 16), Math.ceil(pairs / 16), 1,
     `triangle.${direction}.project`);
-  execution.dispatch(encoder, contract, [a, b, contracted], Math.ceil(input.length / 8),
-    Math.ceil(input.length / 8), input.triangleHidden, `triangle.${direction}.contract`);
+  const contractGrid = gemmGrid(input.length, input.length);
+  execution.dispatch(encoder, contract, [a, b, contracted], contractGrid[0],
+    contractGrid[1], input.triangleHidden, `triangle.${direction}.contract`);
   execution.dispatch(encoder, normalizeHidden, [contracted, weights, hiddenNormalized], Math.ceil(pairs / 64), 1, 1,
     `triangle.${direction}.normalize-hidden`);
   execution.dispatch(encoder, projectOutput, [normalized, hiddenNormalized, weights, output],
