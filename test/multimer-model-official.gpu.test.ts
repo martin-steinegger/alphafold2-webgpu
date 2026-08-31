@@ -12,7 +12,8 @@ const referenceManifests = (process.env.AFWEBGPU_MULTIMER_REFERENCES
   ?? process.env.AFWEBGPU_MULTIMER_REFERENCE ?? "")
   .split(",").map((value) => value.trim()).filter((value) => value !== "");
 const float32Manifest = process.env.AFWEBGPU_MULTIMER_F32_MANIFEST;
-const q8Manifest = process.env.AFWEBGPU_MULTIMER_Q8_MANIFEST;
+const compressedManifest = process.env.AFWEBGPU_MULTIMER_COMPRESSED_MANIFEST
+  ?? process.env.AFWEBGPU_MULTIMER_Q8_MANIFEST;
 const gpuEnabled = process.env.AFWEBGPU_GPU_TESTS === "1";
 
 interface MultimerReferenceManifest {
@@ -26,11 +27,16 @@ interface MultimerReferenceManifest {
 }
 
 async function multimerWeights(fixture: AlphaFoldFixture): Promise<MultimerModelWeights> {
-  const [embedding, extraStack, mainStack, structure, confidence, geometry] = await Promise.all([
-    fixture.multimerEmbeddingWeights(), fixture.extraStackWeights(), fixture.mainStackWeights(),
-    fixture.multimerStructureWeights(), fixture.confidenceWeights(), fixture.geometryTables(),
-  ]);
-  return { embedding, extraStack, mainStack, structure,
+  // Load large f32 shards sequentially so native WebGPU test workers do not
+  // transiently retain duplicate shard buffers while several readers resolve.
+  const embedding = await fixture.multimerEmbeddingWeights();
+  const multimerTemplate = await fixture.multimerTemplateWeights();
+  const extraStack = await fixture.extraStackWeights();
+  const mainStack = await fixture.mainStackWeights();
+  const structure = await fixture.multimerStructureWeights();
+  const confidence = await fixture.confidenceWeights();
+  const geometry = await fixture.geometryTables();
+  return { embedding, multimerTemplate, extraStack, mainStack, structure,
     lddt: confidence.lddt, pae: confidence.pae, geometry };
 }
 
@@ -72,17 +78,28 @@ async function capturedFeatures(
   return results;
 }
 
-async function predict(
-  device: GPUDevice,
+interface PreparedPrediction {
+  readonly features: readonly MultimerRecycleFeatures[];
+  readonly weights: MultimerModelWeights;
+  readonly paeBreaks: Float32Array;
+}
+
+async function preparePrediction(
   modelManifest: string,
   reference: FileTensorStore,
-): Promise<MultimerPrediction> {
+): Promise<PreparedPrediction> {
   const model = AlphaFoldFixture.fromStore(await FileTensorStore.open(modelManifest));
+  return {
+    features: await capturedFeatures(reference, model),
+    weights: await multimerWeights(model),
+    paeBreaks: await model.tensor("confidencePaeBreaks"),
+  };
+}
+
+async function predict(device: GPUDevice, prepared: PreparedPrediction): Promise<MultimerPrediction> {
   return new AlphaFoldMultimerGpu(device, {
     compactTransitions: true, recycleEarlyStopTolerance: -1,
-  }).predict(
-    await capturedFeatures(reference, model), await multimerWeights(model), await model.tensor("confidencePaeBreaks"),
-  );
+  }).predict(prepared.features, prepared.weights, prepared.paeBreaks);
 }
 
 for (const referenceManifest of referenceManifests.length > 0 ? referenceManifests : [undefined]) {
@@ -92,17 +109,19 @@ describe.skipIf(!(gpuEnabled && referenceManifest !== undefined && float32Manife
   () => {
     let device: GPUDevice;
     let reference: FileTensorStore;
+    let prepared: PreparedPrediction;
     beforeAll(async () => {
+      reference = await FileTensorStore.open(referenceManifest!);
+      prepared = await preparePrediction(float32Manifest!, reference);
       Object.assign(globalThis, globals);
-      const adapter = await create([]).requestAdapter({ powerPreference: "high-performance" });
+      const adapter = await create([]).requestAdapter();
       if (adapter === null) throw new Error("no WebGPU adapter");
       device = await adapter.requestDevice();
-      reference = await FileTensorStore.open(referenceManifest!);
     });
     afterAll(() => device?.destroy());
 
     it("matches official float32 confidence, PAE, and atom coordinates", async () => {
-      const prediction = await predict(device, float32Manifest!, reference);
+      const prediction = await predict(device, prepared);
       const manifest = reference.manifest as unknown as MultimerReferenceManifest;
       expect(prediction.recycles).toHaveLength(manifest.recycles + 1);
       for (let recycle = 0; recycle < prediction.recycles.length; recycle += 1) {
@@ -124,37 +143,41 @@ describe.skipIf(!(gpuEnabled && referenceManifest !== undefined && float32Manife
 );
 
 describe.skipIf(!(gpuEnabled && referenceManifest !== undefined
-  && float32Manifest !== undefined && q8Manifest !== undefined))(
-  `quantized AlphaFold-Multimer-v3 model 1 (${referenceLabel})`,
+  && float32Manifest !== undefined && compressedManifest !== undefined))(
+  `compressed AlphaFold-Multimer-v3 model 1 (${referenceLabel})`,
   () => {
     let device: GPUDevice;
     let reference: FileTensorStore;
+    let float32Prepared: PreparedPrediction;
+    let compressedPrepared: PreparedPrediction;
     beforeAll(async () => {
+      reference = await FileTensorStore.open(referenceManifest!);
+      float32Prepared = await preparePrediction(float32Manifest!, reference);
+      compressedPrepared = await preparePrediction(compressedManifest!, reference);
       Object.assign(globalThis, globals);
-      const adapter = await create([]).requestAdapter({ powerPreference: "high-performance" });
+      const adapter = await create([]).requestAdapter();
       if (adapter === null) throw new Error("no WebGPU adapter");
       device = await adapter.requestDevice();
-      reference = await FileTensorStore.open(referenceManifest!);
     });
     afterAll(() => device?.destroy());
 
     it("stays within the predeclared float32 comparability envelope", async () => {
-      const float32 = await predict(device, float32Manifest!, reference);
-      const q8 = await predict(device, q8Manifest!, reference);
-      expect(q8.recycles).toHaveLength(float32.recycles.length);
-      for (let recycle = 0; recycle < q8.recycles.length; recycle += 1) {
-        expect(Math.abs(q8.recycles[recycle]!.confidence.meanPlddt
+      const float32 = await predict(device, float32Prepared);
+      const compressed = await predict(device, compressedPrepared);
+      expect(compressed.recycles).toHaveLength(float32.recycles.length);
+      for (let recycle = 0; recycle < compressed.recycles.length; recycle += 1) {
+        expect(Math.abs(compressed.recycles[recycle]!.confidence.meanPlddt
           - float32.recycles[recycle]!.confidence.meanPlddt)).toBeLessThan(0.25);
-        expect(Math.abs(q8.recycles[recycle]!.confidence.ptm
+        expect(Math.abs(compressed.recycles[recycle]!.confidence.ptm
           - float32.recycles[recycle]!.confidence.ptm)).toBeLessThan(0.005);
-        expect(Math.abs(q8.recycles[recycle]!.confidence.iptm
+        expect(Math.abs(compressed.recycles[recycle]!.confidence.iptm
           - float32.recycles[recycle]!.confidence.iptm)).toBeLessThan(0.005);
       }
-      expect(errorMetrics(q8.final.confidence.plddt,
+      expect(errorMetrics(compressed.final.confidence.plddt,
         float32.final.confidence.plddt).meanAbsoluteError).toBeLessThan(0.5);
-      expect(errorMetrics(q8.final.confidence.predictedAlignedError,
+      expect(errorMetrics(compressed.final.confidence.predictedAlignedError,
         float32.final.confidence.predictedAlignedError).meanAbsoluteError).toBeLessThan(0.5);
-      expect(errorMetrics(q8.final.structure.atom37,
+      expect(errorMetrics(compressed.final.structure.atom37,
         float32.final.structure.atom37).rootMeanSquareError).toBeLessThan(0.5);
     }, 600_000);
   },

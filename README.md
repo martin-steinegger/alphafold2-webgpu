@@ -40,7 +40,7 @@ The browser uses `model_1_ptm` for a single chain and `model_1_multimer_v3` for 
 5. Inspect the MSA coverage, per-recycle confidence, pLDDT, PAE, and interactive 3D structure.
 6. Download the predicted PDB, scores JSON, and generated A3M.
 
-The first prediction downloads the selected model bundle and compiles WebGPU pipelines. The mixed q8 bundle is approximately 97 MiB; the reference float32 bundle is 355 MiB. Versioned model shards are byte-length validated and retained in the browser's persistent cache when storage policy permits. Later predictions can be much faster; **Clear downloaded model** under Advanced settings removes both persistent and in-memory copies.
+The first prediction downloads the selected model bundle and compiles WebGPU pipelines. The qualified Multimer mixed-f16 bundle is approximately 182 MiB; its reference float32 bundle is 356 MiB. Versioned model shards are byte-length validated and retained in the browser's persistent cache when storage policy permits. Later predictions can be much faster; **Clear downloaded model** under Advanced settings removes both persistent and in-memory copies.
 
 ## Input modes and privacy
 
@@ -89,11 +89,11 @@ It is designed to use standards-compliant WebGPU and should run on WebGPU-capabl
 
 ### Why is the first run slow?
 
-The browser must download model parameters and compile many GPU pipelines. The q8 and float32 bundles are both split into eight balanced files to avoid hundreds of small HTTP requests. The page retains the resolved tensors, WebGPU device, and device-scoped pipeline cache, so repeating a prediction without closing the page avoids downloading and parsing the model again. A warm second run is the useful measure of inference performance.
+The browser must download model parameters and compile many GPU pipelines. Model bundles are split into eight balanced files to avoid hundreds of small HTTP requests. The page retains the resolved tensors, WebGPU device, and device-scoped pipeline cache, so repeating a prediction without closing the page avoids downloading and parsing the model again. A warm second run is the useful measure of inference performance.
 
 ### How are the model weights stored?
 
-The loader accepts float32 and mixed q8 bundles. The q8 representation uses symmetric int8 weights with one float16 scale per 64-value block, while sensitive tensors remain float32; neural-network arithmetic is still float32 after one-time decoding. Multimer model 1 is 354.3 MiB in float32 and 97.1 MiB in q8. Every published shard has a declared SHA-256 digest, and the loader verifies it before use or persistent caching. The official parameters remain under DeepMind's CC BY 4.0 weights license, which is copied into each exported bundle.
+The loader accepts float32, float16, and mixed q8 bundles; neural-network arithmetic remains float32 after one-time decoding. Multimer model 1 is 355.5 MiB in float32 and 181.6 MiB in the qualified mixed-f16 form (structure tensors remain float32). Pure int8 failed the fixed paired-MSA pLDDT envelope and is not a release format. Every published shard has a declared SHA-256 digest, and the loader verifies it before use or persistent caching. The official parameters remain under DeepMind's CC BY 4.0 weights license, which is copied into each exported bundle.
 
 ### What is the maximum sequence length?
 
@@ -277,7 +277,7 @@ npm run build:web
 npm run build:web:standalone
 ```
 
-The exporter copies only the 335 tensors required for inference and discards captured activations and reference outputs. It packs the tensors into eight balanced binary shards. `build:web:standalone` produces the 355.3 MiB float32 reference bundle. To produce and qualify the 97.3 MiB mixed q8 bundle:
+The monomer exporter can produce and qualify its mixed-q8 bundle:
 
 ```bash
 npm run export:web-model -- test/fixtures/evoformer/model1-query-59-stack/manifest.json /tmp/afwebgpu-model-f32
@@ -289,21 +289,21 @@ AFWEBGPU_GPU_TESTS=1 AFWEBGPU_QUANTIZED_MANIFEST=dist/web/model/manifest.json \
 
 The quantized qualification is deliberately separate from the float32 reference tests: it compares four-recycle pLDDT and pTM, final per-residue confidence, PAE, and atom coordinates against a float32 run without changing any existing reference tensor or tolerance.
 
-To export the official Multimer-v3 model 1 checkpoint from a ColabFold environment, create the same eight-shard manifest and quantize it:
+The Multimer exporter copies the 355 tensors required for no-template-search ColabFold inference, including the learned mock-template pair stack and torsion rows, and packs them into eight balanced shards. To produce its qualified 181.6 MiB mixed-f16 bundle:
 
 ```bash
 python tools/export_alphafold_multimer_model.py \
   --data-dir ~/.cache/colabfold --model-number 1 \
-  --output /tmp/afwebgpu-multimer-model1-f32-v1
-npm run verify:web-model -- /tmp/afwebgpu-multimer-model1-f32-v1/manifest.json --require-sha256
-npm run quantize:web-model -- /tmp/afwebgpu-multimer-model1-f32-v1 \
-  /tmp/afwebgpu-multimer-model1-q8-v1 --format=int8
-npm run verify:web-model -- /tmp/afwebgpu-multimer-model1-q8-v1/manifest.json --require-sha256
+  --output /tmp/afwebgpu-multimer-model1-f32-v2
+npm run verify:web-model -- /tmp/afwebgpu-multimer-model1-f32-v2/manifest.json --require-sha256
+npm run quantize:web-model -- /tmp/afwebgpu-multimer-model1-f32-v2 \
+  /tmp/model-multimer --format=float16
+npm run verify:web-model -- /tmp/model-multimer/manifest.json --require-sha256
 ```
 
-The browser automatically uses `./model-multimer/manifest.json` for colon-separated input. Official differential captures can be regenerated with `tools/capture_alphafold_multimer_reference.py`; pass one `--unpaired-a3m` and `--paired-a3m` file per unique entity to capture a paired/unpaired case. The optional end-to-end test accepts comma-separated query-only and paired capture manifests through `AFWEBGPU_MULTIMER_REFERENCES`, plus `AFWEBGPU_MULTIMER_F32_MANIFEST` and `AFWEBGPU_MULTIMER_Q8_MANIFEST`. It compares official JAX to WebGPU float32, then q8 to WebGPU float32 without changing reference data or tolerances.
+The browser automatically uses `./model-multimer/manifest.json` for colon-separated input. Official differential captures can be regenerated with `tools/capture_alphafold_multimer_reference.py`; pass one `--unpaired-a3m` and `--paired-a3m` file per unique entity to capture a paired/unpaired case. Qualification accepts comma-separated captures through `AFWEBGPU_MULTIMER_REFERENCES`, plus `AFWEBGPU_MULTIMER_F32_MANIFEST` and `AFWEBGPU_MULTIMER_COMPRESSED_MANIFEST`. It compares official JAX to WebGPU float32, then mixed-f16 to WebGPU float32 without changing reference data or tolerances.
 
-Full-model captures are excluded from source history. The monomer bundle is stored in the `model1-ptm` GitHub Release. The Multimer q8 bundle is stored separately under tag `model1-multimer-v3-q8-v1` as `afwebgpu-model1-multimer-v3-q8-v1.tar.gz`. The Pages workflow downloads the enabled assets and constructs the deployment artifact.
+Full-model captures are excluded from source history. The monomer bundle is stored in the `model1-ptm` GitHub Release. The Multimer mixed-f16 bundle is stored separately under tag `model1-multimer-v3-f16-v1` as `afwebgpu-model1-multimer-v3-f16-v1.tar.gz`. The Pages workflow downloads the enabled assets and constructs the deployment artifact.
 
 To prepare the release asset from a checkout containing the full fixture:
 
@@ -313,13 +313,13 @@ mkdir -p artifacts
 tar -C dist/web -czf artifacts/afwebgpu-model1-ptm.tar.gz model
 ```
 
-Create a release tagged `model1-ptm` and attach the archive. For Multimer, archive the q8 directory as top-level `model-multimer/`, attach it to tag `model1-multimer-v3-q8-v1`, and set `AFWEBGPU_INCLUDE_MULTIMER_MODEL=true`. `AFWEBGPU_INCLUDE_MODEL=true` independently enables the monomer bundle. The workflow verifies manifests, shard hashes, byte ranges, and a conservative 900 MiB site-size ceiling before upload.
+Create a release tagged `model1-ptm` and attach the archive. For Multimer, archive the f16 directory as top-level `model-multimer/`, attach it to tag `model1-multimer-v3-f16-v1`, and set `AFWEBGPU_INCLUDE_MULTIMER_MODEL=true`. `AFWEBGPU_INCLUDE_MODEL=true` independently enables the monomer bundle. The workflow verifies manifests, shard hashes, byte ranges, and a conservative 900 MiB site-size ceiling before upload.
 
 ## Current scope
 
-- Monomer `model_1_ptm` and no-template `model_1_multimer_v3`, float32 and mixed block-int8 model storage, mock monomer templates, and fixed model channel sizes are supported. Neural-network arithmetic remains float32 after one-time weight decoding.
+- Monomer `model_1_ptm` and no-template `model_1_multimer_v3` are supported with fixed model channel sizes. Monomer accepts float32 and qualified mixed block-int8 storage; Multimer accepts float32 and the qualified mixed-f16 bundle. Neural-network arithmetic remains float32 after one-time weight decoding.
 - A3M sampling and clustering are implemented in TypeScript with a deterministic application PRNG. They are distribution-equivalent to AlphaFold preprocessing but do not reproduce TensorFlow's private RNG stream unless exact masked-MSA codes are supplied.
-- ColabFold paired/unpaired Multimer MSA preprocessing is supported. Multimer templates, custom complex A3M upload, models 2–5, sub-eight-bit weight formats, and result relaxation are not supported.
+- ColabFold paired/unpaired Multimer MSA preprocessing is supported. Searched/custom Multimer templates, custom complex A3M upload, models 2–5, sub-eight-bit weight formats, and result relaxation are not supported; ColabFold's learned no-search mock-template path is included.
 - Holding pair state on the GPU through confidence and recycle boundaries, plus renewed Apple-GPU profiling after the kernel rewrites, remain opportunities to improve speed and peak memory.
 
 ## Acknowledgments and citation

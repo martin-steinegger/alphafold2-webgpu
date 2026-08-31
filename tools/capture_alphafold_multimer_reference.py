@@ -63,7 +63,7 @@ def main() -> None:
     import jax
     from colabfold.alphafold.models import load_models_and_params
     from colabfold.batch import generate_input_feature, mk_mock_template
-    from alphafold.model import folding_multimer, modules_multimer
+    from alphafold.model import folding_multimer, modules, modules_multimer
 
     raw_features, _ = generate_input_feature(
         unique_chains, cardinalities, unpaired_a3ms, paired_a3ms,
@@ -86,6 +86,30 @@ def main() -> None:
     original_structure = folding_multimer.StructureModule.__call__
     original_msa_feat = modules_multimer.create_msa_feat
     original_extra_feat = modules_multimer.create_extra_msa_feature
+    original_evoformer = modules.EvoformerIteration.__call__
+    evoformer_calls = {"extra": 0, "main": 0}
+
+    def evoformer_call(self: Any, activations: Any, masks: Any, *call_args: Any, **call_kwargs: Any) -> Any:
+        output = original_evoformer(self, activations, masks, *call_args, **call_kwargs)
+        kind = "extra" if self.is_extra_msa else "main"
+
+        def receive(input_msa: Any, input_pair: Any, msa_mask: Any, pair_mask: Any,
+                    output_msa: Any, output_pair: Any) -> None:
+            block = evoformer_calls[kind]
+            if block == 0:
+                captured[f"{kind}Block0InputMsa"] = np.asarray(input_msa, dtype=np.float32).copy()
+                captured[f"{kind}Block0InputPair"] = np.asarray(input_pair, dtype=np.float32).copy()
+                captured[f"{kind}Block0MsaMask"] = np.asarray(msa_mask, dtype=np.float32).copy()
+                captured[f"{kind}Block0PairMask"] = np.asarray(pair_mask, dtype=np.float32).copy()
+                captured[f"{kind}Block0ExpectedMsa"] = np.asarray(output_msa, dtype=np.float32).copy()
+                captured[f"{kind}Block0ExpectedPair"] = np.asarray(output_pair, dtype=np.float32).copy()
+            evoformer_calls[kind] += 1
+
+        jax.debug.callback(
+            receive, activations["msa"], activations["pair"], masks["msa"], masks["pair"],
+            output["msa"], output["pair"], ordered=True,
+        )
+        return output
 
     def create_msa_feat(batch: Any) -> Any:
         output = original_msa_feat(batch)
@@ -141,17 +165,23 @@ def main() -> None:
     def structure_call(self: Any, representations: Any, batch: Any, *call_args: Any, **call_kwargs: Any) -> Any:
         output = original_structure(self, representations, batch, *call_args, **call_kwargs)
 
-        def receive(pair: Any) -> None:
+        def receive(pair: Any, single: Any, msa_first_row: Any) -> None:
             if "structureInputPair" not in captured:
                 captured["structureInputPair"] = np.asarray(pair, dtype=np.float32).copy()
+                captured["structureInputSingle"] = np.asarray(single, dtype=np.float32).copy()
+                captured["structureInputMsaFirstRow"] = np.asarray(msa_first_row, dtype=np.float32).copy()
 
-        jax.debug.callback(receive, representations["pair"], ordered=True)
+        jax.debug.callback(
+            receive, representations["pair"], representations["single"],
+            representations["msa_first_row"], ordered=True,
+        )
         return output
 
     folding_multimer.InvariantPointAttention.__call__ = ipa_call
     folding_multimer.StructureModule.__call__ = structure_call
     modules_multimer.create_msa_feat = create_msa_feat
     modules_multimer.create_extra_msa_feature = create_extra_msa_feature
+    modules.EvoformerIteration.__call__ = evoformer_call
     try:
         runner.params = params
         recycle_metrics: list[dict[str, float | int]] = []
@@ -174,8 +204,10 @@ def main() -> None:
         folding_multimer.StructureModule.__call__ = original_structure
         modules_multimer.create_msa_feat = original_msa_feat
         modules_multimer.create_extra_msa_feature = original_extra_feat
+        modules.EvoformerIteration.__call__ = original_evoformer
 
-    if not {"ipaActivations", "ipaMask", "ipaRigidMatrix", "ipaExpected", "structureInputPair"} <= captured.keys():
+    if not {"ipaActivations", "ipaMask", "ipaRigidMatrix", "ipaExpected", "structureInputPair",
+            "extraBlock0InputMsa", "mainBlock0InputMsa"} <= captured.keys():
         raise RuntimeError(f"failed to capture first IPA call; observed {ipa_calls}")
     length = sum(map(len, chains))
     # The first structure iteration always starts from an identity frame. Store

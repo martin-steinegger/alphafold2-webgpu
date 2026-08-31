@@ -43,13 +43,13 @@ jobs:
       - name: Validate model bundle
         if: ${{ vars.AFWEBGPU_INCLUDE_MODEL == 'true' }}
         run: npm run verify:web-model
-      - name: Add AlphaFold-Multimer-v3 model 1 q8 bundle
+      - name: Add AlphaFold-Multimer-v3 model 1 f16 bundle
         if: ${{ vars.AFWEBGPU_INCLUDE_MULTIMER_MODEL == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download model1-multimer-v3-q8-v1 --pattern afwebgpu-model1-multimer-v3-q8-v1.tar.gz
-          tar -xzf afwebgpu-model1-multimer-v3-q8-v1.tar.gz -C dist/web
+          gh release download model1-multimer-v3-f16-v1 --pattern afwebgpu-model1-multimer-v3-f16-v1.tar.gz
+          tar -xzf afwebgpu-model1-multimer-v3-f16-v1.tar.gz -C dist/web
       - name: Validate Multimer model bundle
         if: ${{ vars.AFWEBGPU_INCLUDE_MULTIMER_MODEL == 'true' }}
         run: npm run verify:web-model -- dist/web/model-multimer/manifest.json --require-sha256

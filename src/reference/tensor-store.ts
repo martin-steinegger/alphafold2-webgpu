@@ -86,6 +86,8 @@ export class FileTensorStore {
     if (!Number.isSafeInteger(byteOffset) || byteOffset < 0 || byteOffset + byteLength > bytes.byteLength) {
       throw new Error(`${name} points outside ${record.file}`);
     }
-    return readTensor(record, bytes.buffer, bytes.byteOffset + byteOffset, true);
+    // Return read-only-by-convention f32 views into the cached shard, matching
+    // the browser store and avoiding hundreds of duplicate full-model buffers.
+    return readTensor(record, bytes.buffer, bytes.byteOffset + byteOffset);
   }
 }

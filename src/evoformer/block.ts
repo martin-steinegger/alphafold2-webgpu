@@ -79,6 +79,8 @@ export interface EvoformerBlockInput {
   readonly cZ: number;
   readonly cOuter: number;
   readonly triangleHidden: number;
+  /** Multimer-v3 applies outer-product mean before MSA attention. */
+  readonly outerProductMeanFirst?: boolean;
   readonly weights: EvoformerBlockWeights;
 }
 
@@ -121,7 +123,7 @@ export type TemplatePairBlockWeights = Omit<EvoformerPairBlockWeights, "outerPro
 
 type EvoformerShape = Pick<
   EvoformerBlockInput,
-  "sequences" | "length" | "cM" | "cZ" | "cOuter" | "triangleHidden"
+  "sequences" | "length" | "cM" | "cZ" | "cOuter" | "triangleHidden" | "outerProductMeanFirst"
 >;
 
 const GLOBAL_ATTENTION_COMMON = `
@@ -618,6 +620,13 @@ export async function encodeEvoformerBlock(
   msaMask: GpuTensor,
   pairMask: GpuTensor,
 ): Promise<void> {
+  const applyOuterProductMean = async (): Promise<void> => {
+    const update = await encodeOuterProductMean(
+      execution, encoder, msa, msaMask, input, input.weights.outerProductMean, pair,
+    );
+    if (update !== pair) await execution.addInPlace(encoder, pair, update, "outer-product-mean.residual");
+  };
+  if (input.outerProductMeanFirst === true) await applyOuterProductMean();
   const row = input.weights.msaRowAttention;
   await encodeAttention(execution, encoder, {
     source: msa, mask: msaMask, pairSource: pair, batch: input.sequences, queries: input.length,
@@ -642,10 +651,7 @@ export async function encodeEvoformerBlock(
     input.weights.msaTransition, "msa-transition", msa,
   );
 
-  let update = await encodeOuterProductMean(
-    execution, encoder, msa, msaMask, input, input.weights.outerProductMean, pair,
-  );
-  if (update !== pair) await execution.addInPlace(encoder, pair, update, "outer-product-mean.residual");
+  if (input.outerProductMeanFirst !== true) await applyOuterProductMean();
 
   await encodeTriangleMultiplication(
     execution, encoder, pair, pairMask, input, input.weights.triangleMultiplicationOutgoing, "outgoing", pair,
@@ -685,11 +691,14 @@ export async function encodeEvoformerPairBlock(
   pair: GpuTensor,
   msaMask: GpuTensor,
   pairMask: GpuTensor,
+  includeOuterProductMean = true,
 ): Promise<void> {
-  let update = await encodeOuterProductMean(
-    execution, encoder, msa, msaMask, shape, weights.outerProductMean, pair,
-  );
-  if (update !== pair) await execution.addInPlace(encoder, pair, update, "extra.outer-product-mean.residual");
+  if (includeOuterProductMean) {
+    const update = await encodeOuterProductMean(
+      execution, encoder, msa, msaMask, shape, weights.outerProductMean, pair,
+    );
+    if (update !== pair) await execution.addInPlace(encoder, pair, update, "extra.outer-product-mean.residual");
+  }
   await encodeTriangleMultiplication(
     execution, encoder, pair, pairMask, shape, weights.triangleMultiplicationOutgoing, "outgoing", pair,
   );
@@ -730,6 +739,12 @@ export async function encodeExtraMsaBlock(
   msaMask: GpuTensor,
   pairMask: GpuTensor,
 ): Promise<void> {
+  if (shape.outerProductMeanFirst === true) {
+    const update = await encodeOuterProductMean(
+      execution, encoder, msa, msaMask, shape, weights.outerProductMean, pair,
+    );
+    if (update !== pair) await execution.addInPlace(encoder, pair, update, "extra.outer-product-mean.residual");
+  }
   const row = weights.msaRowAttention;
   await encodeAttention(execution, encoder, {
     source: msa, mask: msaMask, pairSource: pair, batch: shape.sequences, queries: shape.length,
@@ -749,7 +764,10 @@ export async function encodeExtraMsaBlock(
     execution, encoder, msa, shape.sequences * shape.length, shape.cM, weights.msaTransition,
     "extra.msa-transition", msa,
   );
-  await encodeEvoformerPairBlock(execution, encoder, shape, weights, msa, pair, msaMask, pairMask);
+  await encodeEvoformerPairBlock(
+    execution, encoder, shape, weights, msa, pair, msaMask, pairMask,
+    shape.outerProductMeanFirst !== true,
+  );
 }
 
 export async function encodeTemplatePairBlock(
@@ -787,6 +805,38 @@ export async function encodeTemplatePairBlock(
   await encodeTransition(
     execution, encoder, pair, shape.length * shape.length, shape.cZ,
     weights.pairTransition, "template.pair-transition", pair,
+  );
+}
+
+/** Multimer-v3 template pair stack order (Algorithms 16 and 17). */
+export async function encodeMultimerTemplatePairBlock(
+  execution: WebGpuExecution,
+  encoder: GPUCommandEncoder,
+  shape: EvoformerShape,
+  weights: TemplatePairBlockWeights,
+  pair: GpuTensor,
+  pairMask: GpuTensor,
+): Promise<void> {
+  await encodeTriangleMultiplication(
+    execution, encoder, pair, pairMask, shape, weights.triangleMultiplicationOutgoing, "outgoing", pair,
+  );
+  await encodeTriangleMultiplication(
+    execution, encoder, pair, pairMask, shape, weights.triangleMultiplicationIncoming, "incoming", pair,
+  );
+  for (const [module, transpose, label] of [
+    [weights.triangleAttentionStarting, false, "multimer-template.triangle-attention-starting"],
+    [weights.triangleAttentionEnding, true, "multimer-template.triangle-attention-ending"],
+  ] as const) {
+    await encodeAttention(execution, encoder, {
+      source: pair, mask: pairMask, batch: shape.length, queries: shape.length,
+      channels: shape.cZ, heads: module.heads, transpose, weights: module.attention,
+      pairBias: { source: "normalized-input", projectionWeight: module.pairProjectionWeight },
+      label, residualTarget: pair,
+    });
+  }
+  await encodeTransition(
+    execution, encoder, pair, shape.length * shape.length, shape.cZ,
+    weights.pairTransition, "multimer-template.pair-transition", pair,
   );
 }
 

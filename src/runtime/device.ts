@@ -1,4 +1,5 @@
 import { COMPACT_GPU_POOL_BYTES } from "./allocator.js";
+import { recordSubgroupRange } from "./subgroups.js";
 
 const WEBGPU_BASE_MAX_BUFFER_SIZE = 256 * 1024 * 1024;
 const WEBGPU_BASE_MAX_STORAGE_BINDING_SIZE = 128 * 1024 * 1024;
@@ -238,8 +239,10 @@ export async function requestAlphaFoldDevice(
     adapter.limits.maxBufferSize,
     nextLimitTier(Math.max(requiredBufferSize, maxStorageBufferBindingSize), WEBGPU_BASE_MAX_BUFFER_SIZE),
   );
-  return adapter.requestDevice({
+  const device = await adapter.requestDevice({
     requiredFeatures,
     requiredLimits: { maxBufferSize, maxStorageBufferBindingSize },
   });
+  recordSubgroupRange(device, adapter);
+  return device;
 }

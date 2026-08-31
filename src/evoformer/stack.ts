@@ -38,6 +38,7 @@ export interface ExtraMsaPairStackInput {
   readonly cZ: number;
   readonly cOuter: number;
   readonly triangleHidden: number;
+  readonly outerProductMeanFirst?: boolean;
   readonly blockWeights: readonly EvoformerPairBlockWeights[];
 }
 

@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       qualification_release:
-        description: Draft release containing the f32, q8, and reference archives
+        description: Draft release containing the f32, f16, and reference archives
         required: true
         default: model1-multimer-v3-qualification-v1
 
@@ -22,6 +22,8 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - name: Install Chrome qualification runtime
+        run: npx playwright install chromium
       - name: Record Apple GPU
         run: system_profiler SPHardwareDataType SPDisplaysDataType
       - name: Download qualification inputs
@@ -31,20 +33,22 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/qualification"
           gh release download "$RELEASE_TAG" --dir "$RUNNER_TEMP/qualification" \
-            --pattern afwebgpu-model1-multimer-v3-f32-v1.tar.gz \
-            --pattern afwebgpu-model1-multimer-v3-q8-v1.tar.gz \
-            --pattern afwebgpu-multimer-references-v1.tar.gz
-          tar -xzf "$RUNNER_TEMP/qualification/afwebgpu-model1-multimer-v3-f32-v1.tar.gz" -C "$RUNNER_TEMP/qualification"
-          tar -xzf "$RUNNER_TEMP/qualification/afwebgpu-model1-multimer-v3-q8-v1.tar.gz" -C "$RUNNER_TEMP/qualification"
-          tar -xzf "$RUNNER_TEMP/qualification/afwebgpu-multimer-references-v1.tar.gz" -C "$RUNNER_TEMP/qualification"
+            --pattern afwebgpu-model1-multimer-v3-f32-v2.tar.gz \
+            --pattern afwebgpu-model1-multimer-v3-f16-v1.tar.gz \
+            --pattern afwebgpu-multimer-references-v2.tar.gz
+          tar -xzf "$RUNNER_TEMP/qualification/afwebgpu-model1-multimer-v3-f32-v2.tar.gz" -C "$RUNNER_TEMP/qualification"
+          tar -xzf "$RUNNER_TEMP/qualification/afwebgpu-model1-multimer-v3-f16-v1.tar.gz" -C "$RUNNER_TEMP/qualification"
+          tar -xzf "$RUNNER_TEMP/qualification/afwebgpu-multimer-references-v2.tar.gz" -C "$RUNNER_TEMP/qualification"
       - name: Verify model shards
         run: |
-          npm run verify:web-model -- "$RUNNER_TEMP/qualification/afwebgpu-multimer-model1-f32-v1/manifest.json" --require-sha256
+          npm run verify:web-model -- "$RUNNER_TEMP/qualification/afwebgpu-multimer-model1-f32-v2/manifest.json" --require-sha256
           npm run verify:web-model -- "$RUNNER_TEMP/qualification/model-multimer/manifest.json" --require-sha256
-      - name: Compare official JAX, WebGPU f32, and WebGPU q8
+      - name: Compare official JAX, Chrome WebGPU f32, and Chrome WebGPU f16
         env:
-          AFWEBGPU_GPU_TESTS: "1"
-          AFWEBGPU_MULTIMER_REFERENCES: ${{ runner.temp }}/qualification/afwebgpu-multimer-reference-e2e-v1/manifest.json,${{ runner.temp }}/qualification/afwebgpu-multimer-paired-reference-v1/manifest.json
-          AFWEBGPU_MULTIMER_F32_MANIFEST: ${{ runner.temp }}/qualification/afwebgpu-multimer-model1-f32-v1/manifest.json
-          AFWEBGPU_MULTIMER_Q8_MANIFEST: ${{ runner.temp }}/qualification/model-multimer/manifest.json
-        run: npx vitest run test/multimer-model-official.gpu.test.ts --reporter=verbose
+          AFWEBGPU_BROWSER_MULTIMER_QUALIFICATION: "1"
+          AFWEBGPU_QUALIFICATION_ASSET_ROOT: ${{ runner.temp }}/qualification
+        run: >-
+          npx playwright test
+          test/browser/multimer-qualification.spec.ts
+          test/browser/multimer-homodimer-prediction.spec.ts
+          --workers=1

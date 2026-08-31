@@ -34,9 +34,10 @@ interface ThreeDmolApi { createViewer(element: HTMLElement, options: object): Vi
 declare global {
   interface Window {
     __AFWEBGPU_PREDICTION__?: {
-      meanPlddt: number; ptm: number; elapsedMilliseconds: number; modelLoadMilliseconds: number;
+      meanPlddt: number; ptm: number; iptm?: number;
+      elapsedMilliseconds: number; modelLoadMilliseconds: number;
       recycles: readonly {
-        elapsedMilliseconds: number; meanPlddt: number; ptm: number;
+        elapsedMilliseconds: number; meanPlddt: number; ptm: number; iptm?: number;
         trunkSubmissions: MonomerRecycleResult["trunkSubmissions"];
       }[];
     };
@@ -108,7 +109,9 @@ async function loadModelWeights(manifestValue: string) {
     fixture.tensor("confidencePaeBreaks"),
   ] as const);
   const template = multimer ? undefined : await fixture.templateWeights();
-  return { multimer, embedding, template, extraStack, mainStack, structure, confidence, geometry, featureTables, paeBreaks };
+  const multimerTemplate = multimer ? await fixture.multimerTemplateWeights() : undefined;
+  return { multimer, embedding, template, multimerTemplate, extraStack, mainStack, structure,
+    confidence, geometry, featureTables, paeBreaks };
 }
 
 type LoadedModelWeights = Awaited<ReturnType<typeof loadModelWeights>>;
@@ -341,10 +344,14 @@ function showResults(prediction: MonomerPrediction | MultimerPrediction, sequenc
   element<HTMLButtonElement>("download-scores").onclick = () => download(`${jobName}_scores.json`, currentScores, "application/json");
   window.__AFWEBGPU_PREDICTION__ = {
     meanPlddt: confidence.meanPlddt, ptm: confidence.ptm,
+    ...(multimerConfidence.iptm === undefined ? {} : { iptm: multimerConfidence.iptm }),
     elapsedMilliseconds: prediction.elapsedMilliseconds, modelLoadMilliseconds,
     recycles: prediction.recycles.map((result) => ({
       elapsedMilliseconds: result.elapsedMilliseconds, meanPlddt: result.confidence.meanPlddt,
-      ptm: result.confidence.ptm, trunkSubmissions: result.trunkSubmissions,
+      ptm: result.confidence.ptm,
+      ...((result as MultimerRecycleResult).confidence.iptm === undefined
+        ? {} : { iptm: (result as MultimerRecycleResult).confidence.iptm }),
+      trunkSubmissions: result.trunkSubmissions,
     })),
   };
 }
@@ -436,7 +443,7 @@ async function runPrediction(): Promise<void> {
     }));
     const [input, loadedModel] = await Promise.all([inputPromise, measuredModel]);
     const { weights, elapsedMilliseconds: modelLoadMilliseconds } = loadedModel;
-    const { multimer: multimerModel, embedding, template, extraStack, mainStack, structure,
+    const { multimer: multimerModel, embedding, template, multimerTemplate, extraStack, mainStack, structure,
       confidence, geometry, featureTables, paeBreaks } = weights;
     if (input.multimer !== multimerModel) {
       throw new Error(input.multimer
@@ -528,7 +535,8 @@ async function runPrediction(): Promise<void> {
     };
     const prediction: MonomerPrediction | MultimerPrediction = input.multimer
       ? await new AlphaFoldMultimerGpu(device, modelOptions).predict(
-        features as readonly MultimerRecycleFeatures[], commonWeights, paeBreaks, reportRecycle,
+        features as readonly MultimerRecycleFeatures[], { ...commonWeights, multimerTemplate: multimerTemplate! },
+        paeBreaks, reportRecycle,
       )
       : await new AlphaFoldMonomerGpu(device, modelOptions).predict(features, {
         ...commonWeights, template: template!,

@@ -16,21 +16,21 @@ Upload the archive to the `model1-ptm` release. It must contain `model/manifest.
 
 ## AlphaFold-Multimer-v3 model 1
 
-Models 2–5 are not part of this release. Export official model 1 parameters from a ColabFold installation, verify the float32 reference bundle, then generate and verify the q8 web bundle:
+Models 2–5 are not part of this release. Export official model 1 parameters from a ColabFold installation, verify the float32 reference bundle, then generate and verify the mixed-f16 web bundle:
 
 ```bash
 python tools/export_alphafold_multimer_model.py \
   --data-dir ~/.cache/colabfold \
   --model-number 1 \
-  --output /tmp/afwebgpu-multimer-model1-f32-v1
+  --output /tmp/afwebgpu-multimer-model1-f32-v2
 npm run verify:web-model -- \
-  /tmp/afwebgpu-multimer-model1-f32-v1/manifest.json --require-sha256
+  /tmp/afwebgpu-multimer-model1-f32-v2/manifest.json --require-sha256
 npm run quantize:web-model -- \
-  /tmp/afwebgpu-multimer-model1-f32-v1 \
-  /tmp/model-multimer --format=int8
+  /tmp/afwebgpu-multimer-model1-f32-v2 \
+  /tmp/model-multimer --format=float16
 npm run verify:web-model -- \
   /tmp/model-multimer/manifest.json --require-sha256
-tar -C /tmp -czf afwebgpu-model1-multimer-v3-q8-v1.tar.gz model-multimer
+tar -C /tmp -czf afwebgpu-model1-multimer-v3-f16-v1.tar.gz model-multimer
 ```
 
 The exporter requires the official `WEIGHTS_LICENSE` from the parameter directory, copies it into the output, records its CC BY 4.0 provenance in the manifest, and hashes every shard. The quantizer preserves the license and adds a modification record. Do not publish a bundle that fails `--require-sha256` validation.
@@ -40,16 +40,16 @@ Before release, run the end-to-end differential qualification against an indepen
 ```bash
 AFWEBGPU_GPU_TESTS=1 \
 AFWEBGPU_MULTIMER_REFERENCES=/path/to/query/manifest.json,/path/to/paired/manifest.json \
-AFWEBGPU_MULTIMER_F32_MANIFEST=/tmp/afwebgpu-multimer-model1-f32-v1/manifest.json \
-AFWEBGPU_MULTIMER_Q8_MANIFEST=/tmp/model-multimer/manifest.json \
+AFWEBGPU_MULTIMER_F32_MANIFEST=/tmp/afwebgpu-multimer-model1-f32-v2/manifest.json \
+AFWEBGPU_MULTIMER_COMPRESSED_MANIFEST=/tmp/model-multimer/manifest.json \
 npx vitest run test/multimer-model-official.gpu.test.ts
 ```
 
-This first compares WebGPU float32 with official JAX outputs, then q8 with WebGPU float32. It covers pLDDT, pTM, ipTM, ranking confidence, PAE, and atom coordinates with fixed thresholds. Chrome on macOS Apple Silicon is the release target and must be qualified before enabling the Pages bundle.
+This first compares WebGPU float32 with official JAX outputs, then mixed-f16 with WebGPU float32. It covers pLDDT, pTM, ipTM, ranking confidence, PAE, and atom coordinates with fixed thresholds. The release workflow runs these comparisons in Chrome, plus the 118-residue homodimer smoke test, on macOS Apple Silicon before the Pages bundle is enabled.
 
-For repeatable Apple Silicon qualification, create a draft release tagged `model1-multimer-v3-qualification-v1` containing the f32 archive, q8 archive, and `afwebgpu-multimer-references-v1.tar.gz`. Dispatch **Qualify Multimer on Apple Silicon**; the manual workflow runs both query-only and paired references on GitHub's `macos-15` Apple Silicon runner without deploying Pages. Promote the q8 asset only after that workflow succeeds.
+For repeatable Apple Silicon qualification, create a draft release tagged `model1-multimer-v3-qualification-v1` containing `afwebgpu-model1-multimer-v3-f32-v2.tar.gz`, `afwebgpu-model1-multimer-v3-f16-v1.tar.gz`, and `afwebgpu-multimer-references-v2.tar.gz`. Dispatch **Qualify Multimer on Apple Silicon**; the manual workflow runs Chrome against both query-only and paired references and the homodimer smoke case on GitHub's `macos-15` Apple Silicon runner without deploying Pages. Promote the f16 asset only after that workflow succeeds.
 
-Upload the archive to release tag `model1-multimer-v3-q8-v1` as `afwebgpu-model1-multimer-v3-q8-v1.tar.gz`. Its top-level directory must be `model-multimer/` so the default browser URL resolves to `./model-multimer/manifest.json`.
+Upload the archive to release tag `model1-multimer-v3-f16-v1` as `afwebgpu-model1-multimer-v3-f16-v1.tar.gz`. Its top-level directory must be `model-multimer/` so the default browser URL resolves to `./model-multimer/manifest.json`.
 
 ## Immutability and Pages limits
 

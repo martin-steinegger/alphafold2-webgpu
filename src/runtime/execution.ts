@@ -176,7 +176,9 @@ export class WebGpuExecution {
 
   async mapFloat32(readback: GpuTensor): Promise<Float32Array> {
     await readback.allocation.buffer.mapAsync(GPUMapMode.READ);
-    const result = new Float32Array(readback.allocation.buffer.getMappedRange().slice(0));
+    const result = new Float32Array(
+      readback.allocation.buffer.getMappedRange(0, readback.elements * Float32Array.BYTES_PER_ELEMENT).slice(0),
+    );
     readback.allocation.buffer.unmap();
     return result;
   }
@@ -216,7 +218,10 @@ export class WebGpuExecution {
   async readTimestampProfile(pending: PendingTimestampReadback): Promise<readonly GpuTimestampEntry[]> {
     try {
       await pending.readback.allocation.buffer.mapAsync(GPUMapMode.READ);
-      const values = new BigUint64Array(pending.readback.allocation.buffer.getMappedRange().slice(0));
+      const values = new BigUint64Array(
+        pending.readback.allocation.buffer
+          .getMappedRange(0, pending.readback.elements * Float32Array.BYTES_PER_ELEMENT).slice(0),
+      );
       pending.readback.allocation.buffer.unmap();
       return pending.labels.map((label, index) => ({
         label,

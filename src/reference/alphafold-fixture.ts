@@ -11,6 +11,7 @@ import type {
 import type { InputEmbedderWeights } from "../evoformer/input-embedder.js";
 import type { OuterProductMeanWeights } from "../evoformer/outer-product-mean.js";
 import type { QueryOnlyTemplateWeights } from "../evoformer/template.js";
+import type { MultimerMockTemplateWeights } from "../evoformer/multimer-template.js";
 import type { TransitionWeights } from "../evoformer/transition.js";
 import type { TriangleMultiplicationWeights } from "../triangle/types.js";
 import type { StructureModuleWeights } from "../structure/module.js";
@@ -36,6 +37,7 @@ interface ModelManifest {
   readonly extraMsaStack: { readonly blocks: number; readonly parameters: ParameterMap };
   readonly embedding: { readonly parameters: ParameterMap };
   readonly templateEmbedding: { readonly parameters: ParameterMap };
+  readonly multimerTemplate?: { readonly templates: number; readonly parameters: ParameterMap };
   readonly structureModule: { readonly parameters: ParameterMap };
   readonly confidenceHeads: {
     readonly parameters: { readonly predictedLddt: ParameterMap; readonly predictedAlignedError: ParameterMap };
@@ -325,6 +327,58 @@ export class AlphaFoldFixture {
       relativePositionBias: await parameter("~_relative_encoding/position_activations", "bias"),
       extraMsaWeight: await parameter("extra_msa_activations", "weights"),
       extraMsaBias: await parameter("extra_msa_activations", "bias"),
+    };
+  }
+
+  async multimerTemplateWeights(): Promise<MultimerMockTemplateWeights> {
+    const section = this.manifest.multimerTemplate;
+    if (section === undefined) throw new Error("Multimer model bundle is missing mock-template parameters");
+    const p = section.parameters;
+    const parameter = (module: string, name: string): Promise<Float32Array> => this.#parameter(p, module, name);
+    const root = "single_template_embedding/template_embedding_iteration";
+    const blockWeights: TemplatePairBlockWeights[] = [];
+    for (let block = 0; block < 2; block += 1) {
+      const starting = await this.#triangleAttention(p, `${root}/triangle_attention_starting_node`, block, 2);
+      const ending = await this.#triangleAttention(p, `${root}/triangle_attention_ending_node`, block, 2);
+      blockWeights.push({
+        triangleAttentionStarting: starting,
+        triangleAttentionEnding: ending,
+        triangleMultiplicationOutgoing: await this.#triangle(
+          p, `${root}/triangle_multiplication_outgoing`, 64, block, 2,
+        ),
+        triangleMultiplicationIncoming: await this.#triangle(
+          p, `${root}/triangle_multiplication_incoming`, 64, block, 2,
+        ),
+        pairTransition: await this.#transition(p, `${root}/pair_transition`, block, 2),
+      });
+    }
+    const pairInputBias = new Float32Array(64);
+    for (let module = 0; module <= 8; module += 1) {
+      const bias = await parameter(`single_template_embedding/template_pair_embedding_${module}`, "bias");
+      for (let channel = 0; channel < 64; channel += 1) {
+        pairInputBias[channel] = pairInputBias[channel]! + bias[channel]!;
+      }
+    }
+    for (const module of [2, 3]) {
+      const weight = await parameter(`single_template_embedding/template_pair_embedding_${module}`, "weights");
+      for (let channel = 0; channel < 64; channel += 1) {
+        pairInputBias[channel] = pairInputBias[channel]! + weight[channel]!;
+      }
+    }
+    return {
+      queryNormScale: await parameter("single_template_embedding/query_embedding_norm", "scale"),
+      queryNormOffset: await parameter("single_template_embedding/query_embedding_norm", "offset"),
+      pairInputWeight: await parameter("single_template_embedding/template_pair_embedding_8", "weights"),
+      pairInputBias, blockWeights,
+      outputNormScale: await parameter("single_template_embedding/output_layer_norm", "scale"),
+      outputNormOffset: await parameter("single_template_embedding/output_layer_norm", "offset"),
+      outputWeight: await parameter("output_linear", "weights"),
+      outputBias: await parameter("output_linear", "bias"),
+      msaInputWeight: await parameter("template_single_embedding", "weights"),
+      msaInputBias: await parameter("template_single_embedding", "bias"),
+      msaOutputWeight: await parameter("template_projection", "weights"),
+      msaOutputBias: await parameter("template_projection", "bias"),
+      templateRows: section.templates,
     };
   }
 

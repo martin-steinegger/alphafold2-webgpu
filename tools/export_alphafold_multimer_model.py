@@ -120,6 +120,7 @@ def main() -> None:
     evoformer_prefix = "alphafold/alphafold_iteration/evoformer/"
     main_prefix = f"{evoformer_prefix}evoformer_iteration/"
     extra_prefix = f"{evoformer_prefix}extra_msa_stack/"
+    template_prefix = f"{evoformer_prefix}template_embedding/"
     embedding_names = {
         "extra_msa_activations", "left_single", "preprocess_1d", "preprocess_msa",
         "prev_msa_first_row_norm", "prev_pair_norm", "prev_pos_linear", "right_single",
@@ -147,6 +148,14 @@ def main() -> None:
         tensors[name] = {"file": filename, "shape": list(array.shape), "dtype": "float32"}
         geometry_names.append(name)
 
+    template_parameters = parameter_map(template_prefix)
+    for name in ("template_single_embedding", "template_projection"):
+        path = f"{evoformer_prefix}{name}"
+        template_parameters[name] = {
+            parameter_name: store(value, "parameter")
+            for parameter_name, value in sorted(params[path].items())
+        }
+
     manifest = {
         "formatVersion": 1,
         "source": "official AlphaFold-Multimer-v3 parameters loaded by ColabFold with use_fuse=False",
@@ -171,6 +180,11 @@ def main() -> None:
             "blocks": 4, "parameterFormat": "stacked-haiku", "parameters": parameter_map(extra_prefix),
         },
         "embedding": {"parameterFormat": "haiku", "parameters": embedding},
+        "multimerTemplate": {
+            "implementation": "ColabFold mock-template pair and torsion-row embedding",
+            "templates": 4,
+            "parameters": template_parameters,
+        },
         "structureModule": {
             "implementation": "official AlphaFold folding_multimer.StructureModule",
             "dtype": "float32", "iterations": 8, "positionScale": 20,
@@ -198,7 +212,7 @@ def main() -> None:
     files: list[dict[str, Any]] = []
     source_files: list[Path] = []
     for shard in shards:
-        filename = f"weights-{shard['index']:02d}.v1.f32.bin"
+        filename = f"weights-{shard['index']:02d}.v2.f32.bin"
         position = 0
         with (args.output / filename).open("wb") as output_file:
             for name in shard["names"]:
@@ -218,7 +232,7 @@ def main() -> None:
     )
     manifest["bundle"].update({
         "version": 1,
-        "id": f"model_{args.model_number}_multimer_v3-f32-v1",
+        "id": f"model_{args.model_number}_multimer_v3-f32-v2",
         "tensors": len(tensors),
         "bytes": bytes_written,
         "shards": shard_count,

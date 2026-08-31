@@ -1,5 +1,6 @@
 import { GpuBufferAllocator, type AllocatedGpuBuffer, type AllocationSnapshot } from "../runtime/allocator.js";
 import { pipelineCacheForDevice, type ComputePipelineCache } from "../runtime/pipeline-cache.js";
+import { subgroupRange } from "../runtime/subgroups.js";
 
 export interface AttentionWeights {
   readonly queryNormScale: Float32Array;
@@ -576,7 +577,16 @@ fn main(
 }`;
 
 export function supportsAttentionSubgroups(device: GPUDevice, headDim = 32): boolean {
-  return headDim === 32 && device.features.has("subgroups") && device.features.has("subgroup-size-control");
+  // subgroup-size-control only permits selecting a width inside the device's
+  // advertised range. SwiftShader, for example, exposes the feature while
+  // fixing the range to [4, 4], so feature detection alone is insufficient.
+  const range = subgroupRange(device);
+  return headDim === 32
+    && device.features.has("subgroups")
+    && device.features.has("subgroup-size-control")
+    && range !== undefined
+    && range[0] <= 32
+    && range[1] >= 32;
 }
 
 /**
