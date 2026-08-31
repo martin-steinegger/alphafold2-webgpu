@@ -31,3 +31,20 @@ test("auto-detects monomers and multimers and switches to custom A3M", async ({ 
   await expect(page.locator("#a3m-field")).toBeVisible();
   await expect(page.locator("#sequence-field")).toBeHidden();
 });
+
+test("reports a WebGPU compatibility verdict before any prediction starts", async ({ page }) => {
+  await page.goto("/");
+  const summary = page.locator("#gpu-summary");
+  await expect(summary).not.toHaveAttribute("data-state", "checking", { timeout: 20_000 });
+  const state = await summary.getAttribute("data-state");
+  expect(["ready", "warning", "failed"]).toContain(state);
+  await expect(page.locator("#gpu-summary-text")).not.toHaveText("");
+  if (state === "ready") {
+    await expect(page.locator("#gpu-summary-text")).toContainText("WebGPU ready");
+    await expect(page.locator("#gpu-details")).toBeHidden();
+    return;
+  }
+  // Every non-ready verdict must tell the user what to change.
+  await expect(page.locator("#gpu-details")).toBeVisible();
+  expect(await page.locator("#gpu-remedies li").count()).toBeGreaterThan(0);
+});

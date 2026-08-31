@@ -21,6 +21,9 @@ import {
 } from "../src/runtime/device.js";
 import { confidenceJson, predictionToPdb, safeJobName } from "./prediction-results.js";
 import { drawMsaCoverage } from "./msa-plot.js";
+import {
+  browserPreflightEnvironment, preflightErrorMessage, runWebGpuPreflight, type PreflightStatus, type WebGpuPreflight,
+} from "./webgpu-preflight.js";
 
 interface Viewer3D {
   addModel(data: string, format: string): void;
@@ -426,10 +429,18 @@ async function runPrediction(): Promise<void> {
   const clearCacheButton = element<HTMLButtonElement>("clear-model-cache"); clearCacheButton.disabled = true;
   element<HTMLElement>("results-section").hidden = true; resetStages(); log("Starting prediction…", false); lastMsaStatus = "";
   try {
-    stage("device", "active", "Requesting adapter"); setPredictionStatus("Preparing WebGPU");
-    if (navigator.gpu === undefined) throw new Error("WebGPU is unavailable. Use a current Chrome or Edge browser on a supported GPU.");
+    stage("device", "active", "Checking WebGPU support"); setPredictionStatus("Preparing WebGPU");
+    const preflight = await webGpuPreflight();
+    if (!preflight.usable) {
+      log(`${preflight.headline}. ${preflight.detail}`);
+      for (const remedy of preflight.remedies) log(`· ${remedy}`);
+      throw new Error(preflight.headline);
+    }
+    if (preflight.status === "warning") log(`Warning: ${preflight.headline}. ${preflight.detail}`);
+    stage("device", "active", "Requesting adapter");
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
-    if (adapter === null) throw new Error("No compatible WebGPU adapter was found");
+    // A preflight-passing page can still lose its adapter (driver reset, GPU process crash); re-diagnose.
+    if (adapter === null) throw new Error(preflightErrorMessage(await webGpuPreflight(true)));
     const adapterName = adapter.info.description || adapter.info.device || adapter.info.vendor || "WebGPU adapter";
     const appleUnifiedMemory = isAppleUnifiedMemory(adapter);
     const compactMemoryPolicy = appleUnifiedMemory || parameter("compact", "0") === "1";
@@ -642,15 +653,37 @@ element<HTMLButtonElement>("clear-model-cache").addEventListener("click", () => 
 })(); });
 updateInputMode();
 
-async function checkWebGpu(): Promise<void> {
-  const summary = element<HTMLDivElement>("gpu-summary");
-  try {
-    const adapter = await navigator.gpu?.requestAdapter({ powerPreference: "high-performance" });
-    if (adapter === null || adapter === undefined) throw new Error("No WebGPU adapter found");
-    const name = adapter.info.description || adapter.info.device || adapter.info.vendor || "compatible GPU";
-    summary.dataset.state = "ready"; summary.lastElementChild!.textContent = `WebGPU ready · ${name}`;
-  } catch (error) {
-    summary.dataset.state = "failed"; summary.lastElementChild!.textContent = error instanceof Error ? error.message : String(error);
+let preflightPromise: Promise<WebGpuPreflight> | undefined;
+
+/** Runs the capability check once per page and reuses its verdict for every prediction. */
+function webGpuPreflight(refresh = false): Promise<WebGpuPreflight> {
+  if (refresh || preflightPromise === undefined) {
+    preflightPromise = runWebGpuPreflight(browserPreflightEnvironment());
   }
+  return preflightPromise;
 }
-void checkWebGpu();
+
+const capabilityState: Readonly<Record<PreflightStatus, string>> = {
+  ready: "ready", warning: "warning", unsupported: "failed", blocked: "failed", insufficient: "failed",
+};
+
+function renderPreflight(preflight: WebGpuPreflight): void {
+  element<HTMLDivElement>("gpu-summary").dataset.state = capabilityState[preflight.status];
+  element<HTMLElement>("gpu-summary-text").textContent = preflight.headline;
+  element<HTMLElement>("gpu-detail-text").textContent = preflight.detail;
+  const remedies = element<HTMLUListElement>("gpu-remedies");
+  remedies.replaceChildren(...preflight.remedies.map((remedy) => {
+    const item = document.createElement("li"); item.textContent = remedy; return item;
+  }));
+  const details = element<HTMLDetailsElement>("gpu-details");
+  details.hidden = preflight.status === "ready";
+  details.open = !preflight.usable;
+}
+
+void webGpuPreflight().then(renderPreflight, (error: unknown) => {
+  renderPreflight({
+    status: "blocked", usable: false, headline: "The WebGPU compatibility check failed",
+    detail: error instanceof Error ? error.message : String(error), remedies: [],
+    adapter: undefined, shortfalls: [], browser: { engine: "unknown", name: "This browser", version: undefined, platform: "unknown" },
+  });
+});

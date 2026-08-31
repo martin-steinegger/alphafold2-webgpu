@@ -1,6 +1,6 @@
 @import url("https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&family=Roboto+Mono:wght@400;500&display=swap");
 
-:root { color-scheme: light; font-family: Roboto, Arial, sans-serif; color: #252525; background: #f5f5f5; font-synthesis: none; --primary: #1976d2; --primary-dark: #125ba4; --ink: #252525; --muted: #6f6f6f; --line: #d5d5d5; --panel-bar: #454545; --danger: #c62828; --success: #26834a; }
+:root { color-scheme: light; font-family: Roboto, Arial, sans-serif; color: #252525; background: #f5f5f5; font-synthesis: none; --primary: #1976d2; --primary-dark: #125ba4; --ink: #252525; --muted: #6f6f6f; --line: #d5d5d5; --panel-bar: #454545; --danger: #c62828; --warning: #b26a00; --success: #26834a; }
 * { box-sizing: border-box; }
 html { scroll-behavior: smooth; }
 [hidden] { display: none !important; }
@@ -94,10 +94,17 @@ th, td { padding: .65rem; border-bottom: 1px solid #ddd; text-align: right; } th
 .eyebrow { color: var(--primary); font: .72rem "Roboto Mono", monospace; letter-spacing: .12em; text-transform: uppercase; }
 .about h2 { max-width: 430px; margin-top: .6rem; font-size: clamp(2rem, 4vw, 3.5rem); line-height: 1; }
 .about p { margin: 0; color: #666; line-height: 1.75; } .about-copy { display: grid; gap: 1.1rem; align-content: start; }
-.capability { display: inline-flex; align-items: center; gap: .6rem; color: #777; font: .76rem "Roboto Mono", monospace; }
-.capability-dot { width: 8px; height: 8px; border-radius: 50%; background: #d49a20; box-shadow: 0 0 0 4px #d49a201d; }
+.capability { display: flex; align-items: start; gap: .6rem; line-height: 1.5; color: #777; font: .76rem "Roboto Mono", monospace; }
+.capability-dot { flex: 0 0 auto; margin-top: .35rem; width: 8px; height: 8px; border-radius: 50%; background: #d49a20; box-shadow: 0 0 0 4px #d49a201d; }
 .capability[data-state="ready"] { color: var(--success); } .capability[data-state="ready"] .capability-dot { background: var(--success); box-shadow: 0 0 0 4px #26834a1d; }
 .capability[data-state="failed"] { color: var(--danger); } .capability[data-state="failed"] .capability-dot { background: var(--danger); }
+.capability[data-state="warning"] { color: var(--warning); } .capability[data-state="warning"] .capability-dot { background: var(--warning); box-shadow: 0 0 0 4px #b26a001d; }
+.capability-block { display: grid; gap: .55rem; max-width: 46rem; }
+.capability-details { color: #666; font-size: .78rem; line-height: 1.6; }
+.capability-details summary { color: var(--primary); font: .74rem "Roboto Mono", monospace; cursor: pointer; }
+.capability-details p { margin: .55rem 0 0; color: #555; font-size: .78rem; }
+.capability-details ul { margin: .5rem 0 0; padding-left: 1.1rem; display: grid; gap: .35rem; }
+.capability-details li { color: #555; font-size: .78rem; }
 footer { display: flex; justify-content: space-between; padding: 1.5rem 1rem 2.5rem; color: #888; font-size: .7rem; }
 
 @media (max-width: 900px) { .workspace { grid-template-columns: 1fr; } .result-grid { grid-template-columns: 1fr; grid-template-areas: "structure" "plddt" "msa" "pae" "recycle"; } .about { grid-template-columns: 1fr; } }
