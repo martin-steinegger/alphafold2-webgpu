@@ -1,4 +1,6 @@
 import type { QueryOnlyFeatureTables } from "./query-only-features.js";
+import { makeA3mFeatures, type A3mFeatureOptions } from "./a3m-features.js";
+import { parseA3m } from "./a3m.js";
 import type { MonomerRecycleFeatures } from "../model/monomer.js";
 
 const RESTYPES = "ARNDCQEGHILKMFPSTWYV";
@@ -221,4 +223,35 @@ export function makeMultimerQueryOnlyFeatures(
     });
   }
   return result;
+}
+
+/** Build Multimer-v3 tensors from ColabFold-style paired/unpaired complex MSA rows. */
+export function makeMultimerA3mFeatures(
+  chainsValue: string | readonly string[],
+  a3mText: string,
+  alignmentMask: Float32Array,
+  tables: QueryOnlyFeatureTables,
+  options: A3mFeatureOptions = {},
+): readonly MultimerRecycleFeatures[] {
+  const sequence = makeMultimerSequenceFeatures(chainsValue, tables);
+  const alignment = parseA3m(a3mText);
+  if (alignment.query !== sequence.sequence) {
+    throw new Error("complex A3M query does not match the concatenated input chains");
+  }
+  if (alignmentMask.length !== alignment.depth * alignment.length) {
+    throw new RangeError("complex MSA mask must have shape [depth, total residues]");
+  }
+  return makeA3mFeatures(a3mText, tables, { ...options, alignmentMask }).map((features) => ({
+    ...features,
+    targetFeatures: sequence.targetFeatures.slice(),
+    residueIndex: sequence.residueIndex.slice(),
+    aatype: sequence.aatype.slice(),
+    seqMask: sequence.seqMask.slice(),
+    atom37ToAtom14: sequence.atom37ToAtom14.slice(),
+    atom37Mask: sequence.atom37Mask.slice(),
+    targetChannels: 21,
+    chainRelative: {
+      asymId: sequence.asymId.slice(), entityId: sequence.entityId.slice(), symId: sequence.symId.slice(),
+    },
+  }));
 }

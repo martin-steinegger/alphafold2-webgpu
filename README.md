@@ -8,7 +8,7 @@
   <a href="https://martin-steinegger.github.io/alphafold2-webgpu/"><strong>Open AlphaFold2 WebGPU</strong></a>
 </p>
 
-AlphaFold2 WebGPU runs AlphaFold2 model 1 PTM and the no-template AlphaFold-Multimer-v3 path locally on a WebGPU-capable device. Paste a protein sequence or colon-separated complex, then inspect the predicted structure and confidence in the browser.
+AlphaFold2 WebGPU runs AlphaFold2 model 1 PTM and AlphaFold-Multimer-v3 model 1 locally on a WebGPU-capable device. One sequence field accepts either a monomer or a colon-separated complex and selects the matching model automatically.
 
 The neural network runs in WGSL on the GPU. There is no ONNX runtime, server-side model execution, or CPU neural-network fallback. The CPU is used only for input preprocessing, scheduling, readback, and confidence aggregation.
 
@@ -23,19 +23,19 @@ Open the hosted application:
 
 | Application | Monomers | Complexes | MMseqs2 MSA | Custom A3M | Templates | Relaxation |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| [AlphaFold2 WebGPU](https://martin-steinegger.github.io/alphafold2-webgpu/) | Yes | Query-only | Yes | Yes | No | No |
+| [AlphaFold2 WebGPU](https://martin-steinegger.github.io/alphafold2-webgpu/) | Yes | Yes | Yes | Monomer | No | No |
 
-The browser accepts `model_1_ptm` and one exported `model_N_multimer_v3` checkpoint at a time. The model manifest URL must match the selected input mode.
+The browser uses `model_1_ptm` for a single chain and `model_1_multimer_v3` for two or more colon-separated chains. Models 2–5 are intentionally not shipped. Separate manifest settings allow both bundles to remain available without manual switching.
 
 ## Quick start
 
 1. Open [AlphaFold2 WebGPU](https://martin-steinegger.github.io/alphafold2-webgpu/) in a WebGPU-capable browser.
 2. Paste a protein sequence using the one-letter amino-acid alphabet.
-3. Choose an input mode:
+3. Choose an alignment mode:
    - **MMseqs2 MSA** searches for related sequences through the public ColabFold API and normally produces the best predictions.
    - **Single sequence** runs without a remote search and is useful for testing, but confidence can be substantially lower.
-   - **Multimer-v3** accepts two or more colon-separated chains and runs the local no-template/query-only multimer model.
-   - **Custom A3M** uses an alignment that you provide.
+   - **Custom monomer A3M** uses an alignment that you provide for a single chain.
+   Colon-separated sequences are detected as complexes. MMseqs2 mode generates ColabFold-style paired and unpaired complex MSAs; single-sequence mode creates a query-only complex input.
 4. Choose the number of recycles and press **Fold protein**.
 5. Inspect the MSA coverage, per-recycle confidence, pLDDT, PAE, and interactive 3D structure.
 6. Download the predicted PDB, scores JSON, and generated A3M.
@@ -60,7 +60,9 @@ Paste or upload A3M text. The first FASTA entry must be the ungapped query seque
 
 ### Multimer-v3
 
-Separate chains with colons, for example `ACDE:FGHI`. Chain-relative, entity, and symmetry features follow the official Multimer-v3 encoding; the structure module uses native Multimer-v3 Q/K/V projections, a position scale of 20, ipTM, and the `0.8 × ipTM + 0.2 × pTM` ranking score. The current browser feature path is query-only and does not yet pair per-chain MSAs, so it is mainly suitable for validating the implementation and small complexes. The input stays local.
+Separate chains with colons, for example `ACDE:FGHI`. In MMseqs2 mode the browser requests both paired and unpaired per-entity alignments, then merges paired rows densely and unpaired rows block-diagonally as ColabFold does. Repeated homomer chains share the dense unpaired alignment and do not require a redundant pairing request. In single-sequence mode the complex is query-only and stays local.
+
+Chain-relative, entity, and symmetry features follow the official Multimer-v3 encoding. The structure module uses native Multimer-v3 Q/K/V projections, a position scale of 20, ipTM, and the `0.8 × ipTM + 0.2 × pTM` ranking score.
 
 ## Results
 
@@ -91,7 +93,7 @@ The browser must download model parameters and compile many GPU pipelines. The q
 
 ### How are the model weights stored?
 
-The loader accepts the original float32 `model_1_ptm` bundle and a mixed q8 bundle. The latter uses symmetric int8 weights with one float16 scale per 64-value block, while the structure module, residue geometry, and PAE bin boundaries remain float32. It reduces 355.3 MiB to 97.3 MiB. A four-recycle differential qualification compares q8 and float32 pLDDT, pTM, PAE, and atom coordinates before a quantized bundle is published.
+The loader accepts float32 and mixed q8 bundles. The q8 representation uses symmetric int8 weights with one float16 scale per 64-value block, while sensitive tensors remain float32; neural-network arithmetic is still float32 after one-time decoding. Multimer model 1 is 354.3 MiB in float32 and 97.1 MiB in q8. Every published shard has a declared SHA-256 digest, and the loader verifies it before use or persistent caching. The official parameters remain under DeepMind's CC BY 4.0 weights license, which is copied into each exported bundle.
 
 ### What is the maximum sequence length?
 
@@ -103,7 +105,7 @@ This is expected for many proteins. For the 59-residue acceptance sequence below
 
 ### Are complexes, templates, or Amber relaxation supported?
 
-No-template, query-only AlphaFold-Multimer-v3 complexes are supported. Paired/unpaired multimer MSAs, real template hits, other parameter families, and Amber relaxation are not yet supported.
+No-template AlphaFold-Multimer-v3 model 1 complexes are supported with ColabFold paired/unpaired MMseqs2 MSAs or query-only input. Real template hits, models 2–5, Amber relaxation, and custom complex A3M upload are not supported.
 
 ### Is this the same as ColabFold?
 
@@ -287,17 +289,21 @@ AFWEBGPU_GPU_TESTS=1 AFWEBGPU_QUANTIZED_MANIFEST=dist/web/model/manifest.json \
 
 The quantized qualification is deliberately separate from the float32 reference tests: it compares four-recycle pLDDT and pTM, final per-residue confidence, PAE, and atom coordinates against a float32 run without changing any existing reference tensor or tolerance.
 
-To export one official Multimer-v3 checkpoint from a ColabFold environment, create the same eight-shard manifest and optionally quantize it:
+To export the official Multimer-v3 model 1 checkpoint from a ColabFold environment, create the same eight-shard manifest and quantize it:
 
 ```bash
 python tools/export_alphafold_multimer_model.py \
-  --data-dir ~/.cache/colabfold --model-number 1 --output /tmp/multimer-v3-f32
-npm run quantize:web-model -- /tmp/multimer-v3-f32 /tmp/multimer-v3-q8 --format=int8
+  --data-dir ~/.cache/colabfold --model-number 1 \
+  --output /tmp/afwebgpu-multimer-model1-f32-v1
+npm run verify:web-model -- /tmp/afwebgpu-multimer-model1-f32-v1/manifest.json --require-sha256
+npm run quantize:web-model -- /tmp/afwebgpu-multimer-model1-f32-v1 \
+  /tmp/afwebgpu-multimer-model1-q8-v1 --format=int8
+npm run verify:web-model -- /tmp/afwebgpu-multimer-model1-q8-v1/manifest.json --require-sha256
 ```
 
-Set the browser's model manifest URL to that directory's `manifest.json` before selecting **Multimer-v3**. Official differential captures can be regenerated with `tools/capture_alphafold_multimer_reference.py`; the optional GPU test reads its manifest through `AFWEBGPU_MULTIMER_REFERENCE`.
+The browser automatically uses `./model-multimer/manifest.json` for colon-separated input. Official differential captures can be regenerated with `tools/capture_alphafold_multimer_reference.py`. The optional end-to-end test uses `AFWEBGPU_MULTIMER_REFERENCE`, `AFWEBGPU_MULTIMER_F32_MANIFEST`, and `AFWEBGPU_MULTIMER_Q8_MANIFEST`; it compares official JAX to WebGPU float32, then q8 to WebGPU float32 without changing reference data or tolerances.
 
-Full-model captures are excluded from source history. The reduced browser model is stored in the repository's `model1-ptm` GitHub Release as `afwebgpu-model1-ptm.tar.gz`. The Pages workflow downloads that asset and constructs the deployment artifact.
+Full-model captures are excluded from source history. The monomer bundle is stored in the `model1-ptm` GitHub Release. The Multimer q8 bundle is stored separately under tag `model1-multimer-v3-q8-v1` as `afwebgpu-model1-multimer-v3-q8-v1.tar.gz`. The Pages workflow downloads the enabled assets and constructs the deployment artifact.
 
 To prepare the release asset from a checkout containing the full fixture:
 
@@ -307,13 +313,13 @@ mkdir -p artifacts
 tar -C dist/web -czf artifacts/afwebgpu-model1-ptm.tar.gz model
 ```
 
-Create a release tagged `model1-ptm` and attach the archive. It must contain a top-level `model/` directory so the Pages workflow can extract it directly into the built site. Select **Settings → Pages → Source: GitHub Actions** to deploy the site. To publish the model with the demo, set the Actions variable `AFWEBGPU_INCLUDE_MODEL` to `true` under **Settings → Secrets and variables → Actions → Variables**. The full Pages artifact is about 356 MiB and remains below GitHub's 1 GiB Pages artifact/site limit.
+Create a release tagged `model1-ptm` and attach the archive. For Multimer, archive the q8 directory as top-level `model-multimer/`, attach it to tag `model1-multimer-v3-q8-v1`, and set `AFWEBGPU_INCLUDE_MULTIMER_MODEL=true`. `AFWEBGPU_INCLUDE_MODEL=true` independently enables the monomer bundle. The workflow verifies manifests, shard hashes, byte ranges, and a conservative 900 MiB site-size ceiling before upload.
 
 ## Current scope
 
-- Monomer `model_1_ptm` and no-template/query-only `model_N_multimer_v3`, float32 and mixed block-int8 model storage, mock monomer templates, and fixed model channel sizes are supported. Neural-network arithmetic remains float32 after one-time weight decoding.
+- Monomer `model_1_ptm` and no-template `model_1_multimer_v3`, float32 and mixed block-int8 model storage, mock monomer templates, and fixed model channel sizes are supported. Neural-network arithmetic remains float32 after one-time weight decoding.
 - A3M sampling and clustering are implemented in TypeScript with a deterministic application PRNG. They are distribution-equivalent to AlphaFold preprocessing but do not reproduce TensorFlow's private RNG stream unless exact masked-MSA codes are supplied.
-- Paired multimer MSA preprocessing, multimer templates, other AlphaFold2 parameter families, sub-eight-bit weight formats, and result relaxation are not supported.
+- ColabFold paired/unpaired Multimer MSA preprocessing is supported. Multimer templates, custom complex A3M upload, models 2–5, sub-eight-bit weight formats, and result relaxation are not supported.
 - Holding pair state on the GPU through confidence and recycle boundaries, plus renewed Apple-GPU profiling after the kernel rewrites, remain opportunities to improve speed and peak memory.
 
 ## Acknowledgments and citation

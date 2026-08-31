@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
-import { extractMmseqs2A3m, generateMmseqs2Msa, readTarFiles } from "../src/input/mmseqs2-api.js";
+import { parseA3m } from "../src/input/a3m.js";
+import {
+  assembleComplexA3m, extractMmseqs2A3m, generateMmseqs2ComplexMsa,
+  generateMmseqs2Msa, readTarFiles,
+} from "../src/input/mmseqs2-api.js";
 
 function tar(files: Readonly<Record<string, string>>): Uint8Array {
   const chunks: Uint8Array[] = [];
@@ -52,5 +56,62 @@ describe("MMseqs2 API", () => {
     ]);
     expect(String(requests[0]!.init?.body)).toContain("mode=env");
     expect(phases).toEqual(["submitting", "queued", "running", "downloading", "complete"]);
+  });
+
+  it("assembles paired rows densely and unpaired rows block-diagonally", () => {
+    const assembled = assembleComplexA3m(
+      ["AC", "GG"], ["AC", "GG"],
+      [">101\nAC\n>uA\nA-\n", ">102\nGG\n>uB\nG-\n"],
+      [">101\nAC\n>p\n-C\n", ">102\nGG\n>p\n-G\n"],
+    );
+    expect(parseA3m(assembled.a3m).sequences).toEqual(["ACGG", "-C-G", "A---", "--G-"]);
+    expect(assembled.depth).toBe(4);
+    expect([...assembled.mask]).toEqual([
+      1, 1, 1, 1,
+      1, 1, 1, 1,
+      1, 1, 0, 0,
+      0, 0, 1, 1,
+    ]);
+  });
+
+  it("uses a dense unpaired alignment for repeated homomer chains", () => {
+    const assembled = assembleComplexA3m(
+      ["AC", "AC", "AC"], ["AC"], [">101\nAC\n>hit\nA-\n"],
+    );
+    expect(parseA3m(assembled.a3m).sequences).toEqual(["ACACAC", "A-A-A-"]);
+    expect([...assembled.mask]).toEqual(new Array(12).fill(1));
+  });
+
+  it("runs ColabFold unpaired and greedy-paired searches for heteromers", async () => {
+    const unpairedTar = tar({
+      "uniref.a3m": ">101\nAC\n>uA\nA-\n\0>102\nGG\n>uB\nG-\n\0",
+    });
+    const pairedTar = tar({
+      "pair.a3m": ">101\nAC\n>p\n-C\n\0>102\nGG\n>p\n-G\n\0",
+    });
+    const submissions: { endpoint: string; body: string }[] = [];
+    const fetchImplementation = vi.fn(async (input: URL | RequestInfo, init?: RequestInit) => {
+      const url = String(input);
+      if (init?.method === "POST" && (url.endsWith("ticket/msa") || url.endsWith("ticket/pair"))) {
+        const endpoint = url.endsWith("pair") ? "pair" : "msa";
+        submissions.push({ endpoint, body: String(init?.body) });
+        return new Response(JSON.stringify({ status: "PENDING", id: endpoint }));
+      }
+      if (url.includes("/ticket/")) return new Response(JSON.stringify({ status: "COMPLETE" }));
+      if (url.endsWith("/msa")) return new Response(Uint8Array.of(1));
+      if (url.endsWith("/pair")) return new Response(Uint8Array.of(2));
+      throw new Error(`unexpected request ${url}`);
+    }) as typeof fetch;
+    const result = await generateMmseqs2ComplexMsa(["AC", "GG"], {
+      useEnvironmental: false, fetchImplementation, wait: async () => {},
+      decompress: async (archive) => new Uint8Array(archive)[0] === 1 ? unpairedTar : pairedTar,
+    });
+    expect(result.unpairedTicket).toBe("msa");
+    expect(result.pairedTicket).toBe("pair");
+    expect(result.depth).toBe(4);
+    expect(submissions.map((entry) => entry.endpoint).sort()).toEqual(["msa", "pair"]);
+    expect(submissions.find((entry) => entry.endpoint === "msa")!.body).toContain("mode=all");
+    expect(submissions.find((entry) => entry.endpoint === "pair")!.body).toContain("mode=pairgreedy");
+    expect(submissions.every((entry) => entry.body.includes("%3E101") && entry.body.includes("%3E102"))).toBe(true);
   });
 });

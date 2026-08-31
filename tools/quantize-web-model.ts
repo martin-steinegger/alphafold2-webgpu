@@ -1,8 +1,11 @@
-import { mkdir, open, readFile, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, open, readFile, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { dirname, relative, resolve } from "node:path";
 import { float16ToNumber } from "../src/reference/dtype.js";
 import { numberToFloat16 } from "../src/runtime/float16.js";
-import type { BinaryTensorManifest, BinaryTensorRecord } from "../src/reference/tensor-store.js";
+import type {
+  BinaryTensorManifest, BinaryTensorRecord, BinaryTensorShard,
+} from "../src/reference/tensor-store.js";
 
 const BLOCK = 64;
 const format = process.argv.find((value) => value.startsWith("--format="))?.slice(9) ?? "int8";
@@ -46,7 +49,7 @@ for (const entries of byShard.values()) entries.sort(
 
 await mkdir(outputDirectory, { recursive: true });
 const tensors: Record<string, BinaryTensorRecord> = {};
-const files: { file: string; bytes: number }[] = [];
+const files: BinaryTensorShard[] = [];
 const counts = { float32: 0, float16: 0, int8: 0 };
 
 for (const [sourceFile, entries] of [...byShard].sort(([left], [right]) => left.localeCompare(right))) {
@@ -119,7 +122,8 @@ for (const [sourceFile, entries] of [...byShard].sort(([left], [right]) => left.
   } finally {
     await handle.close();
   }
-  files.push({ file: targetFile, bytes: position });
+  const digest = createHash("sha256").update(await readFile(targetPath)).digest("hex");
+  files.push({ file: targetFile, bytes: position, sha256: digest });
 }
 
 const bytes = files.reduce((sum, file) => sum + file.bytes, 0);
@@ -129,6 +133,13 @@ const modelId = typeof manifest.bundle?.model === "string" && manifest.bundle.mo
 const id = `${modelId}-${format === "int8" ? "q8" : "f16"}-v1`;
 const output: BinaryTensorManifest = {
   ...manifest,
+  ...((manifest as { readonly weightsLicense?: unknown }).weightsLicense === undefined ? {} : {
+    weightsLicense: {
+      ...(manifest as unknown as { readonly weightsLicense: Record<string, unknown> }).weightsLicense,
+      modified: true,
+      modifications: ["repacked into versioned browser shards", `converted learned tensors to ${encoding}`],
+    },
+  }),
   bundle: {
     ...manifest.bundle, version: 1, id, encoding,
     tensors: Object.keys(tensors).length, bytes, shards: files.length, files,
@@ -136,5 +147,9 @@ const output: BinaryTensorManifest = {
   },
   tensors,
 };
+const license = (manifest as { readonly weightsLicense?: { readonly file?: unknown } }).weightsLicense;
+if (typeof license?.file === "string" && license.file !== "") {
+  await copyFile(resolve(sourceDirectory, license.file), resolve(outputDirectory, license.file));
+}
 await writeFile(resolve(outputDirectory, "manifest.json"), `${JSON.stringify(output, null, 2)}\n`);
 console.log(`Wrote ${id}: ${counts.int8} int8, ${counts.float16} float16, ${counts.float32} float32 tensors; ${(bytes / 2 ** 20).toFixed(1)} MiB`);

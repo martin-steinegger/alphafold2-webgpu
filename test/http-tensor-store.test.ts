@@ -116,4 +116,21 @@ describe("HttpTensorStore", () => {
     const store = await HttpTensorStore.open(new URL("https://example.test/model/manifest.json"));
     await expect(store.tensor("value")).rejects.toThrow(/exceeds its content length|invalid byte length/);
   });
+
+  it("rejects same-length shard corruption using its declared SHA-256 digest", async () => {
+    const expected = Float32Array.of(7, 8);
+    const digestBytes = new Uint8Array(await crypto.subtle.digest("SHA-256", expected));
+    const sha256 = [...digestBytes].map((value) => value.toString(16).padStart(2, "0")).join("");
+    vi.stubGlobal("fetch", vi.fn(async (input: URL | RequestInfo) => {
+      if (String(input).endsWith("manifest.json")) return new Response(JSON.stringify({
+        bundle: { version: 1, id: "bad-digest", files: [
+          { file: "weights.v1.bin", bytes: expected.byteLength, sha256 },
+        ] },
+        tensors: { value: { file: "weights.v1.bin", dtype: "float32", shape: [2] } },
+      }));
+      return new Response(Float32Array.of(7, 9));
+    }));
+    const store = await HttpTensorStore.open(new URL("https://example.test/model/manifest.json"));
+    await expect(store.tensor("value")).rejects.toThrow(/invalid SHA-256 digest/);
+  });
 });

@@ -4,23 +4,26 @@ const HOMOMER_CHAIN = "PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELA
 const HOMODIMER = new Array(2).fill(HOMOMER_CHAIN).join(":");
 const HOMOTRIMER = new Array(3).fill(HOMOMER_CHAIN).join(":");
 
-test("shows monomer and multimer input modes and switches to custom A3M", async ({ page }) => {
+test("auto-detects monomers and multimers and switches to custom A3M", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Fold a protein in your browser." })).toBeVisible();
   await expect(page.locator("#sequence-length")).toHaveText("59 residues");
   await expect(page.locator("#input-mode")).toHaveValue("mmseqs2");
   await expect(page.locator("#msa-api-url")).toHaveValue("https://api.colabfold.com");
   await expect(page.locator("#predict-label")).toHaveText("Generate MSA & predict");
-  await expect(page.locator("#model-url")).toHaveValue("./model/manifest.json");
-  await expect(page.locator("#sequence")).toHaveCSS("min-height", "112px");
+  await expect(page.locator("#monomer-model-url")).toHaveValue("./model/manifest.json");
+  await expect(page.locator("#multimer-model-url")).toHaveValue("./model-multimer/manifest.json");
+  await expect(page.locator("#sequence")).toHaveCSS("min-height", "80px");
   await page.getByText("Advanced settings").click();
   await expect(page.getByRole("button", { name: "Clear downloaded model" })).toBeVisible();
-  await page.locator("#input-mode").selectOption("multimer");
-  await expect(page.locator("#predict-label")).toHaveText("Run Multimer-v3");
-  await expect(page.locator("#recycles")).toHaveValue("20");
-  await expect(page.locator("#max-msa")).toBeDisabled();
   await page.locator("#sequence").fill(HOMODIMER);
   await expect(page.locator("#sequence-length")).toHaveText("118 residues · 2 chains");
+  await expect(page.locator("#predict-label")).toHaveText("Generate complex MSA & predict");
+  await expect(page.locator("#recycles")).toHaveValue("20");
+  await expect(page.locator("#max-msa")).toBeEnabled();
+  await page.locator("#input-mode").selectOption("single");
+  await expect(page.locator("#predict-label")).toHaveText("Run Multimer-v3");
+  await expect(page.locator("#max-msa")).toBeDisabled();
   await page.locator("#sequence").fill(HOMOTRIMER);
   await expect(page.locator("#sequence-length")).toHaveText("177 residues · 3 chains");
   await page.locator("#input-mode").selectOption("custom");

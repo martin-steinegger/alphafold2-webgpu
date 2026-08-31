@@ -5,6 +5,18 @@ import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
 
 describe("A3M model feature preprocessing", () => {
+  it("keeps block padding as gaps while excluding it from masked-MSA augmentation", async () => {
+    const fixture = AlphaFoldFixture.fromStore(await FileTensorStore.open("test/fixtures/evoformer/model1-query-59-stack/manifest.json"));
+    const result = makeA3mFeatures(">query\nACGG\n>chain\nA---\n", await fixture.queryOnlyFeatureTables(), {
+      recycles: 0, randomSeed: 0, maxMsaSequences: 2,
+      alignmentMask: Float32Array.of(1, 1, 1, 1, 1, 1, 0, 0),
+    });
+    const features = result[0]!;
+    expect([...features.msaMask]).toEqual(new Array(8).fill(1));
+    expect(features.msaFeatures[6 * 49 + 21]).toBe(1);
+    expect(features.msaFeatures[7 * 49 + 21]).toBe(1);
+  });
+
   it("clusters the uploaded 8,076-row alignment into model-1 tensors", async () => {
     const fixture = AlphaFoldFixture.fromStore(await FileTensorStore.open("test/fixtures/evoformer/model1-query-59-stack/manifest.json"));
     const result = makeA3mFeatures(await readFile("test.a3m", "utf8"), await fixture.queryOnlyFeatureTables(), {

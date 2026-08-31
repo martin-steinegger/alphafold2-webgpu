@@ -9,7 +9,9 @@ parameter layout consumed by AFWebGPU's independently tested kernels.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import shutil
 from pathlib import Path
 from types import GeneratorType
 from typing import Any
@@ -21,7 +23,7 @@ def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--data-dir", type=Path, default=Path.home() / ".cache" / "colabfold")
-    parser.add_argument("--model-number", type=int, choices=range(1, 6), default=1)
+    parser.add_argument("--model-number", type=int, choices=(1,), default=1)
     return parser.parse_args()
 
 
@@ -83,6 +85,10 @@ def main() -> None:
     )[0]
 
     args.output.mkdir(parents=True, exist_ok=True)
+    license_source = args.data_dir / "params" / "LICENSE"
+    if not license_source.is_file():
+        raise RuntimeError(f"official parameter license is missing: {license_source}")
+    shutil.copyfile(license_source, args.output / "WEIGHTS_LICENSE.txt")
     tensors: dict[str, dict[str, Any]] = {}
     tensor_index = 0
 
@@ -145,6 +151,14 @@ def main() -> None:
         "formatVersion": 1,
         "source": "official AlphaFold-Multimer-v3 parameters loaded by ColabFold with use_fuse=False",
         "model": {"name": model_name, "type": "alphafold2_multimer_v3", "number": args.model_number},
+        "weightsLicense": {
+            "spdx": "CC-BY-4.0",
+            "file": "WEIGHTS_LICENSE.txt",
+            "source": "AlphaFold model parameters",
+            "url": "https://github.com/google-deepmind/alphafold",
+            "modified": True,
+            "modifications": ["repacked into versioned browser shards"],
+        },
         "bundle": {
             "purpose": "browser-inference",
             "model": f"model_{args.model_number}_multimer_v3",
@@ -195,7 +209,8 @@ def main() -> None:
                 source_files.append(source_path)
                 tensors[name] = {**record, "file": filename, "byteOffset": position}
                 position += len(value)
-        files.append({"file": filename, "bytes": position})
+        digest = hashlib.sha256((args.output / filename).read_bytes()).hexdigest()
+        files.append({"file": filename, "bytes": position, "sha256": digest})
     for source_path in source_files:
         source_path.unlink()
     bytes_written = sum(

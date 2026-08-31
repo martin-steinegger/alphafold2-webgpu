@@ -94,15 +94,21 @@ export { makeA3mFeatures } from "./input/a3m-features.js";
 export type { A3mFeatureOptions } from "./input/a3m-features.js";
 export {
   MULTIMER_MAX_RELATIVE_CHAIN, MULTIMER_MAX_RELATIVE_INDEX, MULTIMER_RELATIVE_CHANNELS,
-  makeMultimerQueryOnlyFeatures, makeMultimerSequenceFeatures, multimerChainIdentifiers, multimerRelativeFeatures,
+  makeMultimerA3mFeatures, makeMultimerQueryOnlyFeatures, makeMultimerSequenceFeatures,
+  multimerChainIdentifiers, multimerRelativeFeatures,
 } from "./input/multimer-features.js";
 export type {
   MultimerFeatureOptions, MultimerRecycleFeatures, MultimerSequenceFeatures,
 } from "./input/multimer-features.js";
-export { extractMmseqs2A3m, generateMmseqs2Msa, readTarFiles } from "./input/mmseqs2-api.js";
-export type {
-  Mmseqs2MsaOptions, Mmseqs2MsaPhase, Mmseqs2MsaProgress, Mmseqs2MsaResult,
+export {
+  assembleComplexA3m, extractMmseqs2A3m, generateMmseqs2ComplexMsa, generateMmseqs2Msa, readTarFiles,
 } from "./input/mmseqs2-api.js";
+export type {
+  Mmseqs2ComplexMsaOptions, Mmseqs2ComplexMsaResult, Mmseqs2MsaOptions, Mmseqs2MsaPhase,
+  Mmseqs2MsaProgress, Mmseqs2MsaResult,
+} from "./input/mmseqs2-api.js";
+export { parseSequenceExpression } from "./input/sequence-expression.js";
+export type { ParsedSequenceExpression } from "./input/sequence-expression.js";
 export { AlphaFoldFixture } from "./reference/alphafold-fixture.js";
 export type { TensorStore } from "./reference/alphafold-fixture.js";
 export { HttpTensorStore } from "./reference/http-tensor-store.js";

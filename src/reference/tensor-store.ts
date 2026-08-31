@@ -15,6 +15,7 @@ export interface BinaryTensorRecord {
 export interface BinaryTensorShard {
   readonly file: string;
   readonly bytes: number;
+  readonly sha256?: string;
 }
 
 export interface BinaryTensorBundle {

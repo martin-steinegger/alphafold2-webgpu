@@ -37,11 +37,11 @@
           <form id="prediction-form">
             <div class="field-row two-columns">
               <label>Job name<input id="job-name" value="test" autocomplete="off" maxlength="80" /></label>
-              <label>Input mode<select id="input-mode"><option value="mmseqs2" selected>MMseqs2 MSA</option><option value="single">Single sequence</option><option value="multimer">Multimer-v3</option><option value="custom">Custom A3M</option></select></label>
+              <label>Alignment<select id="input-mode"><option value="mmseqs2" selected>MMseqs2 MSA</option><option value="single">Single sequence</option><option value="custom">Custom monomer A3M</option></select></label>
             </div>
             <label id="sequence-field">Protein sequence
-              <textarea id="sequence" rows="5" spellcheck="false">PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK</textarea>
-              <span id="sequence-hint" class="hint">One monomer. MMseqs2 mode sends this sequence to the public ColabFold MSA server.</span>
+              <textarea id="sequence" rows="3" spellcheck="false">PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK</textarea>
+              <span id="sequence-hint" class="hint">Enter one chain for AlphaFold2 or colon-separated chains for Multimer-v3.</span>
             </label>
             <label id="a3m-field" class="file-field" hidden>Custom alignment (.a3m)
               <input id="a3m-file" type="file" accept=".a3m,.fa,.fasta,text/plain" />
@@ -55,9 +55,13 @@
                 <label>Random seed<input id="seed" type="number" min="0" max="4294967295" value="0" /></label>
                 <label>Clustered MSA rows<input id="max-msa" type="number" min="1" max="508" value="508" /></label>
                 <label>Extra MSA rows<input id="max-extra" type="number" min="1" max="1024" value="1024" /></label>
-                <label class="wide">Model manifest URL
-                  <input id="model-url" value="./model/manifest.json" spellcheck="false" />
-                  <span class="hint">A same-origin Pages bundle or a CORS-enabled external model directory.</span>
+                <label class="wide">Monomer model manifest URL
+                  <input id="monomer-model-url" value="./model/manifest.json" spellcheck="false" />
+                  <span class="hint">Used automatically for single-chain and custom-A3M inputs.</span>
+                </label>
+                <label class="wide">Multimer model manifest URL
+                  <input id="multimer-model-url" value="./model-multimer/manifest.json" spellcheck="false" />
+                  <span class="hint">Used automatically when the sequence contains colon-separated chains.</span>
                 </label>
                 <div class="wide model-cache-control">
                   <button id="clear-model-cache" class="quiet" type="button">Clear downloaded model</button>
@@ -130,8 +134,8 @@
           <h2 id="about-heading">Fold a protein in your browser.</h2>
         </div>
         <div class="about-copy">
-          <p>AlphaFold2 model-1 PTM and AlphaFold-Multimer-v3 inference on WebGPU. Inference and predictions stay on this device. In MMseqs2 mode, the query sequence is sent to the selected MSA API; single-sequence, multimer query-only, and custom-A3M modes remain local.</p>
-          <p>The TypeScript runtime preprocesses inputs and orchestrates inference. All learned AlphaFold operations execute as WGSL compute shaders on your local GPU. MMseqs2 search, custom A3M upload, and no-template Multimer-v3 are supported; multimer MSA pairing, templates, relaxation, and model ensembling remain to be implemented.</p>
+          <p>AlphaFold2 model-1 PTM and AlphaFold-Multimer-v3 model 1 inference run on WebGPU. Inference and predictions stay on this device. In MMseqs2 mode, the query is sent to the selected MSA API; single-sequence and custom-A3M modes remain local.</p>
+          <p>The TypeScript runtime preprocesses inputs and orchestrates inference. All learned AlphaFold operations execute as WGSL compute shaders on your local GPU. ColabFold-style paired/unpaired complex MSAs and custom monomer A3Ms are supported; templates, relaxation, and model ensembling are not.</p>
           <div id="gpu-summary" class="capability" data-state="checking">
             <span class="capability-dot"></span><span>Checking WebGPU compatibility…</span>
           </div>

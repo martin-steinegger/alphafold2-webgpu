@@ -1,9 +1,12 @@
 import { readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { dirname, relative, resolve } from "node:path";
-import type { BinaryTensorManifest } from "../src/reference/tensor-store.js";
+import type { BinaryTensorManifest, BinaryTensorShard } from "../src/reference/tensor-store.js";
 import { tensorByteLength } from "../src/reference/dtype.js";
 
-const manifestPath = resolve(process.argv[2] ?? "dist/web/model/manifest.json");
+const requireSha256 = process.argv.includes("--require-sha256");
+const manifestArgument = process.argv.slice(2).find((value) => !value.startsWith("--"));
+const manifestPath = resolve(manifestArgument ?? "dist/web/model/manifest.json");
 const directory = dirname(manifestPath);
 const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as BinaryTensorManifest;
 if (manifest.tensors === undefined) throw new Error("model bundle has no tensor table");
@@ -17,13 +20,22 @@ const declaredFiles = manifest.bundle?.files;
 if (declaredFiles !== undefined && (manifest.bundle?.version !== 1 || manifest.bundle.id === undefined)) {
   throw new Error("model bundle has unsupported versioned shard metadata");
 }
-const files = new Map((declaredFiles ?? [...requiredBytes].map(([file, bytes]) => ({ file, bytes })))
+const fileRecords: readonly BinaryTensorShard[] = declaredFiles
+  ?? [...requiredBytes].map(([file, bytes]) => ({ file, bytes }));
+const files = new Map(fileRecords
   .map((file) => [file.file, file]));
 for (const shard of files.values()) {
   const path = resolve(directory, shard.file);
   if (relative(directory, path).startsWith("..")) throw new Error(`${shard.file} escapes the model directory`);
   const bytes = await readFile(path);
   if (bytes.byteLength !== shard.bytes) throw new Error(`${shard.file} has an invalid byte length`);
+  if (shard.sha256 === undefined) {
+    if (requireSha256) throw new Error(`${shard.file} has no SHA-256 digest`);
+  } else {
+    if (!/^[0-9a-f]{64}$/.test(shard.sha256)) throw new Error(`${shard.file} has an invalid SHA-256 declaration`);
+    const digest = createHash("sha256").update(bytes).digest("hex");
+    if (digest !== shard.sha256) throw new Error(`${shard.file} has an invalid SHA-256 digest`);
+  }
 }
 for (const [name, tensor] of Object.entries(manifest.tensors)) {
   const shard = files.get(tensor.file);

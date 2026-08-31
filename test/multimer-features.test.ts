@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  MULTIMER_RELATIVE_CHANNELS, makeMultimerQueryOnlyFeatures, makeMultimerSequenceFeatures,
+  MULTIMER_RELATIVE_CHANNELS, makeMultimerA3mFeatures, makeMultimerQueryOnlyFeatures, makeMultimerSequenceFeatures,
   multimerChainIdentifiers, multimerRelativeFeatures,
 } from "../src/input/multimer-features.js";
 
@@ -105,5 +105,49 @@ describe("AlphaFold-Multimer sequence features", () => {
     expect([...recycles[0]!.chainRelative.asymId]).toEqual([1, 1, 2, 2]);
     expect([...recycles[0]!.chainRelative.entityId]).toEqual([1, 1, 2, 2]);
     expect(recycles[0]!.msaFeatures).not.toEqual(recycles[1]!.msaFeatures);
+  });
+
+  it("builds paired/unpaired Multimer MSA features with block-padding masks", () => {
+    const tables = {
+      atom37ToAtom14: Float32Array.from({ length: 21 * 37 }, (_, index) => index % 14),
+      atom37Mask: new Float32Array(21 * 37).fill(1),
+    };
+    const features = makeMultimerA3mFeatures(
+      ["AC", "GG"],
+      ">query\nACGG\n>paired\nA-G-\n>unpaired_a\nA---\n",
+      Float32Array.of(1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0),
+      tables,
+      { recycles: 0, maxMsaSequences: 3, randomSeed: 0 },
+    )[0]!;
+    expect(features.targetChannels).toBe(21);
+    expect(features.msaFeatureChannels).toBe(49);
+    expect(features.msaSequences).toBe(3);
+    expect([...features.msaMask]).toEqual(new Array(12).fill(1));
+    expect([...features.chainRelative.asymId]).toEqual([1, 1, 2, 2]);
+    expect([...features.chainRelative.entityId]).toEqual([1, 1, 2, 2]);
+    expect([...features.residueIndex]).toEqual([0, 1, 0, 1]);
+  });
+
+  it("applies the shared clustered and extra-MSA row limits to complexes", () => {
+    const tables = {
+      atom37ToAtom14: Float32Array.from({ length: 21 * 37 }, (_, index) => index % 14),
+      atom37Mask: new Float32Array(21 * 37).fill(1),
+    };
+    const a3m = [
+      ">query", "ACGG", ">paired_1", "A-GG", ">paired_2", "AC-G",
+      ">unpaired_a_1", "A---", ">unpaired_a_2", "-C--",
+      ">unpaired_b_1", "--G-", ">unpaired_b_2", "---G",
+    ].join("\n");
+    const depth = 7;
+    const features = makeMultimerA3mFeatures(
+      ["AC", "GG"], a3m, new Float32Array(depth * 4).fill(1), tables,
+      { recycles: 0, randomSeed: 0, maxMsaSequences: 2, maxExtraSequences: 3 },
+    )[0]!;
+    expect(features.msaSequences).toBe(2);
+    expect(features.extraSequences).toBe(3);
+    expect(features.msaFeatures).toHaveLength(2 * 4 * 49);
+    expect(features.extraMsa).toHaveLength(3 * 4);
+    expect(features.msaMask).toHaveLength(2 * 4);
+    expect(features.extraMsaMask).toHaveLength(3 * 4);
   });
 });

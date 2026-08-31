@@ -74,7 +74,8 @@ function validateManifest(manifest: BinaryTensorManifest): void {
   }
   if (files !== undefined) for (const shard of files) {
     if (typeof shard.file !== "string" || shard.file === ""
-      || !Number.isSafeInteger(shard.bytes) || shard.bytes <= 0 || shard.bytes > MAX_MODEL_BYTES) {
+      || !Number.isSafeInteger(shard.bytes) || shard.bytes <= 0 || shard.bytes > MAX_MODEL_BYTES
+      || (shard.sha256 !== undefined && !/^[0-9a-f]{64}$/.test(shard.sha256))) {
       throw new Error("model manifest contains invalid shard metadata");
     }
   }
@@ -183,7 +184,7 @@ export class HttpTensorStore {
     if (cached !== undefined) {
       const buffer = await cached.arrayBuffer();
       try {
-        this.#verifyFile(file, buffer, expectedLength);
+        await this.#verifyFile(file, buffer, expectedLength, shard);
         this.#loadedBytes += buffer.byteLength;
         this.#reportProgress();
         return buffer;
@@ -213,14 +214,22 @@ export class HttpTensorStore {
       if (offset !== output.byteLength) throw new Error(`${file} has an invalid byte length`);
       buffer = output.buffer;
     }
-    this.#verifyFile(file, buffer, expectedLength);
+    await this.#verifyFile(file, buffer, expectedLength, shard);
     if (cache !== undefined) {
       try { await cache.put(url.href, new Response(buffer.slice(0))); } catch { /* quota or private mode */ }
     }
     return buffer;
   }
-  #verifyFile(file: string, buffer: ArrayBuffer, expectedLength: number): void {
+  async #verifyFile(
+    file: string, buffer: ArrayBuffer, expectedLength: number, shard?: BinaryTensorShard,
+  ): Promise<void> {
     if (buffer.byteLength !== expectedLength) throw new Error(`${file} has an invalid byte length`);
+    if (shard?.sha256 !== undefined) {
+      if (globalThis.crypto?.subtle === undefined) throw new Error("SHA-256 verification is unavailable");
+      const digest = new Uint8Array(await globalThis.crypto.subtle.digest("SHA-256", buffer));
+      const actual = [...digest].map((value) => value.toString(16).padStart(2, "0")).join("");
+      if (actual !== shard.sha256) throw new Error(`${file} has an invalid SHA-256 digest`);
+    }
   }
   #reportProgress(tensorName?: string): void {
     const progress = {

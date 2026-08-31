@@ -17,11 +17,14 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--chains", default="AC:GG")
     parser.add_argument("--data-dir", type=Path, default=Path.home() / ".cache" / "colabfold")
-    parser.add_argument("--model-number", type=int, choices=range(1, 6), default=1)
+    parser.add_argument("--model-number", type=int, choices=(1,), default=1)
+    parser.add_argument("--recycles", type=int, default=0)
     args = parser.parse_args()
     chains = [chain.strip().upper() for chain in args.chains.split(":")]
     if len(chains) < 2 or any(not chain for chain in chains):
         raise SystemExit("--chains requires at least two non-empty colon-separated chains")
+    if args.recycles < 0:
+        raise SystemExit("--recycles must be non-negative")
 
     original_sum = np.sum
 
@@ -40,7 +43,7 @@ def main() -> None:
         [mk_mock_template(chain) for chain in chains], True, "alphafold2_multimer_v3", 1,
     )
     model_name, runner, params = load_models_and_params(
-        num_models=1, use_templates=False, num_recycles=0, recycle_early_stop_tolerance=-1,
+        num_models=1, use_templates=False, num_recycles=args.recycles, recycle_early_stop_tolerance=-1,
         num_ensemble=1, model_order=[args.model_number], model_type="alphafold2_multimer_v3",
         data_dir=args.data_dir, max_seq=1, max_extra_seq=1, use_fuse=False,
         use_bfloat16=False, use_dropout=False, save_all=True,
@@ -48,6 +51,8 @@ def main() -> None:
     processed = runner.process_features(raw_features, random_seed=0)
     captured: dict[str, np.ndarray] = {}
     ipa_calls = 0
+    msa_feature_calls = 0
+    extra_feature_calls = 0
     original_ipa = folding_multimer.InvariantPointAttention.__call__
     original_structure = folding_multimer.StructureModule.__call__
     original_msa_feat = modules_multimer.create_msa_feat
@@ -56,18 +61,31 @@ def main() -> None:
     def create_msa_feat(batch: Any) -> Any:
         output = original_msa_feat(batch)
 
-        def receive(value: Any) -> None:
-            captured.setdefault("feature_msa_feat", np.asarray(value, dtype=np.float32).copy())
+        def receive(value: Any, mask_value: Any) -> None:
+            nonlocal msa_feature_calls
+            captured[f"feature_msa_feat_recycle{msa_feature_calls}"] = np.asarray(
+                value, dtype=np.float32
+            ).copy()
+            captured[f"feature_msa_mask_recycle{msa_feature_calls}"] = np.asarray(
+                mask_value, dtype=np.float32
+            ).copy()
+            msa_feature_calls += 1
 
-        jax.debug.callback(receive, output, ordered=True)
+        jax.debug.callback(receive, output, batch["msa_mask"], ordered=True)
         return output
 
     def create_extra_msa_feature(batch: Any, num_extra_msa: int) -> Any:
         output, mask = original_extra_feat(batch, num_extra_msa)
 
         def receive(value: Any, mask_value: Any) -> None:
-            captured.setdefault("feature_extra_msa_feat", np.asarray(value, dtype=np.float32).copy())
-            captured.setdefault("feature_extra_msa_mask", np.asarray(mask_value, dtype=np.float32).copy())
+            nonlocal extra_feature_calls
+            captured[f"feature_extra_msa_feat_recycle{extra_feature_calls}"] = np.asarray(
+                value, dtype=np.float32
+            ).copy()
+            captured[f"feature_extra_msa_mask_recycle{extra_feature_calls}"] = np.asarray(
+                mask_value, dtype=np.float32
+            ).copy()
+            extra_feature_calls += 1
 
         jax.debug.callback(
             receive, output, mask, ordered=True,
@@ -107,7 +125,20 @@ def main() -> None:
     modules_multimer.create_extra_msa_feature = create_extra_msa_feature
     try:
         runner.params = params
-        prediction, recycle_iteration = runner.predict(processed, random_seed=0)
+        recycle_metrics: list[dict[str, float | int]] = []
+
+        def record_recycle(result: Any, recycle: int) -> None:
+            ptm = float(result["ptm"])
+            iptm = float(result["iptm"])
+            recycle_metrics.append({
+                "recycle": int(recycle),
+                "meanPlddt": float(np.mean(result["plddt"])),
+                "ptm": ptm,
+                "iptm": iptm,
+                "rankingConfidence": 0.2 * ptm + 0.8 * iptm,
+            })
+
+        prediction, recycle_iteration = runner.predict(processed, random_seed=0, callback=record_recycle)
         jax.effects_barrier()
     finally:
         folding_multimer.InvariantPointAttention.__call__ = original_ipa
@@ -121,13 +152,42 @@ def main() -> None:
     # The first structure iteration always starts from an identity frame. Store
     # the exact seven-value representation used by the WebGPU implementation.
     captured["ipaAffine"] = np.tile(np.asarray([1, 0, 0, 0, 0, 0, 0], dtype=np.float32), (length, 1))
-    for feature_name in (
-        "aatype", "seq_mask", "residue_index", "msa", "deletion_matrix", "msa_mask",
-        "extra_msa", "extra_has_deletion", "extra_deletion_value", "extra_msa_mask",
-        "asym_id", "entity_id", "sym_id", "atom37_atom_exists", "residx_atom37_to_atom14",
-    ):
-        if feature_name in processed:
-            captured[f"feature_{feature_name}"] = np.asarray(processed[feature_name], dtype=np.float32).copy()
+    feature_ranks = {
+        "aatype": 1, "seq_mask": 1, "residue_index": 1,
+        "asym_id": 1, "entity_id": 1, "sym_id": 1,
+    }
+    for feature_name, base_rank in feature_ranks.items():
+        if feature_name not in processed:
+            raise RuntimeError(f"processed Multimer features are missing {feature_name}")
+        value = np.asarray(processed[feature_name])
+        has_recycle_axis = value.ndim == base_rank + 1
+        if value.ndim != base_rank and not has_recycle_axis:
+            raise RuntimeError(f"processed feature {feature_name} has unexpected shape {value.shape}")
+        for recycle in range(args.recycles + 1):
+            selected = value[recycle] if has_recycle_axis else value
+            captured[f"feature_{feature_name}_recycle{recycle}"] = np.asarray(
+                selected, dtype=np.float32
+            ).copy()
+    for recycle in range(args.recycles + 1):
+        def feature(name: str) -> np.ndarray:
+            return captured[f"feature_{name}_recycle{recycle}"]
+
+        captured[f"feature_target_feat_recycle{recycle}"] = np.eye(
+            21, dtype=np.float32
+        )[feature("aatype").astype(np.int32)]
+        msa_feature_name = f"feature_msa_feat_recycle{recycle}"
+        extra_feature_name = f"feature_extra_msa_feat_recycle{recycle}"
+        if msa_feature_name not in captured or extra_feature_name not in captured:
+            raise RuntimeError(
+                f"failed to capture Multimer MSA features; observed {msa_feature_calls} MSA and "
+                f"{extra_feature_calls} extra-MSA calls"
+            )
+        extra_feat = captured.pop(extra_feature_name)
+        captured[f"feature_extra_msa_recycle{recycle}"] = np.argmax(
+            extra_feat[..., :23], axis=-1
+        ).astype(np.float32)
+        captured[f"feature_extra_has_deletion_recycle{recycle}"] = extra_feat[..., 23].astype(np.float32)
+        captured[f"feature_extra_deletion_value_recycle{recycle}"] = extra_feat[..., 24].astype(np.float32)
     captured["predictionAtom37"] = np.asarray(prediction["structure_module"]["final_atom_positions"], dtype=np.float32)
     captured["predictionPlddt"] = np.asarray(prediction["plddt"], dtype=np.float32)
     captured["predictionPae"] = np.asarray(prediction["predicted_aligned_error"], dtype=np.float32)
@@ -161,10 +221,13 @@ def main() -> None:
         "source": "official AlphaFold-Multimer-v3 JAX float32 inference",
         "model": {"name": model_name, "type": "alphafold2_multimer_v3", "number": args.model_number},
         "chains": chains,
+        "recycles": args.recycles,
         "recycleIteration": int(recycle_iteration),
         "reference": {
             "meanPlddt": float(np.mean(prediction["plddt"])), "ptm": float(prediction["ptm"]),
             "iptm": float(prediction["iptm"]), "rankingConfidence": float(prediction["ranking_confidence"]),
+            "multimerRankingConfidence": 0.2 * float(prediction["ptm"]) + 0.8 * float(prediction["iptm"]),
+            "recycleMetrics": recycle_metrics,
         },
         "ipaParameters": parameter_records,
         "tensors": records,

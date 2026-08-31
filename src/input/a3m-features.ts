@@ -8,6 +8,8 @@ const INDEX = new Map([...RESTYPES].map((residue, index) => [residue, index]));
 export interface A3mFeatureOptions {
   readonly recycles?: number; readonly randomSeed?: number;
   readonly maxMsaSequences?: number; readonly maxExtraSequences?: number;
+  /** Per-cell mask for masked-MSA augmentation; Multimer block padding remains visible as gaps to the model. */
+  readonly alignmentMask?: Float32Array;
 }
 
 function generator(seed: number): () => number {
@@ -30,6 +32,11 @@ export function makeA3mFeatures(a3mText: string, tables: QueryOnlyFeatureTables,
   options: A3mFeatureOptions = {}): readonly MonomerRecycleFeatures[] {
   const alignment = parseA3m(a3mText);
   const length = alignment.length; const depth = alignment.depth;
+  const alignmentMask = options.alignmentMask ?? new Float32Array(depth * length).fill(1);
+  if (alignmentMask.length !== depth * length
+    || alignmentMask.some((value) => value !== 0 && value !== 1)) {
+    throw new RangeError("A3M alignment mask must have shape [depth, length] and contain only zero or one");
+  }
   const encoded = new Uint8Array(depth * length);
   for (let row = 0; row < depth; row += 1) for (let residue = 0; residue < length; residue += 1) {
     const symbol = alignment.sequences[row]![residue]!;
@@ -53,6 +60,8 @@ export function makeA3mFeatures(a3mText: string, tables: QueryOnlyFeatureTables,
       centerCodes.set(encoded.subarray(centers[center]! * length, (centers[center]! + 1) * length), center * length);
     }
     for (let index = 0; index < centerCodes.length; index += 1) {
+      const center = Math.floor(index / length); const residue = index % length;
+      if (alignmentMask[centers[center]! * length + residue] === 0) continue;
       if (random() >= 0.15) continue;
       const original = centerCodes[index]!; const draw = random();
       if (draw < 0.7) centerCodes[index] = 22;
@@ -76,13 +85,15 @@ export function makeA3mFeatures(a3mText: string, tables: QueryOnlyFeatureTables,
     const deletionSums = new Float32Array(centers.length * length);
     const counts = new Float32Array(centers.length * length).fill(1 + 1e-6);
     for (let center = 0; center < centers.length; center += 1) for (let residue = 0; residue < length; residue += 1) {
-      profile[(center * length + residue) * 23 + centerCodes[center * length + residue]!] = 1;
-      deletionSums[center * length + residue] = alignment.deletionMatrix[centers[center]!]![residue]!;
+      const slot = center * length + residue;
+      profile[slot * 23 + centerCodes[slot]!] = 1;
+      deletionSums[slot] = alignment.deletionMatrix[centers[center]!]![residue]!;
     }
     for (let extraIndex = 0; extraIndex < extras.length; extraIndex += 1) {
       const row = extras[extraIndex]!; const center = assignments[extraIndex]!;
       for (let residue = 0; residue < length; residue += 1) {
-        const slot = center * length + residue; counts[slot] = counts[slot]! + 1;
+        const slot = center * length + residue;
+        counts[slot] = counts[slot]! + 1;
         const profileSlot = slot * 23 + encoded[row * length + residue]!;
         profile[profileSlot] = profile[profileSlot]! + 1;
         deletionSums[slot] = deletionSums[slot]! + alignment.deletionMatrix[row]![residue]!;
@@ -106,10 +117,12 @@ export function makeA3mFeatures(a3mText: string, tables: QueryOnlyFeatureTables,
       const slot = extraIndex * length + residue; const row = extras[extraIndex]!;
       const deletion = alignment.deletionMatrix[row]![residue]!;
       extraMsa[slot] = encoded[row * length + residue]!; extraHasDeletion[slot] = Math.min(deletion, 1);
-      extraDeletionValue[slot] = deletionValue(deletion); extraMsaMask[slot] = 1;
+      extraDeletionValue[slot] = deletionValue(deletion);
+      extraMsaMask[slot] = 1;
     }
     results.push({
-      targetFeatures: base.targetFeatures.slice(), msaFeatures, msaMask: new Float32Array(centers.length * length).fill(1),
+      targetFeatures: base.targetFeatures.slice(), msaFeatures,
+      msaMask: new Float32Array(centers.length * length).fill(1),
       extraMsa, extraHasDeletion, extraDeletionValue, extraMsaMask,
       residueIndex: base.residueIndex.slice(), aatype: base.aatype.slice(), seqMask: base.seqMask.slice(),
       atom37ToAtom14: base.atom37ToAtom14.slice(), atom37Mask: base.atom37Mask.slice(),
