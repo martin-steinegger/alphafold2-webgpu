@@ -47,6 +47,8 @@ npx vitest run test/multimer-model-official.gpu.test.ts
 
 This first compares WebGPU float32 with official JAX outputs, then q8 with WebGPU float32. It covers pLDDT, pTM, ipTM, ranking confidence, PAE, and atom coordinates with fixed thresholds. Chrome on macOS Apple Silicon is the release target and must be qualified before enabling the Pages bundle.
 
+For repeatable Apple Silicon qualification, create a draft release tagged `model1-multimer-v3-qualification-v1` containing the f32 archive, q8 archive, and `afwebgpu-multimer-references-v1.tar.gz`. Dispatch **Qualify Multimer on Apple Silicon**; the manual workflow runs both query-only and paired references on GitHub's `macos-15` Apple Silicon runner without deploying Pages. Promote the q8 asset only after that workflow succeeds.
+
 Upload the archive to release tag `model1-multimer-v3-q8-v1` as `afwebgpu-model1-multimer-v3-q8-v1.tar.gz`. Its top-level directory must be `model-multimer/` so the default browser URL resolves to `./model-multimer/manifest.json`.
 
 ## Immutability and Pages limits

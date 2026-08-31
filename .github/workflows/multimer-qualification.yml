@@ -1,0 +1,50 @@
+name: Qualify Multimer on Apple Silicon
+
+on:
+  workflow_dispatch:
+    inputs:
+      qualification_release:
+        description: Draft release containing the f32, q8, and reference archives
+        required: true
+        default: model1-multimer-v3-qualification-v1
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Record Apple GPU
+        run: system_profiler SPHardwareDataType SPDisplaysDataType
+      - name: Download qualification inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.qualification_release }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/qualification"
+          gh release download "$RELEASE_TAG" --dir "$RUNNER_TEMP/qualification" \
+            --pattern afwebgpu-model1-multimer-v3-f32-v1.tar.gz \
+            --pattern afwebgpu-model1-multimer-v3-q8-v1.tar.gz \
+            --pattern afwebgpu-multimer-references-v1.tar.gz
+          tar -xzf "$RUNNER_TEMP/qualification/afwebgpu-model1-multimer-v3-f32-v1.tar.gz" -C "$RUNNER_TEMP/qualification"
+          tar -xzf "$RUNNER_TEMP/qualification/afwebgpu-model1-multimer-v3-q8-v1.tar.gz" -C "$RUNNER_TEMP/qualification"
+          tar -xzf "$RUNNER_TEMP/qualification/afwebgpu-multimer-references-v1.tar.gz" -C "$RUNNER_TEMP/qualification"
+      - name: Verify model shards
+        run: |
+          npm run verify:web-model -- "$RUNNER_TEMP/qualification/afwebgpu-multimer-model1-f32-v1/manifest.json" --require-sha256
+          npm run verify:web-model -- "$RUNNER_TEMP/qualification/model-multimer/manifest.json" --require-sha256
+      - name: Compare official JAX, WebGPU f32, and WebGPU q8
+        env:
+          AFWEBGPU_GPU_TESTS: "1"
+          AFWEBGPU_MULTIMER_REFERENCES: ${{ runner.temp }}/qualification/afwebgpu-multimer-reference-e2e-v1/manifest.json,${{ runner.temp }}/qualification/afwebgpu-multimer-paired-reference-v1/manifest.json
+          AFWEBGPU_MULTIMER_F32_MANIFEST: ${{ runner.temp }}/qualification/afwebgpu-multimer-model1-f32-v1/manifest.json
+          AFWEBGPU_MULTIMER_Q8_MANIFEST: ${{ runner.temp }}/qualification/model-multimer/manifest.json
+        run: npx vitest run test/multimer-model-official.gpu.test.ts --reporter=verbose
