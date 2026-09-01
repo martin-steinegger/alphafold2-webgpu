@@ -751,17 +751,24 @@ async function encodeTriangleMultiplication(
   ]);
   const pairs = input.length * input.length;
   const weights = execution.upload(`triangle.${direction}.weights`, packed.data);
-  const normalized = execution.allocate(`triangle.${direction}.normalized`, pairs * input.cZ);
-  const a = execution.allocate(`triangle.${direction}.a`, pairs * input.triangleHidden);
-  const b = execution.allocate(`triangle.${direction}.b`, pairs * input.triangleHidden);
-  const contracted = execution.allocate(`triangle.${direction}.contracted`, pairs * input.triangleHidden);
   const output = residualTarget ?? execution.allocate(`triangle.${direction}.output`, pairs * input.cZ);
+  // Allocation follows the lifetimes rather than the reading order, so each
+  // tensor's storage is available to the next one.
+  const normalized = execution.allocate(`triangle.${direction}.normalized`, pairs * input.cZ);
   execution.dispatch(encoder, normalizeInput, [pair, weights, normalized], Math.ceil(pairs / 64), 1, 1,
     `triangle.${direction}.normalize-input`);
-  let grid = execution.linearGrid(pairs * input.triangleHidden);
+  const a = execution.allocate(`triangle.${direction}.a`, pairs * input.triangleHidden);
+  const b = execution.allocate(`triangle.${direction}.b`, pairs * input.triangleHidden);
   execution.dispatch(encoder, projectAB, [normalized, pairMask, weights, a, b],
     Math.ceil(input.triangleHidden / 16), Math.ceil(pairs / 16), 1,
     `triangle.${direction}.project`);
+  // The normalized input is read at both ends of the operation and by nothing
+  // in between, and it is the largest tensor otherwise live across the
+  // contraction, so it is dropped here and recomputed below. Recomputing costs
+  // one memory-bound pass over the pair tensor; carrying it costs a whole
+  // pair-shaped tensor at the peak.
+  releaseScratch([normalized], output);
+  const contracted = execution.allocate(`triangle.${direction}.contracted`, pairs * input.triangleHidden);
   const contractGrid = gemmGrid(input.length, input.length);
   execution.dispatch(encoder, contract, [a, b, contracted], contractGrid[0],
     contractGrid[1], input.triangleHidden, `triangle.${direction}.contract`);
@@ -774,10 +781,15 @@ async function encodeTriangleMultiplication(
   execution.dispatch(encoder, normalizeHidden, [contracted, weights, hiddenNormalized], Math.ceil(pairs / 64), 1, 1,
     `triangle.${direction}.normalize-hidden`);
   releaseScratch([contracted], output);
-  execution.dispatch(encoder, projectOutput, [normalized, hiddenNormalized, weights, output],
+  // The pair tensor is still the value that was normalized: the output
+  // projection below is the first thing to write it.
+  const renormalized = execution.allocate(`triangle.${direction}.normalized`, pairs * input.cZ);
+  execution.dispatch(encoder, normalizeInput, [pair, weights, renormalized], Math.ceil(pairs / 64), 1, 1,
+    `triangle.${direction}.renormalize-input`);
+  execution.dispatch(encoder, projectOutput, [renormalized, hiddenNormalized, weights, output],
     Math.ceil(input.cZ / 16), Math.ceil(pairs / 16), 1,
     `triangle.${direction}.output`);
-  releaseScratch([normalized, hiddenNormalized], output);
+  releaseScratch([renormalized, hiddenNormalized], output);
   return output;
 }
 
