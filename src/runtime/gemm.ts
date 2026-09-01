@@ -63,9 +63,15 @@ export function createTiledGemmShader(shader: TiledGemmShader): string {
   }
   const lines = (count: number, body: (index: number) => string): string =>
     Array.from({ length: count }, (_, index) => body(index)).join("\n");
+  const items = (count: number, body: (index: number) => string): string =>
+    Array.from({ length: count }, (_, index) => body(index)).join(", ");
   return `${shader.preamble}
 
-var<workgroup> gemm_source: array<vec4<f32>, ${(GEMM_TILE_ROWS * GEMM_TILE_INNER) / 4}>;
+// Adjacent source elements are populated by different invocations. Keep them
+// as scalar workgroup objects: assigning separate lanes of one vec4 concurrently
+// is a data race and Metal may lower each lane assignment to a clobbering
+// read-modify-write of the whole vector.
+var<workgroup> gemm_source: array<f32, ${GEMM_TILE_ROWS * GEMM_TILE_INNER}>;
 var<workgroup> gemm_weight: array<vec4<f32>, ${(GEMM_TILE_INNER * tileColumns) / 4}>;
 
 @compute @workgroup_size(${GEMM_THREADS}, 1, 1)
@@ -92,7 +98,7 @@ ${lines(rowsPerThread, (row) => `  var acc${row} = vec4<f32>(0.0);`)}
       var element = 0.0;
       if (row < gemm_rows && k < gemm_inner) { element = ${shader.sourceElement}; }
       let slot = (item % ${GEMM_TILE_INNER}u) * ${GEMM_TILE_ROWS}u + load_row;
-      gemm_source[slot / 4u][slot % 4u] = element;
+      gemm_source[slot] = element;
     }
     for (var item = thread; item < ${(GEMM_TILE_INNER * tileColumns) / 4}u; item += ${GEMM_THREADS}u) {
       let k = k0 + item / ${columnThreads}u;
@@ -109,8 +115,9 @@ ${lines(4, (lane) => `        {
     workgroupBarrier();
     for (var step = 0u; step < ${GEMM_TILE_INNER}u; step += 1u) {
       let w = gemm_weight[step * ${columnThreads}u + column_thread];
-      let a_base = (step * ${GEMM_TILE_ROWS}u + row_thread * ${rowsPerThread}u) / 4u;
-${lines(vectorsPerThread, (vector) => `      let a${vector} = gemm_source[a_base + ${vector}u];`)}
+      let a_base = step * ${GEMM_TILE_ROWS}u + row_thread * ${rowsPerThread}u;
+${lines(vectorsPerThread, (vector) => `      let a${vector} = vec4<f32>(${items(4,
+    (lane) => `gemm_source[a_base + ${vector * 4 + lane}u]`)});`)}
 ${lines(rowsPerThread, (row) => `      acc${row} += a${Math.floor(row / 4)}[${row % 4}u] * w;`)}
     }
     workgroupBarrier();
