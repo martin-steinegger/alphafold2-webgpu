@@ -207,14 +207,35 @@ ${Array.from({ length: registerRows }, (_, index) => `      if (r == ${index}u) 
 }`;
 }
 
+
+/**
+ * The same tiling, reading A as packed f16 pairs.
+ *
+ * shader-f16 is unavailable on this adapter, but unpack2x16float is core WGSL,
+ * so A can be stored at half width with the arithmetic still in f32. This tests
+ * whether the projection is bandwidth-bound.
+ */
+function tiledGemmPackedSource(tileRows: number, tileColumns: number, tileInner: number): string {
+  return tiledGemm(tileRows, tileColumns, tileInner)
+    .replace("@group(0) @binding(0) var<storage, read> source: array<f32>;",
+      `@group(0) @binding(0) var<storage, read> source_packed: array<u32>;
+
+fn source_at(index: u32) -> f32 {
+  let pair = unpack2x16float(source_packed[index / 2u]);
+  return select(pair.x, pair.y, (index & 1u) == 1u);
+}`)
+    .replace("value = source[source_row * parameters.inner + source_k];",
+      "value = source_at(source_row * parameters.inner + source_k);");
+}
+
 const CANDIDATES: readonly Candidate[] = [
   { name: "current-64x128k8", shader: tiledGemm(64, 128, 8), tileRows: 64, tileColumns: 128 },
+  { name: "tiled-64x64k16", shader: tiledGemm(64, 64, 16), tileRows: 64, tileColumns: 64 },
   { name: "tiled-128x128k8", shader: tiledGemm(128, 128, 8), tileRows: 128, tileColumns: 128 },
+  // 16 KiB of workgroup storage exactly, with no headroom against the WebGPU
+  // minimum, so it is measured but not shipped.
   { name: "tiled-128x128k16", shader: tiledGemm(128, 128, 16), tileRows: 128, tileColumns: 128 },
-  { name: "tiled-64x128k16", shader: tiledGemm(64, 128, 16), tileRows: 64, tileColumns: 128 },
-  { name: "tiled-96x128k8", shader: tiledGemm(96, 128, 8), tileRows: 96, tileColumns: 128 },
-  { name: "tiled-128x256k8", shader: tiledGemm(128, 256, 8), tileRows: 128, tileColumns: 256 },
-  { name: "tiled-256x128k8", shader: tiledGemm(256, 128, 8), tileRows: 256, tileColumns: 128 },
+  { name: "f16-source-64x128k8", shader: tiledGemmPackedSource(64, 128, 8), tileRows: 64, tileColumns: 128 },
 ];
 
 interface Shape { readonly name: string; readonly rows: number; readonly inner: number; readonly columns: number; }
