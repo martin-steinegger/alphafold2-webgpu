@@ -13,7 +13,7 @@ import { AlphaFoldMonomerGpu } from "../src/model/monomer.js";
 import { makeA3mFeatures } from "../src/input/a3m-features.js";
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
-import { requestAlphaFoldDevice } from "../src/runtime/device.js";
+import { planMonomerDevice, requestAlphaFoldDevice } from "../src/runtime/device.js";
 
 Object.assign(globalThis, globals);
 
@@ -52,7 +52,12 @@ const features = makeA3mFeatures(a3m, featureTables, {
 const gpu = create([]);
 const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
 if (adapter === null) throw new Error("no WebGPU adapter");
-const device = await requestAlphaFoldDevice(adapter);
+// Match what the page does: size the device to the shape, not to the base tier.
+const plan = planMonomerDevice(adapter, length, msaRows, extraRows);
+const device = await requestAlphaFoldDevice(adapter, plan.requirements);
+console.error(`device limits: buffer ${(plan.requirements.maxBufferSize / 1024 ** 2).toFixed(0)} MiB, `
+  + `storage binding ${(plan.requirements.maxStorageBufferBindingSize / 1024 ** 2).toFixed(0)} MiB, `
+  + `estimated peak ${(plan.memory.estimatedPeakBytes / 1024 ** 2).toFixed(0)} MiB, mode ${plan.transitionMode}`);
 const tally = new Map<string, { bytes: number; count: number }>();
 if (process.env.AFWEBGPU_MEMORY === "1") {
   const original = device.createBuffer.bind(device);

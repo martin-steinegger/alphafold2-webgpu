@@ -31,14 +31,30 @@ describe("requestAlphaFoldDevice", () => {
   });
 
   it("sizes limits from persistent tensors rather than transition intermediates", () => {
+    // 291 residues over 508 clustered rows: the clustered MSA is the largest
+    // persistent tensor, and every scratch tensor is bounded below it.
     expect(monomerDeviceRequirements(291, 508, 1024)).toEqual({
       maxBufferSize: 256 * 1024 ** 2,
-      maxStorageBufferBindingSize: 32 * 291 * 32 * 128 * 4,
+      maxStorageBufferBindingSize: 508 * 291 * 256 * 4,
     });
+    // At 1000 residues the clustered MSA is still the larger of the two, and
+    // the requirement follows it rather than any scratch tensor.
     expect(monomerDeviceRequirements(1_000, 508, 1024)).toEqual({
-      maxBufferSize: 32 * 1_000 * 32 * 128 * 4,
-      maxStorageBufferBindingSize: 32 * 1_000 * 32 * 128 * 4,
+      maxBufferSize: 508 * 1_000 * 256 * 4,
+      maxStorageBufferBindingSize: 508 * 1_000 * 256 * 4,
     });
+    // With a shallow alignment the pair tensor is what the device must hold.
+    expect(monomerDeviceRequirements(1_000, 32, 64).maxStorageBufferBindingSize)
+      .toBe(1_000 * 1_000 * 128 * 4);
+  });
+
+  it("does not size limits for scratch that every operation now bounds", () => {
+    // The outer-product contraction, the transition window and the attention
+    // window all cap themselves, so none of them may drive the requirement.
+    const requirement = monomerDeviceRequirements(512, 256, 512).maxStorageBufferBindingSize;
+    expect(requirement).toBe(Math.max(256 * 512 * 256 * 4, 512 * 512 * 128 * 4));
+    // Scratch that grew with the shape would have asked for 256 MiB here.
+    expect(requirement).toBeLessThan(256 * 1024 ** 2);
   });
 
   it("uses full transitions only when their shape fits the adapter", () => {
@@ -88,7 +104,7 @@ describe("requestAlphaFoldDevice", () => {
   it("rejects a shape that exceeds the adapter instead of silently lowering its requirements", async () => {
     const { adapter, requestDevice } = adapterWithLimits(128 * 1024 ** 2, 256 * 1024 ** 2);
     const requirements = monomerDeviceRequirements(291, 508, 1024);
-    await expect(requestAlphaFoldDevice(adapter, requirements)).rejects.toThrow(/requires a 146 MiB storage binding/);
+    await expect(requestAlphaFoldDevice(adapter, requirements)).rejects.toThrow(/requires a 144 MiB storage binding/);
     expect(requestDevice).not.toHaveBeenCalled();
   });
 });

@@ -1,4 +1,5 @@
 import { COMPACT_GPU_POOL_BYTES } from "./allocator.js";
+import { OUTER_PRODUCT_BLOCK_LIMIT_BYTES } from "../evoformer/outer-product-mean.js";
 import { recordSubgroupRange } from "./subgroups.js";
 
 const WEBGPU_BASE_MAX_BUFFER_SIZE = 256 * 1024 * 1024;
@@ -149,12 +150,15 @@ export function monomerDeviceRequirements(
     throw new RangeError("monomer device dimensions must be positive safe integers");
   }
   const bytes = Float32Array.BYTES_PER_ELEMENT;
-  const outerProductTileSequences = Math.min(32, Math.max(msaSequences, extraSequences));
+  // The persistent activations, plus the largest scratch tensor, which every
+  // operation now bounds against its own budget rather than letting it grow
+  // with the shape: the outer-product contraction, the transition window and
+  // the attention window are all capped.
   const largestTensor = Math.max(
     msaSequences * length * 256 * bytes,
     extraSequences * length * 64 * bytes,
     length * length * 128 * bytes,
-    outerProductTileSequences * length * 32 * 128 * bytes,
+    OUTER_PRODUCT_BLOCK_LIMIT_BYTES,
   );
   if (!Number.isSafeInteger(largestTensor)) throw new RangeError("monomer tensor size exceeds JavaScript precision");
   return {
