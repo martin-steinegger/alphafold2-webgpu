@@ -139,6 +139,19 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   output[affine_base + 6u] = new_translation.z;
 }`;
 
+export interface PreparedStructurePostAttention {
+  readonly addNormalize: GPUComputePipeline;
+  readonly linear: GPUComputePipeline;
+  readonly affine: GPUComputePipeline;
+  readonly weights: AllocatedGpuBuffer;
+  readonly attentionNormParams: AllocatedGpuBuffer;
+  readonly transitionNormParams: AllocatedGpuBuffer;
+  readonly transitionParams: readonly AllocatedGpuBuffer[];
+  readonly affineParams: AllocatedGpuBuffer;
+  readonly buffers: readonly AllocatedGpuBuffer[];
+  release(): void;
+}
+
 export class StructurePostAttentionGpu {
   readonly device: GPUDevice;
   readonly allocator: GpuBufferAllocator;
@@ -149,78 +162,129 @@ export class StructurePostAttentionGpu {
     this.pipelines = pipelineCacheForDevice(device);
   }
 
-  async run(input: StructurePostAttentionInput): Promise<StructurePostAttentionResult> {
+  /**
+   * Uploads everything that is the same in every structure iteration.
+   *
+   * Only the activations, the attention update and the frame change between
+   * iterations, so hoisting the rest lets the whole loop share one command
+   * buffer: nothing inside it writes a buffer through the queue, which would
+   * otherwise be ordered ahead of the dispatches still reading it.
+   */
+  async prepare(input: StructurePostAttentionInput): Promise<PreparedStructurePostAttention> {
     const packed = pack(input);
     const [addNormalize, linear, affinePipeline] = await Promise.all([
       this.pipelines.get("structure:add-normalize", ADD_NORMALIZE_SHADER),
       this.pipelines.get("structure:linear", LINEAR_SHADER),
       this.pipelines.get("structure:affine", AFFINE_SHADER),
     ]);
-    const allocations: AllocatedGpuBuffer[] = [];
-    const keep = (value: AllocatedGpuBuffer): AllocatedGpuBuffer => { allocations.push(value); return value; };
-    const upload = (label: string, value: ArrayBufferView, usage = GPUBufferUsage.STORAGE): AllocatedGpuBuffer =>
-      keep(this.allocator.upload(label, value, usage));
-    const allocate = (label: string, elements: number, usage = GPUBufferUsage.STORAGE): AllocatedGpuBuffer =>
-      keep(this.allocator.allocate(label, elements * 4, usage));
-    try {
-      const source = upload("structure.source", input.activations);
-      const attention = upload("structure.attention", input.attentionUpdate);
-      const affine = upload("structure.affine", input.affine);
-      const weights = upload("structure.weights", packed.data);
-      const attentionNormParams = upload("structure.attention-norm-params", normParams(
+    const buffers: AllocatedGpuBuffer[] = [];
+    const upload = (label: string, value: ArrayBufferView, usage = GPUBufferUsage.STORAGE): AllocatedGpuBuffer => {
+      const buffer = this.allocator.upload(label, value, usage);
+      buffers.push(buffer);
+      return buffer;
+    };
+    const weights = upload("structure.weights", packed.data);
+    const linearParams = (label: string, weight: number, bias: number, activation: number, columns = input.channels) =>
+      upload(label, new Uint32Array([
+        input.length, input.channels, columns, weight, bias, activation, 0, 0,
+      ]), GPUBufferUsage.UNIFORM);
+    return {
+      addNormalize, linear, affine: affinePipeline, weights, buffers,
+      attentionNormParams: upload("structure.attention-norm-params", normParams(
         input.length, input.channels, packed.offsets[0]!, packed.offsets[1]!,
-      ), GPUBufferUsage.UNIFORM);
-      const transitionNormParams = upload("structure.transition-norm-params", normParams(
+      ), GPUBufferUsage.UNIFORM),
+      transitionNormParams: upload("structure.transition-norm-params", normParams(
         input.length, input.channels, packed.offsets[8]!, packed.offsets[9]!,
-      ), GPUBufferUsage.UNIFORM);
-      const linearParams = (label: string, weight: number, bias: number, activation: number, columns = input.channels) =>
-        upload(label, new Uint32Array([
-          input.length, input.channels, columns, weight, bias, activation, 0, 0,
-        ]), GPUBufferUsage.UNIFORM);
-      const transitionParams = [
+      ), GPUBufferUsage.UNIFORM),
+      transitionParams: [
         linearParams("structure.transition-0-params", packed.offsets[2]!, packed.offsets[3]!, 1),
         linearParams("structure.transition-1-params", packed.offsets[4]!, packed.offsets[5]!, 1),
         linearParams("structure.transition-2-params", packed.offsets[6]!, packed.offsets[7]!, 0),
-      ];
-      const affineParams = linearParams("structure.affine-params", packed.offsets[10]!, packed.offsets[11]!, 0, 6);
-      const elements = input.length * input.channels;
-      const normalized = allocate("structure.attention-normalized", elements);
-      const transition0 = allocate("structure.transition-0", elements);
-      const transition1 = allocate("structure.transition-1", elements);
-      const transition2 = allocate("structure.transition-2", elements);
-      const output = allocate("structure.output", elements, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
-      const affineUpdate = allocate("structure.affine-update", input.length * 6);
-      const affineOutput = allocate("structure.affine-output", input.length * 7,
-        GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+      ],
+      affineParams: linearParams("structure.affine-params", packed.offsets[10]!, packed.offsets[11]!, 0, 6),
+      release: (): void => {
+        for (let index = buffers.length - 1; index >= 0; index -= 1) buffers[index]!.release();
+      },
+    };
+  }
+
+  /** Encodes one iteration's residual update and frame update over GPU-resident tensors. */
+  encode(
+    pass: GPUComputePassEncoder,
+    input: Pick<StructurePostAttentionInput, "length" | "channels">,
+    prepared: PreparedStructurePostAttention,
+    source: AllocatedGpuBuffer,
+    attention: AllocatedGpuBuffer,
+    affine: AllocatedGpuBuffer,
+  ): {
+    readonly activations: AllocatedGpuBuffer; readonly affine: AllocatedGpuBuffer;
+    readonly scratch: readonly AllocatedGpuBuffer[];
+  } {
+    const scratch: AllocatedGpuBuffer[] = [];
+    const allocate = (label: string, elements: number, usage = GPUBufferUsage.STORAGE): AllocatedGpuBuffer => {
+      const buffer = this.allocator.allocate(label, elements * 4, usage);
+      scratch.push(buffer);
+      return buffer;
+    };
+    const elements = input.length * input.channels;
+    const normalized = allocate("structure.attention-normalized", elements);
+    const transition0 = allocate("structure.transition-0", elements);
+    const transition1 = allocate("structure.transition-1", elements);
+    const transition2 = allocate("structure.transition-2", elements);
+    const affineUpdate = allocate("structure.affine-update", input.length * 6);
+    const output = this.allocator.allocate("structure.output", elements * 4,
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+    const affineOutput = this.allocator.allocate("structure.affine-output", input.length * 7 * 4,
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+    // One pass for the whole structure loop: a pass boundary per dispatch cost
+    // more than the dispatches themselves at short chain lengths.
+    const dispatch = (pipeline: GPUComputePipeline, buffers: readonly AllocatedGpuBuffer[], x: number, y = 1): void => {
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer: buffer.buffer } })),
+      }));
+      pass.dispatchWorkgroups(x, y);
+    };
+    const { addNormalize, linear, weights, transitionParams } = prepared;
+    dispatch(addNormalize, [source, attention, weights, prepared.attentionNormParams, normalized], input.length);
+    dispatch(linear, [normalized, weights, transitionParams[0]!, transition0],
+      Math.ceil(input.channels / TRANSITION_TILE_COLUMNS), Math.ceil(input.length / TRANSITION_TILE_ROWS));
+    dispatch(linear, [transition0, weights, transitionParams[1]!, transition1],
+      Math.ceil(input.channels / TRANSITION_TILE_COLUMNS), Math.ceil(input.length / TRANSITION_TILE_ROWS));
+    dispatch(linear, [transition1, weights, transitionParams[2]!, transition2],
+      Math.ceil(input.channels / TRANSITION_TILE_COLUMNS), Math.ceil(input.length / TRANSITION_TILE_ROWS));
+    dispatch(addNormalize, [normalized, transition2, weights, prepared.transitionNormParams, output], input.length);
+    dispatch(linear, [output, weights, prepared.affineParams, affineUpdate],
+      Math.ceil(6 / TRANSITION_TILE_COLUMNS), Math.ceil(input.length / TRANSITION_TILE_ROWS));
+    dispatch(prepared.affine, [affine, affineUpdate, affineOutput], Math.ceil(input.length / 64));
+    return { activations: output, affine: affineOutput, scratch };
+  }
+
+  async run(input: StructurePostAttentionInput): Promise<StructurePostAttentionResult> {
+    const prepared = await this.prepare(input);
+    const allocations: AllocatedGpuBuffer[] = [];
+    try {
+      const source = this.allocator.upload("structure.source", input.activations, GPUBufferUsage.STORAGE);
+      allocations.push(source);
+      const attention = this.allocator.upload(
+        "structure.attention", input.attentionUpdate, GPUBufferUsage.STORAGE);
+      allocations.push(attention);
+      const affine = this.allocator.upload("structure.affine", input.affine, GPUBufferUsage.STORAGE);
+      allocations.push(affine);
       const encoder = this.device.createCommandEncoder({ label: "structure-post-attention" });
       this.device.pushErrorScope("validation");
-      const pass = (pipeline: GPUComputePipeline, buffers: readonly AllocatedGpuBuffer[], x: number, y = 1): void => {
-        const compute = encoder.beginComputePass();
-        compute.setPipeline(pipeline);
-        compute.setBindGroup(0, this.device.createBindGroup({
-          layout: pipeline.getBindGroupLayout(0),
-          entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer: buffer.buffer } })),
-        }));
-        compute.dispatchWorkgroups(x, y);
-        compute.end();
-      };
-      pass(addNormalize, [source, attention, weights, attentionNormParams, normalized], input.length);
-      pass(linear, [normalized, weights, transitionParams[0]!, transition0],
-        Math.ceil(input.channels / TRANSITION_TILE_COLUMNS), Math.ceil(input.length / TRANSITION_TILE_ROWS));
-      pass(linear, [transition0, weights, transitionParams[1]!, transition1],
-        Math.ceil(input.channels / TRANSITION_TILE_COLUMNS), Math.ceil(input.length / TRANSITION_TILE_ROWS));
-      pass(linear, [transition1, weights, transitionParams[2]!, transition2],
-        Math.ceil(input.channels / TRANSITION_TILE_COLUMNS), Math.ceil(input.length / TRANSITION_TILE_ROWS));
-      pass(addNormalize, [normalized, transition2, weights, transitionNormParams, output], input.length);
-      pass(linear, [output, weights, affineParams, affineUpdate],
-        Math.ceil(6 / TRANSITION_TILE_COLUMNS), Math.ceil(input.length / TRANSITION_TILE_ROWS));
-      pass(affinePipeline, [affine, affineUpdate, affineOutput], Math.ceil(input.length / 64));
-      const actReadback = allocate("structure.act-readback", elements, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
-      const affineReadback = allocate(
-        "structure.affine-readback", input.length * 7, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
-      );
-      encoder.copyBufferToBuffer(output.buffer, 0, actReadback.buffer, 0, output.byteLength);
-      encoder.copyBufferToBuffer(affineOutput.buffer, 0, affineReadback.buffer, 0, affineOutput.byteLength);
+      const pass = encoder.beginComputePass({ label: "structure-post-attention" });
+      const encoded = this.encode(pass, input, prepared, source, attention, affine);
+      pass.end();
+      allocations.push(...encoded.scratch, encoded.activations, encoded.affine);
+      const actReadback = this.allocator.allocate("structure.act-readback", encoded.activations.byteLength,
+        GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
+      const affineReadback = this.allocator.allocate("structure.affine-readback", encoded.affine.byteLength,
+        GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
+      allocations.push(actReadback, affineReadback);
+      encoder.copyBufferToBuffer(encoded.activations.buffer, 0, actReadback.buffer, 0, encoded.activations.byteLength);
+      encoder.copyBufferToBuffer(encoded.affine.buffer, 0, affineReadback.buffer, 0, encoded.affine.byteLength);
       const start = performance.now();
       this.device.queue.submit([encoder.finish()]);
       const error = await this.device.popErrorScope();
@@ -235,6 +299,7 @@ export class StructurePostAttentionGpu {
       };
     } finally {
       for (let index = allocations.length - 1; index >= 0; index -= 1) allocations[index]!.release();
+      prepared.release();
     }
   }
 }

@@ -624,9 +624,12 @@ export class InvariantPointAttentionGpu {
         compute.end();
         this.device.pushErrorScope("validation");
         this.device.queue.submit([encoder.finish()]);
+        // Deliberately not waiting for completion. The normalized pair is only
+        // read by dispatches submitted after this one, which the queue orders
+        // behind it, and WebGPU keeps a destroyed buffer's memory alive until
+        // the work already submitted against it has finished.
         const error = await this.device.popErrorScope();
         if (error !== null) throw new Error(`WebGPU IPA preparation failed: ${error.message}`);
-        await this.device.queue.onSubmittedWorkDone();
       } finally {
         pairNormParams?.release();
         pairSource?.release();
@@ -642,79 +645,105 @@ export class InvariantPointAttentionGpu {
     }
   }
 
+  /**
+   * Encodes one attention pass over GPU-resident activations.
+   *
+   * The eight structure iterations differ only in their activations and frame,
+   * so keeping them on the device lets the whole loop share one command buffer
+   * instead of a submission, a fence and a readback per iteration. Scratch is
+   * returned rather than released, because it stays live until submission.
+   */
+  encode(
+    pass: GPUComputePassEncoder,
+    input: InvariantPointAttentionInput,
+    shared: PreparedInvariantPointAttention,
+    source: AllocatedGpuBuffer,
+    affine: AllocatedGpuBuffer,
+  ): { readonly output: AllocatedGpuBuffer; readonly scratch: readonly AllocatedGpuBuffer[] } {
+    const {
+      pipelines, weights, params, mask, pair, featureChannels,
+      queryScalarColumns, kvScalarColumns, queryPointColumns, kvPointColumns,
+    } = shared;
+    const scratch: AllocatedGpuBuffer[] = [];
+    const allocate = (label: string, elements: number, usage = GPUBufferUsage.STORAGE): AllocatedGpuBuffer => {
+      const buffer = this.allocator.allocate(label, elements * 4, usage);
+      scratch.push(buffer);
+      return buffer;
+    };
+    const queryScalar = allocate("ipa.query-scalar", input.length * queryScalarColumns);
+    const kvScalar = allocate("ipa.kv-scalar", input.length * kvScalarColumns);
+    const queryPointLocal = allocate("ipa.query-point-local", input.length * queryPointColumns);
+    const kvPointLocal = allocate("ipa.kv-point-local", input.length * kvPointColumns);
+    const queryPoint = allocate("ipa.query-point", input.length * input.heads * input.pointQk * 3);
+    const kvPoint = allocate("ipa.kv-point", input.length * input.heads * (input.pointQk + input.pointV) * 3);
+    const attentionElements = input.heads * input.length * input.length;
+    const logits = allocate("ipa.logits", attentionElements);
+    const attention = allocate("ipa.attention", attentionElements);
+    const features = allocate("ipa.features", input.length * featureChannels);
+    const output = this.allocator.allocate("ipa.output", input.length * input.channels * 4,
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+    // One pass for the whole structure loop: a pass boundary per dispatch cost
+    // more than the dispatches themselves at short chain lengths.
+    const dispatch = (pipeline: GPUComputePipeline, buffers: readonly AllocatedGpuBuffer[], x: number, y = 1): void => {
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer: buffer.buffer } })),
+      }));
+      pass.dispatchWorkgroups(x, y);
+    };
+    const gridFor = (elements: number, workgroupSize = 64): readonly [number, number] => {
+      const groups = Math.ceil(elements / workgroupSize);
+      return [Math.min(groups, 32_768), Math.ceil(groups / 32_768)];
+    };
+    const linear = (paramsValue: AllocatedGpuBuffer, result: AllocatedGpuBuffer, columns: number): void =>
+      dispatch(pipelines[1]!, [source, weights, paramsValue, result],
+        Math.ceil(columns / TRANSITION_TILE_COLUMNS), Math.ceil(input.length / TRANSITION_TILE_ROWS));
+    linear(shared.qScalarParams, queryScalar, queryScalarColumns);
+    linear(shared.kvScalarParams, kvScalar, kvScalarColumns);
+    linear(shared.qPointParams, queryPointLocal, queryPointColumns);
+    linear(shared.kvPointParams, kvPointLocal, kvPointColumns);
+    dispatch(pipelines[2]!, [queryPointLocal, affine, shared.qPointTransformParams, queryPoint],
+      Math.ceil(queryPoint.byteLength / 4 / 3 / 64));
+    dispatch(pipelines[2]!, [kvPointLocal, affine, shared.kvPointTransformParams, kvPoint],
+      Math.ceil(kvPoint.byteLength / 4 / 3 / 64));
+    const attentionGrid = gridFor(attentionElements);
+    dispatch(pipelines[3]!, [queryScalar, kvScalar, queryPoint, kvPoint, pair, mask, weights, params, logits],
+      attentionGrid[0], attentionGrid[1]);
+    dispatch(pipelines[4]!, [logits, params, attention], input.heads * input.length);
+    dispatch(pipelines[5]!, [attention, kvScalar, params, features],
+      Math.ceil(input.length * input.heads * input.scalarV / 64));
+    dispatch(pipelines[6]!, [attention, kvPoint, affine, params, features],
+      Math.ceil(input.length * input.heads * input.pointV / 64));
+    dispatch(pipelines[7]!, [attention, pair, params, features],
+      Math.ceil(input.length * input.heads * input.pairChannels / 64));
+    dispatch(pipelines[1]!, [features, weights, shared.outputParams, output],
+      Math.ceil(input.channels / TRANSITION_TILE_COLUMNS), Math.ceil(input.length / TRANSITION_TILE_ROWS));
+    return { output, scratch };
+  }
+
   async run(input: InvariantPointAttentionInput): Promise<InvariantPointAttentionResult> {
     validateInput(input);
     const shared = input.prepared ?? await this.prepare(input);
     const ownsShared = input.prepared === undefined;
     shared.assertCompatible(this.device, input);
-    const {
-      pipelines, weights, params, mask, pair, featureChannels,
-      queryScalarColumns, kvScalarColumns, queryPointColumns, kvPointColumns,
-    } = shared;
     const allocations: AllocatedGpuBuffer[] = [];
-    const keep = (value: AllocatedGpuBuffer): AllocatedGpuBuffer => { allocations.push(value); return value; };
-    const upload = (label: string, value: ArrayBufferView, usage = GPUBufferUsage.STORAGE): AllocatedGpuBuffer =>
-      keep(this.allocator.upload(label, value, usage));
-    const allocate = (label: string, elements: number, usage = GPUBufferUsage.STORAGE): AllocatedGpuBuffer =>
-      keep(this.allocator.allocate(label, elements * 4, usage));
     try {
-      const source = upload("ipa.source", input.activations);
-      const affine = upload("ipa.affine", input.affine);
-      const queryScalar = allocate("ipa.query-scalar", input.length * queryScalarColumns);
-      const kvScalar = allocate("ipa.kv-scalar", input.length * kvScalarColumns);
-      const queryPointLocal = allocate("ipa.query-point-local", input.length * queryPointColumns);
-      const kvPointLocal = allocate("ipa.kv-point-local", input.length * kvPointColumns);
-      const queryPoint = allocate("ipa.query-point", input.length * input.heads * input.pointQk * 3);
-      const kvPoint = allocate(
-        "ipa.kv-point", input.length * input.heads * (input.pointQk + input.pointV) * 3,
-      );
-      const attentionElements = input.heads * input.length * input.length;
-      const logits = allocate("ipa.logits", attentionElements);
-      const attention = allocate("ipa.attention", attentionElements);
-      const features = allocate("ipa.features", input.length * featureChannels);
-      const output = allocate("ipa.output", input.length * input.channels, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+      const source = this.allocator.upload("ipa.source", input.activations, GPUBufferUsage.STORAGE);
+      allocations.push(source);
+      const affine = this.allocator.upload("ipa.affine", input.affine, GPUBufferUsage.STORAGE);
+      allocations.push(affine);
       const encoder = this.device.createCommandEncoder({ label: "invariant-point-attention" });
       this.device.pushErrorScope("validation");
-      const pass = (pipeline: GPUComputePipeline, buffers: readonly AllocatedGpuBuffer[], x: number, y = 1): void => {
-        const compute = encoder.beginComputePass();
-        compute.setPipeline(pipeline);
-        compute.setBindGroup(0, this.device.createBindGroup({
-          layout: pipeline.getBindGroupLayout(0),
-          entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer: buffer.buffer } })),
-        }));
-        compute.dispatchWorkgroups(x, y);
-        compute.end();
-      };
-      const grid = (elements: number, workgroupSize = 64): readonly [number, number] => {
-        const groups = Math.ceil(elements / workgroupSize);
-        return [Math.min(groups, 32_768), Math.ceil(groups / 32_768)];
-      };
-      const linear = (paramsValue: AllocatedGpuBuffer, result: AllocatedGpuBuffer, columns: number): void =>
-        pass(pipelines[1]!, [source, weights, paramsValue, result],
-          Math.ceil(columns / TRANSITION_TILE_COLUMNS), Math.ceil(input.length / TRANSITION_TILE_ROWS));
-      linear(shared.qScalarParams, queryScalar, queryScalarColumns);
-      linear(shared.kvScalarParams, kvScalar, kvScalarColumns);
-      linear(shared.qPointParams, queryPointLocal, queryPointColumns);
-      linear(shared.kvPointParams, kvPointLocal, kvPointColumns);
-      pass(pipelines[2]!, [queryPointLocal, affine, shared.qPointTransformParams, queryPoint],
-        Math.ceil(queryPoint.byteLength / 4 / 3 / 64));
-      pass(pipelines[2]!, [kvPointLocal, affine, shared.kvPointTransformParams, kvPoint],
-        Math.ceil(kvPoint.byteLength / 4 / 3 / 64));
-      const dispatch = grid(attentionElements);
-      pass(pipelines[3]!, [queryScalar, kvScalar, queryPoint, kvPoint, pair, mask, weights, params, logits],
-        dispatch[0], dispatch[1]);
-      pass(pipelines[4]!, [logits, params, attention], input.heads * input.length);
-      pass(pipelines[5]!, [attention, kvScalar, params, features],
-        Math.ceil(input.length * input.heads * input.scalarV / 64));
-      pass(pipelines[6]!, [attention, kvPoint, affine, params, features],
-        Math.ceil(input.length * input.heads * input.pointV / 64));
-      pass(pipelines[7]!, [attention, pair, params, features],
-        Math.ceil(input.length * input.heads * input.pairChannels / 64));
-      pass(pipelines[1]!, [features, weights, shared.outputParams, output],
-        Math.ceil(input.channels / TRANSITION_TILE_COLUMNS), Math.ceil(input.length / TRANSITION_TILE_ROWS));
-      const outputElements = output.byteLength / 4;
-      const readback = allocate("ipa.readback", outputElements, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
-      encoder.copyBufferToBuffer(output.buffer, 0, readback.buffer, 0, output.byteLength);
+      const pass = encoder.beginComputePass({ label: "invariant-point-attention" });
+      const encoded = this.encode(pass, input, shared, source, affine);
+      pass.end();
+      allocations.push(...encoded.scratch, encoded.output);
+      const outputElements = encoded.output.byteLength / 4;
+      const readback = this.allocator.allocate("ipa.readback", outputElements * 4,
+        GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
+      allocations.push(readback);
+      encoder.copyBufferToBuffer(encoded.output.buffer, 0, readback.buffer, 0, encoded.output.byteLength);
       const start = performance.now();
       this.device.queue.submit([encoder.finish()]);
       const error = await this.device.popErrorScope();
