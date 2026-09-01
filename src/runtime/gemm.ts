@@ -34,6 +34,14 @@ export interface TiledGemmShader {
   readonly weightElement: string;
   /** Statements storing one result, with `row`, `column` and `element` in scope. */
   readonly store: string;
+  /**
+   * Statements storing one invocation's four adjacent results at once, with
+   * `row`, `column` (the first of the four, a multiple of four) and
+   * `values: vec4<f32>` in scope. Replaces `store`; the caller bounds the
+   * columns itself, which lets an epilogue combine neighbouring columns such
+   * as a projection and its gate.
+   */
+  readonly storeVector?: string;
   /** Narrower tile for outputs that would otherwise waste most of a workgroup. */
   readonly tileColumns?: number;
 }
@@ -127,7 +135,9 @@ ${lines(rowsPerThread, (index) => `
   {
     let row = row_origin + ${index}u;
     if (row < gemm_rows) {
-${lines(4, (lane) => `      {
+${shader.storeVector !== undefined ? `      let column = tile_column;
+      let values = acc${index};
+      ${shader.storeVector}` : lines(4, (lane) => `      {
         let column = tile_column + ${lane}u;
         if (column < gemm_columns) {
           let element = acc${index}[${lane}u];

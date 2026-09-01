@@ -60,12 +60,12 @@ class TriangleMultiplicationGpu {
       input.shape, precision, packedWeights.offsets, input.epsilon ?? 1e-5, this.direction,
     );
     const pipelineKey = `${this.direction}:${precision}:${length}:${cZ}:${cHidden}:${input.epsilon ?? 1e-5}`;
-    const [normalizeInput, projectBlock, projectWhole, contract, normalizeHidden, projectOutput]
+    const [inputStatistics, normalizeInput, projectA, projectB, contract, normalizeHidden, projectOutput]
       = await Promise.all([
+      this.pipelines.get(`${pipelineKey}:input-statistics`, shaders.inputStatistics),
       this.pipelines.get(`${pipelineKey}:normalize-input`, shaders.normalizeInput),
-      this.pipelines.get(`${pipelineKey}:project-block`, shaders.projectBlock),
-      shaders.projectWhole === undefined ? Promise.resolve(undefined)
-        : this.pipelines.get(`${pipelineKey}:project-whole`, shaders.projectWhole),
+      this.pipelines.get(`${pipelineKey}:project-a`, shaders.projectA),
+      this.pipelines.get(`${pipelineKey}:project-b`, shaders.projectB),
       this.pipelines.get(`${pipelineKey}:contract`, shaders.contract),
       this.pipelines.get(`${pipelineKey}:normalize-hidden`, shaders.normalizeHidden),
       this.pipelines.get(`${pipelineKey}:project-output`, shaders.projectOutput),
@@ -83,6 +83,7 @@ class TriangleMultiplicationGpu {
       const z = keep(this.allocator.upload("triangle.z", zData, storage));
       const mask = keep(this.allocator.upload("triangle.mask", input.mask, storage));
       const weights = keep(this.allocator.upload("triangle.weights", packedWeights.data, storage));
+      const statistics = keep(this.allocator.allocate("triangle.statistics", pairCount * 2 * 4, storage));
       const zNormalized = keep(this.allocator.allocate(
         "triangle.z-normalized", pairCount * cZ * 4, storage,
       ));
@@ -120,19 +121,23 @@ class TriangleMultiplicationGpu {
         return [Math.min(groups, LINEAR_GRID_WIDTH), ceilDivide(groups, LINEAR_GRID_WIDTH)];
       };
 
-      runPass("normalize-input", normalizeInput, [z.buffer, weights.buffer, zNormalized.buffer], ceilDivide(pairCount, 64));
       // One block spanning every residue, so every offset is zero.
       const blockParams = keep(this.allocator.upload("triangle.block",
         new Uint32Array([0, pairCount, 0, length]), GPUBufferUsage.UNIFORM));
-      if (projectWhole !== undefined) {
-        runPass("project-whole", projectWhole,
-          [zNormalized.buffer, mask.buffer, weights.buffer, b.buffer, blockParams.buffer],
-          ceilDivide(cHidden, 16), ceilDivide(pairCount, 16));
-      }
-      runPass("project-block", projectBlock,
-        [zNormalized.buffer, mask.buffer, weights.buffer,
-          ...(projectWhole === undefined ? [a.buffer, b.buffer] : [a.buffer]), blockParams.buffer],
-        ceilDivide(cHidden, 16), ceilDivide(pairCount, 16));
+      // One workgroup per pair row.
+      const rowGrid: readonly [number, number] = [
+        Math.min(pairCount, LINEAR_GRID_WIDTH), ceilDivide(pairCount, LINEAR_GRID_WIDTH),
+      ];
+      runPass("input-statistics", inputStatistics, [z.buffer, statistics.buffer], rowGrid[0], rowGrid[1]);
+      runPass("normalize-input", normalizeInput,
+        [z.buffer, weights.buffer, statistics.buffer, zNormalized.buffer, blockParams.buffer], rowGrid[0], rowGrid[1]);
+      const projectionGrid = gemmGrid(pairCount, 2 * cHidden);
+      runPass("project-a", projectA,
+        [z.buffer, mask.buffer, weights.buffer, statistics.buffer, a.buffer, blockParams.buffer],
+        projectionGrid[0], projectionGrid[1]);
+      runPass("project-b", projectB,
+        [z.buffer, mask.buffer, weights.buffer, statistics.buffer, b.buffer, blockParams.buffer],
+        projectionGrid[0], projectionGrid[1]);
       const contractGrid = gemmGrid(length, length);
       runPass("contract", contract, [a.buffer, b.buffer, contracted.buffer, blockParams.buffer],
         contractGrid[0], contractGrid[1], cHidden);

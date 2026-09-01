@@ -742,10 +742,10 @@ async function encodeOuterProductMean(
  * them. The other projection, or the accumulated contraction, stays whole.
  *
  * Every block streams that whole tensor again, so smaller blocks trade
- * bandwidth for memory: at 384 residues, 16 MiB blocks cost 2.7% of the
- * recycle against 24 MiB blocks and free 32 MiB; 12 MiB blocks cost 4%.
+ * bandwidth for memory: at 384 residues, 8 MiB blocks cost 6% of the recycle
+ * against 16 MiB blocks and lower the working set by 33 MiB.
  */
-export const TRIANGLE_BLOCK_TARGET_BYTES = 16 * 1024 * 1024;
+export const TRIANGLE_BLOCK_TARGET_BYTES = 8 * 1024 * 1024;
 
 export function triangleBlockRows(
   length: number, cZ: number, triangleHidden: number,
@@ -775,11 +775,11 @@ async function encodeTriangleMultiplication(
   const shaders = createTriangleShaders(shape, "f32", packed.offsets, 1e-5, direction, blockRows);
   const pipelineKey = `block:triangle:${direction}:${input.length}:${input.cZ}`
     + `:${input.triangleHidden}:${blockRows}`;
-  const [normalizeInput, projectBlock, projectWhole, contract, normalizeHidden, projectOutput] = await Promise.all([
+  const [inputStatistics, normalizeInput, projectA, projectB, contract, normalizeHidden, projectOutput] = await Promise.all([
+    execution.pipelines.get(`${pipelineKey}:input-statistics`, shaders.inputStatistics),
     execution.pipelines.get(`${pipelineKey}:normalize-input`, shaders.normalizeInput),
-    execution.pipelines.get(`${pipelineKey}:project-block`, shaders.projectBlock),
-    shaders.projectWhole === undefined ? Promise.resolve(undefined)
-      : execution.pipelines.get(`${pipelineKey}:project-whole`, shaders.projectWhole),
+    execution.pipelines.get(`${pipelineKey}:project-a`, shaders.projectA),
+    execution.pipelines.get(`${pipelineKey}:project-b`, shaders.projectB),
     execution.pipelines.get(`${pipelineKey}:contract`, shaders.contract),
     execution.pipelines.get(`${pipelineKey}:normalize-hidden`, shaders.normalizeHidden),
     execution.pipelines.get(
@@ -801,16 +801,27 @@ async function encodeTriangleMultiplication(
         new Uint32Array([offset * input.length, count * input.length, offset === 0 ? 1 : 0, count])) });
   }
 
-  // Both projections read the normalized pair, one block of rows at a time, so
-  // only a block of it is ever live.
+  // The projections normalize the raw pair while loading it, from per-row
+  // statistics computed once; only the output projection's gate needs a
+  // normalized block materialized, one block of rows at a time.
+  const statistics = execution.allocate(`triangle.${direction}.statistics`, pairs * 2);
+  const statisticsGrid = execution.linearGrid(pairs, 1);
+  execution.dispatch(encoder, inputStatistics, [pair, statistics], statisticsGrid[0], statisticsGrid[1], 1,
+    `triangle.${direction}.input-statistics`);
   const normalized = execution.allocate(`triangle.${direction}.normalized`, blockPairs * input.cZ);
   const normalizeBlock = (block: (typeof blocks)[number]): GpuTensor => {
     const rows = block.count * input.length;
     const target = execution.view(normalized, 0, rows * input.cZ);
-    execution.dispatch(encoder, normalizeInput,
-      [execution.view(pair, block.offset * input.length * input.cZ, rows * input.cZ), weights, target],
-      Math.ceil(rows / 64), 1, 1, `triangle.${direction}.normalize-input-${block.offset}`);
+    const grid = execution.linearGrid(rows, 1);
+    execution.dispatch(encoder, normalizeInput, [pair, weights, statistics, target, block.uniform],
+      grid[0], grid[1], 1, `triangle.${direction}.normalize-input-${block.offset}`);
     return target;
+  };
+  const project = (pipeline: GPUComputePipeline, target: GpuTensor, block: (typeof blocks)[number],
+    label: string): void => {
+    const grid = gemmGrid(block.count * input.length, 2 * input.triangleHidden);
+    execution.dispatch(encoder, pipeline, [pair, pairMask, weights, statistics, target, block.uniform],
+      grid[0], grid[1], 1, `triangle.${direction}.${label}-${block.offset}`);
   };
 
   // Outgoing contracts over the second residue index, so the projection indexed
@@ -820,13 +831,8 @@ async function encodeTriangleMultiplication(
   const outgoing = direction === "outgoing";
   const wholeProjection = outgoing
     ? execution.allocate(`triangle.${direction}.b`, pairs * input.triangleHidden) : undefined;
-  if (wholeProjection !== undefined && projectWhole !== undefined) {
-    for (const block of blocks) {
-      const source = normalizeBlock(block);
-      execution.dispatch(encoder, projectWhole, [source, pairMask, weights, wholeProjection, block.uniform],
-        Math.ceil(input.triangleHidden / 16), Math.ceil(block.count * input.length / 16), 1,
-        `triangle.${direction}.project-whole-${block.offset}`);
-    }
+  if (wholeProjection !== undefined) {
+    for (const block of blocks) project(projectB, wholeProjection, block, "project-whole");
   }
 
   const blockedA = execution.allocate(`triangle.${direction}.a`, blockPairs * input.triangleHidden);
@@ -852,11 +858,8 @@ async function encodeTriangleMultiplication(
   };
 
   for (const block of blocks) {
-    const source = normalizeBlock(block);
-    const projections = outgoing ? [blockedA] : [blockedA, blockedB!];
-    execution.dispatch(encoder, projectBlock, [source, pairMask, weights, ...projections, block.uniform],
-      Math.ceil(input.triangleHidden / 16), Math.ceil(block.count * input.length / 16), 1,
-      `triangle.${direction}.project-block-${block.offset}`);
+    project(projectA, blockedA, block, "project-a");
+    if (blockedB !== undefined) project(projectB, blockedB, block, "project-b");
     const contractGrid = outgoing
       ? gemmGrid(block.count, input.length) : gemmGrid(input.length, input.length);
     execution.dispatch(encoder, contract,
@@ -868,7 +871,7 @@ async function encodeTriangleMultiplication(
     releaseScratch([blockedA, blockedB], output);
     for (const block of blocks) finish(block);
   }
-  releaseScratch([normalized, blockedA, blockedB, wholeProjection, contracted, hiddenNormalized], output);
+  releaseScratch([statistics, normalized, blockedA, blockedB, wholeProjection, contracted, hiddenNormalized], output);
   return output;
 }
 

@@ -3,15 +3,18 @@ import type { WeightOffsets } from "./weights.js";
 import { createTiledGemmShader } from "../runtime/gemm.js";
 
 export interface TriangleShaders {
+  /** Mean and inverse standard deviation of every pair row, computed once. */
+  readonly inputStatistics: string;
+  /** The normalized input for one block of pair rows, from the statistics. */
   readonly normalizeInput: string;
   /**
-   * Projections for one block step. Incoming blocks the contraction index, so
-   * both projections are block-sized; outgoing blocks the first residue index,
-   * so only the projection indexed by it is, and the other is filled once by
-   * projectWhole beforehand.
+   * The two contraction inputs, each a gated projection of the normalized
+   * pair. Incoming blocks the contraction index, so both are block-sized;
+   * outgoing blocks the first residue index, so only `a` is, and `b` is
+   * filled block by block into a whole tensor before any block contracts.
    */
-  readonly projectBlock: string;
-  readonly projectWhole: string | undefined;
+  readonly projectA: string;
+  readonly projectB: string;
   readonly contract: string;
   readonly normalizeHidden: string;
   readonly projectOutput: string;
@@ -63,153 +66,120 @@ export function createTriangleShaders(
   const common = prelude(shape, precision, offsets, epsilon, blockRows);
   const t = scalar(precision);
 
+  // One workgroup per pair row, so the channel reads of a row are contiguous
+  // across lanes. The statistics let every later consumer normalize the raw
+  // pair on the fly instead of materializing a normalized copy.
+  const inputStatistics = `${common}
+@group(0) @binding(0) var<storage, read> source: array<${t}>;
+@group(0) @binding(1) var<storage, read_write> statistics: array<f32>;
+var<workgroup> partial: array<f32, 64>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) group: vec3<u32>) {
+  let row = group.x + group.y * LINEAR_GRID_WIDTH;
+  let base = row * CZ;
+  var sum = 0.0;
+  if (row < PAIRS) {
+    for (var c = local.x; c < CZ; c += 64u) { sum += ${read(precision, "source[base + c]")}; }
+  }
+  partial[local.x] = sum;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride >>= 1u) {
+    if (local.x < stride) { partial[local.x] += partial[local.x + stride]; }
+    workgroupBarrier();
+  }
+  let mean = partial[0] / f32(CZ);
+  workgroupBarrier();
+  var squared = 0.0;
+  if (row < PAIRS) {
+    for (var c = local.x; c < CZ; c += 64u) {
+      let centered = ${read(precision, "source[base + c]")} - mean;
+      squared += centered * centered;
+    }
+  }
+  partial[local.x] = squared;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride >>= 1u) {
+    if (local.x < stride) { partial[local.x] += partial[local.x + stride]; }
+    workgroupBarrier();
+  }
+  if (local.x == 0u && row < PAIRS) {
+    statistics[2u * row] = mean;
+    statistics[2u * row + 1u] = inverseSqrt(partial[0] / f32(CZ) + EPSILON);
+  }
+}`;
+
+  // x is the first row of this block within the whole pair tensor, y the
+  // number of rows it spans.
   const normalizeInput = `${common}
 @group(0) @binding(0) var<storage, read> source: array<${t}>;
 @group(0) @binding(1) var<storage, read> weights: array<${t}>;
-@group(0) @binding(2) var<storage, read_write> normalized: array<f32>;
+@group(0) @binding(2) var<storage, read> statistics: array<f32>;
+@group(0) @binding(3) var<storage, read_write> normalized: array<f32>;
+@group(0) @binding(4) var<uniform> block: vec4<u32>;
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let row = id.x;
-  if (row >= PAIRS) { return; }
-  let base = row * CZ;
-  var mean = 0.0;
-  for (var c = 0u; c < CZ; c += 1u) {
-    mean += ${read(precision, "source[base + c]")};
-  }
-  mean /= f32(CZ);
-  var variance = 0.0;
-  for (var c = 0u; c < CZ; c += 1u) {
-    let centered = ${read(precision, "source[base + c]")} - mean;
-    variance += centered * centered;
-  }
-  let inverse_std = inverseSqrt(variance / f32(CZ) + EPSILON);
-  for (var c = 0u; c < CZ; c += 1u) {
-    var value = (${read(precision, "source[base + c]")} - mean) * inverse_std;
-    value = value * ${read(precision, "weights[W_LAYERNORMINWEIGHT + c]")}
-      + ${read(precision, "weights[W_LAYERNORMINBIAS + c]")};
-    normalized[base + c] = value;
+fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) group: vec3<u32>) {
+  let row = group.x + group.y * LINEAR_GRID_WIDTH;
+  if (row >= block.y) { return; }
+  let pair_row = block.x + row;
+  let mean = statistics[2u * pair_row];
+  let inverse_std = statistics[2u * pair_row + 1u];
+  for (var c = local.x; c < CZ; c += 64u) {
+    normalized[row * CZ + c] = (${read(precision, "source[pair_row * CZ + c]")} - mean) * inverse_std
+      * ${read(precision, "weights[W_LAYERNORMINWEIGHT + c]")} + ${read(precision, "weights[W_LAYERNORMINBIAS + c]")};
   }
 }`;
 
   /**
-   * The two contraction inputs.
+   * One gated projection as a tiled GEMM over the raw pair rows of a block.
    *
-   * Which of them is blocked differs by direction, so the stride and offset of
-   * each output are supplied by the caller, and either projection can be
-   * skipped when only the other one is being produced for this step.
+   * The normalization is applied while loading the operand, from the row
+   * statistics. Even output columns are the projection and odd ones its gate,
+   * so the four adjacent columns an invocation holds pair each channel with its
+   * gate and the epilogue can combine them with the mask. The result is stored
+   * channel-major, which is how the contraction consumes it.
    */
-  const project = (writeA: boolean, writeB: boolean,
-    aStride: string, aOffset: string, bStride: string, bOffset: string): string => `${common}
-@group(0) @binding(0) var<storage, read> z: array<f32>;
+  const project = (operand: "a" | "b", stride: string, offset: string): string => {
+    const upper = operand.toUpperCase();
+    const weight = (kind: "P" | "G"): string =>
+      read(precision, `weights[W_LINEAR${upper}${kind}WEIGHT + (column >> 1u) * CZ + k]`);
+    const bias = (kind: "P" | "G", channel: string): string =>
+      read(precision, `weights[W_LINEAR${upper}${kind}BIAS + ${channel}]`);
+    return createTiledGemmShader({
+      preamble: `${common}
+@group(0) @binding(0) var<storage, read> z: array<${t}>;
 @group(0) @binding(1) var<storage, read> mask: array<f32>;
 @group(0) @binding(2) var<storage, read> weights: array<${t}>;
-${writeA ? `@group(0) @binding(3) var<storage, read_write> a: array<f32>;` : ""}
-${writeB ? `@group(0) @binding(${writeA ? 4 : 3}) var<storage, read_write> b: array<f32>;` : ""}
-// x is the first row of this block within the whole pair tensor. Bindings are
-// only declared for the projections this variant writes, because an unused one
-// would be dropped from the automatic layout and unbalance the bind group.
-@group(0) @binding(${(writeA ? 1 : 0) + (writeB ? 1 : 0) + 3}) var<uniform> block: vec4<u32>;
+@group(0) @binding(3) var<storage, read> statistics: array<f32>;
+@group(0) @binding(4) var<storage, read_write> ${operand}: array<f32>;
+// x is the first row of this block within the whole pair tensor, y the
+// number of rows it spans.
+@group(0) @binding(5) var<uniform> block: vec4<u32>;
 
-var<workgroup> tile_source: array<f32, 128>;
-var<workgroup> tile_ap_weight: array<f32, 128>;
-var<workgroup> tile_ag_weight: array<f32, 128>;
-var<workgroup> tile_bp_weight: array<f32, 128>;
-var<workgroup> tile_bg_weight: array<f32, 128>;
-
-@compute @workgroup_size(8, 8, 1)
-fn main(
-  @builtin(local_invocation_id) local: vec3<u32>,
-  @builtin(workgroup_id) group: vec3<u32>,
-) {
-  let row = group.y * 16u + local.y;
-  let second_row = row + 8u;
-  let h = group.x * 16u + local.x;
-  let second_h = h + 8u;
-  let tile_index = local.y * 8u + local.x;
-  var ap_00 = 0.0; var ag_00 = 0.0; var bp_00 = 0.0; var bg_00 = 0.0;
-  var ap_01 = 0.0; var ag_01 = 0.0; var bp_01 = 0.0; var bg_01 = 0.0;
-  var ap_10 = 0.0; var ag_10 = 0.0; var bp_10 = 0.0; var bg_10 = 0.0;
-  var ap_11 = 0.0; var ag_11 = 0.0; var bp_11 = 0.0; var bg_11 = 0.0;
-  if (h < CH) {
-    ap_00 = ${read(precision, "weights[W_LINEARAPBIAS + h]")}; ap_10 = ap_00;
-    ag_00 = ${read(precision, "weights[W_LINEARAGBIAS + h]")}; ag_10 = ag_00;
-    bp_00 = ${read(precision, "weights[W_LINEARBPBIAS + h]")}; bp_10 = bp_00;
-    bg_00 = ${read(precision, "weights[W_LINEARBGBIAS + h]")}; bg_10 = bg_00;
-  }
-  if (second_h < CH) {
-    ap_01 = ${read(precision, "weights[W_LINEARAPBIAS + second_h]")}; ap_11 = ap_01;
-    ag_01 = ${read(precision, "weights[W_LINEARAGBIAS + second_h]")}; ag_11 = ag_01;
-    bp_01 = ${read(precision, "weights[W_LINEARBPBIAS + second_h]")}; bp_11 = bp_01;
-    bg_01 = ${read(precision, "weights[W_LINEARBGBIAS + second_h]")}; bg_11 = bg_01;
-  }
-  for (var c0 = 0u; c0 < CZ; c0 += 8u) {
-    let source_c = c0 + local.x;
-    let weight_c = c0 + local.y;
-    tile_source[tile_index] = 0.0;
-    tile_source[tile_index + 64u] = 0.0;
-    if (row < block.y && source_c < CZ) { tile_source[tile_index] = z[row * CZ + source_c]; }
-    if (second_row < block.y && source_c < CZ) {
-      tile_source[tile_index + 64u] = z[second_row * CZ + source_c];
-    }
-    for (var h_block = 0u; h_block < 2u; h_block += 1u) {
-      let output_h = h + h_block * 8u;
-      let weight_tile_index = local.y * 16u + local.x + h_block * 8u;
-      tile_ap_weight[weight_tile_index] = 0.0; tile_ag_weight[weight_tile_index] = 0.0;
-      tile_bp_weight[weight_tile_index] = 0.0; tile_bg_weight[weight_tile_index] = 0.0;
-      if (output_h < CH && weight_c < CZ) {
-        let weight_index = output_h * CZ + weight_c;
-        tile_ap_weight[weight_tile_index] = ${read(precision, "weights[W_LINEARAPWEIGHT + weight_index]")};
-        tile_ag_weight[weight_tile_index] = ${read(precision, "weights[W_LINEARAGWEIGHT + weight_index]")};
-        tile_bp_weight[weight_tile_index] = ${read(precision, "weights[W_LINEARBPWEIGHT + weight_index]")};
-        tile_bg_weight[weight_tile_index] = ${read(precision, "weights[W_LINEARBGWEIGHT + weight_index]")};
+fn normalized_input(pair_row: u32, k: u32) -> f32 {
+  return (${read(precision, "z[pair_row * CZ + k]")} - statistics[2u * pair_row]) * statistics[2u * pair_row + 1u]
+    * ${read(precision, "weights[W_LAYERNORMINWEIGHT + k]")} + ${read(precision, "weights[W_LAYERNORMINBIAS + k]")};
+}`,
+      rows: "block.y",
+      inner: "CZ",
+      columns: "2u * CH",
+      sourceElement: "normalized_input(block.x + row, k)",
+      weightElement: `select(${weight("G")}, ${weight("P")}, (column & 1u) == 0u)`,
+      store: "",
+      storeVector: `let pair_mask = mask[block.x + row];
+      let h = column >> 1u;
+      if (h < CH) {
+        ${operand}[h * ${stride} + ${offset} + row] = pair_mask
+          * (values[0] + ${bias("P", "h")}) * logistic(values[1] + ${bias("G", "h")});
       }
-    }
-    workgroupBarrier();
-    for (var c = 0u; c < 8u; c += 1u) {
-      let x_0 = tile_source[local.y * 8u + c];
-      let x_1 = tile_source[local.y * 8u + c + 64u];
-      let weight_0 = c * 16u + local.x;
-      let weight_1 = weight_0 + 8u;
-      ap_00 += x_0 * tile_ap_weight[weight_0]; ag_00 += x_0 * tile_ag_weight[weight_0];
-      bp_00 += x_0 * tile_bp_weight[weight_0]; bg_00 += x_0 * tile_bg_weight[weight_0];
-      ap_01 += x_0 * tile_ap_weight[weight_1]; ag_01 += x_0 * tile_ag_weight[weight_1];
-      bp_01 += x_0 * tile_bp_weight[weight_1]; bg_01 += x_0 * tile_bg_weight[weight_1];
-      ap_10 += x_1 * tile_ap_weight[weight_0]; ag_10 += x_1 * tile_ag_weight[weight_0];
-      bp_10 += x_1 * tile_bp_weight[weight_0]; bg_10 += x_1 * tile_bg_weight[weight_0];
-      ap_11 += x_1 * tile_ap_weight[weight_1]; ag_11 += x_1 * tile_ag_weight[weight_1];
-      bp_11 += x_1 * tile_bp_weight[weight_1]; bg_11 += x_1 * tile_bg_weight[weight_1];
-    }
-    workgroupBarrier();
-  }
-  // Store the contraction inputs channel-major. The contraction consumes one
-  // complete h slice at a time, so this makes adjacent lanes read adjacent
-  // addresses instead of cache lines spread across the entire pair tensor.
-  if (row < block.y && h < CH) {
-    ${writeA ? `let a_index = h * ${aStride} + ${aOffset} + row;` : ""}
-    ${writeB ? `let b_index = h * ${bStride} + ${bOffset} + row;` : ""}
-    let pair_mask = mask[block.x + row];
-    ${writeA ? `a[a_index] = pair_mask * ap_00 * logistic(ag_00);` : ""} ${writeB ? `b[b_index] = pair_mask * bp_00 * logistic(bg_00);` : ""}
-  }
-  if (row < block.y && second_h < CH) {
-    ${writeA ? `let a_index = second_h * ${aStride} + ${aOffset} + row;` : ""}
-    ${writeB ? `let b_index = second_h * ${bStride} + ${bOffset} + row;` : ""}
-    let pair_mask = mask[block.x + row];
-    ${writeA ? `a[a_index] = pair_mask * ap_01 * logistic(ag_01);` : ""} ${writeB ? `b[b_index] = pair_mask * bp_01 * logistic(bg_01);` : ""}
-  }
-  if (second_row < block.y && h < CH) {
-    ${writeA ? `let a_index = h * ${aStride} + ${aOffset} + second_row;` : ""}
-    ${writeB ? `let b_index = h * ${bStride} + ${bOffset} + second_row;` : ""}
-    let pair_mask = mask[block.x + second_row];
-    ${writeA ? `a[a_index] = pair_mask * ap_10 * logistic(ag_10);` : ""} ${writeB ? `b[b_index] = pair_mask * bp_10 * logistic(bg_10);` : ""}
-  }
-  if (second_row < block.y && second_h < CH) {
-    ${writeA ? `let a_index = second_h * ${aStride} + ${aOffset} + second_row;` : ""}
-    ${writeB ? `let b_index = second_h * ${bStride} + ${bOffset} + second_row;` : ""}
-    let pair_mask = mask[block.x + second_row];
-    ${writeA ? `a[a_index] = pair_mask * ap_11 * logistic(ag_11);` : ""} ${writeB ? `b[b_index] = pair_mask * bp_11 * logistic(bg_11);` : ""}
-  }
-}`;
+      if (h + 1u < CH) {
+        ${operand}[(h + 1u) * ${stride} + ${offset} + row] = pair_mask
+          * (values[2] + ${bias("P", "h + 1u")}) * logistic(values[3] + ${bias("G", "h + 1u")});
+      }`,
+    });
+  };
+
   // out[h][i][j] = sum_k A[h][i][k] * B[h][j][k], one independent matrix per
   // hidden channel, dispatched along z.
   //
@@ -368,10 +338,8 @@ fn main(
   }
 }`;
 
-  const projectBlock = direction === "outgoing"
-    ? project(true, false, "BLOCK_PAIRS", "0u", "", "")
-    : project(true, true, "BLOCK_PAIRS", "0u", "BLOCK_PAIRS", "0u");
-  const projectWhole = direction === "outgoing"
-    ? project(false, true, "", "", "PAIRS", "block.x") : undefined;
-  return { normalizeInput, projectBlock, projectWhole, contract, normalizeHidden, projectOutput };
+  const projectA = project("a", "BLOCK_PAIRS", "0u");
+  const projectB = direction === "outgoing"
+    ? project("b", "PAIRS", "block.x") : project("b", "BLOCK_PAIRS", "0u");
+  return { inputStatistics, normalizeInput, projectA, projectB, contract, normalizeHidden, projectOutput };
 }
