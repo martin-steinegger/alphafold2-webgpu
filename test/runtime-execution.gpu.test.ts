@@ -35,6 +35,7 @@ describe.skipIf(!enabled)("WebGPU bounded buffer reuse", () => {
       await execution.addInPlace(encoder, base, update, "bounded-reuse.add");
       const readback = execution.createReadback("bounded-reuse.readback", base, encoder);
       device.queue.submit([encoder.finish()]);
+      execution.noteSubmitted();
       const validationError = await device.popErrorScope();
       if (validationError !== null) throw new Error(validationError.message);
 

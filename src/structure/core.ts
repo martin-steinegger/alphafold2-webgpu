@@ -1,4 +1,6 @@
-import type { AllocatedGpuBuffer } from "../runtime/allocator.js";
+import {
+  GpuBufferAllocator, type AllocatedGpuBuffer, type AllocationSnapshot,
+} from "../runtime/allocator.js";
 import {
   InvariantPointAttentionGpu,
   type InvariantPointAttentionWeights,
@@ -11,6 +13,7 @@ import {
 export interface StructureCoreInput {
   readonly activations: Float32Array;
   readonly pair: Float32Array;
+  readonly pairBuffer?: GPUBuffer;
   readonly mask: Float32Array;
   readonly affine: Float32Array;
   readonly length: number;
@@ -26,6 +29,7 @@ export interface StructureCoreResult {
   readonly activations: Float32Array;
   readonly affine: Float32Array;
   readonly elapsedMilliseconds: number;
+  readonly memory: AllocationSnapshot;
 }
 
 export class StructureCoreGpu {
@@ -40,12 +44,20 @@ export class StructureCoreGpu {
     if (!Number.isSafeInteger(iterations) || iterations < 0) {
       throw new RangeError("structure iterations must be a non-negative integer");
     }
-    if (iterations === 0) return { activations, affine, elapsedMilliseconds: performance.now() - start };
-    const ipa = new InvariantPointAttentionGpu(this.device);
-    const post = new StructurePostAttentionGpu(this.device);
+    if (iterations === 0) {
+      const allocator = new GpuBufferAllocator(this.device);
+      return { activations, affine, elapsedMilliseconds: performance.now() - start, memory: allocator.snapshot() };
+    }
+    // IPA and the post-attention transition have complementary lifetimes.
+    // Sharing a pool lets later dispatches reuse buffers after their final
+    // encoded use instead of retaining eight complete iteration workspaces.
+    const allocator = new GpuBufferAllocator(this.device, true);
+    const ipa = new InvariantPointAttentionGpu(this.device, allocator);
+    const post = new StructurePostAttentionGpu(this.device, allocator);
     const geometry = {
       activations, affine,
       pair: input.pair,
+      ...(input.pairBuffer === undefined ? {} : { pairBuffer: input.pairBuffer }),
       mask: input.mask,
       length: input.length,
       channels: input.channels,
@@ -80,9 +92,19 @@ export class StructureCoreGpu {
       this.device.pushErrorScope("validation");
       const pass = encoder.beginComputePass({ label: "structure-core" });
       for (let iteration = 0; iteration < iterations; iteration += 1) {
+        const previousActivation = activationTensor;
+        const previousAffine = affineTensor;
         const attended = ipa.encode(pass, geometry, prepared, activationTensor, affineTensor);
         const updated = post.encode(pass, input, preparedPost, activationTensor, attended.output, affineTensor);
         scratch.push(...attended.scratch, attended.output, ...updated.scratch);
+        // These buffers have all had their final uses encoded. Returning them
+        // to the shared pool is safe even before submission because later
+        // dispatches in this pass execute in order.
+        for (const buffer of attended.scratch) buffer.release();
+        for (const buffer of updated.scratch) buffer.release();
+        attended.output.release();
+        previousActivation.release();
+        previousAffine.release();
         activationTensor = updated.activations;
         affineTensor = updated.affine;
         scratch.push(activationTensor, affineTensor);
@@ -97,6 +119,7 @@ export class StructureCoreGpu {
         activationTensor.byteLength);
       encoder.copyBufferToBuffer(affineTensor.buffer, 0, affineReadback.buffer, 0, affineTensor.byteLength);
       this.device.queue.submit([encoder.finish()]);
+      allocator.trimPooled();
       const error = await this.device.popErrorScope();
       if (error !== null) throw new Error(`WebGPU structure core failed: ${error.message}`);
       await Promise.all([
@@ -111,7 +134,8 @@ export class StructureCoreGpu {
       for (let index = scratch.length - 1; index >= 0; index -= 1) scratch[index]!.release();
       preparedPost.release();
       prepared.release();
+      allocator.destroyPooled();
     }
-    return { activations, affine, elapsedMilliseconds: performance.now() - start };
+    return { activations, affine, elapsedMilliseconds: performance.now() - start, memory: allocator.snapshot() };
   }
 }

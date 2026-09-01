@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { GpuBufferAllocator } from "../src/runtime/allocator.js";
 
 describe("GPU buffer pooling", () => {
-  it("evicts the oldest released buffer when the resident pool cap is exceeded", () => {
+  it("defers bounded eviction until a safe submitted boundary", () => {
     const buffers: { destroy: ReturnType<typeof vi.fn> }[] = [];
     const device = { createBuffer: vi.fn(() => {
       const buffer = { destroy: vi.fn() }; buffers.push(buffer); return buffer;
@@ -11,6 +11,12 @@ describe("GPU buffer pooling", () => {
     const first = allocator.allocate("first", 8, 1);
     const second = allocator.allocate("second", 8, 1);
     first.release(); second.release();
+    expect(allocator.snapshot()).toMatchObject({
+      currentBytes: 0, residentBytes: 16, pooledBytes: 16, peakResidentBytes: 16,
+    });
+    expect(buffers[0]!.destroy).not.toHaveBeenCalled();
+    expect(buffers[1]!.destroy).not.toHaveBeenCalled();
+    allocator.trimPooled();
     expect(allocator.snapshot()).toMatchObject({
       currentBytes: 0, residentBytes: 8, pooledBytes: 8, peakResidentBytes: 16,
     });
@@ -29,6 +35,8 @@ describe("GPU buffer pooling", () => {
     const device = { createBuffer: vi.fn(() => buffer) } as unknown as GPUDevice;
     const allocator = new GpuBufferAllocator(device, true, 4);
     allocator.allocate("large", 8, 1).release();
+    expect(buffer.destroy).not.toHaveBeenCalled();
+    allocator.trimPooled();
     expect(buffer.destroy).toHaveBeenCalledOnce();
     expect(allocator.snapshot()).toMatchObject({ residentBytes: 0, pooledBytes: 0 });
   });

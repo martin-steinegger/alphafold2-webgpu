@@ -1,10 +1,10 @@
-import { AlphaFoldMonomerGpu, type MonomerPrediction, type MonomerRecycleResult } from "../src/model/monomer.js";
+import { AlphaFoldMonomerGpu, type MonomerPrediction, type MonomerRecycleSummary } from "../src/model/monomer.js";
 import {
-  AlphaFoldMultimerGpu, type MultimerPrediction, type MultimerRecycleResult,
+  AlphaFoldMultimerGpu, type MultimerPrediction, type MultimerRecycleSummary,
 } from "../src/model/multimer.js";
-import { makeA3mFeatures } from "../src/input/a3m-features.js";
+import { iterateA3mFeatures } from "../src/input/a3m-features.js";
 import {
-  makeMultimerA3mFeatures, makeMultimerQueryOnlyFeatures, type MultimerRecycleFeatures,
+  iterateMultimerA3mFeatures, iterateMultimerQueryOnlyFeatures, type MultimerRecycleFeatures,
 } from "../src/input/multimer-features.js";
 import { parseA3m } from "../src/input/a3m.js";
 import { parseColabFoldComplexA3m } from "../src/input/colabfold-complex-a3m.js";
@@ -42,7 +42,7 @@ declare global {
       elapsedMilliseconds: number; modelLoadMilliseconds: number;
       recycles: readonly {
         elapsedMilliseconds: number; meanPlddt: number; ptm: number; iptm?: number;
-        trunkSubmissions: MonomerRecycleResult["trunkSubmissions"];
+        trunkSubmissions: MonomerRecycleSummary["trunkSubmissions"];
       }[];
     };
     $3Dmol?: ThreeDmolApi;
@@ -354,8 +354,8 @@ function showResults(prediction: MonomerPrediction | MultimerPrediction, sequenc
     recycles: prediction.recycles.map((result) => ({
       elapsedMilliseconds: result.elapsedMilliseconds, meanPlddt: result.confidence.meanPlddt,
       ptm: result.confidence.ptm,
-      ...((result as MultimerRecycleResult).confidence.iptm === undefined
-        ? {} : { iptm: (result as MultimerRecycleResult).confidence.iptm }),
+      ...((result as MultimerRecycleSummary).confidence.iptm === undefined
+        ? {} : { iptm: (result as MultimerRecycleSummary).confidence.iptm }),
       trunkSubmissions: result.trunkSubmissions,
     })),
   };
@@ -521,16 +521,16 @@ async function runPrediction(): Promise<void> {
     };
     const features = input.multimer
       ? input.alignmentMask === undefined
-        ? makeMultimerQueryOnlyFeatures(input.chains!, featureTables, featureOptions)
-        : makeMultimerA3mFeatures(input.chains!, input.a3m, input.alignmentMask, featureTables, featureOptions)
-      : makeA3mFeatures(input.a3m, featureTables, featureOptions);
+        ? iterateMultimerQueryOnlyFeatures(input.chains!, featureTables, featureOptions)
+        : iterateMultimerA3mFeatures(input.chains!, input.a3m, input.alignmentMask, featureTables, featureOptions)
+      : iterateA3mFeatures(input.a3m, featureTables, featureOptions);
     stage("features", "done", `${input.sequence.length} aa · ${input.depth} rows`);
     log(`Features: ${input.sequence.length} residues, ${input.multimer ? `${input.chains!.length} chains` : `A3M depth ${input.depth}`}.`);
 
     stage("inference", "active", `Recycle 0/${featureOptions.recycles}`); setPredictionStatus("Running AlphaFold2 on WebGPU");
-    const reportRecycle = (result: MonomerRecycleResult | MultimerRecycleResult, recycle: number): void => {
+    const reportRecycle = (result: MonomerRecycleSummary | MultimerRecycleSummary, recycle: number): void => {
       stage("inference", "active", `Recycle ${recycle}/${featureOptions.recycles} · pLDDT ${result.confidence.meanPlddt.toFixed(1)}`);
-      const multimerResult = result as MultimerRecycleResult;
+      const multimerResult = result as MultimerRecycleSummary;
       log(`recycle=${recycle} pLDDT=${result.confidence.meanPlddt.toFixed(1)} `
         + `pTM=${result.confidence.ptm.toFixed(3)}${multimerResult.confidence.iptm === undefined
           ? "" : ` ipTM=${multimerResult.confidence.iptm.toFixed(3)}`} time=${formatSeconds(result.elapsedMilliseconds)} `
@@ -559,15 +559,16 @@ async function runPrediction(): Promise<void> {
     };
     const prediction: MonomerPrediction | MultimerPrediction = input.multimer
       ? await new AlphaFoldMultimerGpu(device, modelOptions).predict(
-        features as readonly MultimerRecycleFeatures[], { ...commonWeights, multimerTemplate: multimerTemplate! },
+        features as Iterable<MultimerRecycleFeatures> & { readonly length: number },
+        { ...commonWeights, multimerTemplate: multimerTemplate! },
         paeBreaks, reportRecycle,
       )
       : await new AlphaFoldMonomerGpu(device, modelOptions).predict(features, {
         ...commonWeights, template: template!,
       }, paeBreaks, reportRecycle);
     stage("inference", "done", formatSeconds(prediction.elapsedMilliseconds));
-    log(`Measured allocator peak: ${formatMib(prediction.memory.peakResidentBytes)} resident `
-      + `(${prediction.memory.bufferCount} GPU buffers).`);
+    log(`Measured allocator peak: ${formatMib(prediction.memory.combinedPeakResidentBytes)} combined resident `
+      + `(${formatMib(prediction.memory.mainPeakResidentBytes)} trunk).`);
 
     stage("results", "active", "Rendering"); setPredictionStatus("Preparing results");
     const jobName = safeJobName(element<HTMLInputElement>("job-name").value);

@@ -135,8 +135,12 @@ export class GpuBufferAllocator {
     usage: GPUBufferUsageFlags): void {
     this.#currentBytes -= byteLength;
     if (this.#currentBytes < 0) throw new Error("GPU allocator accounting underflow");
-    if (this.#pooling && allocationByteLength <= this.#maxPooledBytes) {
-      while (this.#pooledBytes + allocationByteLength > this.#maxPooledBytes) this.#evictOldestPooled();
+    if (this.#pooling) {
+      // A tensor can become dead while its command encoder is still being
+      // populated. Keep the physical buffer reusable until the caller marks a
+      // post-submit boundary: destroying it here would invalidate every
+      // already-encoded command that still references it. The pool may exceed
+      // its idle cap transiently within one command buffer.
       const key = `${allocationByteLength}:${usage}`;
       const pooled = this.#pool.get(key) ?? [];
       const entry = { buffer, byteLength: allocationByteLength, usage, key };
@@ -148,6 +152,16 @@ export class GpuBufferAllocator {
       buffer.destroy();
       this.#residentBytes -= allocationByteLength;
     }
+  }
+
+  /**
+   * Enforce the idle-pool cap at a boundary where every command referencing a
+   * retired buffer has already been submitted. GPU queue ordering permits the
+   * remaining pooled buffers to be reused by a later submission without a
+   * host-side wait.
+   */
+  trimPooled(): void {
+    while (this.#pooledBytes > this.#maxPooledBytes) this.#evictOldestPooled();
   }
 
   #evictOldestPooled(): void {

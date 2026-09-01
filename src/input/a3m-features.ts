@@ -17,6 +17,16 @@ export interface A3mFeatureOptions {
   readonly alignmentMask?: Float32Array;
 }
 
+/** A replayable, counted feature stream that materializes one recycle at a time. */
+export interface RecycleFeatureSource<T> extends Iterable<T> { readonly length: number; }
+
+export function recycleFeatureSource<T>(
+  length: number,
+  iterator: () => Iterator<T>,
+): RecycleFeatureSource<T> {
+  return { length, [Symbol.iterator]: iterator };
+}
+
 function generator(seed: number): () => number {
   let state = seed >>> 0;
   return () => { state = (state + 0x6d2b79f5) >>> 0; let value = state;
@@ -43,7 +53,7 @@ function makeColabFoldMultimerFeatures(
   encodedInput: Uint8Array,
   tables: QueryOnlyFeatureTables,
   options: A3mFeatureOptions,
-): readonly MonomerRecycleFeatures[] {
+): RecycleFeatureSource<MonomerRecycleFeatures> {
   const length = alignment.length;
   const inputDepth = alignment.depth;
   const recycles = options.recycles ?? 3;
@@ -78,9 +88,9 @@ function makeColabFoldMultimerFeatures(
   const base = makeQueryOnlyFeatures(alignment.query, tables, { recycles: 0, maskedMsaCodes: [
     Float32Array.from(encoded.subarray(0, length)),
   ] })[0]!;
-  const results: MonomerRecycleFeatures[] = [];
-  let rootKey: JaxKey = [0, (options.randomSeed ?? 0) >>> 0];
-  for (let recycle = 0; recycle <= recycles; recycle += 1) {
+  return recycleFeatureSource(recycles + 1, function* features() {
+    let rootKey: JaxKey = [0, (options.randomSeed ?? 0) >>> 0];
+    for (let recycle = 0; recycle <= recycles; recycle += 1) {
     const keys = multimerMsaKeys(rootKey); rootKey = keys.nextRoot;
     const order = Array.from({ length: depth }, (_, row) => row);
     order.sort((left, right) => {
@@ -179,20 +189,20 @@ function makeColabFoldMultimerFeatures(
       extraDeletionValue[slot] = deletionValue(deletion);
       extraMsaMask[slot] = rowMask[row]!;
     }
-    results.push({
-      targetFeatures: base.targetFeatures.slice(), msaFeatures, msaMask,
+    yield {
+      targetFeatures: base.targetFeatures, msaFeatures, msaMask,
       extraMsa, extraHasDeletion, extraDeletionValue, extraMsaMask,
-      residueIndex: base.residueIndex.slice(), aatype: base.aatype.slice(), seqMask: base.seqMask.slice(),
-      atom37ToAtom14: base.atom37ToAtom14.slice(), atom37Mask: base.atom37Mask.slice(),
+      residueIndex: base.residueIndex, aatype: base.aatype, seqMask: base.seqMask,
+      atom37ToAtom14: base.atom37ToAtom14, atom37Mask: base.atom37Mask,
       msaSequences: centers.length, extraSequences, targetChannels: 22, msaFeatureChannels: 49,
-    });
-  }
-  return results;
+    };
+    }
+  });
 }
 
-/** CPU feature preprocessing for A3M text. Neural inference remains entirely on WebGPU. */
-export function makeA3mFeatures(a3mText: string, tables: QueryOnlyFeatureTables,
-  options: A3mFeatureOptions = {}): readonly MonomerRecycleFeatures[] {
+/** Lazily preprocess A3M text, retaining at most one recycle's large feature tensors. */
+export function iterateA3mFeatures(a3mText: string, tables: QueryOnlyFeatureTables,
+  options: A3mFeatureOptions = {}): RecycleFeatureSource<MonomerRecycleFeatures> {
   const alignment = parseA3m(a3mText);
   const length = alignment.length; const depth = alignment.depth;
   const alignmentMask = options.alignmentMask ?? new Float32Array(depth * length).fill(1);
@@ -212,10 +222,13 @@ export function makeA3mFeatures(a3mText: string, tables: QueryOnlyFeatureTables,
     Float32Array.from(encoded.subarray(0, length)),
   ] })[0]!;
   const recycles = options.recycles ?? 3;
+  if (!Number.isSafeInteger(recycles) || recycles < 0) {
+    throw new RangeError("recycles must be a non-negative safe integer");
+  }
   const maxMsa = Math.min(options.maxMsaSequences ?? 508, depth);
   const maxExtra = options.maxExtraSequences ?? 1024;
-  const results: MonomerRecycleFeatures[] = [];
-  for (let recycle = 0; recycle <= recycles; recycle += 1) {
+  return recycleFeatureSource(recycles + 1, function* features() {
+    for (let recycle = 0; recycle <= recycles; recycle += 1) {
     const random = generator(((options.randomSeed ?? 0) ^ Math.imul(recycle + 1, 0x9e3779b9)) >>> 0);
     const remainder = Array.from({ length: depth - 1 }, (_, index) => index + 1); shuffle(remainder, random);
     const centers = [0, ...remainder.slice(0, Math.max(0, maxMsa - 1))];
@@ -286,14 +299,20 @@ export function makeA3mFeatures(a3mText: string, tables: QueryOnlyFeatureTables,
       extraDeletionValue[slot] = deletionValue(deletion);
       extraMsaMask[slot] = 1;
     }
-    results.push({
-      targetFeatures: base.targetFeatures.slice(), msaFeatures,
+    yield {
+      targetFeatures: base.targetFeatures, msaFeatures,
       msaMask: new Float32Array(centers.length * length).fill(1),
       extraMsa, extraHasDeletion, extraDeletionValue, extraMsaMask,
-      residueIndex: base.residueIndex.slice(), aatype: base.aatype.slice(), seqMask: base.seqMask.slice(),
-      atom37ToAtom14: base.atom37ToAtom14.slice(), atom37Mask: base.atom37Mask.slice(),
+      residueIndex: base.residueIndex, aatype: base.aatype, seqMask: base.seqMask,
+      atom37ToAtom14: base.atom37ToAtom14, atom37Mask: base.atom37Mask,
       msaSequences: centers.length, extraSequences, targetChannels: 22, msaFeatureChannels: 49,
-    });
-  }
-  return results;
+    };
+    }
+  });
+}
+
+/** Eager compatibility wrapper. Prefer iterateA3mFeatures for browser inference. */
+export function makeA3mFeatures(a3mText: string, tables: QueryOnlyFeatureTables,
+  options: A3mFeatureOptions = {}): readonly MonomerRecycleFeatures[] {
+  return [...iterateA3mFeatures(a3mText, tables, options)];
 }

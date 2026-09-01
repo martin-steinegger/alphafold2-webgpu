@@ -93,6 +93,7 @@ export class HttpTensorStore {
   readonly #cache = new Map<string, Promise<Float32Array>>();
   readonly #fileCache = new Map<string, Promise<ArrayBuffer>>();
   readonly #fileByteLengths = new Map<string, number>();
+  readonly #fileRemainingTensors = new Map<string, number>();
   readonly #shards = new Map<string, BinaryTensorShard>();
   readonly #pending: (() => void)[] = [];
   readonly #onProgress: TensorDownloadProgressCallback | undefined;
@@ -112,6 +113,7 @@ export class HttpTensorStore {
     for (const record of records) {
       const end = (record.byteOffset ?? 0) + tensorByteLength(record);
       this.#fileByteLengths.set(record.file, Math.max(this.#fileByteLengths.get(record.file) ?? 0, end));
+      this.#fileRemainingTensors.set(record.file, (this.#fileRemainingTensors.get(record.file) ?? 0) + 1);
     }
     for (const shard of manifest.bundle?.files ?? []) this.#shards.set(shard.file, shard);
   }
@@ -154,7 +156,21 @@ export class HttpTensorStore {
     }
     this.#loadedTensors += 1;
     this.#reportProgress(name);
-    return readTensor(record, buffer, byteOffset);
+    const value = readTensor(record, buffer, byteOffset);
+    const remaining = this.#fileRemainingTensors.get(record.file);
+    if (remaining === undefined || remaining <= 0) throw new Error(`${record.file} tensor accounting underflow`);
+    if (remaining === 1) {
+      // Compressed tensors decode into independent float32 arrays. Once every
+      // tensor in a shard has been decoded, retaining the downloaded shard
+      // would otherwise keep compressed and expanded model copies side by side
+      // for the lifetime of the browser tab. Float32 views still keep their
+      // underlying buffer alive naturally.
+      this.#fileRemainingTensors.delete(record.file);
+      this.#fileCache.delete(record.file);
+    } else {
+      this.#fileRemainingTensors.set(record.file, remaining - 1);
+    }
+    return value;
   }
   async #scheduleDownload(file: string, tensorName: string): Promise<ArrayBuffer> {
     return new Promise<ArrayBuffer>((resolve, reject) => {

@@ -1,25 +1,28 @@
 import {
   AlphaFoldMonomerGpu,
+  summarizeMonomerRecycle,
   type MonomerGpuOptions,
   type MonomerPrediction,
+  type MonomerRecycleDetails,
   type MonomerRecycleResult,
+  type MonomerRecycleSummary,
   type MultimerCompatibleModelWeights,
+  type PredictionConfidenceResult,
 } from "./monomer.js";
 import {
-  makeMultimerQueryOnlyFeatures,
+  iterateMultimerQueryOnlyFeatures,
   type MultimerFeatureOptions,
   type MultimerRecycleFeatures,
 } from "../input/multimer-features.js";
 import type { QueryOnlyFeatureTables } from "../input/query-only-features.js";
+import type { RecycleFeatureSource } from "../input/a3m-features.js";
 import {
-  multimerRankingConfidence,
-  predictedInterfaceTmScore,
-  type ConfidenceResult,
+  multimerRankingConfidence, predictedInterfaceTmScoreFromExpected,
 } from "../heads/confidence.js";
 
 export type MultimerModelWeights = MultimerCompatibleModelWeights;
 
-export interface MultimerConfidenceResult extends ConfidenceResult {
+export interface MultimerConfidenceResult extends PredictionConfidenceResult {
   readonly iptm: number;
   readonly rankingConfidence: number;
 }
@@ -28,25 +31,33 @@ export interface MultimerRecycleResult extends Omit<MonomerRecycleResult, "confi
   readonly confidence: MultimerConfidenceResult;
 }
 
+export interface MultimerRecycleSummary extends Omit<MonomerRecycleSummary, "confidence"> {
+  readonly confidence: Pick<MultimerConfidenceResult, "meanPlddt" | "ptm" | "iptm" | "rankingConfidence">;
+}
+
 export interface MultimerPrediction extends Omit<MonomerPrediction, "recycles" | "final"> {
-  readonly recycles: readonly MultimerRecycleResult[];
+  readonly recycles: readonly MultimerRecycleSummary[];
   readonly final: MultimerRecycleResult;
 }
 
-export type MultimerRecycleCallback = (result: MultimerRecycleResult, recycle: number) => void;
+export type MultimerRecycleCallback = (result: MultimerRecycleSummary, recycle: number) => void;
 
-function withInterfaceConfidence(
-  result: MonomerRecycleResult,
+function summarizeMultimerDetails(
+  result: MonomerRecycleDetails,
   asymId: Float32Array,
-  breaks: Float32Array,
-): MultimerRecycleResult {
-  const iptm = predictedInterfaceTmScore(result.confidence.paeLogits, asymId.length, breaks, asymId);
-  const confidence: MultimerConfidenceResult = {
-    ...result.confidence,
-    iptm,
-    rankingConfidence: multimerRankingConfidence(result.confidence.ptm, iptm),
+): MultimerRecycleSummary {
+  const base = summarizeMonomerRecycle(result);
+  const iptm = predictedInterfaceTmScoreFromExpected(
+    result.confidence.tmScoreTerms, asymId.length, asymId,
+  );
+  return {
+    ...base,
+    confidence: {
+      ...base.confidence,
+      iptm,
+      rankingConfidence: multimerRankingConfidence(result.confidence.ptm, iptm),
+    },
   };
-  return { ...result, confidence };
 }
 
 /**
@@ -75,26 +86,41 @@ export class AlphaFoldMultimerGpu {
     paeBreaks?: Float32Array,
     onRecycle?: MultimerRecycleCallback,
   ): Promise<MultimerPrediction> {
-    return this.predict(makeMultimerQueryOnlyFeatures(chains, featureTables, options), weights, paeBreaks, onRecycle);
+    return this.predict(iterateMultimerQueryOnlyFeatures(chains, featureTables, options),
+      weights, paeBreaks, onRecycle);
   }
 
   async predict(
-    featuresByRecycle: readonly MultimerRecycleFeatures[],
+    featuresByRecycle: RecycleFeatureSource<MultimerRecycleFeatures>,
     weights: MultimerModelWeights,
     paeBreaks: Float32Array = Float32Array.from({ length: 63 }, (_, index) => index * 0.5),
     onRecycle?: MultimerRecycleCallback,
   ): Promise<MultimerPrediction> {
     if (featuresByRecycle.length === 0) throw new RangeError("at least one multimer feature set is required");
-    const asymId = featuresByRecycle[0]!.chainRelative.asymId;
-    const mappedDuringRun: MultimerRecycleResult[] = [];
-    const prediction = await this.#model.predict(featuresByRecycle, weights, paeBreaks, (result, recycle) => {
-      const mapped = withInterfaceConfidence(result, asymId, paeBreaks);
+    const mappedDuringRun: MultimerRecycleSummary[] = [];
+    const prediction = await this.#model.predict(featuresByRecycle, weights, paeBreaks, undefined,
+      (result, recycle, features) => {
+      const asymId = features.chainRelative!.asymId;
+      const mapped = summarizeMultimerDetails(result, asymId);
       mappedDuringRun.push(mapped);
       onRecycle?.(mapped, recycle);
     });
-    const recycles = mappedDuringRun.length === prediction.recycles.length
-      ? mappedDuringRun
-      : prediction.recycles.map((result) => withInterfaceConfidence(result, asymId, paeBreaks));
-    return { ...prediction, recycles, final: recycles[recycles.length - 1]! };
+    if (mappedDuringRun.length !== prediction.recycles.length) {
+      throw new Error("multimer prediction did not report every recycle");
+    }
+    const finalSummary = mappedDuringRun.at(-1);
+    if (finalSummary === undefined) throw new Error("multimer prediction has no confidence summary");
+    return {
+      ...prediction,
+      recycles: mappedDuringRun,
+      final: {
+        ...prediction.final,
+        confidence: {
+          ...prediction.final.confidence,
+          iptm: finalSummary.confidence.iptm,
+          rankingConfidence: finalSummary.confidence.rankingConfidence,
+        },
+      },
+    };
   }
 }

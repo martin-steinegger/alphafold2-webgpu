@@ -234,6 +234,9 @@ export class WebGpuExecution {
 
   checkpoint(): number { return this.#allocations.length; }
 
+  /** Mark a queue-submit boundary at which retired buffers may be destroyed. */
+  noteSubmitted(): void { this.allocator.trimPooled(); }
+
   releaseSince(checkpoint: number): void {
     if (!Number.isSafeInteger(checkpoint) || checkpoint < 0 || checkpoint > this.#allocations.length) {
       throw new RangeError(`invalid GPU allocation checkpoint ${checkpoint}`);
@@ -242,6 +245,10 @@ export class WebGpuExecution {
       this.#allocations[index]!.release();
     }
     this.#allocations.length = checkpoint;
+    // releaseSince is used after a submitted execution window. Enforce the
+    // bound for allocations retired after that submit as well as scratch that
+    // was retired while encoding it.
+    this.allocator.trimPooled();
   }
 
   release(): void {

@@ -1,4 +1,10 @@
-import { ConfidenceHeadsGpu, type ConfidenceResult, type PredictedAlignedErrorWeights, type PredictedLddtWeights } from "../heads/confidence.js";
+import {
+  ConfidenceHeadsGpu,
+  type ConfidenceSummaryResult,
+  type PredictedAlignedErrorWeights,
+  type PredictedLddtWeights,
+  type ReducedConfidenceResult,
+} from "../heads/confidence.js";
 import { encodeInputEmbedder, type InputEmbedderWeights } from "../evoformer/input-embedder.js";
 import {
   encodeEvoformerBlock, encodeExtraMsaBlock, type EvoformerBlockWeights, type ExtraMsaBlockWeights,
@@ -8,7 +14,9 @@ import { MultimerMockTemplateGpu, type MultimerMockTemplateWeights } from "../ev
 import { WebGpuExecution, type GpuTensor, type GpuTimestampEntry } from "../runtime/execution.js";
 import { StructureModuleGpu, type StructureModuleResult, type StructureModuleWeights } from "../structure/module.js";
 import type { ResidueGeometryTables } from "../structure/geometry.js";
-import { makeA3mFeatures, type A3mFeatureOptions } from "../input/a3m-features.js";
+import {
+  iterateA3mFeatures, type A3mFeatureOptions, type RecycleFeatureSource,
+} from "../input/a3m-features.js";
 import type { QueryOnlyFeatureTables } from "../input/query-only-features.js";
 import { TRANSITION_CHUNK_TARGET_BYTES } from "../evoformer/transition.js";
 import { COMPACT_GPU_POOL_BYTES, type AllocationSnapshot } from "../runtime/allocator.js";
@@ -38,18 +46,47 @@ export type MultimerCompatibleModelWeights = Omit<MonomerModelWeights, "template
   readonly multimerTemplate: MultimerMockTemplateWeights;
 };
 
+/** User-facing confidence tensors; raw categorical logits are transient implementation details. */
+export type PredictionConfidenceResult = ConfidenceSummaryResult;
+
 export interface MonomerRecycleResult {
   readonly msaFirstRow: Float32Array; readonly pair: Float32Array;
-  readonly structure: StructureModuleResult; readonly confidence: ConfidenceResult;
+  readonly structure: StructureModuleResult; readonly confidence: PredictionConfidenceResult;
+  readonly elapsedMilliseconds: number;
+  readonly trunkSubmissions: MonomerTrunkSubmissionCounts;
+  readonly gpuProfile?: MonomerRecycleGpuProfile;
+}
+
+/** Full per-recycle data used transiently before the final pair readback. */
+export type MonomerRecycleDetails = Omit<MonomerRecycleResult, "pair" | "confidence"> & {
+  readonly confidence: ReducedConfidenceResult;
+};
+
+type MonomerFinalDetails = Omit<MonomerRecycleResult, "pair">;
+
+export interface MonomerRecycleSummary {
+  readonly confidence: Pick<ConfidenceSummaryResult, "meanPlddt" | "ptm">;
   readonly elapsedMilliseconds: number;
   readonly trunkSubmissions: MonomerTrunkSubmissionCounts;
   readonly gpuProfile?: MonomerRecycleGpuProfile;
 }
 
 export interface MonomerPrediction {
-  readonly recycles: readonly MonomerRecycleResult[]; readonly final: MonomerRecycleResult;
+  /** Lightweight metrics for every recycle; pair and structure arrays are retained only in final. */
+  readonly recycles: readonly MonomerRecycleSummary[]; readonly final: MonomerRecycleResult;
   readonly elapsedMilliseconds: number;
-  readonly memory: AllocationSnapshot;
+  readonly memory: MonomerMemorySnapshot;
+}
+
+export interface MonomerMemorySnapshot extends AllocationSnapshot {
+  /** Main trunk allocator peak (same value as peakResidentBytes). */
+  readonly mainPeakResidentBytes: number;
+  /** Largest structure-core allocator peak across recycles. */
+  readonly structureCorePeakResidentBytes: number;
+  /** Largest confidence-head allocator peak across recycles. */
+  readonly confidencePeakResidentBytes: number;
+  /** Conservative simultaneous peak: live trunk residency plus the active auxiliary stage. */
+  readonly combinedPeakResidentBytes: number;
 }
 
 export interface MonomerTrunkSubmissionCounts {
@@ -86,7 +123,22 @@ export interface MonomerRecycleGpuProfile {
   readonly mainEvoformer: MonomerBlockGpuProfile;
 }
 
-export type MonomerRecycleCallback = (result: MonomerRecycleResult, recycle: number) => void;
+export type MonomerRecycleCallback = (
+  result: MonomerRecycleSummary, recycle: number,
+) => void;
+
+type MonomerRecycleDetailsCallback = (
+  result: MonomerRecycleDetails, recycle: number, features: MonomerRecycleFeatures,
+) => void;
+
+export function summarizeMonomerRecycle(result: MonomerRecycleDetails): MonomerRecycleSummary {
+  return {
+    confidence: { meanPlddt: result.confidence.meanPlddt, ptm: result.confidence.ptm },
+    elapsedMilliseconds: result.elapsedMilliseconds,
+    trunkSubmissions: result.trunkSubmissions,
+    ...(result.gpuProfile === undefined ? {} : { gpuProfile: result.gpuProfile }),
+  };
+}
 
 /** Full monomer model for clustered MSA/A3M inputs, with all learned operations dispatched through WebGPU. */
 export class AlphaFoldMonomerGpu {
@@ -124,24 +176,20 @@ export class AlphaFoldMonomerGpu {
   async predictA3m(a3mText: string, weights: MonomerModelWeights, featureTables: QueryOnlyFeatureTables,
     options: A3mFeatureOptions = {}, paeBreaks?: Float32Array,
     onRecycle?: MonomerRecycleCallback): Promise<MonomerPrediction> {
-    return this.predict(makeA3mFeatures(a3mText, featureTables, options), weights, paeBreaks, onRecycle);
+    return this.predict(iterateA3mFeatures(a3mText, featureTables, options), weights, paeBreaks, onRecycle);
   }
-  async predict(featuresByRecycle: readonly MonomerRecycleFeatures[],
+  async predict(featuresByRecycle: RecycleFeatureSource<MonomerRecycleFeatures>,
     weights: MonomerModelWeights | MultimerCompatibleModelWeights,
-    paeBreaks?: Float32Array, onRecycle?: MonomerRecycleCallback): Promise<MonomerPrediction> {
+    paeBreaks?: Float32Array, onRecycle?: MonomerRecycleCallback,
+    onRecycleDetails?: MonomerRecycleDetailsCallback): Promise<MonomerPrediction> {
     if (featuresByRecycle.length === 0) throw new RangeError("at least one feature set is required");
-    const length = featuresByRecycle[0]!.aatype.length;
+    const featureIterator = featuresByRecycle[Symbol.iterator]();
+    let featureStep = featureIterator.next();
+    if (featureStep.done) throw new RangeError("at least one feature set is required");
+    const length = featureStep.value.aatype.length;
     const pairMask = new Float32Array(length * length);
     for (let i = 0; i < length; i += 1) for (let j = 0; j < length; j += 1) {
-      pairMask[i * length + j] = featuresByRecycle[0]!.seqMask[i]! * featuresByRecycle[0]!.seqMask[j]!;
-    }
-    if (this.multimer) {
-      for (const features of featuresByRecycle) {
-        if (features.targetChannels !== 21 || features.msaFeatureChannels !== 49
-          || features.chainRelative === undefined) {
-          throw new RangeError("Multimer-v3 requires 21 target channels, 49 MSA channels, and chain identifiers");
-        }
-      }
+      pairMask[i * length + j] = featureStep.value.seqMask[i]! * featureStep.value.seqMask[j]!;
     }
     const templateUpdateValue = !this.multimer
       ? (weights as MonomerModelWeights).template === undefined
@@ -163,15 +211,23 @@ export class AlphaFoldMonomerGpu {
       ...(this.compactTransitions ? { transitionBufferLimit: TRANSITION_CHUNK_TARGET_BYTES } : {}),
       ...(this.maxPooledBytes === undefined ? {} : { maxPooledBytes: this.maxPooledBytes }),
     });
-    const results: MonomerRecycleResult[] = [];
+    const results: MonomerRecycleSummary[] = [];
+    let finalDetails: MonomerFinalDetails | undefined;
+    let structureCorePeakResidentBytes = 0;
+    let confidencePeakResidentBytes = 0;
+    let combinedPeakResidentBytes = 0;
     const start = performance.now();
     const submit = async (encoder: GPUCommandEncoder, label: string): Promise<void> => {
       execution.endComputePass(encoder);
       this.device.queue.submit([encoder.finish()]);
+      execution.noteSubmitted();
       const error = await this.device.popErrorScope();
       if (error !== null) throw new Error(`WebGPU ${label} failed: ${error.message}`);
     };
-    const releaseTensor = (tensor: GpuTensor): void => tensor.allocation.release();
+    const releaseTensor = (tensor: GpuTensor): void => {
+      tensor.allocation.release();
+      execution.allocator.trimPooled();
+    };
     try {
       const templateUpdate = templateUpdateValue === undefined ? undefined
         : execution.upload("monomer.template-update", templateUpdateValue);
@@ -182,10 +238,16 @@ export class AlphaFoldMonomerGpu {
         "monomer.recycle-positions-zero", new Float32Array(length * 37 * 3),
       );
       let stopAfterRecycle = Number.POSITIVE_INFINITY;
+      let previousConvergencePositions: Float32Array | undefined;
 
-      for (let recycle = 0; recycle < featuresByRecycle.length; recycle += 1) {
-        const features = featuresByRecycle[recycle]!;
+      let recycle = 0;
+      while (!featureStep.done) {
+        const features = featureStep.value;
         if (features.aatype.length !== length) throw new RangeError("all recycle feature lengths must match");
+        if (this.multimer && (features.targetChannels !== 21 || features.msaFeatureChannels !== 49
+          || features.chainRelative === undefined)) {
+          throw new RangeError("Multimer-v3 requires 21 target channels, 49 MSA channels, and chain identifiers");
+        }
         const recycleStart = performance.now();
         const msaMask = execution.upload(`monomer.msa-mask-${recycle}`, features.msaMask);
         const extraMsaMask = execution.upload(`monomer.extra-msa-mask-${recycle}`, features.extraMsaMask);
@@ -213,28 +275,22 @@ export class AlphaFoldMonomerGpu {
         let templateSubmissions = 0;
         if (this.multimer) {
           const multimerWeights = weights as MultimerCompatibleModelWeights;
-          const pairEncoder = this.device.createCommandEncoder({ label: `multimer.template-query-${recycle}` });
-          const pairReadback = execution.createReadback(
-            `multimer.template-query-readback-${recycle}`, embedding.pairWithoutTemplates, pairEncoder,
-          );
-          this.device.pushErrorScope("validation");
-          await submit(pairEncoder, `Multimer template query recycle ${recycle}`);
-          const pairValue = await execution.mapFloat32(pairReadback);
-          releaseTensor(pairReadback);
-          const template = await new MultimerMockTemplateGpu(this.device).run(
-            pairValue, pairMask, length, multimerWeights.multimerTemplate, execution,
-          );
-          const templatePair = execution.upload(`multimer.template-pair-${recycle}`, template.pairUpdate);
-          const templateMsa = execution.upload(
-            `multimer.template-msa-${recycle}`, template.msaRows, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-          );
           mainSequences += multimerWeights.multimerTemplate.templateRows;
           multimerMainMsa = execution.allocate(`multimer.main-msa-${recycle}`,
             mainSequences * length * 256,
             GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST);
-          const combinedMask = new Float32Array(features.msaMask.length + template.msaMask.length);
-          combinedMask.set(features.msaMask); combinedMask.set(template.msaMask, features.msaMask.length);
+          const combinedMask = new Float32Array(
+            features.msaMask.length + multimerWeights.multimerTemplate.templateRows * length,
+          );
+          combinedMask.set(features.msaMask);
           multimerMainMsaMask = execution.upload(`multimer.main-msa-mask-${recycle}`, combinedMask);
+          const templateCheckpoint = execution.checkpoint();
+          const template = await new MultimerMockTemplateGpu(this.device).run(
+            new Float32Array(0), new Float32Array(0), length, multimerWeights.multimerTemplate, execution,
+            { pair: embedding.pairWithoutTemplates, pairMask: pairMaskTensor },
+          );
+          const templatePair = template.pairUpdateTensor!;
+          const templateMsa = template.msaRowsTensor!;
           const templateEncoder = this.device.createCommandEncoder({ label: `multimer.template-merge-${recycle}` });
           this.device.pushErrorScope("validation");
           await execution.addInPlace(templateEncoder, embedding.pairWithoutTemplates, templatePair,
@@ -245,8 +301,8 @@ export class AlphaFoldMonomerGpu {
           templateEncoder.copyBufferToBuffer(templateMsa.allocation.buffer, 0,
             multimerMainMsa.allocation.buffer, embedding.msa.elements * 4, templateMsa.elements * 4);
           await submit(templateEncoder, `Multimer template merge recycle ${recycle}`);
-          templateSubmissions = template.submissions + 2;
-          releaseTensor(templatePair); releaseTensor(templateMsa);
+          templateSubmissions = template.submissions + 1;
+          execution.releaseSince(templateCheckpoint);
           mainMsa = multimerMainMsa; mainMsaMask = multimerMainMsaMask;
         }
 
@@ -341,27 +397,35 @@ export class AlphaFoldMonomerGpu {
         readbackEncoder.copyBufferToBuffer(
           mainMsa.allocation.buffer, 0, nextPreviousMsa.allocation.buffer, 0, length * 256 * 4,
         );
-        const pairReadback = execution.createReadback(
-          `monomer.pair-readback-${recycle}`, embedding.pairWithoutTemplates, readbackEncoder,
-        );
         this.device.pushErrorScope("validation");
         await submit(readbackEncoder, `readback recycle ${recycle}`);
-        const [msaFirstRow, pair] = await Promise.all([
-          execution.mapFloat32(msaFirstRowTensor), execution.mapFloat32(pairReadback),
-        ]);
-        releaseTensor(msaFirstRowTensor); releaseTensor(pairReadback); releaseTensor(msaMask);
+        const msaFirstRow = await execution.mapFloat32(msaFirstRowTensor);
+        releaseTensor(msaFirstRowTensor); releaseTensor(msaMask);
         if (multimerMainMsa !== undefined) releaseTensor(multimerMainMsa);
         if (multimerMainMsaMask !== undefined) releaseTensor(multimerMainMsaMask);
         releaseTensor(embedding.msa);
 
         const structure = await new StructureModuleGpu(this.device).run({
-          msaFirstRow, pair, mask: features.seqMask, aatype: features.aatype,
+          msaFirstRow, pair: new Float32Array(0), mask: features.seqMask, aatype: features.aatype,
+          pairBuffer: embedding.pairWithoutTemplates.allocation.buffer,
           atom37ToAtom14: features.atom37ToAtom14, atom37Mask: features.atom37Mask,
           length, weights: weights.structure, geometry: weights.geometry,
           ...(this.multimer ? { multimer: true } : {}),
         });
-        const confidence = await new ConfidenceHeadsGpu(this.device).run(
-          structure.finalRepresentation, pair, length, weights.lddt, weights.pae, paeBreaks,
+        const trunkResidentBytes = execution.snapshot().residentBytes;
+        const structurePeak = structure.memory?.peakResidentBytes ?? 0;
+        structureCorePeakResidentBytes = Math.max(structureCorePeakResidentBytes, structurePeak);
+        combinedPeakResidentBytes = Math.max(
+          combinedPeakResidentBytes, trunkResidentBytes + structurePeak,
+        );
+        const confidence = await new ConfidenceHeadsGpu(this.device).runReduced(
+          structure.finalRepresentation, new Float32Array(0), length, weights.lddt, weights.pae, paeBreaks,
+          { pairBuffer: embedding.pairWithoutTemplates.allocation.buffer },
+        );
+        const confidencePeak = confidence.memory?.peakResidentBytes ?? 0;
+        confidencePeakResidentBytes = Math.max(confidencePeakResidentBytes, confidencePeak);
+        combinedPeakResidentBytes = Math.max(
+          combinedPeakResidentBytes, trunkResidentBytes + confidencePeak,
         );
         const trunkSubmissions = {
           embedding: 1, template: templateSubmissions,
@@ -370,27 +434,63 @@ export class AlphaFoldMonomerGpu {
         };
         const gpuProfile = extraProfile === undefined || mainProfile === undefined
           ? undefined : { extraMsa: extraProfile, mainEvoformer: mainProfile };
-        const recycleResult = { msaFirstRow, pair, structure, confidence,
+        const recycleDetails = { msaFirstRow, structure, confidence,
           elapsedMilliseconds: performance.now() - recycleStart, trunkSubmissions,
           ...(gpuProfile === undefined ? {} : { gpuProfile }),
         };
-        results.push(recycleResult);
-        onRecycle?.(recycleResult, recycle);
+        const recycleSummary = summarizeMonomerRecycle(recycleDetails);
+        onRecycleDetails?.(recycleDetails, recycle, features);
+        onRecycle?.(recycleSummary, recycle);
+        results.push(recycleSummary);
+        finalDetails = {
+          ...recycleDetails,
+          confidence: {
+            plddt: confidence.plddt,
+            meanPlddt: confidence.meanPlddt,
+            predictedAlignedError: confidence.predictedAlignedError,
+            maxPredictedAlignedError: confidence.maxPredictedAlignedError,
+            ptm: confidence.ptm,
+            ...(confidence.memory === undefined ? {} : { memory: confidence.memory }),
+          },
+        };
         previousMsa = nextPreviousMsa;
         previousPair = embedding.pairWithoutTemplates;
         previousPositions = execution.upload(`monomer.recycle-positions-${recycle}`, structure.atom37);
         if (this.multimer && recycle > 0 && this.recycleEarlyStopTolerance >= 0
           && stopAfterRecycle === Number.POSITIVE_INFINITY) {
           const rms = multimerRecycleDistanceRms(
-            results[recycle - 1]!.structure.atom37, structure.atom37, features.seqMask,
+            previousConvergencePositions!, structure.atom37, features.seqMask,
           );
           if (rms <= this.recycleEarlyStopTolerance) stopAfterRecycle = recycle + 1;
         }
-        if (recycle >= stopAfterRecycle) break;
+        previousConvergencePositions = structure.atom37;
+        if (recycle >= stopAfterRecycle) {
+          featureIterator.return?.();
+          break;
+        }
+        recycle += 1;
+        featureStep = featureIterator.next();
       }
+      if (finalDetails === undefined) throw new Error("monomer prediction produced no recycle result");
+      const finalReadbackEncoder = this.device.createCommandEncoder({ label: "monomer.final-pair-readback" });
+      const finalPairReadback = execution.createReadback(
+        "monomer.final-pair-readback", previousPair, finalReadbackEncoder,
+      );
+      this.device.pushErrorScope("validation");
+      await submit(finalReadbackEncoder, "final pair readback");
+      const finalPair = await execution.mapFloat32(finalPairReadback);
+      releaseTensor(finalPairReadback);
+      const finalResult: MonomerRecycleResult = { ...finalDetails, pair: finalPair };
+      const mainMemory = execution.snapshot();
       return {
-        recycles: results, final: results[results.length - 1]!, elapsedMilliseconds: performance.now() - start,
-        memory: execution.snapshot(),
+        recycles: results, final: finalResult, elapsedMilliseconds: performance.now() - start,
+        memory: {
+          ...mainMemory,
+          mainPeakResidentBytes: mainMemory.peakResidentBytes,
+          structureCorePeakResidentBytes,
+          confidencePeakResidentBytes,
+          combinedPeakResidentBytes: Math.max(combinedPeakResidentBytes, mainMemory.peakResidentBytes),
+        },
       };
     } finally {
       execution.release();

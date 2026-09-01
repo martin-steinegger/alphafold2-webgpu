@@ -1,5 +1,7 @@
 import type { QueryOnlyFeatureTables } from "./query-only-features.js";
-import { makeA3mFeatures, type A3mFeatureOptions } from "./a3m-features.js";
+import {
+  iterateA3mFeatures, recycleFeatureSource, type A3mFeatureOptions, type RecycleFeatureSource,
+} from "./a3m-features.js";
 import { parseA3m } from "./a3m.js";
 import type { MonomerRecycleFeatures } from "../model/monomer.js";
 
@@ -173,19 +175,19 @@ export function makeMultimerSequenceFeatures(
  * Build a deterministic, no-MSA Multimer-v3 input. Chains remain distinct
  * through asym/entity/sym identifiers even though their query rows are joined.
  */
-export function makeMultimerQueryOnlyFeatures(
+export function iterateMultimerQueryOnlyFeatures(
   chainsValue: string | readonly string[],
   tables: QueryOnlyFeatureTables,
   options: MultimerFeatureOptions = {},
-): readonly MultimerRecycleFeatures[] {
+): RecycleFeatureSource<MultimerRecycleFeatures> {
   const sequence = makeMultimerSequenceFeatures(chainsValue, tables);
   const length = sequence.aatype.length;
   const recycles = options.recycles ?? 20;
   if (!Number.isSafeInteger(recycles) || recycles < 0) {
     throw new RangeError("recycles must be a non-negative safe integer");
   }
-  const result: MultimerRecycleFeatures[] = [];
-  for (let recycle = 0; recycle <= recycles; recycle += 1) {
+  return recycleFeatureSource(recycles + 1, function* features() {
+    for (let recycle = 0; recycle <= recycles; recycle += 1) {
     const random = randomGenerator(((options.randomSeed ?? 0) ^ Math.imul(recycle + 1, 0x9e3779b9)) >>> 0);
     const msaCodes = sequence.aatype.slice();
     for (let residue = 0; residue < length; residue += 1) {
@@ -200,39 +202,48 @@ export function makeMultimerQueryOnlyFeatures(
       msaFeatures[residue * 49 + code] = 1;
       msaFeatures[residue * 49 + 25 + code] = 1 / (1 + 1e-6);
     }
-    result.push({
-      targetFeatures: sequence.targetFeatures.slice(),
+    yield {
+      targetFeatures: sequence.targetFeatures,
       msaFeatures,
       msaMask: new Float32Array(length).fill(1),
       extraMsa: new Float32Array(length),
       extraHasDeletion: new Float32Array(length),
       extraDeletionValue: new Float32Array(length),
       extraMsaMask: new Float32Array(length),
-      residueIndex: sequence.residueIndex.slice(),
-      aatype: sequence.aatype.slice(),
-      seqMask: sequence.seqMask.slice(),
-      atom37ToAtom14: sequence.atom37ToAtom14.slice(),
-      atom37Mask: sequence.atom37Mask.slice(),
+      residueIndex: sequence.residueIndex,
+      aatype: sequence.aatype,
+      seqMask: sequence.seqMask,
+      atom37ToAtom14: sequence.atom37ToAtom14,
+      atom37Mask: sequence.atom37Mask,
       msaSequences: 1,
       extraSequences: 1,
       targetChannels: 21,
       msaFeatureChannels: 49,
       chainRelative: {
-        asymId: sequence.asymId.slice(), entityId: sequence.entityId.slice(), symId: sequence.symId.slice(),
+        asymId: sequence.asymId, entityId: sequence.entityId, symId: sequence.symId,
       },
-    });
-  }
-  return result;
+    };
+    }
+  });
+}
+
+/** Eager compatibility wrapper for callers that need random access. */
+export function makeMultimerQueryOnlyFeatures(
+  chainsValue: string | readonly string[],
+  tables: QueryOnlyFeatureTables,
+  options: MultimerFeatureOptions = {},
+): readonly MultimerRecycleFeatures[] {
+  return [...iterateMultimerQueryOnlyFeatures(chainsValue, tables, options)];
 }
 
 /** Build Multimer-v3 tensors from ColabFold-style paired/unpaired complex MSA rows. */
-export function makeMultimerA3mFeatures(
+export function iterateMultimerA3mFeatures(
   chainsValue: string | readonly string[],
   a3mText: string,
   alignmentMask: Float32Array,
   tables: QueryOnlyFeatureTables,
   options: A3mFeatureOptions = {},
-): readonly MultimerRecycleFeatures[] {
+): RecycleFeatureSource<MultimerRecycleFeatures> {
   const sequence = makeMultimerSequenceFeatures(chainsValue, tables);
   const alignment = parseA3m(a3mText);
   if (alignment.query !== sequence.sequence) {
@@ -241,22 +252,36 @@ export function makeMultimerA3mFeatures(
   if (alignmentMask.length !== alignment.depth * alignment.length) {
     throw new RangeError("complex MSA mask must have shape [depth, total residues]");
   }
-  return makeA3mFeatures(a3mText, tables, {
+  const source = iterateA3mFeatures(a3mText, tables, {
     maxExtraSequences: 2048,
     colabFoldMultimerProcess: true,
     ...options,
     alignmentMask,
-  }).map((features) => ({
-    ...features,
-    targetFeatures: sequence.targetFeatures.slice(),
-    residueIndex: sequence.residueIndex.slice(),
-    aatype: sequence.aatype.slice(),
-    seqMask: sequence.seqMask.slice(),
-    atom37ToAtom14: sequence.atom37ToAtom14.slice(),
-    atom37Mask: sequence.atom37Mask.slice(),
-    targetChannels: 21,
-    chainRelative: {
-      asymId: sequence.asymId.slice(), entityId: sequence.entityId.slice(), symId: sequence.symId.slice(),
-    },
-  }));
+  });
+  return recycleFeatureSource(source.length, function* features() {
+    for (const recycle of source) yield {
+      ...recycle,
+      targetFeatures: sequence.targetFeatures,
+      residueIndex: sequence.residueIndex,
+      aatype: sequence.aatype,
+      seqMask: sequence.seqMask,
+      atom37ToAtom14: sequence.atom37ToAtom14,
+      atom37Mask: sequence.atom37Mask,
+      targetChannels: 21,
+      chainRelative: {
+        asymId: sequence.asymId, entityId: sequence.entityId, symId: sequence.symId,
+      },
+    };
+  });
+}
+
+/** Eager compatibility wrapper for callers that need random access. */
+export function makeMultimerA3mFeatures(
+  chainsValue: string | readonly string[],
+  a3mText: string,
+  alignmentMask: Float32Array,
+  tables: QueryOnlyFeatureTables,
+  options: A3mFeatureOptions = {},
+): readonly MultimerRecycleFeatures[] {
+  return [...iterateMultimerA3mFeatures(chainsValue, a3mText, alignmentMask, tables, options)];
 }

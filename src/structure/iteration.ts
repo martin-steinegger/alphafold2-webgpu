@@ -156,9 +156,9 @@ export class StructurePostAttentionGpu {
   readonly device: GPUDevice;
   readonly allocator: GpuBufferAllocator;
   readonly pipelines: ComputePipelineCache;
-  constructor(device: GPUDevice) {
+  constructor(device: GPUDevice, allocator = new GpuBufferAllocator(device)) {
     this.device = device;
-    this.allocator = new GpuBufferAllocator(device);
+    this.allocator = allocator;
     this.pipelines = pipelineCacheForDevice(device);
   }
 

@@ -100,6 +100,7 @@ export class QueryOnlyTemplateGpu {
       execution.dispatch(encoder, init, [bias, pair], grid[0], grid[1], 1, "template.initialize");
       execution.endComputePass(encoder);
       this.device.queue.submit([encoder.finish()]);
+      execution.noteSubmitted();
       const initError = await this.device.popErrorScope();
       if (initError !== null) throw new Error(`WebGPU template initialization failed: ${initError.message}`);
       const persistentCheckpoint = execution.checkpoint();
@@ -118,6 +119,7 @@ export class QueryOnlyTemplateGpu {
         }, input.weights.blockWeights[block]!, pair, pairMask);
         execution.endComputePass(encoder);
         this.device.queue.submit([encoder.finish()]);
+        execution.noteSubmitted();
         const error = await this.device.popErrorScope();
         if (error !== null) throw new Error(`WebGPU template block ${block} failed: ${error.message}`);
         execution.releaseSince(persistentCheckpoint);
@@ -161,6 +163,7 @@ export class QueryOnlyTemplateGpu {
         grid[0], grid[1], 1, "template.output");
       const readback = execution.createReadback("template.readback", output, encoder);
       this.device.queue.submit([encoder.finish()]);
+      execution.noteSubmitted();
       const error = await this.device.popErrorScope();
       if (error !== null) throw new Error(`WebGPU template output failed: ${error.message}`);
       return {

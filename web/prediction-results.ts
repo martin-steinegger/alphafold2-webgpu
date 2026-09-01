@@ -62,8 +62,11 @@ export function predictionToPdb(
   return `${lines.join("\n")}\n`;
 }
 
-export function confidenceJson(sequence: string, confidence: ConfidenceResult): string {
-  const multimer = confidence as ConfidenceResult & { readonly iptm?: number; readonly rankingConfidence?: number };
+export function confidenceJson(
+  sequence: string,
+  confidence: Omit<ConfidenceResult, "lddtLogits" | "paeLogits">,
+): string {
+  const multimer = confidence as typeof confidence & { readonly iptm?: number; readonly rankingConfidence?: number };
   return JSON.stringify({
     sequence,
     plddt: Array.from(confidence.plddt),

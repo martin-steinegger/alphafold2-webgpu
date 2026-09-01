@@ -1,6 +1,6 @@
 import { ATTENTION_NORMALIZE_SHADER, createAttentionNormParameters } from "./attention.js";
 import { encodeMultimerTemplatePairBlock, type TemplatePairBlockWeights } from "./block.js";
-import { WebGpuExecution } from "../runtime/execution.js";
+import { WebGpuExecution, type GpuTensor } from "../runtime/execution.js";
 
 export interface MultimerMockTemplateWeights {
   readonly queryNormScale: Float32Array;
@@ -24,6 +24,15 @@ export interface MultimerMockTemplateResult {
   readonly msaRows: Float32Array;
   readonly msaMask: Float32Array;
   readonly submissions: number;
+  /** Present only for the internal device-resident trunk handoff. */
+  readonly pairUpdateTensor?: GpuTensor;
+  /** Present only for the internal device-resident trunk handoff. */
+  readonly msaRowsTensor?: GpuTensor;
+}
+
+export interface MultimerMockTemplateResidentInput {
+  readonly pair: GpuTensor;
+  readonly pairMask: GpuTensor;
 }
 
 const PAIR_INIT_SHADER = `
@@ -104,14 +113,20 @@ export class MultimerMockTemplateGpu {
 
   async run(pairValue: Float32Array, pairMaskValue: Float32Array, length: number,
     weightsValue: MultimerMockTemplateWeights,
-    sharedExecution?: WebGpuExecution): Promise<MultimerMockTemplateResult> {
+    sharedExecution?: WebGpuExecution,
+    residentInput?: MultimerMockTemplateResidentInput): Promise<MultimerMockTemplateResult> {
     if (!Number.isSafeInteger(length) || length <= 0) throw new RangeError("template length must be positive");
     const pairs = length * length;
     if (!Number.isSafeInteger(pairs * 128)) throw new RangeError("template tensor size exceeds JavaScript precision");
-    if (pairValue.length !== pairs * 128) throw new RangeError("template pair tensor must have shape [L, L, 128]");
-    if (pairMaskValue.length !== pairs) throw new RangeError("template pair mask must have shape [L, L]");
-    validateFloat32("template pair tensor", pairValue, pairs * 128);
-    validateFloat32("template pair mask", pairMaskValue, pairs);
+    if (residentInput === undefined) {
+      if (pairValue.length !== pairs * 128) throw new RangeError("template pair tensor must have shape [L, L, 128]");
+      if (pairMaskValue.length !== pairs) throw new RangeError("template pair mask must have shape [L, L]");
+      validateFloat32("template pair tensor", pairValue, pairs * 128);
+      validateFloat32("template pair mask", pairMaskValue, pairs);
+    } else if (sharedExecution === undefined || residentInput.pair.elements !== pairs * 128
+      || residentInput.pairMask.elements !== pairs) {
+      throw new RangeError("resident template pair tensors have the wrong shape or execution");
+    }
     if (!Number.isSafeInteger(weightsValue.templateRows) || weightsValue.templateRows <= 0) {
       throw new RangeError("template row count must be positive");
     }
@@ -130,11 +145,12 @@ export class MultimerMockTemplateGpu {
     if (weightsValue.blockWeights.length === 0) throw new RangeError("template pair stack must contain blocks");
     const execution = sharedExecution ?? new WebGpuExecution(this.device);
     const entryCheckpoint = execution.checkpoint();
+    let retainResidentOutput = false;
     try {
       const pairChannels = 128;
       const templateChannels = 64;
-      const pair = execution.upload("multimer-template.query", pairValue);
-      const pairMask = execution.upload("multimer-template.mask", pairMaskValue);
+      const pair = residentInput?.pair ?? execution.upload("multimer-template.query", pairValue);
+      const pairMask = residentInput?.pairMask ?? execution.upload("multimer-template.mask", pairMaskValue);
       const queryNormWeights = new Float32Array(pairChannels * 2);
       queryNormWeights.set(weightsValue.queryNormScale);
       queryNormWeights.set(weightsValue.queryNormOffset, pairChannels);
@@ -142,7 +158,7 @@ export class MultimerMockTemplateGpu {
       const normParams = execution.upload("multimer-template.query-norm-params", createAttentionNormParameters(
         pairs, pairChannels, 0, pairChannels, false, 1, pairs, 1e-5,
       ), GPUBufferUsage.UNIFORM);
-      const normalized = execution.allocate("multimer-template.query-normalized", pairValue.length);
+      const normalized = execution.allocate("multimer-template.query-normalized", pairs * pairChannels);
       const templatePair = execution.allocate("multimer-template.pair", pairs * templateChannels,
         GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
       const inputWeight = execution.upload("multimer-template.input-weight", weightsValue.pairInputWeight);
@@ -162,6 +178,7 @@ export class MultimerMockTemplateGpu {
         grid[0], grid[1]);
       execution.endComputePass(encoder);
       this.device.queue.submit([encoder.finish()]);
+      execution.noteSubmitted();
       let error = await this.device.popErrorScope();
       if (error !== null) throw new Error(`WebGPU Multimer template initialization failed: ${error.message}`);
       const persistent = execution.checkpoint();
@@ -174,6 +191,7 @@ export class MultimerMockTemplateGpu {
         }, weightsValue.blockWeights[block]!, templatePair, pairMask);
         execution.endComputePass(encoder);
         this.device.queue.submit([encoder.finish()]);
+        execution.noteSubmitted();
         error = await this.device.popErrorScope();
         if (error !== null) throw new Error(`WebGPU Multimer template block ${block} failed: ${error.message}`);
         execution.releaseSince(persistent);
@@ -215,20 +233,32 @@ export class MultimerMockTemplateGpu {
       grid = execution.linearGrid(msaRows.elements);
       execution.dispatch(encoder, msaPipeline,
         [msaInputWeight, msaInputBias, msaOutputWeight, msaOutputBias, msaParams, msaRows], grid[0], grid[1]);
-      const pairReadback = execution.createReadback("multimer-template.pair-readback", pairUpdate, encoder);
-      const msaReadback = execution.createReadback("multimer-template.msa-readback", msaRows, encoder);
+      const pairReadback = residentInput === undefined
+        ? execution.createReadback("multimer-template.pair-readback", pairUpdate, encoder) : undefined;
+      const msaReadback = residentInput === undefined
+        ? execution.createReadback("multimer-template.msa-readback", msaRows, encoder) : undefined;
       this.device.queue.submit([encoder.finish()]);
+      execution.noteSubmitted();
       error = await this.device.popErrorScope();
       if (error !== null) throw new Error(`WebGPU Multimer template output failed: ${error.message}`);
+      if (residentInput !== undefined) {
+        retainResidentOutput = true;
+        return {
+          pairUpdate: new Float32Array(0), msaRows: new Float32Array(0),
+          msaMask: new Float32Array(weightsValue.templateRows * length),
+          submissions: weightsValue.blockWeights.length + 2,
+          pairUpdateTensor: pairUpdate, msaRowsTensor: msaRows,
+        };
+      }
       const [pairResult, msaResult] = await Promise.all([
-        execution.mapFloat32(pairReadback), execution.mapFloat32(msaReadback),
+        execution.mapFloat32(pairReadback!), execution.mapFloat32(msaReadback!),
       ]);
       return { pairUpdate: pairResult, msaRows: msaResult,
         msaMask: new Float32Array(weightsValue.templateRows * length),
         submissions: weightsValue.blockWeights.length + 2 };
     } finally {
       if (sharedExecution === undefined) execution.release();
-      else execution.releaseSince(entryCheckpoint);
+      else if (!retainResidentOutput) execution.releaseSince(entryCheckpoint);
     }
   }
 }

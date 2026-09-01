@@ -4,6 +4,7 @@ import { StructureInitializeGpu, type StructureInitializeWeights } from "./initi
 import type { InvariantPointAttentionWeights } from "./ipa.js";
 import type { StructurePostAttentionWeights } from "./iteration.js";
 import { SidechainAnglesGpu, type SidechainWeights } from "./sidechain.js";
+import type { AllocationSnapshot } from "../runtime/allocator.js";
 
 export interface StructureModuleWeights {
   readonly initialize: StructureInitializeWeights;
@@ -15,6 +16,8 @@ export interface StructureModuleWeights {
 export interface StructureModuleInput {
   readonly msaFirstRow: Float32Array;
   readonly pair: Float32Array;
+  /** Pair activation already resident on this device. */
+  readonly pairBuffer?: GPUBuffer;
   readonly mask: Float32Array;
   readonly aatype: Float32Array;
   readonly atom37ToAtom14: Float32Array;
@@ -37,6 +40,8 @@ export interface StructureModuleResult {
   readonly angles: Float32Array;
   readonly unnormalizedAngles: Float32Array;
   readonly elapsedMilliseconds: number;
+  /** Peak for the dominant eight-iteration structure core allocator. */
+  readonly memory?: AllocationSnapshot;
 }
 
 /** Complete eight-iteration AlphaFold structure module. All learned operations and atom geometry execute in WGSL. */
@@ -55,6 +60,7 @@ export class StructureModuleGpu {
     const core = await new StructureCoreGpu(this.device).run({
       activations: initialized.activations,
       pair: input.pair,
+      ...(input.pairBuffer === undefined ? {} : { pairBuffer: input.pairBuffer }),
       mask: input.mask,
       affine: initialized.affine,
       length: input.length,
@@ -86,6 +92,7 @@ export class StructureModuleGpu {
       angles: sidechain.angles,
       unnormalizedAngles: sidechain.unnormalizedAngles,
       elapsedMilliseconds: performance.now() - start,
+      memory: core.memory,
     };
   }
 }

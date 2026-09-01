@@ -168,6 +168,8 @@ export function adaptMultimerInvariantPointAttentionWeights(
 export interface InvariantPointAttentionInput {
   readonly activations: Float32Array;
   readonly pair: Float32Array;
+  /** Optional device-resident pair tensor, avoiding a second pair-sized upload. */
+  readonly pairBuffer?: GPUBuffer;
   readonly mask: Float32Array;
   readonly affine: Float32Array;
   readonly length: number;
@@ -201,7 +203,6 @@ function validateInput(input: InvariantPointAttentionInput): void {
   const featureChannels = input.heads * (input.scalarV + 4 * input.pointV + input.pairChannels);
   const expected = [
     ["activations", input.activations, input.length * input.channels],
-    ["pair", input.pair, input.length * input.length * input.pairChannels],
     ["mask", input.mask, input.length],
     ["affine", input.affine, input.length * 7],
     ["pairNormScale", input.weights.pairNormScale, input.pairChannels],
@@ -226,6 +227,12 @@ function validateInput(input: InvariantPointAttentionInput): void {
     if (!(value instanceof Float32Array) || value.length !== elements || value.byteLength !== elements * 4) {
       throw new RangeError(`${name} must contain exactly ${elements} float32 values`);
     }
+  }
+  if (input.pairBuffer === undefined) {
+    checkedLength("pair", input.pair, input.length * input.length * input.pairChannels);
+  } else if (input.pair.length !== 0
+    && input.pair.length !== input.length * input.length * input.pairChannels) {
+    throw new RangeError("pair must be empty or match the device-resident pair tensor");
   }
 }
 
@@ -366,9 +373,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }`;
 
 const SOFTMAX_SHADER = `${COMMON}
-@group(0) @binding(0) var<storage, read> logits: array<f32>;
+@group(0) @binding(0) var<storage, read_write> logits: array<f32>;
 @group(0) @binding(1) var<uniform> p: Parameters;
-@group(0) @binding(2) var<storage, read_write> output: array<f32>;
 @compute @workgroup_size(1)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let row = id.x;
@@ -378,7 +384,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   for (var k = 0u; k < p.length; k += 1u) { maximum = max(maximum, logits[base + k]); }
   var sum = 0.0;
   for (var k = 0u; k < p.length; k += 1u) { sum += exp(logits[base + k] - maximum); }
-  for (var k = 0u; k < p.length; k += 1u) { output[base + k] = exp(logits[base + k] - maximum) / sum; }
+  for (var k = 0u; k < p.length; k += 1u) { logits[base + k] = exp(logits[base + k] - maximum) / sum; }
 }`;
 
 const SCALAR_FEATURE_SHADER = `${COMMON}
@@ -506,6 +512,7 @@ export class PreparedInvariantPointAttention implements PreparedFields {
   readonly #device: GPUDevice;
   readonly #shape: readonly number[];
   readonly #pairSource: Float32Array;
+  readonly #pairBufferSource: GPUBuffer | undefined;
   readonly #maskSource: Float32Array;
   readonly #weightSource: InvariantPointAttentionWeights;
   readonly #allocations: AllocatedGpuBuffer[];
@@ -517,6 +524,7 @@ export class PreparedInvariantPointAttention implements PreparedFields {
     this.#shape = [input.length, input.channels, input.pairChannels, input.heads,
       input.scalarQk, input.scalarV, input.pointQk, input.pointV, input.multimer === true ? 1 : 0];
     this.#pairSource = input.pair;
+    this.#pairBufferSource = input.pairBuffer;
     this.#maskSource = input.mask;
     this.#weightSource = input.weights;
     this.#allocations = allocations;
@@ -528,7 +536,8 @@ export class PreparedInvariantPointAttention implements PreparedFields {
     const shape = [input.length, input.channels, input.pairChannels, input.heads,
       input.scalarQk, input.scalarV, input.pointQk, input.pointV, input.multimer === true ? 1 : 0];
     if (device !== this.#device || shape.some((value, index) => value !== this.#shape[index])
-      || input.pair !== this.#pairSource || input.mask !== this.#maskSource || input.weights !== this.#weightSource) {
+      || input.pair !== this.#pairSource || input.pairBuffer !== this.#pairBufferSource
+      || input.mask !== this.#maskSource || input.weights !== this.#weightSource) {
       throw new Error("prepared invariant point attention state does not match this input");
     }
   }
@@ -547,9 +556,9 @@ export class InvariantPointAttentionGpu {
   readonly device: GPUDevice;
   readonly allocator: GpuBufferAllocator;
   readonly pipelines: ComputePipelineCache;
-  constructor(device: GPUDevice) {
+  constructor(device: GPUDevice, allocator = new GpuBufferAllocator(device)) {
     this.device = device;
-    this.allocator = new GpuBufferAllocator(device);
+    this.allocator = allocator;
     this.pipelines = pipelineCacheForDevice(device);
   }
 
@@ -606,7 +615,9 @@ export class InvariantPointAttentionGpu {
       let pairSource: AllocatedGpuBuffer | undefined;
       let pairNormParams: AllocatedGpuBuffer | undefined;
       try {
-        pairSource = this.allocator.upload("ipa.pair", input.pair, GPUBufferUsage.STORAGE);
+        if (input.pairBuffer === undefined) {
+          pairSource = this.allocator.upload("ipa.pair", input.pair, GPUBufferUsage.STORAGE);
+        }
         pairNormParams = this.allocator.upload("ipa.pair-norm-parameters", createAttentionNormParameters(
           input.length * input.length, input.pairChannels, packed.offsets[0]!, packed.offsets[1]!,
           false, 1, input.length * input.length, 1e-5,
@@ -616,8 +627,8 @@ export class InvariantPointAttentionGpu {
         compute.setPipeline(pipelines[0]!);
         compute.setBindGroup(0, this.device.createBindGroup({
           layout: pipelines[0]!.getBindGroupLayout(0),
-          entries: [pairSource, weights, pairNormParams, pair].map((buffer, binding) =>
-            ({ binding, resource: { buffer: buffer.buffer } })),
+          entries: [input.pairBuffer ?? pairSource!.buffer, weights.buffer, pairNormParams.buffer, pair.buffer]
+            .map((buffer, binding) => ({ binding, resource: { buffer } })),
         }));
         const rows = input.length * input.length;
         compute.dispatchWorkgroups(Math.min(rows, GRID_WIDTH), Math.ceil(rows / GRID_WIDTH));
@@ -651,7 +662,9 @@ export class InvariantPointAttentionGpu {
    * The eight structure iterations differ only in their activations and frame,
    * so keeping them on the device lets the whole loop share one command buffer
    * instead of a submission, a fence and a readback per iteration. Scratch is
-   * returned rather than released, because it stays live until submission.
+   * returned so the caller can retire it after its final encoded use. A pooled
+   * allocator may then safely alias it in later dispatches in the same pass;
+   * command ordering preserves the earlier reads and writes.
    */
   encode(
     pass: GPUComputePassEncoder,
@@ -678,7 +691,6 @@ export class InvariantPointAttentionGpu {
     const kvPoint = allocate("ipa.kv-point", input.length * input.heads * (input.pointQk + input.pointV) * 3);
     const attentionElements = input.heads * input.length * input.length;
     const logits = allocate("ipa.logits", attentionElements);
-    const attention = allocate("ipa.attention", attentionElements);
     const features = allocate("ipa.features", input.length * featureChannels);
     const output = this.allocator.allocate("ipa.output", input.length * input.channels * 4,
       GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
@@ -710,12 +722,12 @@ export class InvariantPointAttentionGpu {
     const attentionGrid = gridFor(attentionElements);
     dispatch(pipelines[3]!, [queryScalar, kvScalar, queryPoint, kvPoint, pair, mask, weights, params, logits],
       attentionGrid[0], attentionGrid[1]);
-    dispatch(pipelines[4]!, [logits, params, attention], input.heads * input.length);
-    dispatch(pipelines[5]!, [attention, kvScalar, params, features],
+    dispatch(pipelines[4]!, [logits, params], input.heads * input.length);
+    dispatch(pipelines[5]!, [logits, kvScalar, params, features],
       Math.ceil(input.length * input.heads * input.scalarV / 64));
-    dispatch(pipelines[6]!, [attention, kvPoint, affine, params, features],
+    dispatch(pipelines[6]!, [logits, kvPoint, affine, params, features],
       Math.ceil(input.length * input.heads * input.pointV / 64));
-    dispatch(pipelines[7]!, [attention, pair, params, features],
+    dispatch(pipelines[7]!, [logits, pair, params, features],
       Math.ceil(input.length * input.heads * input.pairChannels / 64));
     dispatch(pipelines[1]!, [features, weights, shared.outputParams, output],
       Math.ceil(input.channels / TRANSITION_TILE_COLUMNS), Math.ceil(input.length / TRANSITION_TILE_ROWS));

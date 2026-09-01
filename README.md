@@ -334,7 +334,7 @@ site-size ceiling before upload.
 - Monomer `model_1_ptm` and no-template `model_1_multimer_v3` are supported with fixed model channel sizes. Monomer accepts float32 and qualified mixed block-int8 storage; Multimer accepts float32 and the qualified mixed-f16 bundle. Neural-network arithmetic remains float32 after one-time weight decoding.
 - Multimer A3M sampling, masking, and clustering reproduce the JAX/ColabFold `process_features` keys and ordering. The monomer A3M path uses a deterministic application PRNG and remains distribution-equivalent rather than reproducing TensorFlow's private RNG stream.
 - ColabFold paired/unpaired Multimer MSA preprocessing and serialized complex A3M upload are supported. Searched/custom Multimer templates, models 2–5, sub-eight-bit weight formats, and result relaxation are not supported; ColabFold's learned no-search mock-template path is included.
-- Holding pair state on the GPU through confidence and recycle boundaries, plus renewed Apple-GPU profiling after the kernel rewrites, remain opportunities to improve speed and peak memory.
+- Pair state remains GPU-resident through structure, confidence, and recycle boundaries. The PAE confidence head uses a fixed 16 MiB logits window and GPU-side expectation reduction instead of materializing and reading back the full `L² × 64` tensor. Renewed Apple-GPU profiling after these kernel rewrites remains release work.
 
 ## Acknowledgments and citation
 

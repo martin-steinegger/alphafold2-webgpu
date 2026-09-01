@@ -85,6 +85,7 @@ export class EvoformerStackGpu {
         execution.endComputePass(encoder);
         const pendingProfile = profiling ? execution.finishTimestampProfile(encoder) : undefined;
         this.device.queue.submit([encoder.finish()]);
+        execution.noteSubmitted();
         const validationError = await this.device.popErrorScope();
         if (validationError !== null) {
           throw new Error(`WebGPU block ${block} validation failed: ${validationError.message}`);
@@ -106,6 +107,7 @@ export class EvoformerStackGpu {
       const msaReadback = execution.createReadback("stack.msa-readback", msa, encoder);
       const pairReadback = execution.createReadback("stack.pair-readback", pair, encoder);
       this.device.queue.submit([encoder.finish()]);
+      execution.noteSubmitted();
       const [msaOutput, pairOutput] = await Promise.all([
         execution.mapFloat32(msaReadback), execution.mapFloat32(pairReadback),
       ]);
@@ -151,6 +153,7 @@ export class ExtraMsaPairStackGpu {
         );
         execution.endComputePass(encoder);
         this.device.queue.submit([encoder.finish()]);
+        execution.noteSubmitted();
         const validationError = await this.device.popErrorScope();
         if (validationError !== null) {
           throw new Error(`WebGPU extra-MSA block ${block} validation failed: ${validationError.message}`);
@@ -162,6 +165,7 @@ export class ExtraMsaPairStackGpu {
       const encoder = this.device.createCommandEncoder({ label: "extra-msa-pair-stack.readback" });
       const readback = execution.createReadback("extra-stack.pair-readback", pair, encoder);
       this.device.queue.submit([encoder.finish()]);
+      execution.noteSubmitted();
       const output = await execution.mapFloat32(readback);
       return { pair: output, elapsedMilliseconds: performance.now() - start, memory: execution.snapshot() };
     } finally {
@@ -193,6 +197,7 @@ export class ExtraMsaStackGpu {
         await encodeExtraMsaBlock(execution, encoder, input, input.blockWeights[block]!, msa, pair, msaMask, pairMask);
         execution.endComputePass(encoder);
         this.device.queue.submit([encoder.finish()]);
+        execution.noteSubmitted();
         const validationError = await this.device.popErrorScope();
         if (validationError !== null) throw new Error(`WebGPU extra-MSA block ${block} failed: ${validationError.message}`);
         execution.releaseSince(persistentCheckpoint);
@@ -201,6 +206,7 @@ export class ExtraMsaStackGpu {
       const msaReadback = execution.createReadback("extra-full-stack.msa-readback", msa, encoder);
       const pairReadback = execution.createReadback("extra-full-stack.pair-readback", pair, encoder);
       this.device.queue.submit([encoder.finish()]);
+      execution.noteSubmitted();
       const [msaOutput, pairOutput] = await Promise.all([
         execution.mapFloat32(msaReadback), execution.mapFloat32(pairReadback),
       ]);

@@ -435,6 +435,7 @@ async function encodeTransition(
       Math.ceil(channels / TRANSITION_TILE_COLUMNS), Math.ceil(count / TRANSITION_TILE_ROWS), 1,
       `${label}.second-${rowOffset}`);
   }
+  releaseScratch([normalized, hidden], output);
   return output;
 }
 
@@ -1058,6 +1059,7 @@ export class EvoformerBlockGpu {
       const pairReadback = execution.createReadback("block.pair-readback", pair, encoder);
       const start = performance.now();
       this.device.queue.submit([encoder.finish()]);
+      execution.noteSubmitted();
       const validationError = await this.device.popErrorScope();
       if (validationError !== null) throw new Error(`WebGPU validation failed: ${validationError.message}`);
       const [msaOutput, pairOutput] = await Promise.all([
@@ -1120,6 +1122,7 @@ export class GlobalAttentionGpu {
       const readback = execution.createReadback("global-attention.readback", output, encoder);
       const start = performance.now();
       this.device.queue.submit([encoder.finish()]);
+      execution.noteSubmitted();
       const validationError = await this.device.popErrorScope();
       if (validationError !== null) throw new Error(`WebGPU validation failed: ${validationError.message}`);
       return {

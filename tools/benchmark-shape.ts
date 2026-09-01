@@ -79,7 +79,10 @@ try {
     shape: { length, msaRows, extraRows, recycles },
     elapsedMilliseconds: Math.round(prediction.elapsedMilliseconds),
     millisecondsPerRecycle: Math.round(prediction.elapsedMilliseconds / recycles),
-    peakResidentMiB: Math.round(prediction.memory.peakResidentBytes / 1024 ** 2),
+    peakResidentMiB: Math.round(prediction.memory.combinedPeakResidentBytes / 1024 ** 2),
+    trunkPeakResidentMiB: Math.round(prediction.memory.mainPeakResidentBytes / 1024 ** 2),
+    structureCorePeakMiB: Math.round(prediction.memory.structureCorePeakResidentBytes / 1024 ** 2),
+    confidencePeakMiB: Math.round(prediction.memory.confidencePeakResidentBytes / 1024 ** 2),
     peakConcurrentMiB: Math.round(prediction.memory.peakBytes / 1024 ** 2),
     meanPlddt: Number(prediction.final.confidence.meanPlddt.toFixed(3)),
   }));

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  multimerRankingConfidence, predictedInterfaceTmScore,
+  multimerRankingConfidence, predictedInterfaceTmScore, predictedInterfaceTmScoreFromExpected,
 } from "../src/heads/confidence.js";
 
 describe("AlphaFold-Multimer confidence", () => {
@@ -17,6 +17,11 @@ describe("AlphaFold-Multimer confidence", () => {
     const d0 = 1.24 * Math.cbrt(19 - 15) - 1.8;
     const expected = 1 / (1 + 1 / (d0 * d0));
     expect(predictedInterfaceTmScore(logits, length, breaks, asymId)).toBeCloseTo(expected, 6);
+    const terms = Float32Array.from({ length: length * length }, (_, pair) => {
+      const i = Math.floor(pair / length); const j = pair % length;
+      return asymId[i] === asymId[j] ? 0 : expected;
+    });
+    expect(predictedInterfaceTmScoreFromExpected(terms, length, asymId)).toBeCloseTo(expected, 6);
   });
 
   it("uses the official 0.8 ipTM plus 0.2 pTM ranking", () => {
@@ -27,6 +32,9 @@ describe("AlphaFold-Multimer confidence", () => {
   it("validates chain identifiers", () => {
     expect(() => predictedInterfaceTmScore(
       new Float32Array(12), 2, new Float32Array([0, 2]), new Float32Array([1]),
+    )).toThrow(/asymId/);
+    expect(() => predictedInterfaceTmScoreFromExpected(
+      new Float32Array(4), 2, new Float32Array([1]),
     )).toThrow(/asymId/);
   });
 });
