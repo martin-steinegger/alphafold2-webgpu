@@ -152,7 +152,7 @@ describe.skipIf(!enabled)("complete Evoformer block WebGPU", () => {
       triangleAttentionEnding: ending,
       pairTransition: await transition("pair_transition"),
     };
-    const result = await new EvoformerBlockGpu(device).run({
+    const descriptor = {
       msa,
       pair,
       msaMask: await store.tensor("blockMsaMask"),
@@ -164,12 +164,23 @@ describe.skipIf(!enabled)("complete Evoformer block WebGPU", () => {
       cOuter: outerProductMean.leftBias.length,
       triangleHidden: weights.triangleMultiplicationOutgoing.linearAPBias.length,
       weights,
-    });
+    };
+    const result = await new EvoformerBlockGpu(device).run(descriptor);
     const msaMetrics = errorMetrics(result.msa, await store.tensor("blockExpectedMsa"));
     const pairMetrics = errorMetrics(result.pair, await store.tensor("blockExpectedPair"));
     expect(msaMetrics.meanAbsoluteError).toBeLessThan(5e-5);
     expect(msaMetrics.maxAbsoluteError).toBeLessThan(5e-4);
     expect(pairMetrics.meanAbsoluteError).toBeLessThan(1e-4);
     expect(pairMetrics.maxAbsoluteError).toBeLessThan(1e-3);
-  }, 30_000);
+
+    // Longer chains cover the attention batch in windows. That path never runs
+    // at 59 residues, so force it: windowing partitions the batch and must not
+    // change any value, including for triangle attention, whose pair bias reads
+    // every batch entry and so keeps its normalized input whole.
+    for (const attentionWindowBytes of [64 * 1024, 512 * 1024, 4 * 1024 * 1024]) {
+      const windowed = await new EvoformerBlockGpu(device).run({ ...descriptor, attentionWindowBytes });
+      expect(errorMetrics(windowed.msa, result.msa).maxAbsoluteError).toBe(0);
+      expect(errorMetrics(windowed.pair, result.pair).maxAbsoluteError).toBe(0);
+    }
+  }, 60_000);
 });

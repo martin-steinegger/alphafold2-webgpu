@@ -4,6 +4,8 @@ import {
   ATTENTION_OUTPUT_RESIDUAL_SHADER,
   ATTENTION_PAIR_BIAS_SHADER,
   ATTENTION_PROJECT_SHADER,
+  ATTENTION_WINDOW_TARGET_BYTES,
+  attentionBatchWindow,
   createAttentionNormParameters,
   createAttentionParameters,
   packAttentionWeights,
@@ -80,6 +82,8 @@ export interface EvoformerBlockInput {
   readonly triangleHidden: number;
   /** Multimer-v3 applies outer-product mean before MSA attention. */
   readonly outerProductMeanFirst?: boolean;
+  /** Overrides the attention scratch budget, so tests can force windowing. */
+  readonly attentionWindowBytes?: number;
   readonly weights: EvoformerBlockWeights;
 }
 
@@ -138,6 +142,7 @@ export type TemplatePairBlockWeights = Omit<EvoformerPairBlockWeights, "outerPro
 type EvoformerShape = Pick<
   EvoformerBlockInput,
   "sequences" | "length" | "cM" | "cZ" | "cOuter" | "triangleHidden" | "outerProductMeanFirst"
+  | "attentionWindowBytes"
 >;
 
 const GLOBAL_ATTENTION_COMMON = `
@@ -444,6 +449,7 @@ interface EncodeAttentionOptions {
   readonly pairBias?: AttentionPairBias;
   readonly label: string;
   readonly residualTarget?: GpuTensor;
+  readonly windowBytes?: number | undefined;
 }
 
 async function encodeAttention(
@@ -471,64 +477,105 @@ async function encodeAttention(
       options.residualTarget === undefined ? ATTENTION_OUTPUT_SHADER : ATTENTION_OUTPUT_RESIDUAL_SHADER,
     ),
   ]);
-  const rows = options.batch * options.queries;
-  const elements = rows * options.channels;
+  const wholeRows = options.batch * options.queries;
   const weights = execution.upload(`${options.label}.weights`, packed.data);
-  const params = uniform(execution, `${options.label}.parameters`, createAttentionParameters(descriptor, packed.offsets));
-  const normParams = uniform(execution, `${options.label}.norm-parameters`, createAttentionNormParameters(
-    rows, options.channels, packed.offsets[0]!, packed.offsets[1]!, options.transpose,
-    options.batch, options.queries, 1e-5,
-  ));
-  const normalized = execution.allocate(`${options.label}.normalized`, elements);
-  const query = execution.allocate(`${options.label}.query`, elements);
-  const key = execution.allocate(`${options.label}.key`, elements);
-  const value = execution.allocate(`${options.label}.value`, elements);
-  const gate = execution.allocate(`${options.label}.gate`, elements);
-  const output = options.residualTarget ?? execution.allocate(`${options.label}.output`, elements);
-  let grid = execution.linearGrid(rows, 1);
-  execution.dispatch(encoder, normalize, [options.source, weights, normParams, normalized],
-    grid[0], grid[1], 1,
-    `${options.label}.normalize`);
+  const output = options.residualTarget ?? execution.allocate(
+    `${options.label}.output`, wholeRows * options.channels);
 
-  let normalizedPair = normalized;
-  if (options.pairBias?.source === "separate") {
-    if (options.pairSource === undefined) throw new Error("separate attention pair bias requires a GPU source");
-    normalizedPair = execution.allocate(
-      `${options.label}.pair-normalized`, options.queries * options.queries * options.pairBias.channels,
-    );
-    const pairNormParams = uniform(execution, `${options.label}.pair-norm-parameters`,
+  // Attention is independent across batch entries, so the per-row tensors only
+  // ever have to hold one window of them.
+  const windowBatch = attentionBatchWindow(options.batch, options.queries, options.channels,
+    options.windowBytes ?? ATTENTION_WINDOW_TARGET_BYTES);
+  const windowElements = windowBatch * options.queries * options.channels;
+
+  // A pair bias taken from the normalized input reads every batch entry, so
+  // that one tensor stays whole and the windows read views of it. The others
+  // are still windowed, and nothing is normalized twice.
+  const wholeNormalized = options.pairBias?.source === "normalized-input";
+  const normalized = execution.allocate(`${options.label}.normalized`,
+    wholeNormalized ? wholeRows * options.channels : windowElements);
+  if (wholeNormalized) {
+    const normParams = uniform(execution, `${options.label}.norm-parameters`,
       createAttentionNormParameters(
-        options.queries * options.queries, options.pairBias.channels, packed.offsets[9]!, packed.offsets[10]!,
-        false, 1, options.queries * options.queries, 1e-5,
+        wholeRows, options.channels, packed.offsets[0]!, packed.offsets[1]!, options.transpose,
+        options.batch, options.queries, 1e-5,
       ));
-    grid = execution.linearGrid(options.queries * options.queries, 1);
-    execution.dispatch(encoder, normalize, [options.pairSource, weights, pairNormParams, normalizedPair],
-      grid[0], grid[1], 1, `${options.label}.pair-normalize`);
+    const grid = execution.linearGrid(wholeRows, 1);
+    execution.dispatch(encoder, normalize, [options.source, weights, normParams, normalized],
+      grid[0], grid[1], 1, `${options.label}.normalize`);
   }
+
+  let normalizedPair: GpuTensor | undefined;
   const pairBiasElements = options.pairBias === undefined ? 1 : options.heads * options.queries * options.queries;
   const pairBias = execution.allocate(`${options.label}.pair-bias`, pairBiasElements);
   if (options.pairBias !== undefined) {
-    grid = execution.linearGrid(pairBiasElements);
-    execution.dispatch(encoder, pairProject, [normalizedPair, weights, params, pairBias], grid[0], grid[1], 1,
+    const wholeParams = uniform(execution, `${options.label}.parameters`,
+      createAttentionParameters(descriptor, packed.offsets));
+    let biasSource = normalized;
+    if (options.pairBias.source === "separate") {
+      if (options.pairSource === undefined) throw new Error("separate attention pair bias requires a GPU source");
+      normalizedPair = execution.allocate(
+        `${options.label}.pair-normalized`, options.queries * options.queries * options.pairBias.channels,
+      );
+      const pairNormParams = uniform(execution, `${options.label}.pair-norm-parameters`,
+        createAttentionNormParameters(
+          options.queries * options.queries, options.pairBias.channels, packed.offsets[9]!, packed.offsets[10]!,
+          false, 1, options.queries * options.queries, 1e-5,
+        ));
+      const pairGrid = execution.linearGrid(options.queries * options.queries, 1);
+      execution.dispatch(encoder, normalize, [options.pairSource, weights, pairNormParams, normalizedPair],
+        pairGrid[0], pairGrid[1], 1, `${options.label}.pair-normalize`);
+      biasSource = normalizedPair;
+    }
+    const grid = execution.linearGrid(pairBiasElements);
+    execution.dispatch(encoder, pairProject, [biasSource, weights, wholeParams, pairBias], grid[0], grid[1], 1,
       `${options.label}.pair-bias`);
+    releaseScratch([normalizedPair], output);
   }
-  const projectGrid = gemmGrid(rows, 4 * options.channels);
-  execution.dispatch(encoder, project, [normalized, weights, params, query, key, value, gate],
-    projectGrid[0], projectGrid[1], 1,
-    `${options.label}.project`);
-  // Nothing reads the normalized activations after the projection, and the
-  // attention result is the same shape, so it reuses that allocation. The pair
-  // bias is still live: the flash dispatch below reads it.
-  releaseScratch([normalized, normalizedPair], output);
-  const weighted = execution.allocate(`${options.label}.weighted`, elements);
-  execution.dispatch(encoder, flash, [query, key, value, gate, options.mask, pairBias, params, weighted],
-    Math.ceil(options.queries / flashKernel.queryTile),
-    options.batch, options.heads, `${options.label}.flash`);
-  const outputGrid = gemmGrid(rows, options.channels);
-  execution.dispatch(encoder, outputProject, [weighted, weights, params, output],
-    outputGrid[0], outputGrid[1], 1,
-    `${options.label}.output`);
-  releaseScratch([pairBias, query, key, value, gate, weighted], output);
+
+  const query = execution.allocate(`${options.label}.query`, windowElements);
+  const key = execution.allocate(`${options.label}.key`, windowElements);
+  const value = execution.allocate(`${options.label}.value`, windowElements);
+  const gate = execution.allocate(`${options.label}.gate`, windowElements);
+  // Within a window the normalized input dies at the projection and the
+  // attention result is born at the flash, so one windowed tensor serves both,
+  // and no dispatch binds it in both roles. A whole normalized input can only
+  // be shared this way when there is a single window, since otherwise a later
+  // window still has to read it.
+  const singleWindow = windowBatch >= options.batch;
+  const weighted = wholeNormalized && !singleWindow
+    ? execution.allocate(`${options.label}.weighted`, windowElements) : normalized;
+
+  for (let offset = 0; offset < options.batch; offset += windowBatch) {
+    const count = Math.min(windowBatch, options.batch - offset);
+    const rows = count * options.queries;
+    const params = uniform(execution, `${options.label}.parameters-${offset}`,
+      createAttentionParameters(descriptor, packed.offsets, { offset, count }));
+    let windowNormalized = normalized;
+    if (wholeNormalized) {
+      windowNormalized = execution.view(normalized, offset * options.queries * options.channels,
+        rows * options.channels);
+    } else {
+      const normParams = uniform(execution, `${options.label}.norm-parameters-${offset}`,
+        createAttentionNormParameters(
+          rows, options.channels, packed.offsets[0]!, packed.offsets[1]!, options.transpose,
+          count, options.queries, 1e-5, offset, options.batch,
+        ));
+      const grid = execution.linearGrid(rows, 1);
+      execution.dispatch(encoder, normalize, [options.source, weights, normParams, windowNormalized],
+        grid[0], grid[1], 1, `${options.label}.normalize-${offset}`);
+    }
+    const projectGrid = gemmGrid(rows, 4 * options.channels);
+    execution.dispatch(encoder, project, [windowNormalized, weights, params, query, key, value, gate],
+      projectGrid[0], projectGrid[1], 1, `${options.label}.project-${offset}`);
+    execution.dispatch(encoder, flash, [query, key, value, gate, options.mask, pairBias, params, weighted],
+      Math.ceil(options.queries / flashKernel.queryTile), count, options.heads,
+      `${options.label}.flash-${offset}`);
+    const outputGrid = gemmGrid(rows, options.channels);
+    execution.dispatch(encoder, outputProject, [weighted, weights, params, output],
+      outputGrid[0], outputGrid[1], 1, `${options.label}.output-${offset}`);
+  }
+  releaseScratch([pairBias, normalized, query, key, value, gate, weighted], output);
   return output;
 }
 
@@ -719,6 +766,7 @@ export async function encodeEvoformerBlock(
   msaMask: GpuTensor,
   pairMask: GpuTensor,
 ): Promise<void> {
+  const shapeWindowBytes = input.attentionWindowBytes;
   const applyOuterProductMean = async (): Promise<void> => {
     const update = await encodeOuterProductMean(
       execution, encoder, msa, msaMask, input, input.weights.outerProductMean, pair,
@@ -735,14 +783,16 @@ export async function encodeEvoformerBlock(
       layerNormScale: row.pairLayerNormScale, layerNormOffset: row.pairLayerNormOffset,
       projectionWeight: row.pairProjectionWeight,
     },
-    label: "msa-row-attention", residualTarget: msa,
+    label: "msa-row-attention",
+    windowBytes: shapeWindowBytes, residualTarget: msa,
   });
 
   const column = input.weights.msaColumnAttention;
   await encodeAttention(execution, encoder, {
     source: msa, mask: msaMask, batch: input.length, queries: input.sequences,
     channels: input.cM, heads: column.heads, transpose: true, weights: column.attention,
-    label: "msa-column-attention", residualTarget: msa,
+    label: "msa-column-attention",
+    windowBytes: shapeWindowBytes, residualTarget: msa,
   });
 
   await encodeTransition(
@@ -764,7 +814,8 @@ export async function encodeEvoformerBlock(
     source: pair, mask: pairMask, batch: input.length, queries: input.length,
     channels: input.cZ, heads: starting.heads, transpose: false, weights: starting.attention,
     pairBias: { source: "normalized-input", projectionWeight: starting.pairProjectionWeight },
-    label: "triangle-attention-starting", residualTarget: pair,
+    label: "triangle-attention-starting",
+    windowBytes: shapeWindowBytes, residualTarget: pair,
   });
 
   const ending = input.weights.triangleAttentionEnding;
@@ -772,7 +823,8 @@ export async function encodeEvoformerBlock(
     source: pair, mask: pairMask, batch: input.length, queries: input.length,
     channels: input.cZ, heads: ending.heads, transpose: true, weights: ending.attention,
     pairBias: { source: "normalized-input", projectionWeight: ending.pairProjectionWeight },
-    label: "triangle-attention-ending", residualTarget: pair,
+    label: "triangle-attention-ending",
+    windowBytes: shapeWindowBytes, residualTarget: pair,
   });
 
   await encodeTransition(
@@ -792,6 +844,7 @@ export async function encodeEvoformerPairBlock(
   pairMask: GpuTensor,
   includeOuterProductMean = true,
 ): Promise<void> {
+  const shapeWindowBytes = shape.attentionWindowBytes;
   if (includeOuterProductMean) {
     const update = await encodeOuterProductMean(
       execution, encoder, msa, msaMask, shape, weights.outerProductMean, pair,
@@ -811,7 +864,8 @@ export async function encodeEvoformerPairBlock(
     pairBias: {
       source: "normalized-input", projectionWeight: weights.triangleAttentionStarting.pairProjectionWeight,
     },
-    label: "extra.triangle-attention-starting", residualTarget: pair,
+    label: "extra.triangle-attention-starting",
+    windowBytes: shapeWindowBytes, residualTarget: pair,
   });
   await encodeAttention(execution, encoder, {
     source: pair, mask: pairMask, batch: shape.length, queries: shape.length,
@@ -820,7 +874,8 @@ export async function encodeEvoformerPairBlock(
     pairBias: {
       source: "normalized-input", projectionWeight: weights.triangleAttentionEnding.pairProjectionWeight,
     },
-    label: "extra.triangle-attention-ending", residualTarget: pair,
+    label: "extra.triangle-attention-ending",
+    windowBytes: shapeWindowBytes, residualTarget: pair,
   });
   await encodeTransition(
     execution, encoder, pair, shape.length * shape.length, shape.cZ,
@@ -838,6 +893,7 @@ export async function encodeExtraMsaBlock(
   msaMask: GpuTensor,
   pairMask: GpuTensor,
 ): Promise<void> {
+  const shapeWindowBytes = shape.attentionWindowBytes;
   if (shape.outerProductMeanFirst === true) {
     const update = await encodeOuterProductMean(
       execution, encoder, msa, msaMask, shape, weights.outerProductMean, pair,
@@ -853,7 +909,8 @@ export async function encodeExtraMsaBlock(
       layerNormScale: row.pairLayerNormScale, layerNormOffset: row.pairLayerNormOffset,
       projectionWeight: row.pairProjectionWeight,
     },
-    label: "extra.msa-row-attention", residualTarget: msa,
+    label: "extra.msa-row-attention",
+    windowBytes: shapeWindowBytes, residualTarget: msa,
   });
   await encodeGlobalAttention(
     execution, encoder, msa, msaMask, shape, weights.msaColumnGlobalAttention,

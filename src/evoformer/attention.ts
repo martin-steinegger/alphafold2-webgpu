@@ -114,6 +114,28 @@ function validate(input: AttentionInput): void {
 
 export interface PackedAttentionWeights { readonly data: Float32Array; readonly offsets: readonly number[]; }
 
+/**
+ * Scratch budget for one attention batch window.
+ *
+ * An attention operation holds five tensors of [batch * queries, channels]:
+ * the normalized input, query, key, value and gate. Attention is independent
+ * across batch entries, so covering the batch in windows bounds all five at
+ * once. Windowing costs dispatches, not efficiency: even the narrowest window
+ * this budget produces leaves the projection hundreds of GEMM row tiles tall.
+ */
+export const ATTENTION_WINDOW_TARGET_BYTES = 32 * 1024 * 1024;
+
+export function attentionBatchWindow(
+  batch: number, queries: number, channels: number,
+  budgetBytes: number = ATTENTION_WINDOW_TARGET_BYTES,
+): number {
+  if (![batch, queries, channels, budgetBytes].every((value) => Number.isSafeInteger(value) && value > 0)) {
+    throw new RangeError("attention window dimensions and budget must be positive safe integers");
+  }
+  const bytesPerBatchEntry = queries * channels * Float32Array.BYTES_PER_ELEMENT;
+  return Math.max(1, Math.min(batch, Math.floor(budgetBytes / bytesPerBatchEntry)));
+}
+
 export function packAttentionWeights(input: AttentionInput): PackedAttentionWeights {
   const w = input.weights;
   const tensors: Float32Array[] = [
@@ -134,27 +156,44 @@ export function packAttentionWeights(input: AttentionInput): PackedAttentionWeig
   return { data, offsets };
 }
 
-export function createAttentionParameters(input: AttentionInput, offsets: readonly number[]): Uint32Array {
+/**
+ * @param batchWindow Batch entries covered by this dispatch, and where the
+ * window starts. Defaults to the whole batch.
+ */
+export function createAttentionParameters(
+  input: AttentionInput, offsets: readonly number[],
+  batchWindow: { readonly offset: number; readonly count: number }
+    = { offset: 0, count: input.batch },
+): Uint32Array {
   const pairProjectionIndex = input.pairBias?.source === "separate" ? 11 : 9;
   return new Uint32Array([
-    input.batch, input.queryLength, input.channels, input.heads, input.channels / input.heads,
+    batchWindow.count, input.queryLength, input.channels, input.heads, input.channels / input.heads,
     input.transpose === true ? 1 : 0, input.pairBias === undefined ? 0 : 1,
     offsets[2]!, offsets[3]!, offsets[4]!, offsets[5]!, offsets[6]!, offsets[7]!, offsets[8]!,
     input.pairBias === undefined ? 0 : offsets[pairProjectionIndex]!,
     input.pairBias?.source === "separate" ? input.pairBias.channels : input.channels,
+    batchWindow.offset, input.batch, 0, 0,
   ]);
 }
 
+/**
+ * @param batchOffset First batch entry this dispatch covers, and `batchTotal`
+ * the number in the whole operation. They differ from `batch` only when the
+ * operation is split into windows; `batch` always counts this window.
+ */
 export function createAttentionNormParameters(
   rows: number, channels: number, scale: number, offset: number,
   transpose: boolean, batch: number, queries: number, epsilon: number,
+  batchOffset = 0, batchTotal = batch,
 ): Uint8Array {
-  const buffer = new ArrayBuffer(32);
+  const buffer = new ArrayBuffer(48);
   const view = new DataView(buffer);
   [rows, channels, scale, offset, transpose ? 1 : 0, batch, queries].forEach(
     (value, index) => view.setUint32(index * 4, value, true),
   );
   view.setFloat32(28, epsilon, true);
+  view.setUint32(32, batchOffset, true);
+  view.setUint32(36, batchTotal, true);
   return new Uint8Array(buffer);
 }
 
@@ -162,6 +201,7 @@ export const ATTENTION_NORMALIZE_SHADER = `
 struct NormParameters {
   rows: u32, channels: u32, scale: u32, offset: u32,
   transpose: u32, batch: u32, queries: u32, epsilon: f32,
+  batch_offset: u32, batch_total: u32, padding: vec2<u32>,
 };
 const GRID_WIDTH: u32 = 32768u;
 @group(0) @binding(0) var<storage, read> source: array<f32>;
@@ -171,11 +211,12 @@ const GRID_WIDTH: u32 = 32768u;
 var<workgroup> partial: array<f32, 64>;
 var<workgroup> row_mean: array<f32, 1>;
 
+// Rows are numbered within this batch window; the source holds the whole batch.
 fn source_row(row: u32) -> u32 {
-  if (p.transpose == 0u) { return row; }
-  let b = row / p.queries;
+  let b = p.batch_offset + row / p.queries;
   let q = row % p.queries;
-  return q * p.batch + b;
+  if (p.transpose == 0u) { return b * p.queries + q; }
+  return q * p.batch_total + b;
 }
 
 @compute @workgroup_size(64)
@@ -214,11 +255,14 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
 
 const COMMON = `
 struct Parameters {
+  // batch counts the entries in this window; batch_offset and batch_total
+  // locate it inside the whole operation, which transposed layouts need.
   batch: u32, queries: u32, channels: u32, heads: u32,
   head_dim: u32, transpose: u32, has_pair_bias: u32,
   query_weight: u32, key_weight: u32, value_weight: u32,
   gating_weight: u32, gating_bias: u32, output_weight: u32,
   output_bias: u32, pair_weight: u32, pair_channels: u32,
+  batch_offset: u32, batch_total: u32, padding: vec2<u32>,
 };
 const GRID_WIDTH: u32 = 32768u;
 `;
@@ -232,6 +276,19 @@ const GRID_WIDTH: u32 = 32768u;
  * write. Each invocation's four columns always fall inside one matrix because
  * every AlphaFold projection width is a multiple of four.
  */
+/**
+ * Mask lookup for one batch entry of the current window.
+ *
+ * Shared by every flash variant so the window arithmetic has one definition.
+ * The transposed layout strides by the whole batch, not by the window.
+ */
+const MASK_INDEX = `
+fn mask_index(batch: u32, key_index: u32) -> u32 {
+  let b = p.batch_offset + batch;
+  if (p.transpose == 0u) { return b * p.queries + key_index; }
+  return key_index * p.batch_total + b;
+}`;
+
 export const ATTENTION_PROJECT_SHADER = createTiledGemmShader({
   preamble: `${COMMON}
 @group(0) @binding(0) var<storage, read> source: array<f32>;
@@ -299,10 +356,7 @@ export const ATTENTION_FLASH_SHADER = `${COMMON}
 var<workgroup> partial: array<f32, 32>;
 var<workgroup> state: array<f32, 3>;
 
-fn mask_index(batch: u32, key_index: u32) -> u32 {
-  if (p.transpose == 0u) { return batch * p.queries + key_index; }
-  return key_index * p.batch + batch;
-}
+${MASK_INDEX}
 
 @compute @workgroup_size(32)
 fn main(
@@ -384,10 +438,7 @@ const HD4: u32 = ${vectors}u;
 @group(0) @binding(6) var<uniform> p: Parameters;
 @group(0) @binding(7) var<storage, read_write> output: array<vec4<f32>>;
 
-fn mask_index(batch: u32, key_index: u32) -> u32 {
-  if (p.transpose == 0u) { return batch * p.queries + key_index; }
-  return key_index * p.batch + batch;
-}
+${MASK_INDEX}
 
 @compute @workgroup_size(64)
 fn main(
@@ -452,10 +503,7 @@ ${COMMON}
 var<workgroup> key_tile: array<vec4<f32>, 64>;
 var<workgroup> value_tile: array<vec4<f32>, 64>;
 
-fn mask_index(batch: u32, key_index: u32) -> u32 {
-  if (p.transpose == 0u) { return batch * p.queries + key_index; }
-  return key_index * p.batch + batch;
-}
+${MASK_INDEX}
 
 @compute @workgroup_size(32, 4, 1) @subgroup_size(32)
 fn main(
@@ -565,10 +613,7 @@ ${COMMON}
 var<workgroup> key_tile: array<vec4<f32>, ${keyTile * 8}>;
 var<workgroup> value_tile: array<vec4<f32>, ${keyTile * 8}>;
 
-fn mask_index(batch: u32, key_index: u32) -> u32 {
-  if (p.transpose == 0u) { return batch * p.queries + key_index; }
-  return key_index * p.batch + batch;
-}
+${MASK_INDEX}
 
 @compute @workgroup_size(32, 8, 1) @subgroup_size(32)
 fn main(
@@ -681,10 +726,7 @@ ${COMMON}
 var<workgroup> key_tile: array<vec4<f32>, 256>;
 var<workgroup> value_tile: array<vec4<f32>, 256>;
 
-fn mask_index(batch: u32, key_index: u32) -> u32 {
-  if (p.transpose == 0u) { return batch * p.queries + key_index; }
-  return key_index * p.batch + batch;
-}
+${MASK_INDEX}
 
 @compute @workgroup_size(32, 8, 1) @subgroup_size(32)
 fn main(
@@ -837,8 +879,11 @@ function createAttentionOutputShader(residual: boolean): string {
     columns: "p.channels",
     sourceElement: "source[row * p.heads * p.head_dim + k]",
     weightElement: "weights[p.output_weight + k * p.channels + column]",
-    // Column attention consumes a transposed view, so the result row is remapped.
-    store: `let output_row = select(row, (row % p.queries) * p.batch + row / p.queries, p.transpose != 0u);
+    // Rows are numbered within this batch window, and column attention consumes
+    // a transposed view, so the result row is remapped both ways.
+    store: `let b = p.batch_offset + row / p.queries;
+          let q = row % p.queries;
+          let output_row = select(b * p.queries + q, q * p.batch_total + b, p.transpose != 0u);
           output[output_row * p.channels + column] ${residual ? "+=" : "="}
             element + weights[p.output_bias + column];`,
   });

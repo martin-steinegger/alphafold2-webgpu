@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  ATTENTION_WINDOW_TARGET_BYTES, attentionBatchWindow,
+} from "../src/evoformer/attention.js";
+import {
   OUTER_PRODUCT_BLOCK_LIMIT_BYTES, outerProductMeanRowBlock,
 } from "../src/evoformer/outer-product-mean.js";
 import {
@@ -48,5 +51,27 @@ describe("bounded model scratch tensors", () => {
 
   it("never reports a zero-residue block, however long the chain", () => {
     expect(outerProductMeanRowBlock(65_536, 32)).toBe(1);
+  });
+
+  it("covers the attention batch in one window when its tensors already fit", () => {
+    // 59 residues: row attention over 508 sequences, column attention over 59.
+    expect(attentionBatchWindow(508, 59, 256)).toBe(508);
+    expect(attentionBatchWindow(59, 508, 256)).toBe(59);
+  });
+
+  it("windows the attention batch to stay inside the budget", () => {
+    // Row, column and triangle attention at 384 residues, 256 clustered rows.
+    for (const [batch, queries, channels] of [[256, 384, 256], [384, 256, 256], [384, 384, 128]] as const) {
+      const window = attentionBatchWindow(batch, queries, channels);
+      expect(window).toBeLessThan(batch);
+      expect(window * queries * channels * 4).toBeLessThanOrEqual(ATTENTION_WINDOW_TARGET_BYTES);
+      expect((window + 1) * queries * channels * 4).toBeGreaterThan(ATTENTION_WINDOW_TARGET_BYTES);
+      // Still thousands of rows, so the projection stays a large GEMM.
+      expect(window * queries).toBeGreaterThan(4096);
+    }
+  });
+
+  it("never reports a zero-entry window, however wide the rows", () => {
+    expect(attentionBatchWindow(64, 65_536, 256)).toBe(1);
   });
 });
