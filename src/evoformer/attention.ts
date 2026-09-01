@@ -123,7 +123,7 @@ export interface PackedAttentionWeights { readonly data: Float32Array; readonly 
  * once. Windowing costs dispatches, not efficiency: even the narrowest window
  * this budget produces leaves the projection hundreds of GEMM row tiles tall.
  */
-export const ATTENTION_WINDOW_TARGET_BYTES = 32 * 1024 * 1024;
+export const ATTENTION_WINDOW_TARGET_BYTES = 16 * 1024 * 1024;
 
 export function attentionBatchWindow(
   batch: number, queries: number, channels: number,

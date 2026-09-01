@@ -15,36 +15,59 @@ export interface AllocationSnapshot {
 // scratch under an explicit safety bound.
 export const COMPACT_GPU_POOL_BYTES = 864 * 1024 ** 2;
 
+/**
+ * A retired buffer that no request has taken over within this many submitted
+ * command buffers is destroyed. Every Evoformer block submits at least once
+ * and cycles through the same scratch shapes, so the scratch of the running
+ * phase is always younger than this, while one-shot inputs such as the
+ * embedder's features or a retired alignment do not linger through the trunk.
+ */
+export const POOL_IDLE_GENERATIONS = 4;
+
 interface PooledGpuBuffer {
   readonly buffer: GPUBuffer;
   /** Physical size of the reusable GPUBuffer. */
   readonly byteLength: number;
   readonly usage: GPUBufferUsageFlags;
   readonly key: string;
+  /** Submission generation in which the buffer was retired. */
+  readonly generation: number;
+}
+
+export interface AllocateOptions {
+  /**
+   * Only reuse buffers retired before the last submitted boundary. Queue
+   * writes execute ahead of any command buffer still being encoded, so an
+   * upload must never take over a buffer those pending commands still read.
+   */
+  readonly requireSubmitted?: boolean;
 }
 
 export class AllocatedGpuBuffer {
   readonly buffer: GPUBuffer;
   /** Logical range requested by the tensor using this buffer. */
   readonly byteLength: number;
+  /** Usage the tensor asked for; the physical buffer may carry more. */
   readonly usage: GPUBufferUsageFlags;
   readonly #allocationByteLength: number;
+  readonly #allocationUsage: GPUBufferUsageFlags;
   #allocator: GpuBufferAllocator | undefined;
 
   constructor(allocator: GpuBufferAllocator, buffer: GPUBuffer, byteLength: number,
-    allocationByteLength: number, usage: GPUBufferUsageFlags) {
+    allocationByteLength: number, usage: GPUBufferUsageFlags, allocationUsage: GPUBufferUsageFlags = usage) {
     this.#allocator = allocator;
     this.buffer = buffer;
     this.byteLength = byteLength;
     this.#allocationByteLength = allocationByteLength;
     this.usage = usage;
+    this.#allocationUsage = allocationUsage;
   }
 
   release(): void {
     const allocator = this.#allocator;
     if (allocator === undefined) return;
     this.#allocator = undefined;
-    allocator.noteRelease(this.buffer, this.byteLength, this.#allocationByteLength, this.usage);
+    allocator.noteRelease(this.buffer, this.byteLength, this.#allocationByteLength, this.#allocationUsage);
   }
 }
 
@@ -62,6 +85,7 @@ export class GpuBufferAllocator {
   readonly #pool = new Map<string, PooledGpuBuffer[]>();
   /** Oldest-to-newest insertion order for bounded eviction. */
   readonly #pooledLru = new Set<PooledGpuBuffer>();
+  #generation = 0;
 
   constructor(device: GPUDevice, pooling = false, maxPooledBytes = Number.POSITIVE_INFINITY) {
     if (maxPooledBytes !== Number.POSITIVE_INFINITY
@@ -73,25 +97,27 @@ export class GpuBufferAllocator {
     this.#maxPooledBytes = maxPooledBytes;
   }
 
-  allocate(label: string, requestedBytes: number, usage: GPUBufferUsageFlags): AllocatedGpuBuffer {
+  allocate(
+    label: string, requestedBytes: number, usage: GPUBufferUsageFlags, options: AllocateOptions = {},
+  ): AllocatedGpuBuffer {
     if (!Number.isSafeInteger(requestedBytes) || requestedBytes <= 0) {
       throw new RangeError(`invalid allocation size ${requestedBytes} for ${label}`);
     }
     const byteLength = Math.ceil(requestedBytes / 4) * 4;
-    const key = `${byteLength}:${usage}`;
-    const exactPool = this.#pool.get(key);
-    // An exact match is always preferred. Failing that, the smallest idle
-    // allocation that covers the request is reused rather than creating another
-    // buffer: AlphaFold cycles through a handful of large but unequal shapes,
-    // and exact-size-only pooling kept one retired buffer per distinct shape.
-    let pooledEntry = exactPool?.at(-1);
-    if (pooledEntry === undefined) {
-      for (const candidate of this.#pooledLru) {
-        if (candidate.usage === usage && candidate.byteLength >= byteLength
-          && (pooledEntry === undefined || candidate.byteLength <= pooledEntry.byteLength)) {
-          pooledEntry = candidate;
-        }
-      }
+    // The smallest idle buffer that covers the request and carries every
+    // usage it needs is reused rather than creating another buffer. AlphaFold
+    // cycles through a handful of large but unequal shapes, and matching size
+    // or usage exactly kept one retired buffer per distinct shape and one more
+    // per usage combination: an uploaded template update could never serve as
+    // triangle scratch of the same size. A buffer more than twice the request
+    // is left alone, though: handing a pair-sized buffer to an attention window
+    // only forces the next pair-sized request to create another one.
+    let pooledEntry: PooledGpuBuffer | undefined;
+    for (const candidate of this.#pooledLru) {
+      if ((candidate.usage & usage) !== usage || candidate.byteLength < byteLength
+        || candidate.byteLength > 2 * byteLength) continue;
+      if (options.requireSubmitted === true && candidate.generation >= this.#generation) continue;
+      if (pooledEntry === undefined || candidate.byteLength < pooledEntry.byteLength) pooledEntry = candidate;
     }
     let buffer = pooledEntry?.buffer;
     if (pooledEntry !== undefined) {
@@ -105,6 +131,7 @@ export class GpuBufferAllocator {
       this.#pooledBytes -= pooledEntry.byteLength;
     }
     const allocationByteLength = pooledEntry?.byteLength ?? byteLength;
+    const allocationUsage = pooledEntry?.usage ?? usage;
     if (buffer === undefined) {
       buffer = this.device.createBuffer({ label, size: byteLength, usage });
       this.#residentBytes += byteLength;
@@ -114,11 +141,12 @@ export class GpuBufferAllocator {
     this.#currentBytes += byteLength;
     this.#peakBytes = Math.max(this.#peakBytes, this.#currentBytes);
     this.#allocationCount += 1;
-    return new AllocatedGpuBuffer(this, buffer, byteLength, allocationByteLength, usage);
+    return new AllocatedGpuBuffer(this, buffer, byteLength, allocationByteLength, usage, allocationUsage);
   }
 
   upload(label: string, data: ArrayBufferView, usage: GPUBufferUsageFlags): AllocatedGpuBuffer {
-    const allocation = this.allocate(label, data.byteLength, usage | GPUBufferUsage.COPY_DST);
+    const allocation = this.allocate(label, data.byteLength, usage | GPUBufferUsage.COPY_DST,
+      { requireSubmitted: true });
     if (data.byteLength % 4 === 0) {
       this.device.queue.writeBuffer(allocation.buffer, 0, data.buffer, data.byteOffset, data.byteLength);
     } else {
@@ -143,7 +171,7 @@ export class GpuBufferAllocator {
       // its idle cap transiently within one command buffer.
       const key = `${allocationByteLength}:${usage}`;
       const pooled = this.#pool.get(key) ?? [];
-      const entry = { buffer, byteLength: allocationByteLength, usage, key };
+      const entry = { buffer, byteLength: allocationByteLength, usage, key, generation: this.#generation };
       pooled.push(entry);
       this.#pool.set(key, pooled);
       this.#pooledLru.add(entry);
@@ -164,9 +192,28 @@ export class GpuBufferAllocator {
     while (this.#pooledBytes > this.#maxPooledBytes) this.#evictOldestPooled();
   }
 
+  /**
+   * Mark a submitted boundary: every buffer retired so far may now be taken
+   * over by queue writes as well as by later dispatches, and the idle cap is
+   * enforced.
+   */
+  noteSubmitted(): void {
+    this.#generation += 1;
+    // Insertion order is retirement order, so the stale entries lead the LRU.
+    for (const entry of this.#pooledLru) {
+      if (entry.generation + POOL_IDLE_GENERATIONS > this.#generation) break;
+      this.#evictPooled(entry);
+    }
+    this.trimPooled();
+  }
+
   #evictOldestPooled(): void {
     const entry = this.#pooledLru.values().next().value as PooledGpuBuffer | undefined;
     if (entry === undefined) throw new Error("GPU allocator pool accounting mismatch");
+    this.#evictPooled(entry);
+  }
+
+  #evictPooled(entry: PooledGpuBuffer): void {
     this.#pooledLru.delete(entry);
     const pooled = this.#pool.get(entry.key);
     if (pooled === undefined) throw new Error("GPU allocator pool key missing during eviction");

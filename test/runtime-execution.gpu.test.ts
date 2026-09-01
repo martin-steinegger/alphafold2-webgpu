@@ -23,8 +23,12 @@ describe.skipIf(!enabled)("WebGPU bounded buffer reuse", () => {
     try {
       const dataUsage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC;
       const usage = dataUsage | GPUBufferUsage.COPY_DST;
-      const workspace = execution.allocate("oversized-workspace", 16, usage);
+      // Twice the upload's size: the pool reuses larger buffers up to that ratio.
+      const workspace = execution.allocate("oversized-workspace", 8, usage);
       workspace.allocation.release();
+      // Uploads only take over buffers retired before a submitted boundary,
+      // because the queue write would land ahead of commands still encoding.
+      execution.noteSubmitted();
       const base = execution.upload("base", new Float32Array([1, 2, 3, 4]), dataUsage);
       const update = execution.upload("update", new Float32Array([0.5, -1, 3, -1]));
       expect(base.allocation.buffer).toBe(workspace.allocation.buffer);

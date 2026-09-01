@@ -521,24 +521,33 @@ async function encodeAttention(
   if (options.pairBias !== undefined) {
     if (options.pairBias.source === "separate") {
       if (options.pairSource === undefined) throw new Error("separate attention pair bias requires a GPU source");
-      normalizedPair = execution.allocate(
-        `${options.label}.pair-normalized`, options.queries * options.queries * options.pairBias.channels,
-      );
-      const pairNormParams = uniform(execution, `${options.label}.pair-norm-parameters`,
-        createAttentionNormParameters(
-          options.queries * options.queries, options.pairBias.channels, packed.offsets[9]!, packed.offsets[10]!,
-          false, 1, options.queries * options.queries, 1e-5,
-        ));
-      const pairGrid = execution.linearGrid(options.queries * options.queries, 1);
-      execution.dispatch(encoder, normalize, [options.pairSource, weights, pairNormParams, normalizedPair],
-        pairGrid[0], pairGrid[1], 1, `${options.label}.pair-normalize`);
-      // The separate source spans every query pair at once, so one dispatch
-      // covers the whole bias.
-      const wholeParams = uniform(execution, `${options.label}.parameters-whole`,
-        createAttentionParameters(descriptor, packed.offsets, { offset: 0, count: options.queries }));
-      const grid = execution.linearGrid(pairBiasElements);
-      execution.dispatch(encoder, pairProject, [normalizedPair, weights, wholeParams, pairBias],
-        grid[0], grid[1], 1, `${options.label}.pair-bias`);
+      // The separate source is the pair itself. Its normalization is only an
+      // input to the bias projection, so it is produced one window of pair
+      // rows at a time rather than as a whole pair-shaped tensor.
+      const channels = options.pairBias.channels;
+      const rowElements = options.queries * channels;
+      const pairWindowRows = Math.max(1, Math.min(options.queries, Math.floor(
+        (options.windowBytes ?? ATTENTION_WINDOW_TARGET_BYTES) / (rowElements * Float32Array.BYTES_PER_ELEMENT),
+      )));
+      normalizedPair = execution.allocate(`${options.label}.pair-normalized`, pairWindowRows * rowElements);
+      for (let offset = 0; offset < options.queries; offset += pairWindowRows) {
+        const count = Math.min(pairWindowRows, options.queries - offset);
+        const rows = count * options.queries;
+        const pairNormParams = uniform(execution, `${options.label}.pair-norm-parameters-${offset}`,
+          createAttentionNormParameters(
+            rows, channels, packed.offsets[9]!, packed.offsets[10]!, false, 1, rows, 1e-5,
+          ));
+        const target = execution.view(normalizedPair, 0, rows * channels);
+        const pairGrid = execution.linearGrid(rows, 1);
+        execution.dispatch(encoder, normalize, [
+          execution.view(options.pairSource, offset * rowElements, rows * channels), weights, pairNormParams, target,
+        ], pairGrid[0], pairGrid[1], 1, `${options.label}.pair-normalize-${offset}`);
+        const params = uniform(execution, `${options.label}.pair-parameters-${offset}`,
+          createAttentionParameters(descriptor, packed.offsets, { offset, count }));
+        const grid = execution.linearGrid(options.heads * rows);
+        execution.dispatch(encoder, pairProject, [target, weights, params, pairBias],
+          grid[0], grid[1], 1, `${options.label}.pair-bias-${offset}`);
+      }
       releaseScratch([normalizedPair], output);
     } else {
       // The bias is read by every window's attention but is derived from the
@@ -731,8 +740,12 @@ async function encodeOuterProductMean(
  * The step holds a block of the normalized pair, a block of one projection and
  * a block of the contraction, so the budget is shared between the widest of
  * them. The other projection, or the accumulated contraction, stays whole.
+ *
+ * Every block streams that whole tensor again, so smaller blocks trade
+ * bandwidth for memory: at 384 residues, 16 MiB blocks cost 2.7% of the
+ * recycle against 24 MiB blocks and free 32 MiB; 12 MiB blocks cost 4%.
  */
-export const TRIANGLE_BLOCK_TARGET_BYTES = 24 * 1024 * 1024;
+export const TRIANGLE_BLOCK_TARGET_BYTES = 16 * 1024 * 1024;
 
 export function triangleBlockRows(
   length: number, cZ: number, triangleHidden: number,

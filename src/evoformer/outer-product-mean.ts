@@ -327,7 +327,7 @@ export const OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_RESIDUAL_SHADER =
  * normalized copy only has to exist one window at a time. Windows are a
  * multiple of 64 rows so the mask view stays on a valid binding offset.
  */
-export const OUTER_PRODUCT_NORMALIZE_WINDOW_BYTES = 32 * 1024 * 1024;
+export const OUTER_PRODUCT_NORMALIZE_WINDOW_BYTES = 16 * 1024 * 1024;
 
 export function outerProductMeanNormalizeWindow(
   rows: number, cM: number, budgetBytes: number = OUTER_PRODUCT_NORMALIZE_WINDOW_BYTES,
@@ -341,7 +341,7 @@ export function outerProductMeanNormalizeWindow(
   return Math.max(alignment, Math.min(rows, aligned));
 }
 
-export const OUTER_PRODUCT_BLOCK_LIMIT_BYTES = 64 * 1024 * 1024;
+export const OUTER_PRODUCT_BLOCK_LIMIT_BYTES = 32 * 1024 * 1024;
 
 export function outerProductMeanRowBlock(
   length: number, cOuter: number, budgetBytes: number = OUTER_PRODUCT_BLOCK_LIMIT_BYTES,

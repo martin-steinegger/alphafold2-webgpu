@@ -17,8 +17,8 @@ describe("bounded model scratch tensors", () => {
     // Chunk starts must land on a valid binding offset and a whole GEMM tile.
     expect(chunkRows * 256 * 4 % 256).toBe(0);
     expect(chunkRows % TRANSITION_TILE_ROWS).toBe(0);
-    // Still hundreds of GEMM row tiles, so chunking costs dispatches, not efficiency.
-    expect(chunkRows / TRANSITION_TILE_ROWS).toBeGreaterThan(64);
+    // Still dozens of GEMM row tiles, so chunking costs dispatches, not efficiency.
+    expect(chunkRows / TRANSITION_TILE_ROWS).toBeGreaterThanOrEqual(64);
   });
 
   it("bounds the window by the budget even when the device would allow more", () => {
@@ -54,9 +54,13 @@ describe("bounded model scratch tensors", () => {
   });
 
   it("covers the attention batch in one window when its tensors already fit", () => {
-    // 59 residues: row attention over 508 sequences, column attention over 59.
-    expect(attentionBatchWindow(508, 59, 256)).toBe(508);
-    expect(attentionBatchWindow(59, 508, 256)).toBe(59);
+    // 59 residues: row attention over 256 sequences, column attention over 59.
+    expect(attentionBatchWindow(256, 59, 256)).toBe(256);
+    expect(attentionBatchWindow(59, 256, 256)).toBe(59);
+    // The full 508-row alignment no longer fits the budget and is split.
+    const window = attentionBatchWindow(508, 59, 256);
+    expect(window).toBeLessThan(508);
+    expect(window * 59 * 256 * 4).toBeLessThanOrEqual(ATTENTION_WINDOW_TARGET_BYTES);
   });
 
   it("windows the attention batch to stay inside the budget", () => {

@@ -44,7 +44,7 @@ export const TRANSITION_TILE_ROWS = GEMM_TILE_ROWS;
  * hundreds of GEMM tiles tall, so the window is bounded by this budget rather
  * than by whatever binding size the device happens to allow.
  */
-export const TRANSITION_CHUNK_TARGET_BYTES = 32 * 1024 * 1024;
+export const TRANSITION_CHUNK_TARGET_BYTES = 16 * 1024 * 1024;
 
 const gcd = (left: number, right: number): number => {
   let a = left; let b = right;

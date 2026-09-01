@@ -63,6 +63,45 @@ describe("GPU buffer pooling", () => {
     allocator.destroyPooled();
   });
 
+  it("reuses a retired buffer whose usage covers the request", () => {
+    const buffers: { destroy: ReturnType<typeof vi.fn> }[] = [];
+    const device = { createBuffer: vi.fn(() => {
+      const buffer = { destroy: vi.fn() }; buffers.push(buffer); return buffer;
+    }) } as unknown as GPUDevice;
+    const allocator = new GpuBufferAllocator(device, true);
+    // An uploaded tensor (storage | copy-dst) retires, then plain storage
+    // scratch of the same size takes the buffer over instead of creating one.
+    allocator.allocate("uploaded", 32, 1 | 8).release();
+    const scratch = allocator.allocate("scratch", 32, 1);
+    expect(scratch.buffer).toBe(buffers[0]);
+    expect(buffers.length).toBe(1);
+    // Retiring it keeps the physical usage, so a later upload can reuse it too.
+    scratch.release();
+    allocator.noteSubmitted();
+    expect(allocator.allocate("uploaded-again", 32, 1 | 8).buffer).toBe(buffers[0]);
+    expect(buffers.length).toBe(1);
+    allocator.destroyPooled();
+  });
+
+  it("lets uploads reuse only buffers retired before the last submitted boundary", () => {
+    const buffers: { destroy: ReturnType<typeof vi.fn> }[] = [];
+    const device = { createBuffer: vi.fn(() => {
+      const buffer = { destroy: vi.fn() }; buffers.push(buffer); return buffer;
+    }) } as unknown as GPUDevice;
+    const allocator = new GpuBufferAllocator(device, true);
+    allocator.allocate("scratch", 32, 1 | 8).release();
+    // Commands encoded before this point may still read the retired buffer,
+    // and a queue write would land ahead of them.
+    expect(allocator.allocate("upload", 32, 1 | 8, { requireSubmitted: true }).buffer).toBe(buffers[1]);
+    expect(allocator.allocate("dispatch-written", 32, 1 | 8).buffer).toBe(buffers[0]);
+    allocator.allocate("retired-early", 32, 1 | 8).release();
+    allocator.noteSubmitted();
+    expect(allocator.allocate("upload-after-submit", 32, 1 | 8, { requireSubmitted: true }).buffer)
+      .toBe(buffers[2]);
+    expect(buffers.length).toBe(3);
+    allocator.destroyPooled();
+  });
+
   it("never reuses an allocation whose usage flags differ", () => {
     const buffers: { destroy: ReturnType<typeof vi.fn> }[] = [];
     const device = { createBuffer: vi.fn(() => {

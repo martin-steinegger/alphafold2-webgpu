@@ -361,6 +361,10 @@ export class AlphaFoldMonomerGpu {
           extraSubmissions += 1;
         }
         releaseTensor(embedding.extraMsa); releaseTensor(extraMsaMask);
+        // The extra stack's retired scratch would otherwise sit in the pool
+        // beside the main stack's while the clustered MSA comes to life; the
+        // main stack recreates the shapes it shares once.
+        execution.allocator.destroyPooled();
         let clusteredMsa = multimerMsa;
         if (clusteredMsa === undefined) {
           const msaEncoder = this.device.createCommandEncoder({ label: `monomer.msa-embedding-${recycle}` });
@@ -430,6 +434,12 @@ export class AlphaFoldMonomerGpu {
         if (multimerMainMsa !== undefined) releaseTensor(multimerMainMsa);
         if (multimerMainMsaMask !== undefined) releaseTensor(multimerMainMsaMask);
         releaseTensor(clusteredMsa);
+        // The trunk is complete and read back, so nothing references its
+        // retired scratch. Dropping the pool here keeps the resident footprint
+        // at the live tensors while the structure module and confidence heads
+        // allocate their own working sets, and between recycles; the next
+        // recycle recreates its handful of large buffers once.
+        execution.allocator.destroyPooled();
 
         const structure = await new StructureModuleGpu(this.device).run({
           msaFirstRow, pair: new Float32Array(0), mask: features.seqMask, aatype: features.aatype,

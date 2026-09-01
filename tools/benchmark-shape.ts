@@ -71,7 +71,11 @@ if (process.env.AFWEBGPU_MEMORY === "1") {
 }
 try {
   const profile = process.env.AFWEBGPU_PROFILE === "1";
-  const prediction = await new AlphaFoldMonomerGpu(device, profile ? { profile: true } : {}).predict(features, {
+  const poolMib = Number(process.env.AFWEBGPU_POOL_MIB ?? "");
+  const prediction = await new AlphaFoldMonomerGpu(device, {
+    ...(profile ? { profile: true } : {}),
+    ...(poolMib > 0 ? { maxPooledBytes: poolMib * 1024 ** 2 } : {}),
+  }).predict(features, {
     embedding, template, extraStack, mainStack, structure,
     lddt: confidence.lddt, pae: confidence.pae, geometry,
   }, await model.tensor("confidencePaeBreaks"));

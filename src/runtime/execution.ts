@@ -235,7 +235,7 @@ export class WebGpuExecution {
   checkpoint(): number { return this.#allocations.length; }
 
   /** Mark a queue-submit boundary at which retired buffers may be destroyed. */
-  noteSubmitted(): void { this.allocator.trimPooled(); }
+  noteSubmitted(): void { this.allocator.noteSubmitted(); }
 
   releaseSince(checkpoint: number): void {
     if (!Number.isSafeInteger(checkpoint) || checkpoint < 0 || checkpoint > this.#allocations.length) {

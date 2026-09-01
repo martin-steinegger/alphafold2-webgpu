@@ -2,7 +2,8 @@ import { COMPACT_GPU_POOL_BYTES } from "./allocator.js";
 import {
   OUTER_PRODUCT_BLOCK_LIMIT_BYTES, outerProductMeanNormalizeWindow, outerProductMeanRowBlock,
 } from "../evoformer/outer-product-mean.js";
-import { attentionBatchWindow } from "../evoformer/attention.js";
+import { ATTENTION_WINDOW_TARGET_BYTES, attentionBatchWindow } from "../evoformer/attention.js";
+import { triangleBlockRows } from "../evoformer/block.js";
 import { TRANSITION_CHUNK_TARGET_BYTES, transitionChunkRows } from "../evoformer/transition.js";
 import { recordSubgroupRange } from "./subgroups.js";
 
@@ -69,10 +70,18 @@ export function estimateMonomerMemory(
   const masks = checkedBytes("model masks", length, msaSequences + extraSequences + length, bytes);
   const positions = checkedBytes("atom positions", length, 37, 3, bytes);
 
-  // Live for the whole trunk: both MSA activations, the pair activation, and
-  // the template pair update, which is computed once and added every recycle.
+  const msaFeatures = checkedBytes("MSA features", msaSequences, length, 49, bytes);
+
+  // Only the pair and the masks are live in every phase. The clustered MSA is
+  // embedded after the extra stack and released after the main stack, the
+  // extra MSA is released before the clustered one exists, and the template
+  // update is uploaded per recycle and released with the embedder's command
+  // buffer, so the trunk carries the pair plus the larger alignment.
   const persistentBytes = checkedBytes("persistent activation estimate", 1,
-    msa + extra + 2 * pair + masks + 2 * positions);
+    pair + Math.max(msa, extra) + masks + 2 * positions);
+  // The embedder writes the new pair over the recycled one and adds the
+  // template update while the extra alignment and the MSA features are live.
+  const embedderBytes = 2 * pair + extra + msaFeatures + masks + 2 * positions;
 
   // Every operation bounds its own scratch against an explicit budget, so the
   // peak is the largest single operation's working set, not a sum over the
@@ -88,19 +97,22 @@ export function estimateMonomerMemory(
     + outerProductMeanNormalizeWindow(sequences * length, channels) * channels * bytes
     + 2 * sequences * length * outer * bytes
     + length * length * bytes;
+  // The hidden width matches the pair width in every released AlphaFold model.
+  const triangleBlock = triangleBlockRows(length, 128, 128) * length * 128 * bytes;
 
+  // Attention over the pair adds a bias of one value per head and query pair,
+  // built from the pair one row window at a time.
+  const pairBias = 8 * length * length * bytes + Math.min(pair, ATTENTION_WINDOW_TARGET_BYTES);
   const operatorScratch = Math.max(
     // Row and column attention over the clustered and extra alignments: the
     // normalized input, query, key, value and gate, one batch window each.
-    attentionScratch(msaSequences, length, 256, 5),
+    attentionScratch(msaSequences, length, 256, 5) + pairBias,
     attentionScratch(length, msaSequences, 256, 5),
-    attentionScratch(extraSequences, length, 64, 5),
-    // Triangle attention keeps its normalized input whole, because its pair
-    // bias reads every batch entry.
-    pair + attentionScratch(length, length, 128, 5),
-    // Triangle multiplication holds two projections and the contraction; the
-    // hidden width matches the pair width in every released AlphaFold model.
-    3 * pair,
+    attentionScratch(extraSequences, length, 64, 5) + pairBias,
+    attentionScratch(length, length, 128, 5) + pairBias,
+    // Triangle multiplication keeps one projection whole and streams the
+    // other projection, the contraction and its normalization in row blocks.
+    pair + 4 * triangleBlock,
     transitionScratch(msaSequences * length, 256, 1024),
     transitionScratch(extraSequences * length, 64, 256),
     transitionScratch(length * length, 128, 512),
@@ -110,7 +122,7 @@ export function estimateMonomerMemory(
   // Readbacks, uniforms and allocation padding, none of which scale with the
   // shape, plus headroom for the operator this model does not enumerate.
   const scratchBytes = Math.ceil(operatorScratch * 1.15) + 16 * 1024 ** 2;
-  const estimatedPeakBytes = persistentBytes + scratchBytes;
+  const estimatedPeakBytes = Math.max(persistentBytes + scratchBytes, embedderBytes + 16 * 1024 ** 2);
   if (![persistentBytes, scratchBytes, estimatedPeakBytes].every(Number.isSafeInteger)) {
     throw new RangeError("monomer aggregate memory estimate exceeds JavaScript precision");
   }
