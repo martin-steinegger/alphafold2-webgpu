@@ -172,16 +172,40 @@ fn normalized_input(pair_row: u32, k: u32) -> f32 {
       sourceElement: "normalized_input(block.x + row, k)",
       weightElement: `select(${weight("G")}, ${weight("P")}, (column & 1u) == 0u)`,
       store: "",
-      storeVector: `let pair_mask = mask[block.x + row];
-      let h = column >> 1u;
-      if (h < CH) {
-        ${operand}[h * ${stride} + ${offset} + row] = pair_mask
-          * (values[0] + ${bias("P", "h")}) * logistic(values[1] + ${bias("G", "h")});
-      }
-      if (h + 1u < CH) {
-        ${operand}[(h + 1u) * ${stride} + ${offset} + row] = pair_mask
-          * (values[2] + ${bias("P", "h + 1u")}) * logistic(values[3] + ${bias("G", "h + 1u")});
-      }`,
+      // The contraction reads the projection channel-major, so a direct store
+      // from the row-major tile would scatter every write across the whole
+      // tensor. Each invocation drops its channel/gate pairs into a staged
+      // transpose instead, thirty-two channels at a time so the staging stays
+      // inside the portable workgroup storage, and the tile is then written out
+      // with adjacent lanes on adjacent pair rows.
+      stageElements: 32 * 64,
+      epilogue: `
+  for (var half = 0u; half < 2u; half += 1u) {
+    if (column_thread >= half * 16u && column_thread < half * 16u + 16u) {
+      let h_local = (column_thread - half * 16u) * 2u;
+      let h = column_origin / 2u + half * 32u + h_local;
+      let bias_p0 = ${bias("P", "h")}; let bias_g0 = ${bias("G", "h")};
+      let bias_p1 = ${bias("P", "h + 1u")}; let bias_g1 = ${bias("G", "h + 1u")};
+${Array.from({ length: 8 }, (_, index) => `      {
+        let r_local = row_thread * 8u + ${index}u;
+        let row = tile_row_origin + r_local;
+        var pair_mask = 0.0;
+        if (row < gemm_rows) { pair_mask = mask[block.x + row]; }
+        gemm_stage[h_local * 64u + r_local] = pair_mask * (acc${index}[0] + bias_p0) * logistic(acc${index}[1] + bias_g0);
+        gemm_stage[(h_local + 1u) * 64u + r_local] = pair_mask * (acc${index}[2] + bias_p1) * logistic(acc${index}[3] + bias_g1);
+      }`).join("\n")}
+    }
+    workgroupBarrier();
+    for (var item = 0u; item < 8u; item += 1u) {
+      let element = thread + item * 256u;
+      let h_local = element / 64u;
+      let r_local = element % 64u;
+      let row = tile_row_origin + r_local;
+      let h = column_origin / 2u + half * 32u + h_local;
+      if (row < gemm_rows && h < CH) { ${operand}[h * ${stride} + ${offset} + row] = gemm_stage[element]; }
+    }
+    workgroupBarrier();
+  }`,
     });
   };
 

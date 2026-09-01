@@ -42,6 +42,17 @@ export interface TiledGemmShader {
    * as a projection and its gate.
    */
   readonly storeVector?: string;
+  /**
+   * A whole-tile epilogue replacing the per-invocation stores. Runs after the
+   * k loop with `acc0`..`acc{rows per invocation - 1}` (vec4<f32> each, four
+   * adjacent columns of one row), `tile_row_origin`, `row_thread`,
+   * `column_thread`, `column_origin`, `thread`, `gemm_rows` and `gemm_columns`
+   * in scope, and `gemm_stage: array<f32, stageElements>` in workgroup storage
+   * for transposing results before storing them. Barriers are permitted: every
+   * invocation of the workgroup runs the epilogue.
+   */
+  readonly epilogue?: string;
+  readonly stageElements?: number;
   /** Narrower tile for outputs that would otherwise waste most of a workgroup. */
   readonly tileColumns?: number;
 }
@@ -81,6 +92,7 @@ export function createTiledGemmShader(shader: TiledGemmShader): string {
 // read-modify-write of the whole vector.
 var<workgroup> gemm_source: array<f32, ${GEMM_TILE_ROWS * GEMM_TILE_INNER}>;
 var<workgroup> gemm_weight: array<vec4<f32>, ${(GEMM_TILE_INNER * tileColumns) / 4}>;
+${shader.epilogue === undefined ? "" : `var<workgroup> gemm_stage: array<f32, ${shader.stageElements ?? 2048}>;`}
 
 @compute @workgroup_size(${GEMM_THREADS}, 1, 1)
 fn main(
@@ -93,7 +105,8 @@ fn main(
   let thread = local.x;
   let column_thread = thread % ${columnThreads}u;
   let row_thread = thread / ${columnThreads}u;
-  let row_origin = group.y * ${GEMM_TILE_ROWS}u + row_thread * ${rowsPerThread}u;
+  let tile_row_origin = group.y * ${GEMM_TILE_ROWS}u;
+  let row_origin = tile_row_origin + row_thread * ${rowsPerThread}u;
   let column_origin = group.x * ${tileColumns}u;
   let tile_column = column_origin + column_thread * 4u;
 ${lines(rowsPerThread, (row) => `  var acc${row} = vec4<f32>(0.0);`)}
@@ -131,7 +144,7 @@ ${lines(rowsPerThread, (row) => `      acc${row} += a${Math.floor(row / 4)}[${ro
     workgroupBarrier();
   }
 
-${lines(rowsPerThread, (index) => `
+${shader.epilogue !== undefined ? shader.epilogue : lines(rowsPerThread, (index) => `
   {
     let row = row_origin + ${index}u;
     if (row < gemm_rows) {
