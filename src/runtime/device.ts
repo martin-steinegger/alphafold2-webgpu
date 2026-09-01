@@ -1,5 +1,9 @@
 import { COMPACT_GPU_POOL_BYTES } from "./allocator.js";
-import { OUTER_PRODUCT_BLOCK_LIMIT_BYTES } from "../evoformer/outer-product-mean.js";
+import {
+  OUTER_PRODUCT_BLOCK_LIMIT_BYTES, outerProductMeanNormalizeWindow, outerProductMeanRowBlock,
+} from "../evoformer/outer-product-mean.js";
+import { attentionBatchWindow } from "../evoformer/attention.js";
+import { TRANSITION_CHUNK_TARGET_BYTES, transitionChunkRows } from "../evoformer/transition.js";
 import { recordSubgroupRange } from "./subgroups.js";
 
 const WEBGPU_BASE_MAX_BUFFER_SIZE = 256 * 1024 * 1024;
@@ -57,6 +61,7 @@ export function estimateMonomerMemory(
     .every((value) => Number.isSafeInteger(value) && value > 0)) {
     throw new RangeError("monomer memory dimensions must be positive safe integers");
   }
+  void transitionMode;
   const bytes = Float32Array.BYTES_PER_ELEMENT;
   const pair = checkedBytes("pair representation", length, length, 128, bytes);
   const msa = checkedBytes("MSA representation", msaSequences, length, 256, bytes);
@@ -64,41 +69,48 @@ export function estimateMonomerMemory(
   const masks = checkedBytes("model masks", length, msaSequences + extraSequences + length, bytes);
   const positions = checkedBytes("atom positions", length, 37, 3, bytes);
 
-  // Previous/current recycle representations coexist during embedding. The
-  // multipliers include residual outputs and pooled buffers retained for reuse.
+  // Live for the whole trunk: both MSA activations, the pair activation, and
+  // the template pair update, which is computed once and added every recycle.
   const persistentBytes = checkedBytes("persistent activation estimate", 1,
-    4 * pair + 4 * msa + 3 * extra + masks + 2 * positions);
-  const transitionRows = transitionMode === "full"
-    ? Math.max(
-      checkedBytes("main transition", msaSequences, length, 1024, bytes),
-      checkedBytes("extra transition", extraSequences, length, 256, bytes),
-      checkedBytes("pair transition", length, length, 512, bytes),
-    )
-    : 96 * 1024 ** 2;
-  const transitionNormalized = transitionMode === "full"
-    ? Math.max(msa, extra, pair)
-    : Math.ceil(transitionRows / 4);
-  const attentionScratch = Math.max(5 * msa, 5 * extra, 6 * pair);
-  const outerTileSequences = Math.min(32, Math.max(msaSequences, extraSequences));
-  const outerProductScratch = checkedBytes(
-    "outer-product scratch", outerTileSequences, length, 32, 128, bytes,
-  ) + checkedBytes("outer-product projections", 2, Math.max(msaSequences, extraSequences), length, 32, bytes)
-    + pair;
+    msa + extra + 2 * pair + masks + 2 * positions);
+
+  // Every operation bounds its own scratch against an explicit budget, so the
+  // peak is the largest single operation's working set, not a sum over the
+  // block. Each term below mirrors what that operation allocates.
+  const attentionScratch = (batch: number, queries: number, channels: number, tensors: number): number =>
+    attentionBatchWindow(batch, queries, channels) * queries * channels * bytes * tensors;
+  const transitionScratch = (rows: number, channels: number, hidden: number): number => {
+    const chunk = transitionChunkRows(rows, channels, hidden, TRANSITION_CHUNK_TARGET_BYTES);
+    return chunk * (channels + hidden) * bytes;
+  };
+  const outerProductScratch = (sequences: number, channels: number, outer: number): number =>
+    outerProductMeanRowBlock(length, outer) * length * outer * outer * bytes
+    + outerProductMeanNormalizeWindow(sequences * length, channels) * channels * bytes
+    + 2 * sequences * length * outer * bytes
+    + length * length * bytes;
+
   const operatorScratch = Math.max(
-    transitionRows + transitionNormalized,
-    attentionScratch,
-    outerProductScratch,
+    // Row and column attention over the clustered and extra alignments: the
+    // normalized input, query, key, value and gate, one batch window each.
+    attentionScratch(msaSequences, length, 256, 5),
+    attentionScratch(length, msaSequences, 256, 5),
+    attentionScratch(extraSequences, length, 64, 5),
+    // Triangle attention keeps its normalized input whole, because its pair
+    // bias reads every batch entry.
+    pair + attentionScratch(length, length, 128, 5),
+    // Triangle multiplication holds two projections and the contraction; the
+    // hidden width matches the pair width in every released AlphaFold model.
+    3 * pair,
+    transitionScratch(msaSequences * length, 256, 1024),
+    transitionScratch(extraSequences * length, 64, 256),
+    transitionScratch(length * length, 128, 512),
+    outerProductScratch(msaSequences, 256, 32),
+    outerProductScratch(extraSequences, 64, 32),
   );
-  // Pipeline parameters, readbacks, alignment padding, and implementation
-  // bookkeeping are deliberately represented by a fixed safety allowance.
-  const scratchBytes = operatorScratch + pair + msaSequences * length * 256 * bytes + 64 * 1024 ** 2;
-  const logicalBytes = persistentBytes + scratchBytes;
-  // Exact-sized unbounded pooling measured a 2.31x resident/model ratio on
-  // GB10. Compact execution bounds idle buffers; its measured live peak needs
-  // a smaller 1.75x allowance plus that explicit pool.
-  const estimatedPeakBytes = transitionMode === "chunked"
-    ? Math.ceil(logicalBytes * 1.75 + COMPACT_GPU_POOL_BYTES)
-    : Math.ceil(logicalBytes * 2.5);
+  // Readbacks, uniforms and allocation padding, none of which scale with the
+  // shape, plus headroom for the operator this model does not enumerate.
+  const scratchBytes = Math.ceil(operatorScratch * 1.15) + 16 * 1024 ** 2;
+  const estimatedPeakBytes = persistentBytes + scratchBytes;
   if (![persistentBytes, scratchBytes, estimatedPeakBytes].every(Number.isSafeInteger)) {
     throw new RangeError("monomer aggregate memory estimate exceeds JavaScript precision");
   }

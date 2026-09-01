@@ -108,3 +108,36 @@ describe("requestAlphaFoldDevice", () => {
     expect(requestDevice).not.toHaveBeenCalled();
   });
 });
+
+describe("estimateMonomerMemory", () => {
+  // Working sets measured on GB10 with the allocator's live-bytes high-water
+  // mark. The estimate gates whether a prediction is allowed to start, so it
+  // has to stay an upper bound without drifting far above what runs: it was
+  // silently 3-5x over once every operation started bounding its own scratch.
+  const measured: ReadonlyArray<readonly [number, number, number, number]> = [
+    [59, 508, 1024, 182], [128, 256, 512, 211], [256, 256, 512, 324],
+    [384, 256, 512, 525], [512, 256, 512, 836],
+  ];
+
+  it("stays an upper bound on the measured working set", () => {
+    for (const [length, msa, extra, workingMib] of measured) {
+      const estimate = estimateMonomerMemory(length, msa, extra, "full").estimatedPeakBytes / 1024 ** 2;
+      expect(estimate, `${length} residues`).toBeGreaterThan(workingMib);
+    }
+  });
+
+  it("does not drift far above what actually runs", () => {
+    for (const [length, msa, extra, workingMib] of measured) {
+      const estimate = estimateMonomerMemory(length, msa, extra, "full").estimatedPeakBytes / 1024 ** 2;
+      expect(estimate / workingMib, `${length} residues`).toBeLessThan(1.6);
+    }
+  });
+
+  it("grows with both alignment depth and chain length", () => {
+    const shallow = estimateMonomerMemory(256, 64, 128, "full").estimatedPeakBytes;
+    const deep = estimateMonomerMemory(256, 512, 1024, "full").estimatedPeakBytes;
+    const longer = estimateMonomerMemory(512, 64, 128, "full").estimatedPeakBytes;
+    expect(deep).toBeGreaterThan(shallow);
+    expect(longer).toBeGreaterThan(shallow);
+  });
+});
