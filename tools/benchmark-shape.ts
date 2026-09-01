@@ -70,7 +70,8 @@ if (process.env.AFWEBGPU_MEMORY === "1") {
   };
 }
 try {
-  const profile = process.env.AFWEBGPU_PROFILE === "1";
+  const profileMode = process.env.AFWEBGPU_PROFILE ?? "";
+  const profile = profileMode !== "";
   const poolMib = Number(process.env.AFWEBGPU_POOL_MIB ?? "");
   const prediction = await new AlphaFoldMonomerGpu(device, {
     ...(profile ? { profile: true } : {}),
@@ -107,6 +108,20 @@ try {
       console.error(`\n== ${name} block ${block.block}: ${total.toFixed(2)} ms x ${blocks} blocks `
         + `= ${(total * blocks / 1000).toFixed(2)} s ==`);
       // Group windows and blocks of the same operation back together.
+      if (profileMode === "raw") {
+        // Per-dispatch labels with only the block index stripped, for kernel-level attribution.
+        const raw = new Map<string, { milliseconds: number; count: number }>();
+        for (const entry of block.entries) {
+          const key = entry.label.replace(/-\d+$/, "");
+          const current = raw.get(key) ?? { milliseconds: 0, count: 0 };
+          current.milliseconds += entry.nanoseconds / 1e6; current.count += 1;
+          raw.set(key, current);
+        }
+        for (const [label, value] of [...raw].sort((a, b) => b[1].milliseconds - a[1].milliseconds).slice(0, 40)) {
+          console.error(`  ${value.milliseconds.toFixed(2).padStart(8)} ms  x${String(value.count).padStart(3)}  ${label}`);
+        }
+        continue;
+      }
       const grouped = new Map<string, { milliseconds: number; count: number }>();
       for (const entry of block.entries) {
         const key = entry.label.replace(/-\d+$/, "").replace(/\.[a-z-]+$/, (suffix) => suffix);

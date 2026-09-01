@@ -373,6 +373,8 @@ export class AlphaFoldMonomerGpu {
           await submit(msaEncoder, `MSA embedding recycle ${recycle}`);
           releaseMsaInputs();
         }
+        // The embedder's inputs retired just now and nothing in the trunk fits them.
+        execution.allocator.destroyPooled();
         const mainMsa = multimerMainMsa ?? clusteredMsa;
 
         const mainDescriptor = {

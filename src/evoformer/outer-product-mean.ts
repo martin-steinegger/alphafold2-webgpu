@@ -341,7 +341,7 @@ export function outerProductMeanNormalizeWindow(
   return Math.max(alignment, Math.min(rows, aligned));
 }
 
-export const OUTER_PRODUCT_BLOCK_LIMIT_BYTES = 32 * 1024 * 1024;
+export const OUTER_PRODUCT_BLOCK_LIMIT_BYTES = 16 * 1024 * 1024;
 
 export function outerProductMeanRowBlock(
   length: number, cOuter: number, budgetBytes: number = OUTER_PRODUCT_BLOCK_LIMIT_BYTES,
