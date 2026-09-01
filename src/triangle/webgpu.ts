@@ -60,9 +60,12 @@ class TriangleMultiplicationGpu {
       input.shape, precision, packedWeights.offsets, input.epsilon ?? 1e-5, this.direction,
     );
     const pipelineKey = `${this.direction}:${precision}:${length}:${cZ}:${cHidden}:${input.epsilon ?? 1e-5}`;
-    const [normalizeInput, projectAB, contract, normalizeHidden, projectOutput] = await Promise.all([
+    const [normalizeInput, projectBlock, projectWhole, contract, normalizeHidden, projectOutput]
+      = await Promise.all([
       this.pipelines.get(`${pipelineKey}:normalize-input`, shaders.normalizeInput),
-      this.pipelines.get(`${pipelineKey}:project-ab`, shaders.projectAB),
+      this.pipelines.get(`${pipelineKey}:project-block`, shaders.projectBlock),
+      shaders.projectWhole === undefined ? Promise.resolve(undefined)
+        : this.pipelines.get(`${pipelineKey}:project-whole`, shaders.projectWhole),
       this.pipelines.get(`${pipelineKey}:contract`, shaders.contract),
       this.pipelines.get(`${pipelineKey}:normalize-hidden`, shaders.normalizeHidden),
       this.pipelines.get(`${pipelineKey}:project-output`, shaders.projectOutput),
@@ -118,14 +121,24 @@ class TriangleMultiplicationGpu {
       };
 
       runPass("normalize-input", normalizeInput, [z.buffer, weights.buffer, zNormalized.buffer], ceilDivide(pairCount, 64));
-      runPass("project-ab", projectAB,
-        [zNormalized.buffer, mask.buffer, weights.buffer, a.buffer, b.buffer],
+      // One block spanning every residue, so every offset is zero.
+      const blockParams = keep(this.allocator.upload("triangle.block",
+        new Uint32Array([0, pairCount, 0, length]), GPUBufferUsage.UNIFORM));
+      if (projectWhole !== undefined) {
+        runPass("project-whole", projectWhole,
+          [zNormalized.buffer, mask.buffer, weights.buffer, b.buffer, blockParams.buffer],
+          ceilDivide(cHidden, 16), ceilDivide(pairCount, 16));
+      }
+      runPass("project-block", projectBlock,
+        [zNormalized.buffer, mask.buffer, weights.buffer,
+          ...(projectWhole === undefined ? [a.buffer, b.buffer] : [a.buffer]), blockParams.buffer],
         ceilDivide(cHidden, 16), ceilDivide(pairCount, 16));
       const contractGrid = gemmGrid(length, length);
-      runPass("contract", contract, [a.buffer, b.buffer, contracted.buffer],
+      runPass("contract", contract, [a.buffer, b.buffer, contracted.buffer, blockParams.buffer],
         contractGrid[0], contractGrid[1], cHidden);
       runPass("normalize-hidden", normalizeHidden,
-        [contracted.buffer, weights.buffer, xNormalized.buffer], ceilDivide(pairCount, 64));
+        [contracted.buffer, weights.buffer, xNormalized.buffer, blockParams.buffer],
+        ceilDivide(pairCount, 64));
       runPass("project-output", projectOutput,
         [zNormalized.buffer, xNormalized.buffer, weights.buffer, output.buffer],
         ceilDivide(cZ, 16), ceilDivide(pairCount, 16));

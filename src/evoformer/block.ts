@@ -491,30 +491,34 @@ async function encodeAttention(
     options.windowBytes ?? ATTENTION_WINDOW_TARGET_BYTES);
   const windowElements = windowBatch * options.queries * options.channels;
 
-  // A pair bias taken from the normalized input reads every batch entry, so
-  // that one tensor stays whole and the windows read views of it. The others
-  // are still windowed, and nothing is normalized twice.
-  const wholeNormalized = options.pairBias?.source === "normalized-input";
-  const normalized = execution.allocate(`${options.label}.normalized`,
-    wholeNormalized ? wholeRows * options.channels : windowElements);
-  if (wholeNormalized) {
-    const normParams = uniform(execution, `${options.label}.norm-parameters`,
-      createAttentionNormParameters(
-        wholeRows, options.channels, packed.offsets[0]!, packed.offsets[1]!, options.transpose,
-        options.batch, options.queries, 1e-5,
-      ));
-    const grid = execution.linearGrid(wholeRows, 1);
-    execution.dispatch(encoder, normalize, [options.source, weights, normParams, normalized],
-      grid[0], grid[1], 1, `${options.label}.normalize`);
+  const normalized = execution.allocate(`${options.label}.normalized`, windowElements);
+  const windows: { readonly offset: number; readonly count: number }[] = [];
+  for (let offset = 0; offset < options.batch; offset += windowBatch) {
+    windows.push({ offset, count: Math.min(windowBatch, options.batch - offset) });
   }
+  const windowParameters = windows.map(({ offset, count }) => ({
+    offset, count,
+    attention: uniform(execution, `${options.label}.parameters-${offset}`,
+      createAttentionParameters(descriptor, packed.offsets, { offset, count })),
+    norm: uniform(execution, `${options.label}.norm-parameters-${offset}`,
+      createAttentionNormParameters(
+        count * options.queries, options.channels, packed.offsets[0]!, packed.offsets[1]!, options.transpose,
+        count, options.queries, 1e-5, offset, options.batch,
+      )),
+  }));
+  const normalizeWindow = (window: (typeof windowParameters)[number]): GpuTensor => {
+    const rows = window.count * options.queries;
+    const target = execution.view(normalized, 0, rows * options.channels);
+    const grid = execution.linearGrid(rows, 1);
+    execution.dispatch(encoder, normalize, [options.source, weights, window.norm, target],
+      grid[0], grid[1], 1, `${options.label}.normalize-${window.offset}`);
+    return target;
+  };
 
   let normalizedPair: GpuTensor | undefined;
   const pairBiasElements = options.pairBias === undefined ? 1 : options.heads * options.queries * options.queries;
   const pairBias = execution.allocate(`${options.label}.pair-bias`, pairBiasElements);
   if (options.pairBias !== undefined) {
-    const wholeParams = uniform(execution, `${options.label}.parameters`,
-      createAttentionParameters(descriptor, packed.offsets));
-    let biasSource = normalized;
     if (options.pairBias.source === "separate") {
       if (options.pairSource === undefined) throw new Error("separate attention pair bias requires a GPU source");
       normalizedPair = execution.allocate(
@@ -528,12 +532,26 @@ async function encodeAttention(
       const pairGrid = execution.linearGrid(options.queries * options.queries, 1);
       execution.dispatch(encoder, normalize, [options.pairSource, weights, pairNormParams, normalizedPair],
         pairGrid[0], pairGrid[1], 1, `${options.label}.pair-normalize`);
-      biasSource = normalizedPair;
+      // The separate source spans every query pair at once, so one dispatch
+      // covers the whole bias.
+      const wholeParams = uniform(execution, `${options.label}.parameters-whole`,
+        createAttentionParameters(descriptor, packed.offsets, { offset: 0, count: options.queries }));
+      const grid = execution.linearGrid(pairBiasElements);
+      execution.dispatch(encoder, pairProject, [normalizedPair, weights, wholeParams, pairBias],
+        grid[0], grid[1], 1, `${options.label}.pair-bias`);
+      releaseScratch([normalizedPair], output);
+    } else {
+      // The bias is read by every window's attention but is derived from the
+      // normalized input one window at a time, so it is built in a pass of its
+      // own first. That costs a second normalization rather than a whole
+      // pair-shaped tensor held across the operation.
+      for (const window of windowParameters) {
+        const source = normalizeWindow(window);
+        const grid = execution.linearGrid(options.heads * window.count * options.queries);
+        execution.dispatch(encoder, pairProject, [source, weights, window.attention, pairBias],
+          grid[0], grid[1], 1, `${options.label}.pair-bias-${window.offset}`);
+      }
     }
-    const grid = execution.linearGrid(pairBiasElements);
-    execution.dispatch(encoder, pairProject, [biasSource, weights, wholeParams, pairBias], grid[0], grid[1], 1,
-      `${options.label}.pair-bias`);
-    releaseScratch([normalizedPair], output);
   }
 
   const query = execution.allocate(`${options.label}.query`, windowElements);
@@ -542,32 +560,15 @@ async function encodeAttention(
   const gate = execution.allocate(`${options.label}.gate`, windowElements);
   // Within a window the normalized input dies at the projection and the
   // attention result is born at the flash, so one windowed tensor serves both,
-  // and no dispatch binds it in both roles. A whole normalized input can only
-  // be shared this way when there is a single window, since otherwise a later
-  // window still has to read it.
-  const singleWindow = windowBatch >= options.batch;
-  const weighted = wholeNormalized && !singleWindow
-    ? execution.allocate(`${options.label}.weighted`, windowElements) : normalized;
+  // and no dispatch binds it in both roles. The next window renormalizes over
+  // it only after this window's output projection has read it.
+  const weighted = normalized;
 
-  for (let offset = 0; offset < options.batch; offset += windowBatch) {
-    const count = Math.min(windowBatch, options.batch - offset);
+  for (const window of windowParameters) {
+    const { offset, count } = window;
     const rows = count * options.queries;
-    const params = uniform(execution, `${options.label}.parameters-${offset}`,
-      createAttentionParameters(descriptor, packed.offsets, { offset, count }));
-    let windowNormalized = normalized;
-    if (wholeNormalized) {
-      windowNormalized = execution.view(normalized, offset * options.queries * options.channels,
-        rows * options.channels);
-    } else {
-      const normParams = uniform(execution, `${options.label}.norm-parameters-${offset}`,
-        createAttentionNormParameters(
-          rows, options.channels, packed.offsets[0]!, packed.offsets[1]!, options.transpose,
-          count, options.queries, 1e-5, offset, options.batch,
-        ));
-      const grid = execution.linearGrid(rows, 1);
-      execution.dispatch(encoder, normalize, [options.source, weights, normParams, windowNormalized],
-        grid[0], grid[1], 1, `${options.label}.normalize-${offset}`);
-    }
+    const params = window.attention;
+    const windowNormalized = normalizeWindow(window);
     const projectGrid = gemmGrid(rows, 4 * options.channels);
     execution.dispatch(encoder, project, [windowNormalized, weights, params, query, key, value, gate],
       projectGrid[0], projectGrid[1], 1, `${options.label}.project-${offset}`);
@@ -724,6 +725,26 @@ async function encodeOuterProductMean(
   return output;
 }
 
+/**
+ * Rows of the blocked residue axis one triangle step covers.
+ *
+ * The step holds a block of the normalized pair, a block of one projection and
+ * a block of the contraction, so the budget is shared between the widest of
+ * them. The other projection, or the accumulated contraction, stays whole.
+ */
+export const TRIANGLE_BLOCK_TARGET_BYTES = 24 * 1024 * 1024;
+
+export function triangleBlockRows(
+  length: number, cZ: number, triangleHidden: number,
+  budgetBytes: number = TRIANGLE_BLOCK_TARGET_BYTES,
+): number {
+  if (![length, cZ, triangleHidden, budgetBytes].every((value) => Number.isSafeInteger(value) && value > 0)) {
+    throw new RangeError("triangle block dimensions must be positive safe integers");
+  }
+  const bytesPerRow = length * Math.max(cZ, triangleHidden) * Float32Array.BYTES_PER_ELEMENT;
+  return Math.max(1, Math.min(length, Math.floor(budgetBytes / bytesPerRow)));
+}
+
 async function encodeTriangleMultiplication(
   execution: WebGpuExecution,
   encoder: GPUCommandEncoder,
@@ -736,11 +757,16 @@ async function encodeTriangleMultiplication(
 ): Promise<GpuTensor> {
   const shape = { length: input.length, cZ: input.cZ, cHidden: input.triangleHidden };
   const packed = packTriangleWeights(weightsValue, "f32");
-  const shaders = createTriangleShaders(shape, "f32", packed.offsets, 1e-5, direction);
-  const pipelineKey = `block:triangle:${direction}:${input.length}:${input.cZ}:${input.triangleHidden}`;
-  const [normalizeInput, projectAB, contract, normalizeHidden, projectOutput] = await Promise.all([
+  const blockRows = triangleBlockRows(input.length, input.cZ, input.triangleHidden,
+    input.scratchWindowBytes ?? TRIANGLE_BLOCK_TARGET_BYTES);
+  const shaders = createTriangleShaders(shape, "f32", packed.offsets, 1e-5, direction, blockRows);
+  const pipelineKey = `block:triangle:${direction}:${input.length}:${input.cZ}`
+    + `:${input.triangleHidden}:${blockRows}`;
+  const [normalizeInput, projectBlock, projectWhole, contract, normalizeHidden, projectOutput] = await Promise.all([
     execution.pipelines.get(`${pipelineKey}:normalize-input`, shaders.normalizeInput),
-    execution.pipelines.get(`${pipelineKey}:project-ab`, shaders.projectAB),
+    execution.pipelines.get(`${pipelineKey}:project-block`, shaders.projectBlock),
+    shaders.projectWhole === undefined ? Promise.resolve(undefined)
+      : execution.pipelines.get(`${pipelineKey}:project-whole`, shaders.projectWhole),
     execution.pipelines.get(`${pipelineKey}:contract`, shaders.contract),
     execution.pipelines.get(`${pipelineKey}:normalize-hidden`, shaders.normalizeHidden),
     execution.pipelines.get(
@@ -751,46 +777,85 @@ async function encodeTriangleMultiplication(
     ),
   ]);
   const pairs = input.length * input.length;
+  const blockPairs = blockRows * input.length;
   const weights = execution.upload(`triangle.${direction}.weights`, packed.data);
   const output = residualTarget ?? execution.allocate(`triangle.${direction}.output`, pairs * input.cZ);
-  // Allocation follows the lifetimes rather than the reading order, so each
-  // tensor's storage is available to the next one.
-  const normalized = execution.allocate(`triangle.${direction}.normalized`, pairs * input.cZ);
-  execution.dispatch(encoder, normalizeInput, [pair, weights, normalized], Math.ceil(pairs / 64), 1, 1,
-    `triangle.${direction}.normalize-input`);
-  const a = execution.allocate(`triangle.${direction}.a`, pairs * input.triangleHidden);
-  const b = execution.allocate(`triangle.${direction}.b`, pairs * input.triangleHidden);
-  execution.dispatch(encoder, projectAB, [normalized, pairMask, weights, a, b],
-    Math.ceil(input.triangleHidden / 16), Math.ceil(pairs / 16), 1,
-    `triangle.${direction}.project`);
-  // The normalized input is read at both ends of the operation and by nothing
-  // in between, and it is the largest tensor otherwise live across the
-  // contraction, so it is dropped here and recomputed below. Recomputing costs
-  // one memory-bound pass over the pair tensor; carrying it costs a whole
-  // pair-shaped tensor at the peak.
-  releaseScratch([normalized], output);
-  const contracted = execution.allocate(`triangle.${direction}.contracted`, pairs * input.triangleHidden);
-  const contractGrid = gemmGrid(input.length, input.length);
-  execution.dispatch(encoder, contract, [a, b, contracted], contractGrid[0],
-    contractGrid[1], input.triangleHidden, `triangle.${direction}.contract`);
-  // The projections die at the contraction and the contraction dies at the
-  // normalization, so the pair-shaped scratch is handed straight back rather
-  // than held for the whole block: two triangle operations run per block, and
-  // each was keeping five tensors of this shape alive.
-  releaseScratch([a, b], output);
-  const hiddenNormalized = execution.allocate(`triangle.${direction}.hidden-normalized`, pairs * input.triangleHidden);
-  execution.dispatch(encoder, normalizeHidden, [contracted, weights, hiddenNormalized], Math.ceil(pairs / 64), 1, 1,
-    `triangle.${direction}.normalize-hidden`);
-  releaseScratch([contracted], output);
-  // The pair tensor is still the value that was normalized: the output
-  // projection below is the first thing to write it.
-  const renormalized = execution.allocate(`triangle.${direction}.normalized`, pairs * input.cZ);
-  execution.dispatch(encoder, normalizeInput, [pair, weights, renormalized], Math.ceil(pairs / 64), 1, 1,
-    `triangle.${direction}.renormalize-input`);
-  execution.dispatch(encoder, projectOutput, [renormalized, hiddenNormalized, weights, output],
-    Math.ceil(input.cZ / 16), Math.ceil(pairs / 16), 1,
-    `triangle.${direction}.output`);
-  releaseScratch([renormalized, hiddenNormalized], output);
+  const blocks: { readonly offset: number; readonly count: number; readonly uniform: GpuTensor }[] = [];
+  for (let offset = 0; offset < input.length; offset += blockRows) {
+    const count = Math.min(blockRows, input.length - offset);
+    blocks.push({ offset, count,
+      uniform: uniform(execution, `triangle.${direction}.block-${offset}`,
+        new Uint32Array([offset * input.length, count * input.length, offset === 0 ? 1 : 0, count])) });
+  }
+
+  // Both projections read the normalized pair, one block of rows at a time, so
+  // only a block of it is ever live.
+  const normalized = execution.allocate(`triangle.${direction}.normalized`, blockPairs * input.cZ);
+  const normalizeBlock = (block: (typeof blocks)[number]): GpuTensor => {
+    const rows = block.count * input.length;
+    const target = execution.view(normalized, 0, rows * input.cZ);
+    execution.dispatch(encoder, normalizeInput,
+      [execution.view(pair, block.offset * input.length * input.cZ, rows * input.cZ), weights, target],
+      Math.ceil(rows / 64), 1, 1, `triangle.${direction}.normalize-input-${block.offset}`);
+    return target;
+  };
+
+  // Outgoing contracts over the second residue index, so the projection indexed
+  // by the first is blocked and the other has to be complete before any block
+  // contracts. Incoming contracts over the first index, so both projections are
+  // blocked and the output accumulates instead.
+  const outgoing = direction === "outgoing";
+  const wholeProjection = outgoing
+    ? execution.allocate(`triangle.${direction}.b`, pairs * input.triangleHidden) : undefined;
+  if (wholeProjection !== undefined && projectWhole !== undefined) {
+    for (const block of blocks) {
+      const source = normalizeBlock(block);
+      execution.dispatch(encoder, projectWhole, [source, pairMask, weights, wholeProjection, block.uniform],
+        Math.ceil(input.triangleHidden / 16), Math.ceil(block.count * input.length / 16), 1,
+        `triangle.${direction}.project-whole-${block.offset}`);
+    }
+  }
+
+  const blockedA = execution.allocate(`triangle.${direction}.a`, blockPairs * input.triangleHidden);
+  const blockedB = outgoing
+    ? undefined : execution.allocate(`triangle.${direction}.b-block`, blockPairs * input.triangleHidden);
+  const contracted = execution.allocate(`triangle.${direction}.contracted`,
+    (outgoing ? blockPairs : pairs) * input.triangleHidden);
+  const hiddenNormalized = execution.allocate(
+    `triangle.${direction}.hidden-normalized`, blockPairs * input.triangleHidden);
+  const finish = (block: (typeof blocks)[number]): void => {
+    const rows = block.count * input.length;
+    execution.dispatch(encoder, normalizeHidden,
+      [contracted, weights, execution.view(hiddenNormalized, 0, rows * input.triangleHidden), block.uniform],
+      Math.ceil(rows / 64), 1, 1, `triangle.${direction}.normalize-hidden-${block.offset}`);
+    // The pair tensor is still the value that was normalized: the output
+    // projection is the first thing to write it.
+    const renormalized = normalizeBlock(block);
+    execution.dispatch(encoder, projectOutput, [
+      renormalized, execution.view(hiddenNormalized, 0, rows * input.triangleHidden), weights,
+      execution.view(output, block.offset * input.length * input.cZ, rows * input.cZ),
+    ], Math.ceil(input.cZ / 16), Math.ceil(rows / 16), 1,
+      `triangle.${direction}.project-output-${block.offset}`);
+  };
+
+  for (const block of blocks) {
+    const source = normalizeBlock(block);
+    const projections = outgoing ? [blockedA] : [blockedA, blockedB!];
+    execution.dispatch(encoder, projectBlock, [source, pairMask, weights, ...projections, block.uniform],
+      Math.ceil(input.triangleHidden / 16), Math.ceil(block.count * input.length / 16), 1,
+      `triangle.${direction}.project-block-${block.offset}`);
+    const contractGrid = outgoing
+      ? gemmGrid(block.count, input.length) : gemmGrid(input.length, input.length);
+    execution.dispatch(encoder, contract,
+      [outgoing ? blockedA : blockedA, outgoing ? wholeProjection! : blockedB!, contracted, block.uniform],
+      contractGrid[0], contractGrid[1], input.triangleHidden, `triangle.${direction}.contract-${block.offset}`);
+    if (outgoing) finish(block);
+  }
+  if (!outgoing) {
+    releaseScratch([blockedA, blockedB], output);
+    for (const block of blocks) finish(block);
+  }
+  releaseScratch([normalized, blockedA, blockedB, wholeProjection, contracted, hiddenNormalized], output);
   return output;
 }
 

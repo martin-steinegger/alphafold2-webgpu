@@ -180,8 +180,16 @@ describe.skipIf(!enabled)("complete Evoformer block WebGPU", () => {
     // and so keeps its normalized input whole.
     for (const scratchWindowBytes of [64 * 1024, 512 * 1024, 4 * 1024 * 1024]) {
       const windowed = await new EvoformerBlockGpu(device).run({ ...descriptor, scratchWindowBytes });
-      expect(errorMetrics(windowed.msa, result.msa).maxAbsoluteError).toBe(0);
-      expect(errorMetrics(windowed.pair, result.pair).maxAbsoluteError).toBe(0);
+      // Every windowed path partitions its axis, so the MSA is untouched.
+      expect(errorMetrics(windowed.msa, result.msa).maxAbsoluteError,
+        `msa at ${scratchWindowBytes} B`).toBe(0);
+      // The incoming triangle multiplication is the one exception: it blocks
+      // the axis it contracts over, so a long dot product is summed in groups
+      // rather than as one running total. That regroups the additions, which is
+      // a rounding difference and nothing else, an order of magnitude inside the
+      // tolerance this block is held to against official AlphaFold above.
+      expect(errorMetrics(windowed.pair, result.pair).maxAbsoluteError,
+        `pair at ${scratchWindowBytes} B`).toBeLessThan(1e-4);
     }
   }, 60_000);
 });

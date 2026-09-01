@@ -329,19 +329,23 @@ export const ATTENTION_PAIR_BIAS_SHADER = `${COMMON}
 @group(0) @binding(2) var<uniform> p: Parameters;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
 
+// The bias source is indexed by its own row, which is the attention batch when
+// the bias comes from the normalized input. p.batch counts the rows in this
+// window and p.batch_offset places them, so a windowed source works unchanged;
+// a separate source passes the whole row count with a zero offset.
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let index = id.x + id.y * GRID_WIDTH * 64u;
-  if (index >= p.heads * p.queries * p.queries) { return; }
+  if (index >= p.heads * p.batch * p.queries) { return; }
   let k = index % p.queries;
-  let q = (index / p.queries) % p.queries;
-  let head = index / (p.queries * p.queries);
+  let row = (index / p.queries) % p.batch;
+  let head = index / (p.queries * p.batch);
   var result = 0.0;
   for (var c = 0u; c < p.pair_channels; c += 1u) {
-    result += pair[(q * p.queries + k) * p.pair_channels + c]
+    result += pair[(row * p.queries + k) * p.pair_channels + c]
       * weights[p.pair_weight + c * p.heads + head];
   }
-  output[index] = result;
+  output[(head * p.queries + p.batch_offset + row) * p.queries + k] = result;
 }`;
 
 export const ATTENTION_FLASH_SHADER = `${COMMON}
@@ -970,6 +974,12 @@ export class AttentionGpu {
       const pairBiasElements = input.pairBias === undefined
         ? 1 : input.heads * input.queryLength * input.queryLength;
       const pairBias = keep(this.allocator.allocate("attention.pair-bias", pairBiasElements * 4, storage));
+      // The bias projection is indexed by its source's rows: the query pairs for
+      // a separate source, the attention batch for the normalized input.
+      const biasRows = input.pairBias?.source === "separate" ? input.queryLength : input.batch;
+      const biasParams = keep(this.allocator.upload("attention.pair-bias-parameters",
+        createAttentionParameters(input, packed.offsets, { offset: 0, count: biasRows }),
+        GPUBufferUsage.UNIFORM));
 
       const encoder = this.device.createCommandEncoder({ label: "attention" });
       this.device.pushErrorScope("validation");
@@ -993,8 +1003,8 @@ export class AttentionGpu {
           grid[0], grid[1]);
       }
       if (input.pairBias !== undefined) {
-        const pairGrid = linearGrid(input.heads * input.queryLength * input.queryLength);
-        pass(pairProject, [pairNormalized.buffer, weights.buffer, params.buffer, pairBias.buffer],
+        const pairGrid = linearGrid(input.heads * biasRows * input.queryLength);
+        pass(pairProject, [pairNormalized.buffer, weights.buffer, biasParams.buffer, pairBias.buffer],
           pairGrid[0], pairGrid[1]);
       }
       const projectGrid = gemmGrid(rows, 4 * input.channels);

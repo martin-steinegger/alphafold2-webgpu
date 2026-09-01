@@ -4,7 +4,14 @@ import { createTiledGemmShader } from "../runtime/gemm.js";
 
 export interface TriangleShaders {
   readonly normalizeInput: string;
-  readonly projectAB: string;
+  /**
+   * Projections for one block step. Incoming blocks the contraction index, so
+   * both projections are block-sized; outgoing blocks the first residue index,
+   * so only the projection indexed by it is, and the other is filled once by
+   * projectWhole beforehand.
+   */
+  readonly projectBlock: string;
+  readonly projectWhole: string | undefined;
   readonly contract: string;
   readonly normalizeHidden: string;
   readonly projectOutput: string;
@@ -17,7 +24,14 @@ const scalar = (precision: Precision): "f16" | "f32" => precision;
 const read = (precision: Precision, expression: string): string =>
   precision === "f16" ? `f32(${expression})` : expression;
 
-function prelude(shape: TriangleShape, precision: Precision, offsets: WeightOffsets, epsilon: number): string {
+/**
+ * @param blockRows Rows of the blocked residue axis one step covers. PAIRS
+ * stays the whole pair count; BLOCK_PAIRS is one step's worth.
+ */
+function prelude(
+  shape: TriangleShape, precision: Precision, offsets: WeightOffsets, epsilon: number,
+  blockRows = shape.length,
+): string {
   const offsetConstants = Object.entries(offsets)
     .map(([name, offset]) => `const W_${name.toUpperCase()}: u32 = ${offset}u;`)
     .join("\n");
@@ -26,6 +40,8 @@ const L: u32 = ${shape.length}u;
 const CZ: u32 = ${shape.cZ}u;
 const CH: u32 = ${shape.cHidden}u;
 const PAIRS: u32 = L * L;
+const BLOCK_ROWS: u32 = ${blockRows}u;
+const BLOCK_PAIRS: u32 = BLOCK_ROWS * L;
 const LINEAR_GRID_WIDTH: u32 = 32768u;
 const EPSILON: f32 = ${epsilon.toPrecision(9)};
 ${offsetConstants}
@@ -42,8 +58,9 @@ export function createTriangleShaders(
   offsets: WeightOffsets,
   epsilon = 1e-5,
   direction: TriangleDirection = "outgoing",
+  blockRows = shape.length,
 ): TriangleShaders {
-  const common = prelude(shape, precision, offsets, epsilon);
+  const common = prelude(shape, precision, offsets, epsilon, blockRows);
   const t = scalar(precision);
 
   const normalizeInput = `${common}
@@ -75,12 +92,24 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   }
 }`;
 
-  const projectAB = `${common}
+  /**
+   * The two contraction inputs.
+   *
+   * Which of them is blocked differs by direction, so the stride and offset of
+   * each output are supplied by the caller, and either projection can be
+   * skipped when only the other one is being produced for this step.
+   */
+  const project = (writeA: boolean, writeB: boolean,
+    aStride: string, aOffset: string, bStride: string, bOffset: string): string => `${common}
 @group(0) @binding(0) var<storage, read> z: array<f32>;
 @group(0) @binding(1) var<storage, read> mask: array<f32>;
 @group(0) @binding(2) var<storage, read> weights: array<${t}>;
-@group(0) @binding(3) var<storage, read_write> a: array<f32>;
-@group(0) @binding(4) var<storage, read_write> b: array<f32>;
+${writeA ? `@group(0) @binding(3) var<storage, read_write> a: array<f32>;` : ""}
+${writeB ? `@group(0) @binding(${writeA ? 4 : 3}) var<storage, read_write> b: array<f32>;` : ""}
+// x is the first row of this block within the whole pair tensor. Bindings are
+// only declared for the projections this variant writes, because an unused one
+// would be dropped from the automatic layout and unbalance the bind group.
+@group(0) @binding(${(writeA ? 1 : 0) + (writeB ? 1 : 0) + 3}) var<uniform> block: vec4<u32>;
 
 var<workgroup> tile_source: array<f32, 128>;
 var<workgroup> tile_ap_weight: array<f32, 128>;
@@ -119,8 +148,8 @@ fn main(
     let weight_c = c0 + local.y;
     tile_source[tile_index] = 0.0;
     tile_source[tile_index + 64u] = 0.0;
-    if (row < PAIRS && source_c < CZ) { tile_source[tile_index] = z[row * CZ + source_c]; }
-    if (second_row < PAIRS && source_c < CZ) {
+    if (row < block.y && source_c < CZ) { tile_source[tile_index] = z[row * CZ + source_c]; }
+    if (second_row < block.y && source_c < CZ) {
       tile_source[tile_index + 64u] = z[second_row * CZ + source_c];
     }
     for (var h_block = 0u; h_block < 2u; h_block += 1u) {
@@ -156,73 +185,99 @@ fn main(
   // Store the contraction inputs channel-major. The contraction consumes one
   // complete h slice at a time, so this makes adjacent lanes read adjacent
   // addresses instead of cache lines spread across the entire pair tensor.
-  if (row < PAIRS && h < CH) {
-    let index = h * PAIRS + row; let pair_mask = mask[row];
-    a[index] = pair_mask * ap_00 * logistic(ag_00); b[index] = pair_mask * bp_00 * logistic(bg_00);
+  if (row < block.y && h < CH) {
+    ${writeA ? `let a_index = h * ${aStride} + ${aOffset} + row;` : ""}
+    ${writeB ? `let b_index = h * ${bStride} + ${bOffset} + row;` : ""}
+    let pair_mask = mask[block.x + row];
+    ${writeA ? `a[a_index] = pair_mask * ap_00 * logistic(ag_00);` : ""} ${writeB ? `b[b_index] = pair_mask * bp_00 * logistic(bg_00);` : ""}
   }
-  if (row < PAIRS && second_h < CH) {
-    let index = second_h * PAIRS + row; let pair_mask = mask[row];
-    a[index] = pair_mask * ap_01 * logistic(ag_01); b[index] = pair_mask * bp_01 * logistic(bg_01);
+  if (row < block.y && second_h < CH) {
+    ${writeA ? `let a_index = second_h * ${aStride} + ${aOffset} + row;` : ""}
+    ${writeB ? `let b_index = second_h * ${bStride} + ${bOffset} + row;` : ""}
+    let pair_mask = mask[block.x + row];
+    ${writeA ? `a[a_index] = pair_mask * ap_01 * logistic(ag_01);` : ""} ${writeB ? `b[b_index] = pair_mask * bp_01 * logistic(bg_01);` : ""}
   }
-  if (second_row < PAIRS && h < CH) {
-    let index = h * PAIRS + second_row; let pair_mask = mask[second_row];
-    a[index] = pair_mask * ap_10 * logistic(ag_10); b[index] = pair_mask * bp_10 * logistic(bg_10);
+  if (second_row < block.y && h < CH) {
+    ${writeA ? `let a_index = h * ${aStride} + ${aOffset} + second_row;` : ""}
+    ${writeB ? `let b_index = h * ${bStride} + ${bOffset} + second_row;` : ""}
+    let pair_mask = mask[block.x + second_row];
+    ${writeA ? `a[a_index] = pair_mask * ap_10 * logistic(ag_10);` : ""} ${writeB ? `b[b_index] = pair_mask * bp_10 * logistic(bg_10);` : ""}
   }
-  if (second_row < PAIRS && second_h < CH) {
-    let index = second_h * PAIRS + second_row; let pair_mask = mask[second_row];
-    a[index] = pair_mask * ap_11 * logistic(ag_11); b[index] = pair_mask * bp_11 * logistic(bg_11);
+  if (second_row < block.y && second_h < CH) {
+    ${writeA ? `let a_index = second_h * ${aStride} + ${aOffset} + second_row;` : ""}
+    ${writeB ? `let b_index = second_h * ${bStride} + ${bOffset} + second_row;` : ""}
+    let pair_mask = mask[block.x + second_row];
+    ${writeA ? `a[a_index] = pair_mask * ap_11 * logistic(ag_11);` : ""} ${writeB ? `b[b_index] = pair_mask * bp_11 * logistic(bg_11);` : ""}
   }
 }`;
-
-  const loadATile = direction === "outgoing"
-    ? "a[h * PAIRS + i * L + a_k]"
-    : "b[h * PAIRS + a_k * L + i]";
-  const loadBTile = direction === "outgoing"
-    ? "b[h * PAIRS + j * L + b_k]"
-    : "a[h * PAIRS + b_k * L + j]";
   // out[h][i][j] = sum_k A[h][i][k] * B[h][j][k], one independent matrix per
-  // hidden channel, dispatched along z. The shared tiling gives each invocation
-  // eight rows by four columns, against one output element per invocation
-  // before, which raises it from half a multiply-add per shared read to almost
-  // three.
-  const contract = createTiledGemmShader({
-    preamble: `${common}
+  // hidden channel, dispatched along z.
+  //
+  // The two directions contract over different indices, so they block
+  // differently. Outgoing contracts over the second index, so blocking the
+  // first leaves one projection whole and writes its own slice of the output.
+  // Incoming contracts over the first index, so blocking it shrinks both
+  // projections but every block contributes to every output element, and the
+  // output is accumulated across blocks instead of partitioned.
+  const contract = direction === "outgoing"
+    ? createTiledGemmShader({
+      preamble: `${common}
 @group(0) @binding(0) var<storage, read> a: array<f32>;
 @group(0) @binding(1) var<storage, read> b: array<f32>;
-@group(0) @binding(2) var<storage, read_write> output: array<f32>;`,
-    rows: "L",
-    inner: "L",
-    columns: "L",
-    sourceElement: direction === "outgoing"
-      ? "a[group.z * PAIRS + row * L + k]"
-      : "b[group.z * PAIRS + k * L + row]",
-    weightElement: direction === "outgoing"
-      ? "b[group.z * PAIRS + column * L + k]"
-      : "a[group.z * PAIRS + k * L + column]",
-    store: "output[group.z * PAIRS + row * L + column] = element;",
-  });
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+// x is the first pair row of the block, w the residue count it spans.
+@group(0) @binding(3) var<uniform> block: vec4<u32>;`,
+      rows: "block.w",
+      inner: "L",
+      columns: "L",
+      sourceElement: "a[group.z * BLOCK_PAIRS + row * L + k]",
+      weightElement: "b[group.z * PAIRS + column * L + k]",
+      store: "output[group.z * BLOCK_PAIRS + row * L + column] = element;",
+    })
+    : createTiledGemmShader({
+      preamble: `${common}
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read> b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+// x is the first pair row of the block, w the contraction rows it spans.
+@group(0) @binding(3) var<uniform> block: vec4<u32>;`,
+      rows: "L",
+      inner: "block.w",
+      columns: "L",
+      sourceElement: "b[group.z * BLOCK_PAIRS + k * L + row]",
+      weightElement: "a[group.z * BLOCK_PAIRS + k * L + column]",
+      // z marks the first block, which overwrites rather than accumulating, so
+      // the output needs no separate clear and no copy-destination usage.
+      store: `let index = group.z * PAIRS + row * L + column;
+          output[index] = select(output[index], 0.0, block.z == 1u) + element;`,
+    });
 
+  const contracted = direction === "outgoing"
+    ? { stride: "BLOCK_PAIRS", offset: "" } : { stride: "PAIRS", offset: "block.x + " };
   const normalizeHidden = `${common}
 @group(0) @binding(0) var<storage, read> source: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<${t}>;
 @group(0) @binding(2) var<storage, read_write> normalized: array<f32>;
+// x is the first row of this block; the contraction is whole for the incoming
+// direction and blocked for the outgoing one.
+@group(0) @binding(3) var<uniform> block: vec4<u32>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let row = id.x;
-  if (row >= PAIRS) { return; }
+  if (row >= block.y) { return; }
   let base = row * CH;
   var mean = 0.0;
-  for (var h = 0u; h < CH; h += 1u) { mean += source[h * PAIRS + row]; }
+  for (var h = 0u; h < CH; h += 1u) { mean += source[h * ${contracted.stride} + ${contracted.offset}row]; }
   mean /= f32(CH);
   var variance = 0.0;
   for (var h = 0u; h < CH; h += 1u) {
-    let centered = source[h * PAIRS + row] - mean;
+    let centered = source[h * ${contracted.stride} + ${contracted.offset}row] - mean;
     variance += centered * centered;
   }
   let inverse_std = inverseSqrt(variance / f32(CH) + EPSILON);
   for (var h = 0u; h < CH; h += 1u) {
-    var value = (source[h * PAIRS + row] - mean) * inverse_std;
+    var value = (source[h * ${contracted.stride} + ${contracted.offset}row] - mean) * inverse_std;
     value = value * ${read(precision, "weights[W_LAYERNORMOUTWEIGHT + h]")}
       + ${read(precision, "weights[W_LAYERNORMOUTBIAS + h]")};
     normalized[base + h] = value;
@@ -313,5 +368,10 @@ fn main(
   }
 }`;
 
-  return { normalizeInput, projectAB, contract, normalizeHidden, projectOutput };
+  const projectBlock = direction === "outgoing"
+    ? project(true, false, "BLOCK_PAIRS", "0u", "", "")
+    : project(true, true, "BLOCK_PAIRS", "0u", "BLOCK_PAIRS", "0u");
+  const projectWhole = direction === "outgoing"
+    ? project(false, true, "", "", "PAIRS", "block.x") : undefined;
+  return { normalizeInput, projectBlock, projectWhole, contract, normalizeHidden, projectOutput };
 }
