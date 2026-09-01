@@ -19,6 +19,8 @@ import {
   createOuterProductMeanParameters,
   OUTER_PRODUCT_MEAN_CONTRACT_SHADER,
   OUTER_PRODUCT_MEAN_PAIR_COUNT_SHADER,
+  OUTER_PRODUCT_NORMALIZE_WINDOW_BYTES,
+  outerProductMeanNormalizeWindow,
   outerProductMeanRowBlock,
   OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_SHADER,
   OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_RESIDUAL_SHADER,
@@ -82,8 +84,8 @@ export interface EvoformerBlockInput {
   readonly triangleHidden: number;
   /** Multimer-v3 applies outer-product mean before MSA attention. */
   readonly outerProductMeanFirst?: boolean;
-  /** Overrides the attention scratch budget, so tests can force windowing. */
-  readonly attentionWindowBytes?: number;
+  /** Overrides the scratch budget of every windowed operation, so tests can force windowing. */
+  readonly scratchWindowBytes?: number;
   readonly weights: EvoformerBlockWeights;
 }
 
@@ -142,7 +144,7 @@ export type TemplatePairBlockWeights = Omit<EvoformerPairBlockWeights, "outerPro
 type EvoformerShape = Pick<
   EvoformerBlockInput,
   "sequences" | "length" | "cM" | "cZ" | "cOuter" | "triangleHidden" | "outerProductMeanFirst"
-  | "attentionWindowBytes"
+  | "scratchWindowBytes"
 >;
 
 const GLOBAL_ATTENTION_COMMON = `
@@ -676,20 +678,35 @@ async function encodeOuterProductMean(
   const rows = input.sequences * input.length;
   const weights = execution.upload("opm.weights", packed.data);
   const params = uniform(execution, "opm.parameters", createOuterProductMeanParameters(descriptor, packed.offsets));
-  const normalized = execution.allocate("opm.normalized", rows * input.cM);
+  const normalizeRows = outerProductMeanNormalizeWindow(rows, input.cM,
+    input.scratchWindowBytes ?? OUTER_PRODUCT_NORMALIZE_WINDOW_BYTES);
+  const normalized = execution.allocate("opm.normalized", normalizeRows * input.cM);
   const left = execution.allocate("opm.left", rows * input.cOuter);
   const right = execution.allocate("opm.right", rows * input.cOuter);
   const rowBlock = outerProductMeanRowBlock(input.length, input.cOuter);
   const outer = execution.allocate("opm.outer", rowBlock * input.length * input.cOuter * input.cOuter);
   const pairCount = execution.allocate("opm.pair-count", input.length * input.length);
   const output = residualTarget ?? execution.allocate("opm.output", input.length * input.length * input.cZ);
-  let grid = execution.linearGrid(rows, 1);
-  execution.dispatch(encoder, normalize, [msa, weights, params, normalized],
-    grid[0], grid[1], 1, "opm.normalize");
-  grid = execution.linearGrid(rows * input.cOuter);
-  execution.dispatch(encoder, project, [normalized, msaMask, weights, params, left, right], grid[0], grid[1], 1,
-    "opm.project");
-  grid = execution.linearGrid(input.length * input.length);
+  // Both the normalization and the projection are row-wise, so a window of rows
+  // needs only views of the whole-operation tensors and a shorter dispatch. The
+  // shaders' own bounds checks are against the full row count, which a shorter
+  // dispatch never reaches.
+  for (let offset = 0; offset < rows; offset += normalizeRows) {
+    const count = Math.min(normalizeRows, rows - offset);
+    const msaWindow = execution.view(msa, offset * input.cM, count * input.cM);
+    const maskWindow = execution.view(msaMask, offset, count);
+    const normalizedWindow = execution.view(normalized, 0, count * input.cM);
+    const leftWindow = execution.view(left, offset * input.cOuter, count * input.cOuter);
+    const rightWindow = execution.view(right, offset * input.cOuter, count * input.cOuter);
+    let windowGrid = execution.linearGrid(count, 1);
+    execution.dispatch(encoder, normalize, [msaWindow, weights, params, normalizedWindow],
+      windowGrid[0], windowGrid[1], 1, `opm.normalize-${offset}`);
+    windowGrid = execution.linearGrid(count * input.cOuter);
+    execution.dispatch(encoder, project,
+      [normalizedWindow, maskWindow, weights, params, leftWindow, rightWindow],
+      windowGrid[0], windowGrid[1], 1, `opm.project-${offset}`);
+  }
+  let grid = execution.linearGrid(input.length * input.length);
   execution.dispatch(encoder, pairCountPipeline, [msaMask, params, pairCount],
     grid[0], grid[1], 1, "opm.pair-count");
   for (let offset = 0; offset < input.length; offset += rowBlock) {
@@ -773,7 +790,7 @@ export async function encodeEvoformerBlock(
   msaMask: GpuTensor,
   pairMask: GpuTensor,
 ): Promise<void> {
-  const shapeWindowBytes = input.attentionWindowBytes;
+  const shapeWindowBytes = input.scratchWindowBytes;
   const applyOuterProductMean = async (): Promise<void> => {
     const update = await encodeOuterProductMean(
       execution, encoder, msa, msaMask, input, input.weights.outerProductMean, pair,
@@ -851,7 +868,7 @@ export async function encodeEvoformerPairBlock(
   pairMask: GpuTensor,
   includeOuterProductMean = true,
 ): Promise<void> {
-  const shapeWindowBytes = shape.attentionWindowBytes;
+  const shapeWindowBytes = shape.scratchWindowBytes;
   if (includeOuterProductMean) {
     const update = await encodeOuterProductMean(
       execution, encoder, msa, msaMask, shape, weights.outerProductMean, pair,
@@ -900,7 +917,7 @@ export async function encodeExtraMsaBlock(
   msaMask: GpuTensor,
   pairMask: GpuTensor,
 ): Promise<void> {
-  const shapeWindowBytes = shape.attentionWindowBytes;
+  const shapeWindowBytes = shape.scratchWindowBytes;
   if (shape.outerProductMeanFirst === true) {
     const update = await encodeOuterProductMean(
       execution, encoder, msa, msaMask, shape, weights.outerProductMean, pair,

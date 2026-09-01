@@ -319,6 +319,28 @@ export const OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_RESIDUAL_SHADER =
  * contraction is blocked over the first residue axis: every block keeps the
  * cheaper arithmetic while the intermediate stays bounded.
  */
+/**
+ * Rows of the normalized MSA one window covers.
+ *
+ * The normalization and the left/right projection are both row-wise, and the
+ * projections they feed are a small fraction of the width, so the full-width
+ * normalized copy only has to exist one window at a time. Windows are a
+ * multiple of 64 rows so the mask view stays on a valid binding offset.
+ */
+export const OUTER_PRODUCT_NORMALIZE_WINDOW_BYTES = 32 * 1024 * 1024;
+
+export function outerProductMeanNormalizeWindow(
+  rows: number, cM: number, budgetBytes: number = OUTER_PRODUCT_NORMALIZE_WINDOW_BYTES,
+): number {
+  if (![rows, cM, budgetBytes].every((value) => Number.isSafeInteger(value) && value > 0)) {
+    throw new RangeError("outer-product normalize window dimensions must be positive safe integers");
+  }
+  const alignment = 64;
+  const capacity = Math.floor(budgetBytes / (cM * Float32Array.BYTES_PER_ELEMENT));
+  const aligned = Math.floor(capacity / alignment) * alignment;
+  return Math.max(alignment, Math.min(rows, aligned));
+}
+
 export const OUTER_PRODUCT_BLOCK_LIMIT_BYTES = 64 * 1024 * 1024;
 
 export function outerProductMeanRowBlock(
