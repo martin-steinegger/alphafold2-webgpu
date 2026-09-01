@@ -253,6 +253,19 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
   }
 }`;
 
+/**
+ * The same LayerNorm writing over its input. WebGPU rejects one buffer bound
+ * both read-only and read-write in a dispatch, so the in-place form has a
+ * single read-write binding. It is exact for `transpose == 0` with one batch
+ * (every row reads and writes the same offsets): all reads of a row complete
+ * before any invocation stores, and each invocation stores only elements it
+ * alone read in the final loop.
+ */
+export const ATTENTION_NORMALIZE_IN_PLACE_SHADER = ATTENTION_NORMALIZE_SHADER
+  .replace("var<storage, read> source", "var<storage, read_write> source")
+  .replace("@group(0) @binding(3) var<storage, read_write> output: array<f32>;\n", "")
+  .replace(/\boutput\[/g, "source[");
+
 const COMMON = `
 struct Parameters {
   // batch counts the entries in this window; batch_offset and batch_total

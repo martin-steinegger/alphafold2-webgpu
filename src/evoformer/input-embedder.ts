@@ -1,4 +1,6 @@
-import { ATTENTION_NORMALIZE_SHADER, createAttentionNormParameters } from "./attention.js";
+import {
+  ATTENTION_NORMALIZE_IN_PLACE_SHADER, ATTENTION_NORMALIZE_SHADER, createAttentionNormParameters,
+} from "./attention.js";
 import { GpuBufferAllocator, type AllocatedGpuBuffer, type AllocationSnapshot } from "../runtime/allocator.js";
 import { pipelineCacheForDevice, type ComputePipelineCache } from "../runtime/pipeline-cache.js";
 import { WebGpuExecution, type GpuTensor } from "../runtime/execution.js";
@@ -229,6 +231,16 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   output[index] = result;
 }`;
 
+/**
+ * The pair embedding written over the recycled pair it reads. Each invocation
+ * reads `previous_pair` only at the element it stores, so a single read-write
+ * binding is exact and one pair-shaped tensor serves as input and output.
+ */
+const PAIR_IN_PLACE_SHADER = PAIR_SHADER
+  .replace("var<storage, read> previous_pair", "var<storage, read_write> previous_pair")
+  .replace("@group(0) @binding(8) var<storage, read_write> output: array<f32>;\n", "")
+  .replace(/\boutput\[/g, "previous_pair[");
+
 function validateChainRelative(input: InputEmbedderInput): void {
   const chain = input.chainRelative;
   const relativeChannels = chain === undefined ? 65 : 73;
@@ -256,14 +268,27 @@ function packedChainIdentifiers(input: InputEmbedderInput): Float32Array {
 }
 
 export interface EncodedInputEmbedder {
-  readonly msa: GpuTensor;
+  /** The new pair, written in place over the `previousPair` tensor passed in. */
   readonly pairWithoutTemplates: GpuTensor;
   readonly extraMsa: GpuTensor;
-  /** Inputs and scratch that may be pooled after this command buffer is submitted. */
+  /** Inputs that may be pooled once the pair and extra-MSA command buffer is submitted. */
   readonly temporaries: readonly GpuTensor[];
+  /**
+   * Encodes the clustered-MSA embedding. Nothing in the extra-MSA stack reads
+   * it, so a caller may defer this until that stack has finished and keep the
+   * largest tensor of the prediction out of the extra stack's peak. It
+   * normalizes `previousMsa` in place; release it and `msaTemporaries` only
+   * after the returned command buffer is submitted.
+   */
+  readonly encodeMsa: (encoder: GPUCommandEncoder) => GpuTensor;
+  readonly msaTemporaries: readonly GpuTensor[];
 }
 
-/** Encode the input embedding into an existing execution without crossing the CPU boundary. */
+/**
+ * Encode the input embedding into an existing execution without crossing the
+ * CPU boundary. `previousPair` and `previousMsa` are consumed: the new pair is
+ * written over `previousPair`, so callers must not release it separately.
+ */
 export async function encodeInputEmbedder(
   execution: WebGpuExecution,
   encoder: GPUCommandEncoder,
@@ -282,9 +307,9 @@ export async function encodeInputEmbedder(
   }
   const packed = packWeights(input);
   const [normalize, msaPipeline, pairPipeline, extraPipeline] = await Promise.all([
-    execution.pipelines.get("embed:normalize", ATTENTION_NORMALIZE_SHADER),
+    execution.pipelines.get("embed:normalize-in-place", ATTENTION_NORMALIZE_IN_PLACE_SHADER),
     execution.pipelines.get("embed:msa", MSA_SHADER),
-    execution.pipelines.get("embed:pair", PAIR_SHADER),
+    execution.pipelines.get("embed:pair-in-place", PAIR_IN_PLACE_SHADER),
     execution.pipelines.get("embed:extra", EXTRA_SHADER),
   ]);
   const temporaries: GpuTensor[] = [];
@@ -312,31 +337,37 @@ export async function encodeInputEmbedder(
     input.length * input.length, input.pairChannels, packed.offsets[12]!, packed.offsets[13]!,
     false, 1, input.length * input.length, 1e-5,
   ), GPUBufferUsage.UNIFORM);
-  const previousMsaNormalized = temporaryAllocate("embed.previous-msa-normalized", expectedPreviousMsa);
-  const previousPairNormalized = temporaryAllocate("embed.previous-pair-normalized", expectedPreviousPair);
   const msaElements = input.msaSequences * input.length * input.msaChannels;
   const pairElements = expectedPreviousPair;
   const extraElements = input.extraSequences * input.length * input.extraMsaChannels;
-  const msa = execution.allocate("embed.msa", msaElements, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
-  const pair = execution.allocate("embed.pair", pairElements, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+  // The recycled pair is consumed only here, so both the normalization and the
+  // new pair overwrite it in place: LayerNorm finishes every read of a row
+  // before any invocation writes its own elements, and the pair kernel reads
+  // exactly the element it stores. This keeps one pair-shaped tensor live at
+  // the embedder instead of three.
+  const pair = previousPair;
   const extra = execution.allocate("embed.extra", extraElements);
-  let grid = execution.linearGrid(input.length, 1);
-  execution.dispatch(encoder, normalize, [previousMsa, weights, previousMsaNormParams, previousMsaNormalized],
-    grid[0], grid[1]);
-  grid = execution.linearGrid(input.length * input.length, 1);
-  execution.dispatch(encoder, normalize, [previousPair, weights, previousPairNormParams, previousPairNormalized],
-    grid[0], grid[1]);
-  grid = execution.linearGrid(msaElements);
-  execution.dispatch(encoder, msaPipeline, [target, msaFeatures, previousMsaNormalized, weights, params, msa],
-    grid[0], grid[1]);
+  let grid = execution.linearGrid(input.length * input.length, 1);
+  execution.dispatch(encoder, normalize, [previousPair, weights, previousPairNormParams], grid[0], grid[1]);
   grid = execution.linearGrid(pairElements);
   execution.dispatch(encoder, pairPipeline,
-    [target, previousPairNormalized, previousPositions, aatype, residueIndex, chainIds,
-      weights, params, pair], grid[0], grid[1]);
+    [target, previousPair, previousPositions, aatype, residueIndex, chainIds, weights, params],
+    grid[0], grid[1]);
   grid = execution.linearGrid(extraElements);
   execution.dispatch(encoder, extraPipeline, [extraMsaInput, hasDeletion, deletionValue, weights, params, extra],
     grid[0], grid[1]);
-  return { msa, pairWithoutTemplates: pair, extraMsa: extra, temporaries };
+  const msaTemporaries = [target, msaFeatures, weights, params, previousMsaNormParams];
+  const pairTemporaries = temporaries.filter((tensor) => !msaTemporaries.includes(tensor));
+  const encodeMsa = (msaEncoder: GPUCommandEncoder): GpuTensor => {
+    const msa = execution.allocate("embed.msa", msaElements, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+    let msaGrid = execution.linearGrid(input.length, 1);
+    execution.dispatch(msaEncoder, normalize, [previousMsa, weights, previousMsaNormParams], msaGrid[0], msaGrid[1]);
+    msaGrid = execution.linearGrid(msaElements);
+    execution.dispatch(msaEncoder, msaPipeline, [target, msaFeatures, previousMsa, weights, params, msa],
+      msaGrid[0], msaGrid[1]);
+    return msa;
+  };
+  return { pairWithoutTemplates: pair, extraMsa: extra, temporaries: pairTemporaries, msaTemporaries, encodeMsa };
 }
 
 export class InputEmbedderGpu {

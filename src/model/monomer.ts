@@ -229,11 +229,10 @@ export class AlphaFoldMonomerGpu {
       execution.allocator.trimPooled();
     };
     try {
-      const templateUpdate = templateUpdateValue === undefined ? undefined
-        : execution.upload("monomer.template-update", templateUpdateValue);
       const pairMaskTensor = execution.upload("monomer.pair-mask", pairMask);
       let previousMsa = execution.upload("monomer.recycle-msa-zero", new Float32Array(length * 256));
-      let previousPair = execution.upload("monomer.recycle-pair-zero", new Float32Array(length * length * 128));
+      let previousPair = execution.upload("monomer.recycle-pair-zero", new Float32Array(length * length * 128),
+        GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST);
       let previousPositions = execution.upload(
         "monomer.recycle-positions-zero", new Float32Array(length * 37 * 3),
       );
@@ -260,14 +259,32 @@ export class AlphaFoldMonomerGpu {
           msaChannels: 256, pairChannels: 128, extraMsaChannels: 64, weights: weights.embedding,
           ...(features.chainRelative === undefined ? {} : { chainRelative: features.chainRelative }),
         }, previousMsa, previousPair, previousPositions);
+        // The template update is constant across recycles but read only here, so
+        // it lives on the GPU for one command buffer per recycle instead of the
+        // whole prediction; the upload costs far less than holding a pair-shaped
+        // tensor through every Evoformer block.
+        const templateUpdate = templateUpdateValue === undefined ? undefined
+          : execution.upload(`monomer.template-update-${recycle}`, templateUpdateValue);
         if (templateUpdate !== undefined) await execution.addInPlace(
           embeddingEncoder, embedding.pairWithoutTemplates, templateUpdate, `monomer.template-residual-${recycle}`,
         );
+        // Multimer merges template rows into the clustered MSA before the extra
+        // stack, so it embeds the MSA now. The monomer defers it until the extra
+        // stack has finished: nothing there reads it, and keeping the largest
+        // tensor of the prediction out of that stack's peak lowers the high-water
+        // mark of the whole run.
+        const multimerMsa = this.multimer ? embedding.encodeMsa(embeddingEncoder) : undefined;
         await submit(embeddingEncoder, `embedding recycle ${recycle}`);
+        // The new pair was written over `previousPair`, which therefore stays live.
         for (const temporary of embedding.temporaries) releaseTensor(temporary);
-        releaseTensor(previousMsa); releaseTensor(previousPair); releaseTensor(previousPositions);
+        releaseTensor(previousPositions);
+        if (templateUpdate !== undefined) releaseTensor(templateUpdate);
+        const releaseMsaInputs = (): void => {
+          for (const temporary of embedding.msaTemporaries) releaseTensor(temporary);
+          releaseTensor(previousMsa);
+        };
+        if (multimerMsa !== undefined) releaseMsaInputs();
 
-        let mainMsa = embedding.msa;
         let mainMsaMask = msaMask;
         let mainSequences = features.msaSequences;
         let multimerMainMsa: GpuTensor | undefined;
@@ -296,14 +313,14 @@ export class AlphaFoldMonomerGpu {
           await execution.addInPlace(templateEncoder, embedding.pairWithoutTemplates, templatePair,
             `multimer.template-pair-residual-${recycle}`);
           execution.endComputePass(templateEncoder);
-          templateEncoder.copyBufferToBuffer(embedding.msa.allocation.buffer, 0,
-            multimerMainMsa.allocation.buffer, 0, embedding.msa.elements * 4);
+          templateEncoder.copyBufferToBuffer(multimerMsa!.allocation.buffer, 0,
+            multimerMainMsa.allocation.buffer, 0, multimerMsa!.elements * 4);
           templateEncoder.copyBufferToBuffer(templateMsa.allocation.buffer, 0,
-            multimerMainMsa.allocation.buffer, embedding.msa.elements * 4, templateMsa.elements * 4);
+            multimerMainMsa.allocation.buffer, multimerMsa!.elements * 4, templateMsa.elements * 4);
           await submit(templateEncoder, `Multimer template merge recycle ${recycle}`);
           templateSubmissions = template.submissions + 1;
           execution.releaseSince(templateCheckpoint);
-          mainMsa = multimerMainMsa; mainMsaMask = multimerMainMsaMask;
+          mainMsaMask = multimerMainMsaMask;
         }
 
         const extraShape = {
@@ -344,6 +361,15 @@ export class AlphaFoldMonomerGpu {
           extraSubmissions += 1;
         }
         releaseTensor(embedding.extraMsa); releaseTensor(extraMsaMask);
+        let clusteredMsa = multimerMsa;
+        if (clusteredMsa === undefined) {
+          const msaEncoder = this.device.createCommandEncoder({ label: `monomer.msa-embedding-${recycle}` });
+          this.device.pushErrorScope("validation");
+          clusteredMsa = embedding.encodeMsa(msaEncoder);
+          await submit(msaEncoder, `MSA embedding recycle ${recycle}`);
+          releaseMsaInputs();
+        }
+        const mainMsa = multimerMainMsa ?? clusteredMsa;
 
         const mainDescriptor = {
           msa: new Float32Array(0), pair: new Float32Array(0), msaMask: new Float32Array(0),
@@ -403,7 +429,7 @@ export class AlphaFoldMonomerGpu {
         releaseTensor(msaFirstRowTensor); releaseTensor(msaMask);
         if (multimerMainMsa !== undefined) releaseTensor(multimerMainMsa);
         if (multimerMainMsaMask !== undefined) releaseTensor(multimerMainMsaMask);
-        releaseTensor(embedding.msa);
+        releaseTensor(clusteredMsa);
 
         const structure = await new StructureModuleGpu(this.device).run({
           msaFirstRow, pair: new Float32Array(0), mask: features.seqMask, aatype: features.aatype,
