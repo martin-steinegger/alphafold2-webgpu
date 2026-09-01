@@ -233,6 +233,7 @@ export class MultimerMockTemplateGpu {
       grid = execution.linearGrid(msaRows.elements);
       execution.dispatch(encoder, msaPipeline,
         [msaInputWeight, msaInputBias, msaOutputWeight, msaOutputBias, msaParams, msaRows], grid[0], grid[1]);
+      execution.endComputePass(encoder);
       const pairReadback = residentInput === undefined
         ? execution.createReadback("multimer-template.pair-readback", pairUpdate, encoder) : undefined;
       const msaReadback = residentInput === undefined
