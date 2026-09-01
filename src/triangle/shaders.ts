@@ -19,7 +19,9 @@ export interface TriangleShaders {
   readonly projectA: string;
   readonly projectB: string;
   readonly contract: string;
-  readonly normalizeHidden: string;
+  /** Mean and inverse standard deviation of each contracted row over the hidden channels. */
+  readonly hiddenStatistics: string;
+  /** The gated output projection, normalizing the contraction while loading it. */
   readonly projectOutput: string;
 }
 
@@ -253,19 +255,19 @@ ${Array.from({ length: 8 }, (_, index) => `      {
 
   const contracted = direction === "outgoing"
     ? { stride: "BLOCK_PAIRS", offset: "" } : { stride: "PAIRS", offset: "block.x + " };
-  const normalizeHidden = `${common}
+  // One invocation per contracted row: adjacent invocations read adjacent
+  // addresses of the channel-major contraction.
+  const hiddenStatistics = `${common}
 @group(0) @binding(0) var<storage, read> source: array<f32>;
-@group(0) @binding(1) var<storage, read> weights: array<${t}>;
-@group(0) @binding(2) var<storage, read_write> normalized: array<f32>;
+@group(0) @binding(1) var<storage, read_write> statistics: array<f32>;
 // x is the first row of this block; the contraction is whole for the incoming
 // direction and blocked for the outgoing one.
-@group(0) @binding(3) var<uniform> block: vec4<u32>;
+@group(0) @binding(2) var<uniform> block: vec4<u32>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let row = id.x;
   if (row >= block.y) { return; }
-  let base = row * CH;
   var mean = 0.0;
   for (var h = 0u; h < CH; h += 1u) { mean += source[h * ${contracted.stride} + ${contracted.offset}row]; }
   mean /= f32(CH);
@@ -274,13 +276,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let centered = source[h * ${contracted.stride} + ${contracted.offset}row] - mean;
     variance += centered * centered;
   }
-  let inverse_std = inverseSqrt(variance / f32(CH) + EPSILON);
-  for (var h = 0u; h < CH; h += 1u) {
-    var value = (source[h * ${contracted.stride} + ${contracted.offset}row] - mean) * inverse_std;
-    value = value * ${read(precision, "weights[W_LAYERNORMOUTWEIGHT + h]")}
-      + ${read(precision, "weights[W_LAYERNORMOUTBIAS + h]")};
-    normalized[base + h] = value;
-  }
+  statistics[2u * row] = mean;
+  statistics[2u * row + 1u] = inverseSqrt(variance / f32(CH) + EPSILON);
 }`;
 
   // The output is the projected, gated hidden block; `output` is a view of the
@@ -288,14 +285,20 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   const projectOutput = createTiledGemmShader({
     preamble: `${common}
 @group(0) @binding(0) var<storage, read> gate: array<f32>;
-@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> contracted: array<f32>;
 @group(0) @binding(2) var<storage, read> weights: array<${t}>;
-@group(0) @binding(3) var<storage, read_write> output: array<f32>;
-@group(0) @binding(4) var<uniform> block: vec4<u32>;`,
+@group(0) @binding(3) var<storage, read> statistics: array<f32>;
+@group(0) @binding(4) var<storage, read_write> output: array<f32>;
+@group(0) @binding(5) var<uniform> block: vec4<u32>;
+
+fn normalized_hidden(row: u32, h: u32) -> f32 {
+  return (contracted[h * ${contracted.stride} + ${contracted.offset}row] - statistics[2u * row]) * statistics[2u * row + 1u]
+    * ${read(precision, "weights[W_LAYERNORMOUTWEIGHT + h]")} + ${read(precision, "weights[W_LAYERNORMOUTBIAS + h]")};
+}`,
     rows: "block.y",
     inner: "CH",
     columns: "CZ",
-    sourceElement: "x[row * CH + k]",
+    sourceElement: "normalized_hidden(row, k)",
     weightElement: read(precision, "weights[W_LINEARZWEIGHT + column * CH + k]"),
     store: `let index = row * CZ + column;
           output[index] = (element + ${read(precision, "weights[W_LINEARZBIAS + column]")}) * gate[index];`,
@@ -304,5 +307,5 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   const projectA = project("a", "BLOCK_PAIRS", "0u");
   const projectB = direction === "outgoing"
     ? project("b", "PAIRS", "block.x") : project("b", "BLOCK_PAIRS", "0u");
-  return { inputStatistics, projectGate, projectA, projectB, contract, normalizeHidden, projectOutput };
+  return { inputStatistics, projectGate, projectA, projectB, contract, hiddenStatistics, projectOutput };
 }

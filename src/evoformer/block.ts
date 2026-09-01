@@ -775,13 +775,13 @@ async function encodeTriangleMultiplication(
   const shaders = createTriangleShaders(shape, "f32", packed.offsets, 1e-5, direction, blockRows);
   const pipelineKey = `block:triangle:${direction}:${input.length}:${input.cZ}`
     + `:${input.triangleHidden}:${blockRows}`;
-  const [inputStatistics, projectGate, projectA, projectB, contract, normalizeHidden, projectOutput] = await Promise.all([
+  const [inputStatistics, projectGate, projectA, projectB, contract, hiddenStatistics, projectOutput] = await Promise.all([
     execution.pipelines.get(`${pipelineKey}:input-statistics`, shaders.inputStatistics),
     execution.pipelines.get(`${pipelineKey}:project-gate`, shaders.projectGate),
     execution.pipelines.get(`${pipelineKey}:project-a`, shaders.projectA),
     execution.pipelines.get(`${pipelineKey}:project-b`, shaders.projectB),
     execution.pipelines.get(`${pipelineKey}:contract`, shaders.contract),
-    execution.pipelines.get(`${pipelineKey}:normalize-hidden`, shaders.normalizeHidden),
+    execution.pipelines.get(`${pipelineKey}:hidden-statistics`, shaders.hiddenStatistics),
     execution.pipelines.get(
       `${pipelineKey}:project-output${residualTarget === undefined ? "" : "-residual"}`,
       // The tiled GEMM emits the store once per lane and row.
@@ -832,13 +832,12 @@ async function encodeTriangleMultiplication(
     ? undefined : execution.allocate(`triangle.${direction}.b-block`, blockPairs * input.triangleHidden);
   const contracted = execution.allocate(`triangle.${direction}.contracted`,
     (outgoing ? blockPairs : pairs) * input.triangleHidden);
-  const hiddenNormalized = execution.allocate(
-    `triangle.${direction}.hidden-normalized`, blockPairs * input.triangleHidden);
+  const hiddenStats = execution.allocate(`triangle.${direction}.hidden-statistics`, blockPairs * 2);
   const finish = (block: (typeof blocks)[number]): void => {
     const rows = block.count * input.length;
-    execution.dispatch(encoder, normalizeHidden,
-      [contracted, weights, execution.view(hiddenNormalized, 0, rows * input.triangleHidden), block.uniform],
-      Math.ceil(rows / 64), 1, 1, `triangle.${direction}.normalize-hidden-${block.offset}`);
+    const stats = execution.view(hiddenStats, 0, rows * 2);
+    execution.dispatch(encoder, hiddenStatistics, [contracted, stats, block.uniform],
+      Math.ceil(rows / 64), 1, 1, `triangle.${direction}.hidden-statistics-${block.offset}`);
     // The pair tensor is still the value that was normalized: the output
     // projection is the first thing to write it.
     const gateGrid = gemmGrid(rows, input.cZ);
@@ -846,7 +845,7 @@ async function encodeTriangleMultiplication(
     execution.dispatch(encoder, projectGate, [pair, weights, statistics, gateBlock, block.uniform],
       gateGrid[0], gateGrid[1], 1, `triangle.${direction}.project-gate-${block.offset}`);
     execution.dispatch(encoder, projectOutput, [
-      gateBlock, execution.view(hiddenNormalized, 0, rows * input.triangleHidden), weights,
+      gateBlock, contracted, weights, stats,
       execution.view(output, block.offset * input.length * input.cZ, rows * input.cZ), block.uniform,
     ], gateGrid[0], gateGrid[1], 1, `triangle.${direction}.project-output-${block.offset}`);
   };
@@ -865,7 +864,7 @@ async function encodeTriangleMultiplication(
     releaseScratch([blockedA, blockedB], output);
     for (const block of blocks) finish(block);
   }
-  releaseScratch([statistics, gate, blockedA, blockedB, wholeProjection, contracted, hiddenNormalized], output);
+  releaseScratch([statistics, gate, blockedA, blockedB, wholeProjection, contracted, hiddenStats], output);
   return output;
 }
 

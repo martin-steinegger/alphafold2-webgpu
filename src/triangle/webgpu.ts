@@ -60,14 +60,14 @@ class TriangleMultiplicationGpu {
       input.shape, precision, packedWeights.offsets, input.epsilon ?? 1e-5, this.direction,
     );
     const pipelineKey = `${this.direction}:${precision}:${length}:${cZ}:${cHidden}:${input.epsilon ?? 1e-5}`;
-    const [inputStatistics, projectGate, projectA, projectB, contract, normalizeHidden, projectOutput]
+    const [inputStatistics, projectGate, projectA, projectB, contract, hiddenStatistics, projectOutput]
       = await Promise.all([
       this.pipelines.get(`${pipelineKey}:input-statistics`, shaders.inputStatistics),
       this.pipelines.get(`${pipelineKey}:project-gate`, shaders.projectGate),
       this.pipelines.get(`${pipelineKey}:project-a`, shaders.projectA),
       this.pipelines.get(`${pipelineKey}:project-b`, shaders.projectB),
       this.pipelines.get(`${pipelineKey}:contract`, shaders.contract),
-      this.pipelines.get(`${pipelineKey}:normalize-hidden`, shaders.normalizeHidden),
+      this.pipelines.get(`${pipelineKey}:hidden-statistics`, shaders.hiddenStatistics),
       this.pipelines.get(`${pipelineKey}:project-output`, shaders.projectOutput),
     ]);
 
@@ -88,9 +88,7 @@ class TriangleMultiplicationGpu {
       const a = keep(this.allocator.allocate("triangle.a", pairCount * cHidden * 4, storage));
       const b = keep(this.allocator.allocate("triangle.b", pairCount * cHidden * 4, storage));
       const contracted = keep(this.allocator.allocate("triangle.contracted", pairCount * cHidden * 4, storage));
-      const xNormalized = keep(this.allocator.allocate(
-        "triangle.x-normalized", pairCount * cHidden * 4, storage,
-      ));
+      const hiddenStatisticsBuffer = keep(this.allocator.allocate("triangle.hidden-statistics", pairCount * 2 * 4, storage));
       const output = keep(this.allocator.allocate(
         "triangle.output", pairCount * cZ * 4, storage | GPUBufferUsage.COPY_SRC,
       ));
@@ -137,14 +135,13 @@ class TriangleMultiplicationGpu {
       const contractGrid = gemmGrid(length, length);
       runPass("contract", contract, [a.buffer, b.buffer, contracted.buffer, blockParams.buffer],
         contractGrid[0], contractGrid[1], cHidden);
-      runPass("normalize-hidden", normalizeHidden,
-        [contracted.buffer, weights.buffer, xNormalized.buffer, blockParams.buffer],
-        ceilDivide(pairCount, 64));
+      runPass("hidden-statistics", hiddenStatistics,
+        [contracted.buffer, hiddenStatisticsBuffer.buffer, blockParams.buffer], ceilDivide(pairCount, 64));
       const outputGrid = gemmGrid(pairCount, cZ);
       runPass("project-gate", projectGate,
         [z.buffer, weights.buffer, statistics.buffer, gate.buffer, blockParams.buffer], outputGrid[0], outputGrid[1]);
       runPass("project-output", projectOutput,
-        [gate.buffer, xNormalized.buffer, weights.buffer, output.buffer, blockParams.buffer],
+        [gate.buffer, contracted.buffer, weights.buffer, hiddenStatisticsBuffer.buffer, output.buffer, blockParams.buffer],
         outputGrid[0], outputGrid[1]);
       encoder.copyBufferToBuffer(output.buffer, 0, readback.buffer, 0, pairCount * cZ * 4);
 

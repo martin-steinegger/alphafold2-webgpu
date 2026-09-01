@@ -111,8 +111,8 @@ export function estimateMonomerMemory(
     attentionScratch(extraSequences, length, 64, 5) + pairBias,
     attentionScratch(length, length, 128, 5) + pairBias,
     // Triangle multiplication keeps one projection whole and streams the
-    // other projection, the contraction and its normalization in row blocks.
-    pair + 4 * triangleBlock,
+    // other projection, the contraction and the output gate in row blocks.
+    pair + 3 * triangleBlock,
     transitionScratch(msaSequences * length, 256, 1024),
     transitionScratch(extraSequences * length, 64, 256),
     transitionScratch(length * length, 128, 512),
