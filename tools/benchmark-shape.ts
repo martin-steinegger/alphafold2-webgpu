@@ -102,8 +102,20 @@ try {
       const total = block.entries.reduce((sum, entry) => sum + entry.nanoseconds, 0) / 1e6;
       console.error(`\n== ${name} block ${block.block}: ${total.toFixed(2)} ms x ${blocks} blocks `
         + `= ${(total * blocks / 1000).toFixed(2)} s ==`);
-      for (const entry of [...block.entries].sort((a, b) => b.nanoseconds - a.nanoseconds).slice(0, 12)) {
-        console.error(`  ${(entry.nanoseconds / 1e6).toFixed(3)} ms  ${entry.label}`);
+      // Group windows and blocks of the same operation back together.
+      const grouped = new Map<string, { milliseconds: number; count: number }>();
+      for (const entry of block.entries) {
+        const key = entry.label.replace(/-\d+$/, "").replace(/\.[a-z-]+$/, (suffix) => suffix);
+        const operation = key.split(".").slice(0, 2).join(".");
+        const current = grouped.get(operation) ?? { milliseconds: 0, count: 0 };
+        current.milliseconds += entry.nanoseconds / 1e6;
+        current.count += 1;
+        grouped.set(operation, current);
+      }
+      for (const [operation, value] of [...grouped].sort((a, b) => b[1].milliseconds - a[1].milliseconds)) {
+        const share = (value.milliseconds / total * 100).toFixed(0);
+        console.error(`  ${value.milliseconds.toFixed(2).padStart(6)} ms  ${share.padStart(3)}%  `
+          + `x${String(value.count).padStart(3)}  ${operation}`);
       }
     }
   }
