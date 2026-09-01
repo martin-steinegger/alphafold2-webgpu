@@ -738,7 +738,6 @@ async function encodeTriangleMultiplication(
   const a = execution.allocate(`triangle.${direction}.a`, pairs * input.triangleHidden);
   const b = execution.allocate(`triangle.${direction}.b`, pairs * input.triangleHidden);
   const contracted = execution.allocate(`triangle.${direction}.contracted`, pairs * input.triangleHidden);
-  const hiddenNormalized = execution.allocate(`triangle.${direction}.hidden-normalized`, pairs * input.triangleHidden);
   const output = residualTarget ?? execution.allocate(`triangle.${direction}.output`, pairs * input.cZ);
   execution.dispatch(encoder, normalizeInput, [pair, weights, normalized], Math.ceil(pairs / 64), 1, 1,
     `triangle.${direction}.normalize-input`);
@@ -749,11 +748,19 @@ async function encodeTriangleMultiplication(
   const contractGrid = gemmGrid(input.length, input.length);
   execution.dispatch(encoder, contract, [a, b, contracted], contractGrid[0],
     contractGrid[1], input.triangleHidden, `triangle.${direction}.contract`);
+  // The projections die at the contraction and the contraction dies at the
+  // normalization, so the pair-shaped scratch is handed straight back rather
+  // than held for the whole block: two triangle operations run per block, and
+  // each was keeping five tensors of this shape alive.
+  releaseScratch([a, b], output);
+  const hiddenNormalized = execution.allocate(`triangle.${direction}.hidden-normalized`, pairs * input.triangleHidden);
   execution.dispatch(encoder, normalizeHidden, [contracted, weights, hiddenNormalized], Math.ceil(pairs / 64), 1, 1,
     `triangle.${direction}.normalize-hidden`);
+  releaseScratch([contracted], output);
   execution.dispatch(encoder, projectOutput, [normalized, hiddenNormalized, weights, output],
     Math.ceil(input.cZ / 16), Math.ceil(pairs / 16), 1,
     `triangle.${direction}.output`);
+  releaseScratch([normalized, hiddenNormalized], output);
   return output;
 }
 
