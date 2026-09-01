@@ -24,6 +24,15 @@ export const COMPACT_GPU_POOL_BYTES = 864 * 1024 ** 2;
  */
 export const POOL_IDLE_GENERATIONS = 4;
 
+/**
+ * Requests of at least this size are backed by a whole number of mebibytes.
+ * Operations size their scratch from byte budgets and land a few percent
+ * apart (an attention window at 15.8 MiB, a transition chunk at 16.0), and
+ * a request can only reuse a buffer at least as large, so without a common
+ * granularity every operation kept its own set of nearly equal chunks.
+ */
+export const POOL_GRANULARITY_BYTES = 1024 ** 2;
+
 interface PooledGpuBuffer {
   readonly buffer: GPUBuffer;
   /** Physical size of the reusable GPUBuffer. */
@@ -104,6 +113,9 @@ export class GpuBufferAllocator {
       throw new RangeError(`invalid allocation size ${requestedBytes} for ${label}`);
     }
     const byteLength = Math.ceil(requestedBytes / 4) * 4;
+    // Readback buffers keep their exact size: callers map them whole.
+    const physicalBytes = byteLength >= POOL_GRANULARITY_BYTES && (usage & GPUBufferUsage.MAP_READ) === 0
+      ? Math.ceil(byteLength / POOL_GRANULARITY_BYTES) * POOL_GRANULARITY_BYTES : byteLength;
     // The smallest idle buffer that covers the request and carries every
     // usage it needs is reused rather than creating another buffer. AlphaFold
     // cycles through a handful of large but unequal shapes, and matching size
@@ -114,8 +126,8 @@ export class GpuBufferAllocator {
     // only forces the next pair-sized request to create another one.
     let pooledEntry: PooledGpuBuffer | undefined;
     for (const candidate of this.#pooledLru) {
-      if ((candidate.usage & usage) !== usage || candidate.byteLength < byteLength
-        || candidate.byteLength > 2 * byteLength) continue;
+      if ((candidate.usage & usage) !== usage || candidate.byteLength < physicalBytes
+        || candidate.byteLength > 2 * physicalBytes) continue;
       if (options.requireSubmitted === true && candidate.generation >= this.#generation) continue;
       if (pooledEntry === undefined || candidate.byteLength < pooledEntry.byteLength) pooledEntry = candidate;
     }
@@ -130,11 +142,11 @@ export class GpuBufferAllocator {
       this.#pooledLru.delete(pooledEntry);
       this.#pooledBytes -= pooledEntry.byteLength;
     }
-    const allocationByteLength = pooledEntry?.byteLength ?? byteLength;
+    const allocationByteLength = pooledEntry?.byteLength ?? physicalBytes;
     const allocationUsage = pooledEntry?.usage ?? usage;
     if (buffer === undefined) {
-      buffer = this.device.createBuffer({ label, size: byteLength, usage });
-      this.#residentBytes += byteLength;
+      buffer = this.device.createBuffer({ label, size: physicalBytes, usage });
+      this.#residentBytes += physicalBytes;
       this.#peakResidentBytes = Math.max(this.#peakResidentBytes, this.#residentBytes);
       this.#bufferCount += 1;
     }

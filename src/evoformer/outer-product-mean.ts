@@ -327,7 +327,7 @@ export const OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_RESIDUAL_SHADER =
  * normalized copy only has to exist one window at a time. Windows are a
  * multiple of 64 rows so the mask view stays on a valid binding offset.
  */
-export const OUTER_PRODUCT_NORMALIZE_WINDOW_BYTES = 16 * 1024 * 1024;
+export const OUTER_PRODUCT_NORMALIZE_WINDOW_BYTES = 8 * 1024 * 1024;
 
 export function outerProductMeanNormalizeWindow(
   rows: number, cM: number, budgetBytes: number = OUTER_PRODUCT_NORMALIZE_WINDOW_BYTES,

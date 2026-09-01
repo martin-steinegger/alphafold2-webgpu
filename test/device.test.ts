@@ -115,7 +115,7 @@ describe("estimateMonomerMemory", () => {
   // has to stay an upper bound without drifting far above what runs: it was
   // silently 3-5x over once every operation started bounding its own scratch.
   const measured: ReadonlyArray<readonly [number, number, number, number]> = [
-    [59, 508, 1024, 113], [128, 256, 512, 123], [256, 256, 512, 184],
+    [59, 508, 1024, 73], [128, 256, 512, 87], [256, 256, 512, 167],
     [384, 256, 512, 279], [512, 256, 512, 425],
   ];
 

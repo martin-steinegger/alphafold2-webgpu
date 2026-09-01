@@ -5,8 +5,11 @@ import { createTiledGemmShader } from "../runtime/gemm.js";
 export interface TriangleShaders {
   /** Mean and inverse standard deviation of every pair row, computed once. */
   readonly inputStatistics: string;
-  /** The normalized input for one block of pair rows, from the statistics. */
-  readonly normalizeInput: string;
+  /**
+   * The output gate for one block of pair rows, from the raw pair and the
+   * statistics; the output projection multiplies it in.
+   */
+  readonly projectGate: string;
   /**
    * The two contraction inputs, each a gated projection of the normalized
    * pair. Incoming blocks the contraction index, so both are block-sized;
@@ -109,27 +112,29 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
   }
 }`;
 
-  // x is the first row of this block within the whole pair tensor, y the
-  // number of rows it spans.
-  const normalizeInput = `${common}
-@group(0) @binding(0) var<storage, read> source: array<${t}>;
+  // The output gate is a projection of the normalized input, so like the
+  // contraction inputs it normalizes the raw pair while loading it.
+  const projectGate = createTiledGemmShader({
+    preamble: `${common}
+@group(0) @binding(0) var<storage, read> z: array<${t}>;
 @group(0) @binding(1) var<storage, read> weights: array<${t}>;
 @group(0) @binding(2) var<storage, read> statistics: array<f32>;
-@group(0) @binding(3) var<storage, read_write> normalized: array<f32>;
+@group(0) @binding(3) var<storage, read_write> gate: array<f32>;
+// x is the first row of this block within the whole pair tensor, y the
+// number of rows it spans.
 @group(0) @binding(4) var<uniform> block: vec4<u32>;
 
-@compute @workgroup_size(64)
-fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) group: vec3<u32>) {
-  let row = group.x + group.y * LINEAR_GRID_WIDTH;
-  if (row >= block.y) { return; }
-  let pair_row = block.x + row;
-  let mean = statistics[2u * pair_row];
-  let inverse_std = statistics[2u * pair_row + 1u];
-  for (var c = local.x; c < CZ; c += 64u) {
-    normalized[row * CZ + c] = (${read(precision, "source[pair_row * CZ + c]")} - mean) * inverse_std
-      * ${read(precision, "weights[W_LAYERNORMINWEIGHT + c]")} + ${read(precision, "weights[W_LAYERNORMINBIAS + c]")};
-  }
-}`;
+fn normalized_input(pair_row: u32, k: u32) -> f32 {
+  return (${read(precision, "z[pair_row * CZ + k]")} - statistics[2u * pair_row]) * statistics[2u * pair_row + 1u]
+    * ${read(precision, "weights[W_LAYERNORMINWEIGHT + k]")} + ${read(precision, "weights[W_LAYERNORMINBIAS + k]")};
+}`,
+    rows: "block.y",
+    inner: "CZ",
+    columns: "CZ",
+    sourceElement: "normalized_input(block.x + row, k)",
+    weightElement: read(precision, "weights[W_LINEARGWEIGHT + column * CZ + k]"),
+    store: `gate[row * CZ + column] = logistic(element + ${read(precision, "weights[W_LINEARGBIAS + column]")});`,
+  });
 
   /**
    * One gated projection as a tiled GEMM over the raw pair rows of a block.
@@ -254,92 +259,26 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   }
 }`;
 
-  const projectOutput = `${common}
-@group(0) @binding(0) var<storage, read> z: array<f32>;
+  // The output is the projected, gated hidden block; `output` is a view of the
+  // rows this block produces.
+  const projectOutput = createTiledGemmShader({
+    preamble: `${common}
+@group(0) @binding(0) var<storage, read> gate: array<f32>;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
 @group(0) @binding(2) var<storage, read> weights: array<${t}>;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
-
-var<workgroup> tile_x: array<f32, 128>;
-var<workgroup> tile_z: array<f32, 128>;
-var<workgroup> tile_projection_weight: array<f32, 128>;
-var<workgroup> tile_gate_weight: array<f32, 128>;
-
-fn write_output(row: u32, out_channel: u32, projected: f32, gate: f32) {
-  let index = row * CZ + out_channel;
-  output[index] = projected * logistic(gate);
-}
-
-@compute @workgroup_size(8, 8, 1)
-fn main(
-  @builtin(local_invocation_id) local: vec3<u32>,
-  @builtin(workgroup_id) group: vec3<u32>,
-) {
-  let row = group.y * 16u + local.y;
-  let second_row = row + 8u;
-  let out_channel = group.x * 16u + local.x;
-  let second_channel = out_channel + 8u;
-  let tile_index = local.y * 8u + local.x;
-  var projected_00 = 0.0; var gate_00 = 0.0;
-  var projected_01 = 0.0; var gate_01 = 0.0;
-  var projected_10 = 0.0; var gate_10 = 0.0;
-  var projected_11 = 0.0; var gate_11 = 0.0;
-  if (out_channel < CZ) {
-    projected_00 = ${read(precision, "weights[W_LINEARZBIAS + out_channel]")}; projected_10 = projected_00;
-    gate_00 = ${read(precision, "weights[W_LINEARGBIAS + out_channel]")}; gate_10 = gate_00;
-  }
-  if (second_channel < CZ) {
-    projected_01 = ${read(precision, "weights[W_LINEARZBIAS + second_channel]")}; projected_11 = projected_01;
-    gate_01 = ${read(precision, "weights[W_LINEARGBIAS + second_channel]")}; gate_11 = gate_01;
-  }
-  for (var k0 = 0u; k0 < max(CH, CZ); k0 += 8u) {
-    let source_k = k0 + local.x;
-    let weight_k = k0 + local.y;
-    tile_x[tile_index] = 0.0; tile_x[tile_index + 64u] = 0.0;
-    tile_z[tile_index] = 0.0; tile_z[tile_index + 64u] = 0.0;
-    if (row < PAIRS && source_k < CH) { tile_x[tile_index] = x[row * CH + source_k]; }
-    if (second_row < PAIRS && source_k < CH) {
-      tile_x[tile_index + 64u] = x[second_row * CH + source_k];
-    }
-    if (row < PAIRS && source_k < CZ) { tile_z[tile_index] = z[row * CZ + source_k]; }
-    if (second_row < PAIRS && source_k < CZ) {
-      tile_z[tile_index + 64u] = z[second_row * CZ + source_k];
-    }
-    for (var channel_block = 0u; channel_block < 2u; channel_block += 1u) {
-      let channel = out_channel + channel_block * 8u;
-      let weight_tile_index = local.y * 16u + local.x + channel_block * 8u;
-      tile_projection_weight[weight_tile_index] = 0.0; tile_gate_weight[weight_tile_index] = 0.0;
-      if (channel < CZ && weight_k < CH) {
-        tile_projection_weight[weight_tile_index] = ${read(precision,
-          "weights[W_LINEARZWEIGHT + channel * CH + weight_k]")};
-      }
-      if (channel < CZ && weight_k < CZ) {
-        tile_gate_weight[weight_tile_index] = ${read(precision,
-          "weights[W_LINEARGWEIGHT + channel * CZ + weight_k]")};
-      }
-    }
-    workgroupBarrier();
-    for (var k = 0u; k < 8u; k += 1u) {
-      let x_0 = tile_x[local.y * 8u + k]; let x_1 = tile_x[local.y * 8u + k + 64u];
-      let z_0 = tile_z[local.y * 8u + k]; let z_1 = tile_z[local.y * 8u + k + 64u];
-      let weight_0 = k * 16u + local.x; let weight_1 = weight_0 + 8u;
-      projected_00 += x_0 * tile_projection_weight[weight_0]; gate_00 += z_0 * tile_gate_weight[weight_0];
-      projected_01 += x_0 * tile_projection_weight[weight_1]; gate_01 += z_0 * tile_gate_weight[weight_1];
-      projected_10 += x_1 * tile_projection_weight[weight_0]; gate_10 += z_1 * tile_gate_weight[weight_0];
-      projected_11 += x_1 * tile_projection_weight[weight_1]; gate_11 += z_1 * tile_gate_weight[weight_1];
-    }
-    workgroupBarrier();
-  }
-  if (row < PAIRS && out_channel < CZ) { write_output(row, out_channel, projected_00, gate_00); }
-  if (row < PAIRS && second_channel < CZ) { write_output(row, second_channel, projected_01, gate_01); }
-  if (second_row < PAIRS && out_channel < CZ) { write_output(second_row, out_channel, projected_10, gate_10); }
-  if (second_row < PAIRS && second_channel < CZ) {
-    write_output(second_row, second_channel, projected_11, gate_11);
-  }
-}`;
+@group(0) @binding(4) var<uniform> block: vec4<u32>;`,
+    rows: "block.y",
+    inner: "CH",
+    columns: "CZ",
+    sourceElement: "x[row * CH + k]",
+    weightElement: read(precision, "weights[W_LINEARZWEIGHT + column * CH + k]"),
+    store: `let index = row * CZ + column;
+          output[index] = (element + ${read(precision, "weights[W_LINEARZBIAS + column]")}) * gate[index];`,
+  });
 
   const projectA = project("a", "BLOCK_PAIRS", "0u");
   const projectB = direction === "outgoing"
     ? project("b", "PAIRS", "block.x") : project("b", "BLOCK_PAIRS", "0u");
-  return { inputStatistics, normalizeInput, projectA, projectB, contract, normalizeHidden, projectOutput };
+  return { inputStatistics, projectGate, projectA, projectB, contract, normalizeHidden, projectOutput };
 }

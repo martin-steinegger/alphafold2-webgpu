@@ -54,9 +54,9 @@ describe("bounded model scratch tensors", () => {
   });
 
   it("covers the attention batch in one window when its tensors already fit", () => {
-    // 59 residues: row attention over 256 sequences, column attention over 59.
-    expect(attentionBatchWindow(256, 59, 256)).toBe(256);
-    expect(attentionBatchWindow(59, 256, 256)).toBe(59);
+    // 59 residues: row attention over 128 sequences, column attention over 59.
+    expect(attentionBatchWindow(128, 59, 256)).toBe(128);
+    expect(attentionBatchWindow(59, 128, 256)).toBe(59);
     // The full 508-row alignment no longer fits the budget and is split.
     const window = attentionBatchWindow(508, 59, 256);
     expect(window).toBeLessThan(508);

@@ -121,9 +121,12 @@ export interface PackedAttentionWeights { readonly data: Float32Array; readonly 
  * the normalized input, query, key, value and gate. Attention is independent
  * across batch entries, so covering the batch in windows bounds all five at
  * once. Windowing costs dispatches, not efficiency: even the narrowest window
- * this budget produces leaves the projection hundreds of GEMM row tiles tall.
+ * this budget produces leaves the projection over a hundred GEMM row tiles
+ * tall, and 8 MiB windows measured no slower than 16 MiB ones at 384
+ * residues. Every operation's scratch shares this chunk size so the pool can
+ * hand one operation's retired chunks to the next.
  */
-export const ATTENTION_WINDOW_TARGET_BYTES = 16 * 1024 * 1024;
+export const ATTENTION_WINDOW_TARGET_BYTES = 8 * 1024 * 1024;
 
 export function attentionBatchWindow(
   batch: number, queries: number, channels: number,

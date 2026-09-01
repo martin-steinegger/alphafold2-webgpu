@@ -60,10 +60,10 @@ class TriangleMultiplicationGpu {
       input.shape, precision, packedWeights.offsets, input.epsilon ?? 1e-5, this.direction,
     );
     const pipelineKey = `${this.direction}:${precision}:${length}:${cZ}:${cHidden}:${input.epsilon ?? 1e-5}`;
-    const [inputStatistics, normalizeInput, projectA, projectB, contract, normalizeHidden, projectOutput]
+    const [inputStatistics, projectGate, projectA, projectB, contract, normalizeHidden, projectOutput]
       = await Promise.all([
       this.pipelines.get(`${pipelineKey}:input-statistics`, shaders.inputStatistics),
-      this.pipelines.get(`${pipelineKey}:normalize-input`, shaders.normalizeInput),
+      this.pipelines.get(`${pipelineKey}:project-gate`, shaders.projectGate),
       this.pipelines.get(`${pipelineKey}:project-a`, shaders.projectA),
       this.pipelines.get(`${pipelineKey}:project-b`, shaders.projectB),
       this.pipelines.get(`${pipelineKey}:contract`, shaders.contract),
@@ -84,9 +84,7 @@ class TriangleMultiplicationGpu {
       const mask = keep(this.allocator.upload("triangle.mask", input.mask, storage));
       const weights = keep(this.allocator.upload("triangle.weights", packedWeights.data, storage));
       const statistics = keep(this.allocator.allocate("triangle.statistics", pairCount * 2 * 4, storage));
-      const zNormalized = keep(this.allocator.allocate(
-        "triangle.z-normalized", pairCount * cZ * 4, storage,
-      ));
+      const gate = keep(this.allocator.allocate("triangle.gate", pairCount * cZ * 4, storage));
       const a = keep(this.allocator.allocate("triangle.a", pairCount * cHidden * 4, storage));
       const b = keep(this.allocator.allocate("triangle.b", pairCount * cHidden * 4, storage));
       const contracted = keep(this.allocator.allocate("triangle.contracted", pairCount * cHidden * 4, storage));
@@ -129,8 +127,6 @@ class TriangleMultiplicationGpu {
         Math.min(pairCount, LINEAR_GRID_WIDTH), ceilDivide(pairCount, LINEAR_GRID_WIDTH),
       ];
       runPass("input-statistics", inputStatistics, [z.buffer, statistics.buffer], rowGrid[0], rowGrid[1]);
-      runPass("normalize-input", normalizeInput,
-        [z.buffer, weights.buffer, statistics.buffer, zNormalized.buffer, blockParams.buffer], rowGrid[0], rowGrid[1]);
       const projectionGrid = gemmGrid(pairCount, 2 * cHidden);
       runPass("project-a", projectA,
         [z.buffer, mask.buffer, weights.buffer, statistics.buffer, a.buffer, blockParams.buffer],
@@ -144,9 +140,12 @@ class TriangleMultiplicationGpu {
       runPass("normalize-hidden", normalizeHidden,
         [contracted.buffer, weights.buffer, xNormalized.buffer, blockParams.buffer],
         ceilDivide(pairCount, 64));
+      const outputGrid = gemmGrid(pairCount, cZ);
+      runPass("project-gate", projectGate,
+        [z.buffer, weights.buffer, statistics.buffer, gate.buffer, blockParams.buffer], outputGrid[0], outputGrid[1]);
       runPass("project-output", projectOutput,
-        [zNormalized.buffer, xNormalized.buffer, weights.buffer, output.buffer],
-        ceilDivide(cZ, 16), ceilDivide(pairCount, 16));
+        [gate.buffer, xNormalized.buffer, weights.buffer, output.buffer, blockParams.buffer],
+        outputGrid[0], outputGrid[1]);
       encoder.copyBufferToBuffer(output.buffer, 0, readback.buffer, 0, pairCount * cZ * 4);
 
       const start = performance.now();
