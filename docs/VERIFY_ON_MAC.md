@@ -163,12 +163,12 @@ Keep the release model outside the repository:
 
 ```bash
 QUAL_ROOT="$(mktemp -d)"
-mkdir -p "$QUAL_ROOT/model"
 gh release download model1-ptm-q8-v1 \
   --repo martin-steinegger/alphafold2-webgpu \
   --pattern afwebgpu-model1-ptm-q8-v1.tar.gz \
   --dir "$QUAL_ROOT"
-tar -xzf "$QUAL_ROOT/afwebgpu-model1-ptm-q8-v1.tar.gz" -C "$QUAL_ROOT/model"
+# The archive already contains its top-level model/ directory.
+tar -xzf "$QUAL_ROOT/afwebgpu-model1-ptm-q8-v1.tar.gz" -C "$QUAL_ROOT"
 mkdir -p "$QUAL_ROOT/acceptance"
 cp test.a3m "$QUAL_ROOT/acceptance/test.a3m"
 AFWEBGPU_QUALIFICATION_ASSET_ROOT="$QUAL_ROOT" \
@@ -182,6 +182,12 @@ remain above pLDDT 90 / pTM 0.65, and packed must remain within 0.25 pLDDT and
 0.005 pTM. Its console output prints both confidence pairs. For an interactive
 run, start `AFWEBGPU_QUALIFICATION_ASSET_ROOT="$QUAL_ROOT" npm run dev` after
 the test.
+
+Known pass for commit `9f0252a` on an Apple M4 Pro (20-core GPU), macOS
+15.4.1 and Chrome 152.0.7977.65: the exact result was pLDDT 96.802248 / pTM
+0.754544, the packed result was 96.802616 / 0.754548, and the test took 14.1
+seconds. Chrome reported the non-fallback `apple metal-3` adapter with 4096
+MiB maximum buffer and storage-binding limits.
 
 Open `http://127.0.0.1:4173/` in stable Chrome, then:
 
