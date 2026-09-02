@@ -22,7 +22,10 @@ them together as an explicit reduced-memory monomer option; exact f32 remains
 the default and Multimer remains f32.
 
 Since then the allocator records what was live when the peak was reached, and
-that list settled where the memory actually is. At 512 residues with 508
+that list settled where the memory actually is. It also found the structure
+module holding a normalized copy of the pair, 128 MiB at 512 residues; the
+invariant point attention now normalizes while loading, which took that phase
+from 162 to 48 MiB exactly. At 512 residues with 508
 clustered rows the 544 MiB peak is the MSA activations at 254 MiB, the pair at
 128 and the triangle multiplication's whole projection at 128, with 34 MiB for
 everything else. The pair joined the packable tensors as `pairStorage: "f16"`,
@@ -305,7 +308,11 @@ AFWEBGPU_PAIR_F16=1 AFWEBGPU_MSA_F16=1 AFWEBGPU_TRIANGLE_F16=1 \
 On the Linux GB10, packing the pair alone left mean pLDDT and pTM unchanged to
 two decimals on four proteins of 164 to 396 residues, and lowered the peak by
 5 to 10 per cent. All three options together took a synthetic 512-residue
-shape from 544 to 320 MiB live. Report both numbers per protein: if Metal's
+shape from 544 to 320 MiB live, and 663 to 444 MiB resident. Packing also
+halves the largest storage binding, which is what an adapter limits: this
+Chrome reports 128 MiB, which an exact pair reaches at 512 residues and a
+packed one at about 724, so on Metal please report both the limit Chrome
+gives you and the longest chain that runs. Report both numbers per protein: if Metal's
 rounding differs, it will show as a pLDDT difference here first.
 
 `AFWEBGPU_MEMORY=1` on `tools/benchmark-shape.ts` now prints what was live at
