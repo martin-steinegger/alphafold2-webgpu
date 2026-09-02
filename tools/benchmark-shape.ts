@@ -76,6 +76,7 @@ try {
   const prediction = await new AlphaFoldMonomerGpu(device, {
     ...(profile ? { profile: true } : {}),
     ...(process.env.AFWEBGPU_TRIANGLE_F16 === "1" ? { triangleWholeStorage: "f16" as const } : {}),
+    ...(process.env.AFWEBGPU_MSA_F16 === "1" ? { msaStorage: "f16" as const } : {}),
     ...(poolMib > 0 ? { maxPooledBytes: poolMib * 1024 ** 2 } : {}),
   }).predict(features, {
     embedding, template, extraStack, mainStack, structure,

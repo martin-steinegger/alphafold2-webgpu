@@ -5,6 +5,7 @@ import {
 import { ATTENTION_WINDOW_TARGET_BYTES, attentionBatchWindow } from "../evoformer/attention.js";
 import { triangleBlockRows } from "../evoformer/block.js";
 import type { TriangleWholeStorage } from "../triangle/shaders.js";
+import type { ActivationStorage } from "./storage.js";
 import { TRANSITION_CHUNK_TARGET_BYTES, transitionChunkRows } from "../evoformer/transition.js";
 import { recordSubgroupRange } from "./subgroups.js";
 
@@ -56,6 +57,8 @@ function checkedBytes(label: string, ...factors: number[]): number {
 export interface MonomerMemoryOptions {
   /** Storage of the triangle multiplication's whole projection; `f16` halves it. */
   readonly triangleWholeStorage?: TriangleWholeStorage;
+  /** Storage of the MSA activations; `f16` halves them. */
+  readonly msaStorage?: ActivationStorage;
 }
 
 export function estimateMonomerMemory(
@@ -72,8 +75,9 @@ export function estimateMonomerMemory(
   void transitionMode;
   const bytes = Float32Array.BYTES_PER_ELEMENT;
   const pair = checkedBytes("pair representation", length, length, 128, bytes);
-  const msa = checkedBytes("MSA representation", msaSequences, length, 256, bytes);
-  const extra = checkedBytes("extra-MSA representation", extraSequences, length, 64, bytes);
+  const activationBytes = options.msaStorage === "f16" ? 2 : bytes;
+  const msa = checkedBytes("MSA representation", msaSequences, length, 256, activationBytes);
+  const extra = checkedBytes("extra-MSA representation", extraSequences, length, 64, activationBytes);
   const masks = checkedBytes("model masks", length, msaSequences + extraSequences + length, bytes);
   const positions = checkedBytes("atom positions", length, 37, 3, bytes);
 

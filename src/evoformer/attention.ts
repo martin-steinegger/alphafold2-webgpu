@@ -1,6 +1,7 @@
 import { GpuBufferAllocator, type AllocatedGpuBuffer, type AllocationSnapshot } from "../runtime/allocator.js";
 import { pipelineCacheForDevice, type ComputePipelineCache } from "../runtime/pipeline-cache.js";
 import { subgroupRange } from "../runtime/subgroups.js";
+import { type ActivationStorage, storageArray, storedElement } from "../runtime/storage.js";
 import { createTiledGemmShader, gemmGrid } from "../runtime/gemm.js";
 
 export interface AttentionWeights {
@@ -200,14 +201,15 @@ export function createAttentionNormParameters(
   return new Uint8Array(buffer);
 }
 
-export const ATTENTION_NORMALIZE_SHADER = `
+export function createAttentionNormalizeShader(storage: ActivationStorage = "f32"): string {
+  return `
 struct NormParameters {
   rows: u32, channels: u32, scale: u32, offset: u32,
   transpose: u32, batch: u32, queries: u32, epsilon: f32,
   batch_offset: u32, batch_total: u32, padding: vec2<u32>,
 };
 const GRID_WIDTH: u32 = 32768u;
-@group(0) @binding(0) var<storage, read> source: array<f32>;
+@group(0) @binding(0) var<storage, read> source: array<${storageArray(storage)}>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> p: NormParameters;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
@@ -229,7 +231,7 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
   let input_base = source_row(row) * p.channels;
   let output_base = row * p.channels;
   var sum = 0.0;
-  for (var c = local.x; c < p.channels; c += 64u) { sum += source[input_base + c]; }
+  for (var c = local.x; c < p.channels; c += 64u) { sum += ${storedElement(storage, "source", "input_base + c")}; }
   partial[local.x] = sum;
   workgroupBarrier();
   for (var stride = 32u; stride > 0u; stride /= 2u) {
@@ -240,7 +242,7 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
   workgroupBarrier();
   var squared = 0.0;
   for (var c = local.x; c < p.channels; c += 64u) {
-    let centered = source[input_base + c] - row_mean[0];
+    let centered = ${storedElement(storage, "source", "input_base + c")} - row_mean[0];
     squared += centered * centered;
   }
   partial[local.x] = squared;
@@ -251,10 +253,14 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
   }
   let inverse_std = inverseSqrt(partial[0] / f32(p.channels) + p.epsilon);
   for (var c = local.x; c < p.channels; c += 64u) {
-    output[output_base + c] = (source[input_base + c] - row_mean[0]) * inverse_std
+    output[output_base + c] = (${storedElement(storage, "source", "input_base + c")} - row_mean[0]) * inverse_std
       * weights[p.scale + c] + weights[p.offset + c];
   }
 }`;
+}
+
+/** Row LayerNorm over an f32 source. */
+export const ATTENTION_NORMALIZE_SHADER = createAttentionNormalizeShader("f32");
 
 /**
  * The same LayerNorm writing over its input. WebGPU rejects one buffer bound
@@ -887,25 +893,37 @@ export function selectAttentionFlashKernel(
   return { cacheKey: "attention:flash", shader: ATTENTION_FLASH_SHADER, queryTile: 1, variant };
 }
 
-function createAttentionOutputShader(residual: boolean): string {
+export function createAttentionOutputShader(residual: boolean, storage: ActivationStorage = "f32"): string {
+  // Rows are numbered within this batch window, and column attention consumes
+  // a transposed view, so the result row is remapped both ways.
+  const outputRow = `let b = p.batch_offset + row / p.queries;
+          let q = row % p.queries;
+          let output_row = select(b * p.queries + q, q * p.batch_total + b, p.transpose != 0u);`;
   return createTiledGemmShader({
     preamble: `${COMMON}
 @group(0) @binding(0) var<storage, read> source: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> p: Parameters;
-@group(0) @binding(3) var<storage, read_write> output: array<f32>;`,
+@group(0) @binding(3) var<storage, read_write> output: array<${storageArray(storage)}>;`,
     rows: "p.batch * p.queries",
     inner: "p.heads * p.head_dim",
     columns: "p.channels",
     sourceElement: "source[row * p.heads * p.head_dim + k]",
     weightElement: "weights[p.output_weight + k * p.channels + column]",
-    // Rows are numbered within this batch window, and column attention consumes
-    // a transposed view, so the result row is remapped both ways.
-    store: `let b = p.batch_offset + row / p.queries;
-          let q = row % p.queries;
-          let output_row = select(b * p.queries + q, q * p.batch_total + b, p.transpose != 0u);
+    store: `${outputRow}
           output[output_row * p.channels + column] ${residual ? "+=" : "="}
             element + weights[p.output_bias + column];`,
+    // Packed storage is written a word (two adjacent channels) at a time; the
+    // four columns an invocation holds start at a multiple of four and the
+    // channel count is even, so the words are its own.
+    ...(storage === "f16" ? { storeVector: `${outputRow}
+          let base = output_row * p.channels + column;
+${[0, 2].map((pair) => `          if (column + ${pair + 1}u < p.channels) {
+            var stored = vec2<f32>(values[${pair}] + weights[p.output_bias + column + ${pair}u],
+              values[${pair + 1}] + weights[p.output_bias + column + ${pair + 1}u]);
+            ${residual ? `stored += unpack2x16float(output[(base + ${pair}u) >> 1u]);` : ""}
+            output[(base + ${pair}u) >> 1u] = pack2x16float(stored);
+          }`).join("\n")}` } : {}),
   });
 }
 

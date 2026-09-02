@@ -1,5 +1,6 @@
 import { GpuBufferAllocator, type AllocatedGpuBuffer, type AllocationSnapshot } from "../runtime/allocator.js";
 import { pipelineCacheForDevice, type ComputePipelineCache } from "../runtime/pipeline-cache.js";
+import { type ActivationStorage, storageArray, storedElement } from "../runtime/storage.js";
 import { createTiledGemmShader, GEMM_TILE_COLUMNS, GEMM_TILE_ROWS } from "../runtime/gemm.js";
 
 export interface TransitionWeights {
@@ -84,7 +85,7 @@ export function transitionChunkRows(
  * The Evoformer/IPA/head projection: A x W + bias, optional ReLU, optionally
  * accumulated into an existing output tensor.
  */
-export function createLinearShader(residual: boolean): string {
+export function createLinearShader(residual: boolean, storage: ActivationStorage = "f32"): string {
   return createTiledGemmShader({
     preamble: `
 struct MatmulParameters {
@@ -99,7 +100,7 @@ struct MatmulParameters {
 @group(0) @binding(0) var<storage, read> source: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> parameters: MatmulParameters;
-@group(0) @binding(3) var<storage, read_write> output: array<f32>;`,
+@group(0) @binding(3) var<storage, read_write> output: array<${storageArray(storage)}>;`,
     rows: "parameters.rows",
     inner: "parameters.inner",
     columns: "parameters.columns",
@@ -108,6 +109,15 @@ struct MatmulParameters {
     store: `var stored = element + weights[parameters.bias_offset + column];
           if (parameters.activation == 1u) { stored = max(stored, 0.0); }
           output[row * parameters.columns + column] ${residual ? "+=" : "="} stored;`,
+    // Packed storage is written a word (two adjacent columns) at a time.
+    ...(storage === "f16" ? { storeVector: `let base = row * parameters.columns + column;
+${[0, 2].map((pair) => `          if (column + ${pair + 1}u < parameters.columns) {
+            var stored = vec2<f32>(values[${pair}] + weights[parameters.bias_offset + column + ${pair}u],
+              values[${pair + 1}] + weights[parameters.bias_offset + column + ${pair + 1}u]);
+            if (parameters.activation == 1u) { stored = max(stored, vec2<f32>(0.0)); }
+            ${residual ? `stored += unpack2x16float(output[(base + ${pair}u) >> 1u]);` : ""}
+            output[(base + ${pair}u) >> 1u] = pack2x16float(stored);
+          }`).join("\n")}` } : {}),
   });
 }
 
@@ -150,7 +160,9 @@ export function packTransitionWeights(input: TransitionInput): { data: Float32Ar
   return { data, offsets };
 }
 
-export function createTransitionShaders(input: TransitionInput, offsets: readonly number[]): readonly string[] {
+export function createTransitionShaders(
+  input: TransitionInput, offsets: readonly number[], storage: ActivationStorage = "f32",
+): readonly string[] {
   void input;
   void offsets;
   const normalize = `
@@ -165,7 +177,7 @@ struct NormalizeParameters {
   padding_2: u32,
 };
 const GRID_WIDTH: u32 = 32768u;
-@group(0) @binding(0) var<storage, read> source: array<f32>;
+@group(0) @binding(0) var<storage, read> source: array<${storageArray(storage)}>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> parameters: NormalizeParameters;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
@@ -182,7 +194,7 @@ fn main(
   let base = row * parameters.channels;
   var sum = 0.0;
   for (var c = local.x; c < parameters.channels; c += 64u) {
-    sum += source[base + c];
+    sum += ${storedElement(storage, "source", "base + c")};
   }
   partial[local.x] = sum;
   workgroupBarrier();
@@ -195,7 +207,7 @@ fn main(
 
   var sum_squared = 0.0;
   for (var c = local.x; c < parameters.channels; c += 64u) {
-    let centered = source[base + c] - row_mean[0];
+    let centered = ${storedElement(storage, "source", "base + c")} - row_mean[0];
     sum_squared += centered * centered;
   }
   partial[local.x] = sum_squared;
@@ -206,11 +218,11 @@ fn main(
   }
   let inverse_std = inverseSqrt(partial[0] / f32(parameters.channels) + parameters.epsilon);
   for (var c = local.x; c < parameters.channels; c += 64u) {
-    output[base + c] = (source[base + c] - row_mean[0]) * inverse_std
+    output[base + c] = (${storedElement(storage, "source", "base + c")} - row_mean[0]) * inverse_std
       * weights[parameters.scale_offset + c] + weights[parameters.offset_offset + c];
   }
 }`;
-  return [normalize, createLinearShader(false), createLinearShader(true)];
+  return [normalize, createLinearShader(false), createLinearShader(true, storage)];
 }
 
 export function createTransitionNormalizeParameters(input: TransitionInput, offsets: readonly number[]): Uint8Array {

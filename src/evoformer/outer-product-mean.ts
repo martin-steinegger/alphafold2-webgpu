@@ -1,5 +1,6 @@
 import { GpuBufferAllocator, type AllocatedGpuBuffer, type AllocationSnapshot } from "../runtime/allocator.js";
 import { pipelineCacheForDevice, type ComputePipelineCache } from "../runtime/pipeline-cache.js";
+import { type ActivationStorage, storageArray, storedElement } from "../runtime/storage.js";
 import { createTiledGemmShader, gemmGrid } from "../runtime/gemm.js";
 
 export interface OuterProductMeanWeights {
@@ -106,8 +107,9 @@ struct Parameters {
 const GRID_WIDTH: u32 = 32768u;
 `;
 
-export const OUTER_PRODUCT_MEAN_NORMALIZE_SHADER = `${COMMON}
-@group(0) @binding(0) var<storage, read> source: array<f32>;
+export function createOuterProductMeanNormalizeShader(storage: ActivationStorage = "f32"): string {
+  return `${COMMON}
+@group(0) @binding(0) var<storage, read> source: array<${storageArray(storage)}>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> p: Parameters;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
@@ -121,7 +123,7 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
   if (row >= rows) { return; }
   let base = row * p.c_m;
   var sum = 0.0;
-  for (var c = local.x; c < p.c_m; c += 64u) { sum += source[base + c]; }
+  for (var c = local.x; c < p.c_m; c += 64u) { sum += ${storedElement(storage, "source", "base + c")}; }
   partial[local.x] = sum;
   workgroupBarrier();
   for (var stride = 32u; stride > 0u; stride /= 2u) {
@@ -132,7 +134,7 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
   workgroupBarrier();
   var squared = 0.0;
   for (var c = local.x; c < p.c_m; c += 64u) {
-    let centered = source[base + c] - row_mean[0];
+    let centered = ${storedElement(storage, "source", "base + c")} - row_mean[0];
     squared += centered * centered;
   }
   partial[local.x] = squared;
@@ -143,10 +145,13 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
   }
   let inverse_std = inverseSqrt(partial[0] / f32(p.c_m) + p.layer_norm_epsilon);
   for (var c = local.x; c < p.c_m; c += 64u) {
-    output[base + c] = (source[base + c] - row_mean[0]) * inverse_std
+    output[base + c] = (${storedElement(storage, "source", "base + c")} - row_mean[0]) * inverse_std
       * weights[p.layer_norm_scale + c] + weights[p.layer_norm_offset + c];
   }
 }`;
+}
+
+export const OUTER_PRODUCT_MEAN_NORMALIZE_SHADER = createOuterProductMeanNormalizeShader("f32");
 
 export const OUTER_PRODUCT_MEAN_PROJECT_SHADER = `${COMMON}
 @group(0) @binding(0) var<storage, read> source: array<f32>;

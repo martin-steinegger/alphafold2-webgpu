@@ -166,12 +166,27 @@ describe.skipIf(!enabled)("complete Evoformer block WebGPU", () => {
       weights,
     };
     const result = await new EvoformerBlockGpu(device).run(descriptor);
-    const msaMetrics = errorMetrics(result.msa, await store.tensor("blockExpectedMsa"));
-    const pairMetrics = errorMetrics(result.pair, await store.tensor("blockExpectedPair"));
+    const expectedMsa = await store.tensor("blockExpectedMsa");
+    const expectedPair = await store.tensor("blockExpectedPair");
+    const msaMetrics = errorMetrics(result.msa, expectedMsa);
+    const pairMetrics = errorMetrics(result.pair, expectedPair);
     expect(msaMetrics.meanAbsoluteError).toBeLessThan(5e-5);
     expect(msaMetrics.maxAbsoluteError).toBeLessThan(5e-4);
     expect(pairMetrics.meanAbsoluteError).toBeLessThan(1e-4);
     expect(pairMetrics.maxAbsoluteError).toBeLessThan(1e-3);
+
+    // Packed half-precision MSA storage is inexact by design: every write to
+    // the MSA rounds to about three significant digits, and this activation
+    // reaches magnitudes near 300, where a half-precision step is 0.25. This
+    // pins that option's error on one block; it says nothing about the exact
+    // path. Measured: MSA mean 1.6e-3, max 0.27; pair mean 4.4e-3, max 0.06.
+    const packed = await new EvoformerBlockGpu(device).run({ ...descriptor, msaStorage: "f16" });
+    const packedMsa = errorMetrics(packed.msa, expectedMsa);
+    const packedPair = errorMetrics(packed.pair, expectedPair);
+    expect(packedMsa.meanAbsoluteError).toBeLessThan(5e-3);
+    expect(packedMsa.maxAbsoluteError).toBeLessThan(0.5);
+    expect(packedPair.meanAbsoluteError).toBeLessThan(1e-2);
+    expect(packedPair.maxAbsoluteError).toBeLessThan(0.2);
 
     // Longer chains cover the attention batch, and the outer-product mean's
     // normalized MSA, in windows. Neither path runs at 59 residues, so force

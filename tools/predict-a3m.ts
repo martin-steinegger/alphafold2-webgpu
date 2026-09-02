@@ -41,6 +41,7 @@ const device = await requestAlphaFoldDevice(adapter, plan.requirements);
 try {
   const prediction = await new AlphaFoldMonomerGpu(device, {
     ...(process.env.AFWEBGPU_TRIANGLE_F16 === "1" ? { triangleWholeStorage: "f16" as const } : {}),
+    ...(process.env.AFWEBGPU_MSA_F16 === "1" ? { msaStorage: "f16" as const } : {}),
   }).predict(features, {
     embedding, template, extraStack, mainStack, structure,
     lddt: confidence.lddt, pae: confidence.pae, geometry,

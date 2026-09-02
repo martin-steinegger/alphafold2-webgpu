@@ -7,6 +7,7 @@ import {
 } from "../heads/confidence.js";
 import { encodeInputEmbedder, type InputEmbedderWeights } from "../evoformer/input-embedder.js";
 import type { TriangleWholeStorage } from "../triangle/shaders.js";
+import { type ActivationStorage, storageWords, unpackHalfWords } from "../runtime/storage.js";
 import {
   encodeEvoformerBlock, encodeExtraMsaBlock, type EvoformerBlockWeights, type ExtraMsaBlockWeights,
 } from "../evoformer/block.js";
@@ -106,6 +107,8 @@ export interface MonomerGpuOptions {
   readonly compactTransitions?: boolean;
   /** Storage of the triangle multiplication's whole projection; `f16` halves it inexactly. */
   readonly triangleWholeStorage?: TriangleWholeStorage;
+  /** Storage of the MSA activations; `f16` halves them inexactly. Monomer only. */
+  readonly msaStorage?: ActivationStorage;
   /** Caps reusable scratch retained between blocks; compact mode uses the bounded shared default. */
   readonly maxPooledBytes?: number;
   /** Internal model architecture selector used by AlphaFoldMultimerGpu. */
@@ -153,6 +156,7 @@ export class AlphaFoldMonomerGpu {
   readonly compactTransitions: boolean;
   readonly maxPooledBytes: number | undefined;
   readonly triangleWholeStorage: TriangleWholeStorage;
+  readonly msaStorage: ActivationStorage;
   readonly multimer: boolean;
   readonly recycleEarlyStopTolerance: number;
   constructor(device: GPUDevice, options: MonomerGpuOptions = {}) {
@@ -166,6 +170,10 @@ export class AlphaFoldMonomerGpu {
       ?? (this.compactTransitions ? COMPACT_GPU_POOL_BYTES : undefined);
     this.multimer = options.multimer ?? false;
     this.triangleWholeStorage = options.triangleWholeStorage ?? "f32";
+    this.msaStorage = options.msaStorage ?? "f32";
+    if (this.multimer && this.msaStorage !== "f32") {
+      throw new RangeError("packed MSA storage is not supported for Multimer, which merges template rows into the MSA");
+    }
     this.recycleEarlyStopTolerance = options.recycleEarlyStopTolerance ?? -1;
     if (!Number.isFinite(this.recycleEarlyStopTolerance)) {
       throw new RangeError("recycleEarlyStopTolerance must be finite");
@@ -262,6 +270,7 @@ export class AlphaFoldMonomerGpu {
           previousMsaFirstRow: new Float32Array(0), previousPair: new Float32Array(0),
           previousPositions: new Float32Array(0), length,
           msaChannels: 256, pairChannels: 128, extraMsaChannels: 64, weights: weights.embedding,
+          msaStorage: this.msaStorage,
           ...(features.chainRelative === undefined ? {} : { chainRelative: features.chainRelative }),
         }, previousMsa, previousPair, previousPositions);
         // The template update is constant across recycles but read only here, so
@@ -332,7 +341,7 @@ export class AlphaFoldMonomerGpu {
           sequences: features.extraSequences, length, cM: 64, cZ: 128,
           cOuter: weights.extraStack[0]!.outerProductMean.leftBias.length,
           triangleHidden: weights.extraStack[0]!.triangleMultiplicationOutgoing.linearAPBias.length,
-          triangleWholeStorage: this.triangleWholeStorage,
+          triangleWholeStorage: this.triangleWholeStorage, msaStorage: this.msaStorage,
           ...(this.multimer ? { outerProductMeanFirst: true } : {}),
         };
         const shouldProfileRecycle = this.profile && recycle === this.profileRecycle;
@@ -388,7 +397,7 @@ export class AlphaFoldMonomerGpu {
           pairMask: new Float32Array(0), sequences: mainSequences, length, cM: 256, cZ: 128,
           cOuter: weights.mainStack[0]!.outerProductMean.leftBias.length,
           triangleHidden: weights.mainStack[0]!.triangleMultiplicationOutgoing.linearAPBias.length,
-          triangleWholeStorage: this.triangleWholeStorage,
+          triangleWholeStorage: this.triangleWholeStorage, msaStorage: this.msaStorage,
           ...(this.multimer ? { outerProductMeanFirst: true } : {}),
         };
         let mainProfile: MonomerBlockGpuProfile | undefined;
@@ -422,23 +431,32 @@ export class AlphaFoldMonomerGpu {
           mainSubmissions += 1;
         }
         const readbackEncoder = this.device.createCommandEncoder({ label: `monomer.readback-${recycle}` });
+        const firstRowWords = storageWords(length * 256, this.msaStorage);
         const msaFirstRowTensor = execution.allocate(
-          `monomer.msa-first-row-readback-${recycle}`, length * 256,
+          `monomer.msa-first-row-readback-${recycle}`, firstRowWords,
           GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
         );
         execution.endComputePass(readbackEncoder);
         readbackEncoder.copyBufferToBuffer(
-          mainMsa.allocation.buffer, 0, msaFirstRowTensor.allocation.buffer, 0, length * 256 * 4,
+          mainMsa.allocation.buffer, 0, msaFirstRowTensor.allocation.buffer, 0, firstRowWords * 4,
         );
-        const nextPreviousMsa = execution.allocate(
+        // The recycled first row feeds the next embedder as f32. Packed storage
+        // goes through the host, where the readback is unpacked anyway.
+        const nextPreviousMsaCopy = this.msaStorage === "f32" ? execution.allocate(
           `monomer.recycle-msa-${recycle}`, length * 256, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-        );
-        readbackEncoder.copyBufferToBuffer(
-          mainMsa.allocation.buffer, 0, nextPreviousMsa.allocation.buffer, 0, length * 256 * 4,
-        );
+        ) : undefined;
+        if (nextPreviousMsaCopy !== undefined) {
+          readbackEncoder.copyBufferToBuffer(
+            mainMsa.allocation.buffer, 0, nextPreviousMsaCopy.allocation.buffer, 0, length * 256 * 4,
+          );
+        }
         this.device.pushErrorScope("validation");
         await submit(readbackEncoder, `readback recycle ${recycle}`);
-        const msaFirstRow = await execution.mapFloat32(msaFirstRowTensor);
+        const firstRowMapped = await execution.mapFloat32(msaFirstRowTensor);
+        const msaFirstRow = this.msaStorage === "f32" ? firstRowMapped
+          : unpackHalfWords(new Uint32Array(firstRowMapped.buffer, firstRowMapped.byteOffset, firstRowWords), length * 256);
+        const nextPreviousMsa = nextPreviousMsaCopy
+          ?? execution.upload(`monomer.recycle-msa-${recycle}`, msaFirstRow);
         releaseTensor(msaFirstRowTensor); releaseTensor(msaMask);
         if (multimerMainMsa !== undefined) releaseTensor(multimerMainMsa);
         if (multimerMainMsaMask !== undefined) releaseTensor(multimerMainMsaMask);

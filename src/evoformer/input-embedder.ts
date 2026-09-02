@@ -1,6 +1,7 @@
 import {
   ATTENTION_NORMALIZE_IN_PLACE_SHADER, ATTENTION_NORMALIZE_SHADER, createAttentionNormParameters,
 } from "./attention.js";
+import { type ActivationStorage, storageWords } from "../runtime/storage.js";
 import { GpuBufferAllocator, type AllocatedGpuBuffer, type AllocationSnapshot } from "../runtime/allocator.js";
 import { pipelineCacheForDevice, type ComputePipelineCache } from "../runtime/pipeline-cache.js";
 import { WebGpuExecution, type GpuTensor } from "../runtime/execution.js";
@@ -46,6 +47,8 @@ export interface InputEmbedderInput {
   readonly pairChannels: number;
   readonly extraMsaChannels: number;
   readonly weights: InputEmbedderWeights;
+  /** Storage of the MSA activations the embedder produces (GPU path only); `f16` halves them inexactly. */
+  readonly msaStorage?: ActivationStorage;
   /** Enables AlphaFold-Multimer's 73-channel chain-relative position encoding. */
   readonly chainRelative?: {
     readonly asymId: Float32Array;
@@ -145,6 +148,44 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   output[index] = result;
 }`;
 
+function createMsaEmbedShader(storage: ActivationStorage): string {
+  if (storage === "f32") return MSA_SHADER;
+  // One invocation per pair of adjacent channels, packed into one word.
+  return `${COMMON}
+@group(0) @binding(0) var<storage, read> target_features: array<f32>;
+@group(0) @binding(1) var<storage, read> msa_features: array<f32>;
+@group(0) @binding(2) var<storage, read> previous_msa: array<f32>;
+@group(0) @binding(3) var<storage, read> weights: array<f32>;
+@group(0) @binding(4) var<uniform> p: Parameters;
+@group(0) @binding(5) var<storage, read_write> output: array<u32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let pair = id.x + id.y * GRID_WIDTH * 64u;
+  let pairs_per_row = p.msa_channels / 2u;
+  if (pair >= p.msa_sequences * p.length * pairs_per_row) { return; }
+  let channel = (pair % pairs_per_row) * 2u;
+  let row = pair / pairs_per_row;
+  let residue = row % p.length;
+  let sequence = row / p.length;
+  var result = vec2<f32>(weights[p.preprocess_1d_bias + channel] + weights[p.preprocess_msa_bias + channel],
+    weights[p.preprocess_1d_bias + channel + 1u] + weights[p.preprocess_msa_bias + channel + 1u]);
+  for (var c = 0u; c < p.target_channels; c += 1u) {
+    let base = p.preprocess_1d_weight + c * p.msa_channels + channel;
+    result += target_features[residue * p.target_channels + c] * vec2<f32>(weights[base], weights[base + 1u]);
+  }
+  for (var c = 0u; c < p.msa_feature_channels; c += 1u) {
+    let base = p.preprocess_msa_weight + c * p.msa_channels + channel;
+    result += msa_features[row * p.msa_feature_channels + c] * vec2<f32>(weights[base], weights[base + 1u]);
+  }
+  if (sequence == 0u) {
+    let base = residue * p.msa_channels + channel;
+    result += vec2<f32>(previous_msa[base], previous_msa[base + 1u]);
+  }
+  output[pair] = pack2x16float(result);
+}`;
+}
+
+
 const EXTRA_SHADER = `${COMMON}
 @group(0) @binding(0) var<storage, read> extra_msa: array<f32>;
 @group(0) @binding(1) var<storage, read> has_deletion: array<f32>;
@@ -165,6 +206,35 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   result += deletion_value[row] * weights[p.extra_weight + 24u * p.extra_channels + channel];
   output[index] = result;
 }`;
+
+function createExtraEmbedShader(storage: ActivationStorage): string {
+  if (storage === "f32") return EXTRA_SHADER;
+  return `${COMMON}
+@group(0) @binding(0) var<storage, read> extra_msa: array<f32>;
+@group(0) @binding(1) var<storage, read> has_deletion: array<f32>;
+@group(0) @binding(2) var<storage, read> deletion_value: array<f32>;
+@group(0) @binding(3) var<storage, read> weights: array<f32>;
+@group(0) @binding(4) var<uniform> p: Parameters;
+@group(0) @binding(5) var<storage, read_write> output: array<u32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let pair = id.x + id.y * GRID_WIDTH * 64u;
+  let pairs_per_row = p.extra_channels / 2u;
+  if (pair >= p.extra_sequences * p.length * pairs_per_row) { return; }
+  let channel = (pair % pairs_per_row) * 2u;
+  let row = pair / pairs_per_row;
+  let code = u32(extra_msa[row]);
+  var result = vec2<f32>(weights[p.extra_bias + channel], weights[p.extra_bias + channel + 1u]);
+  let coded = p.extra_weight + code * p.extra_channels + channel;
+  result += vec2<f32>(weights[coded], weights[coded + 1u]);
+  let deletion = p.extra_weight + 23u * p.extra_channels + channel;
+  result += has_deletion[row] * vec2<f32>(weights[deletion], weights[deletion + 1u]);
+  let value = p.extra_weight + 24u * p.extra_channels + channel;
+  result += deletion_value[row] * vec2<f32>(weights[value], weights[value + 1u]);
+  output[pair] = pack2x16float(result);
+}`;
+}
+
 
 const PAIR_SHADER = `${COMMON}
 @group(0) @binding(0) var<storage, read> target_features: array<f32>;
@@ -306,11 +376,15 @@ export async function encodeInputEmbedder(
     throw new RangeError("resident recycle tensor shape mismatch");
   }
   const packed = packWeights(input);
+  const storage = input.msaStorage ?? "f32";
+  if (storage === "f16" && (input.msaChannels % 2 !== 0 || input.extraMsaChannels % 2 !== 0)) {
+    throw new RangeError("packed MSA storage needs even channel counts");
+  }
   const [normalize, msaPipeline, pairPipeline, extraPipeline] = await Promise.all([
     execution.pipelines.get("embed:normalize-in-place", ATTENTION_NORMALIZE_IN_PLACE_SHADER),
-    execution.pipelines.get("embed:msa", MSA_SHADER),
+    execution.pipelines.get(`embed:msa:${storage}`, createMsaEmbedShader(storage)),
     execution.pipelines.get("embed:pair-in-place", PAIR_IN_PLACE_SHADER),
-    execution.pipelines.get("embed:extra", EXTRA_SHADER),
+    execution.pipelines.get(`embed:extra:${storage}`, createExtraEmbedShader(storage)),
   ]);
   const temporaries: GpuTensor[] = [];
   const temporaryUpload = (label: string, data: ArrayBufferView, usage = GPUBufferUsage.STORAGE): GpuTensor => {
@@ -346,23 +420,24 @@ export async function encodeInputEmbedder(
   // exactly the element it stores. This keeps one pair-shaped tensor live at
   // the embedder instead of three.
   const pair = previousPair;
-  const extra = execution.allocate("embed.extra", extraElements);
+  const extra = execution.allocate("embed.extra", storageWords(extraElements, storage));
   let grid = execution.linearGrid(input.length * input.length, 1);
   execution.dispatch(encoder, normalize, [previousPair, weights, previousPairNormParams], grid[0], grid[1]);
   grid = execution.linearGrid(pairElements);
   execution.dispatch(encoder, pairPipeline,
     [target, previousPair, previousPositions, aatype, residueIndex, chainIds, weights, params],
     grid[0], grid[1]);
-  grid = execution.linearGrid(extraElements);
+  grid = execution.linearGrid(storageWords(extraElements, storage));
   execution.dispatch(encoder, extraPipeline, [extraMsaInput, hasDeletion, deletionValue, weights, params, extra],
     grid[0], grid[1]);
   const msaTemporaries = [target, msaFeatures, weights, params, previousMsaNormParams];
   const pairTemporaries = temporaries.filter((tensor) => !msaTemporaries.includes(tensor));
   const encodeMsa = (msaEncoder: GPUCommandEncoder): GpuTensor => {
-    const msa = execution.allocate("embed.msa", msaElements, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+    const msa = execution.allocate("embed.msa", storageWords(msaElements, storage),
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
     let msaGrid = execution.linearGrid(input.length, 1);
     execution.dispatch(msaEncoder, normalize, [previousMsa, weights, previousMsaNormParams], msaGrid[0], msaGrid[1]);
-    msaGrid = execution.linearGrid(msaElements);
+    msaGrid = execution.linearGrid(storageWords(msaElements, storage));
     execution.dispatch(msaEncoder, msaPipeline, [target, msaFeatures, previousMsa, weights, params, msa],
       msaGrid[0], msaGrid[1]);
     return msa;

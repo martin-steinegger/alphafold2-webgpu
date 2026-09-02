@@ -1,4 +1,5 @@
 import {
+  createAttentionNormalizeShader, createAttentionOutputShader,
   ATTENTION_NORMALIZE_SHADER,
   ATTENTION_OUTPUT_SHADER,
   ATTENTION_OUTPUT_RESIDUAL_SHADER,
@@ -16,6 +17,7 @@ import { attentionFlashKernelForShape } from "./attention-calibration.js";
 import { createTiledGemmShader, gemmGrid } from "../runtime/gemm.js";
 import { releaseScratch } from "./execution-scratch.js";
 import {
+  createOuterProductMeanNormalizeShader,
   createOuterProductMeanParameters,
   OUTER_PRODUCT_MEAN_CONTRACT_SHADER,
   OUTER_PRODUCT_MEAN_PAIR_COUNT_SHADER,
@@ -40,6 +42,9 @@ import {
 } from "./transition.js";
 import { WebGpuExecution, type GpuTensor } from "../runtime/execution.js";
 import { type TriangleWholeStorage, createTriangleShaders, type TriangleDirection } from "../triangle/shaders.js";
+import {
+  type ActivationStorage, packHalfWords, storageArray, storageWords, unpackHalfWords,
+} from "../runtime/storage.js";
 import type { TriangleMultiplicationWeights } from "../triangle/types.js";
 import { packWeights as packTriangleWeights } from "../triangle/weights.js";
 import type { AllocationSnapshot } from "../runtime/allocator.js";
@@ -88,6 +93,8 @@ export interface EvoformerBlockInput {
   readonly scratchWindowBytes?: number;
   /** Storage of the triangle multiplication's whole projection; `f16` halves it inexactly. */
   readonly triangleWholeStorage?: TriangleWholeStorage;
+  /** Storage of the MSA activations this block reads and updates; `f16` halves them inexactly. */
+  readonly msaStorage?: ActivationStorage;
   readonly weights: EvoformerBlockWeights;
 }
 
@@ -146,7 +153,7 @@ export type TemplatePairBlockWeights = Omit<EvoformerPairBlockWeights, "outerPro
 type EvoformerShape = Pick<
   EvoformerBlockInput,
   "sequences" | "length" | "cM" | "cZ" | "cOuter" | "triangleHidden" | "outerProductMeanFirst"
-  | "scratchWindowBytes" | "triangleWholeStorage"
+  | "scratchWindowBytes" | "triangleWholeStorage" | "msaStorage"
 >;
 
 const GLOBAL_ATTENTION_COMMON = `
@@ -319,14 +326,14 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
  * a tiled GEMM whose A element is the gated attention value evaluates each gate
  * exactly once, because the extra-MSA channel count is one column tile wide.
  */
-function createGlobalAttentionOutputShader(residual: boolean): string {
+function createGlobalAttentionOutputShader(residual: boolean, storage: ActivationStorage = "f32"): string {
   return createTiledGemmShader({
     preamble: `${GLOBAL_ATTENTION_COMMON}
 @group(0) @binding(0) var<storage, read> normalized: array<f32>;
 @group(0) @binding(1) var<storage, read> attended: array<f32>;
 @group(0) @binding(2) var<storage, read> weights: array<f32>;
 @group(0) @binding(3) var<uniform> p: Parameters;
-@group(0) @binding(4) var<storage, read_write> output: array<f32>;
+@group(0) @binding(4) var<storage, read_write> output: array<${storageArray(storage)}>;
 
 // Row is sequence-major; the normalized activations are column-major.
 fn gated_attention(row: u32, projected_channel: u32) -> f32 {
@@ -348,6 +355,14 @@ fn gated_attention(row: u32, projected_channel: u32) -> f32 {
     weightElement: "weights[p.output_weight + k * p.channels + column]",
     store: `output[row * p.channels + column] ${residual ? "+=" : "="}
           element + weights[p.output_bias + column];`,
+    // Packed storage is written a word (two adjacent channels) at a time.
+    ...(storage === "f16" ? { storeVector: `let base = row * p.channels + column;
+${[0, 2].map((pair) => `          if (column + ${pair + 1}u < p.channels) {
+            var stored = vec2<f32>(values[${pair}] + weights[p.output_bias + column + ${pair}u],
+              values[${pair + 1}] + weights[p.output_bias + column + ${pair + 1}u]);
+            ${residual ? `stored += unpack2x16float(output[(base + ${pair}u) >> 1u]);` : ""}
+            output[(base + ${pair}u) >> 1u] = pack2x16float(stored);
+          }`).join("\n")}` } : {}),
   });
 }
 
@@ -367,6 +382,7 @@ async function encodeTransition(
   weightsValue: TransitionWeights,
   label: string,
   residualTarget?: GpuTensor,
+  storage: ActivationStorage = "f32",
 ): Promise<GpuTensor> {
   const hiddenChannels = weightsValue.firstBias.length;
   const descriptor = {
@@ -377,11 +393,11 @@ async function encodeTransition(
     rows, channels, hiddenChannels, execution.transitionBufferLimit,
     execution.device.limits.minStorageBufferOffsetAlignment,
   );
-  const shaders = createTransitionShaders(descriptor, packed.offsets);
+  const shaders = createTransitionShaders(descriptor, packed.offsets, storage);
   const [normalize, linear, linearResidual] = await Promise.all([
-    execution.pipelines.get("block:transition:normalize", shaders[0]!),
+    execution.pipelines.get(`block:transition:normalize:${storage}`, shaders[0]!),
     execution.pipelines.get("block:transition:linear", shaders[1]!),
-    execution.pipelines.get("block:transition:linear-residual", shaders[2]!),
+    execution.pipelines.get(`block:transition:linear-residual:${storage}`, shaders[2]!),
   ]);
   const weights = execution.upload(`${label}.weights`, packed.data);
   const output = residualTarget ?? execution.allocate(`${label}.output`, rows * channels);
@@ -422,8 +438,10 @@ async function encodeTransition(
     const secondParams = uniform(execution, `${label}.second-parameters-${rowOffset}`, new Uint32Array([
       count, hiddenChannels, channels, packed.offsets[4]!, packed.offsets[5]!, 0, 0, 0,
     ]));
-    const sourceChunk = execution.view(source, rowOffset * channels, count * channels);
-    const outputChunk = execution.view(output, rowOffset * channels, count * channels);
+    const sourceChunk = execution.view(source,
+      storageWords(rowOffset * channels, storage), storageWords(count * channels, storage));
+    const outputChunk = execution.view(output,
+      storageWords(rowOffset * channels, storage), storageWords(count * channels, storage));
     const normalizedChunk = execution.view(normalized, 0, count * channels);
     const hiddenChunk = execution.view(hidden, 0, count * hiddenChannels);
     const normalizeGrid = execution.linearGrid(count, 1);
@@ -455,6 +473,8 @@ interface EncodeAttentionOptions {
   readonly label: string;
   readonly residualTarget?: GpuTensor;
   readonly windowBytes?: number | undefined;
+  /** Storage of `source` (and of `residualTarget`, which is the same tensor when set). */
+  readonly storage?: ActivationStorage | undefined;
 }
 
 async function encodeAttention(
@@ -472,15 +492,18 @@ async function encodeAttention(
   const flashKernel = await attentionFlashKernelForShape(
     execution.device, options.channels / options.heads, options.queries,
   );
-  const [normalize, project, pairProject, flash, outputProject] = await Promise.all([
-    execution.pipelines.get("block:attention:normalize", ATTENTION_NORMALIZE_SHADER),
+  const storage = options.storage ?? "f32";
+  const [normalize, project, pairProject, flash, outputProject, pairNormalize] = await Promise.all([
+    execution.pipelines.get(`block:attention:normalize:${storage}`, createAttentionNormalizeShader(storage)),
     execution.pipelines.get("block:attention:project", ATTENTION_PROJECT_SHADER),
     execution.pipelines.get("block:attention:pair-bias", ATTENTION_PAIR_BIAS_SHADER),
     execution.pipelines.get(`block:${flashKernel.cacheKey}`, flashKernel.shader),
     execution.pipelines.get(
-      options.residualTarget === undefined ? "block:attention:output" : "block:attention:output-residual",
-      options.residualTarget === undefined ? ATTENTION_OUTPUT_SHADER : ATTENTION_OUTPUT_RESIDUAL_SHADER,
+      `block:attention:output${options.residualTarget === undefined ? "" : "-residual"}:${storage}`,
+      createAttentionOutputShader(options.residualTarget !== undefined, storage),
     ),
+    // The pair bias source is always f32, whatever the attention source's storage.
+    execution.pipelines.get("block:attention:normalize:f32", ATTENTION_NORMALIZE_SHADER),
   ]);
   const wholeRows = options.batch * options.queries;
   const weights = execution.upload(`${options.label}.weights`, packed.data);
@@ -541,7 +564,7 @@ async function encodeAttention(
           ));
         const target = execution.view(normalizedPair, 0, rows * channels);
         const pairGrid = execution.linearGrid(rows, 1);
-        execution.dispatch(encoder, normalize, [
+        execution.dispatch(encoder, pairNormalize, [
           execution.view(options.pairSource, offset * rowElements, rows * channels), weights, pairNormParams, target,
         ], pairGrid[0], pairGrid[1], 1, `${options.label}.pair-normalize-${offset}`);
         const params = uniform(execution, `${options.label}.pair-parameters-${offset}`,
@@ -617,15 +640,18 @@ async function encodeGlobalAttention(
     shape.length, shape.sequences, shape.cM, w.heads, headDim,
     offsets[2]!, offsets[3]!, offsets[4]!, offsets[5]!, offsets[6]!, offsets[7]!, offsets[8]!,
   ]);
+  const storage = shape.msaStorage ?? "f32";
   const [normalize, kvPipeline, columnMeanPipeline, queryPipeline, flashPipeline, outputPipeline] = await Promise.all([
-    execution.pipelines.get("block:global-attention:normalize", ATTENTION_NORMALIZE_SHADER),
+    execution.pipelines.get(`block:attention:normalize:${storage}`, createAttentionNormalizeShader(storage)),
     execution.pipelines.get("block:global-attention:kv", GLOBAL_ATTENTION_KV_SHADER),
     execution.pipelines.get("block:global-attention:column-mean", GLOBAL_ATTENTION_COLUMN_MEAN_SHADER),
     execution.pipelines.get("block:global-attention:query", GLOBAL_ATTENTION_QUERY_SHADER),
     execution.pipelines.get("block:global-attention:flash", GLOBAL_ATTENTION_FLASH_SHADER),
     execution.pipelines.get(
-      residualTarget === undefined ? "block:global-attention:output" : "block:global-attention:output-residual",
-      residualTarget === undefined ? GLOBAL_ATTENTION_OUTPUT_SHADER : GLOBAL_ATTENTION_OUTPUT_RESIDUAL_SHADER,
+      `block:global-attention:output${residualTarget === undefined ? "" : "-residual"}:${storage}`,
+      storage === "f32"
+        ? (residualTarget === undefined ? GLOBAL_ATTENTION_OUTPUT_SHADER : GLOBAL_ATTENTION_OUTPUT_RESIDUAL_SHADER)
+        : createGlobalAttentionOutputShader(residualTarget !== undefined, storage),
     ),
   ]);
   const weights = execution.upload(`${label}.weights`, packed);
@@ -677,8 +703,9 @@ async function encodeOuterProductMean(
     weights: weightsValue,
   };
   const packed = packOuterProductMeanWeights(descriptor);
+  const storage = input.msaStorage ?? "f32";
   const [normalize, project, contractPipeline, pairCountPipeline, projectOutputPipeline] = await Promise.all([
-    execution.pipelines.get("block:opm:normalize", OUTER_PRODUCT_MEAN_NORMALIZE_SHADER),
+    execution.pipelines.get(`block:opm:normalize:${storage}`, createOuterProductMeanNormalizeShader(storage)),
     execution.pipelines.get("block:opm:project", OUTER_PRODUCT_MEAN_PROJECT_SHADER),
     execution.pipelines.get("block:opm:contract", OUTER_PRODUCT_MEAN_CONTRACT_SHADER),
     execution.pipelines.get("block:opm:pair-count", OUTER_PRODUCT_MEAN_PAIR_COUNT_SHADER),
@@ -706,7 +733,8 @@ async function encodeOuterProductMean(
   // dispatch never reaches.
   for (let offset = 0; offset < rows; offset += normalizeRows) {
     const count = Math.min(normalizeRows, rows - offset);
-    const msaWindow = execution.view(msa, offset * input.cM, count * input.cM);
+    const msaWindow = execution.view(msa,
+      storageWords(offset * input.cM, storage), storageWords(count * input.cM, storage));
     const maskWindow = execution.view(msaMask, offset, count);
     const normalizedWindow = execution.view(normalized, 0, count * input.cM);
     const leftWindow = execution.view(left, offset * input.cOuter, count * input.cOuter);
@@ -883,7 +911,7 @@ export async function encodeEvoformerBlock(
       projectionWeight: row.pairProjectionWeight,
     },
     label: "msa-row-attention",
-    windowBytes: shapeWindowBytes, residualTarget: msa,
+    windowBytes: shapeWindowBytes, residualTarget: msa, storage: input.msaStorage,
   });
 
   const column = input.weights.msaColumnAttention;
@@ -891,12 +919,12 @@ export async function encodeEvoformerBlock(
     source: msa, mask: msaMask, batch: input.length, queries: input.sequences,
     channels: input.cM, heads: column.heads, transpose: true, weights: column.attention,
     label: "msa-column-attention",
-    windowBytes: shapeWindowBytes, residualTarget: msa,
+    windowBytes: shapeWindowBytes, residualTarget: msa, storage: input.msaStorage,
   });
 
   await encodeTransition(
     execution, encoder, msa, input.sequences * input.length, input.cM,
-    input.weights.msaTransition, "msa-transition", msa,
+    input.weights.msaTransition, "msa-transition", msa, input.msaStorage ?? "f32",
   );
 
   if (input.outerProductMeanFirst !== true) await applyOuterProductMean();
@@ -1009,7 +1037,7 @@ export async function encodeExtraMsaBlock(
       projectionWeight: row.pairProjectionWeight,
     },
     label: "extra.msa-row-attention",
-    windowBytes: shapeWindowBytes, residualTarget: msa,
+    windowBytes: shapeWindowBytes, residualTarget: msa, storage: shape.msaStorage,
   });
   await encodeGlobalAttention(
     execution, encoder, msa, msaMask, shape, weights.msaColumnGlobalAttention,
@@ -1017,7 +1045,7 @@ export async function encodeExtraMsaBlock(
   );
   await encodeTransition(
     execution, encoder, msa, shape.sequences * shape.length, shape.cM, weights.msaTransition,
-    "extra.msa-transition", msa,
+    "extra.msa-transition", msa, shape.msaStorage ?? "f32",
   );
   await encodeEvoformerPairBlock(
     execution, encoder, shape, weights, msa, pair, msaMask, pairMask,
@@ -1108,7 +1136,11 @@ export class EvoformerBlockGpu {
       if (input.msa.length !== msaElements || input.pair.length !== pairElements) {
         throw new RangeError("Evoformer block activation shape mismatch");
       }
-      const msa = execution.upload("block.msa", input.msa, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+      // Packed storage is uploaded packed and unpacked after readback, so the
+      // wrapper compares against references in f32 either way.
+      const msaStorage = input.msaStorage ?? "f32";
+      const msa = execution.upload("block.msa", msaStorage === "f16" ? packHalfWords(input.msa) : input.msa,
+        GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
       const pair = execution.upload("block.pair", input.pair, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
       const msaMask = execution.upload("block.msa-mask", input.msaMask);
       const pairMask = execution.upload("block.pair-mask", input.pairMask);
@@ -1125,7 +1157,9 @@ export class EvoformerBlockGpu {
       const validationError = await this.device.popErrorScope();
       if (validationError !== null) throw new Error(`WebGPU validation failed: ${validationError.message}`);
       const [msaOutput, pairOutput] = await Promise.all([
-        execution.mapFloat32(msaReadback), execution.mapFloat32(pairReadback),
+        execution.mapFloat32(msaReadback).then((words) => msaStorage === "f16"
+          ? unpackHalfWords(new Uint32Array(words.buffer, words.byteOffset, words.length), msaElements) : words),
+        execution.mapFloat32(pairReadback),
       ]);
       return {
         msa: msaOutput,
