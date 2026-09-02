@@ -21,6 +21,20 @@ half precision via `pack2x16float` (no device feature needed). The page exposes
 them together as an explicit reduced-memory monomer option; exact f32 remains
 the default and Multimer remains f32.
 
+Since then the allocator records what was live when the peak was reached, and
+that list settled where the memory actually is. At 512 residues with 508
+clustered rows the 544 MiB peak is the MSA activations at 254 MiB, the pair at
+128 and the triangle multiplication's whole projection at 128, with 34 MiB for
+everything else. The pair joined the packable tensors as `pairStorage: "f16"`,
+which the page's reduced-memory option now sets as well. Three exact changes
+also landed around the peak rather than in it: the recycle buffers are cleared
+on the device instead of being uploaded as zeros, the final pair is read back
+only when a caller asks, and the clustered MSA features carry 27 channels
+instead of 49. Those cut host memory at 384 residues from 1016 to 893 MiB and
+leave the device peak alone. Finally the query-only template module no longer
+runs during a prediction: its update is one constant vector, folded into the
+pair projection's bias.
+
 ## Prerequisites
 
 - macOS on Apple Silicon, Node 22 or newer, Chrome (stable) installed.
@@ -275,6 +289,29 @@ recycle instead of being kept on the host (shorter chains keep the one-time
 computation, where the copy is small and the stack a sizeable share of a
 recycle).
 
+## 7b. The packed options, and what they cost
+
+Compare the exact path against each packed option on a real alignment, at a
+length where the pair matters. `tools/predict-a3m.ts` takes an A3M and the
+switches come from the environment:
+
+```bash
+npx tsx tools/predict-a3m.ts alignment.a3m 508 1024 3
+AFWEBGPU_PAIR_F16=1 npx tsx tools/predict-a3m.ts alignment.a3m 508 1024 3
+AFWEBGPU_PAIR_F16=1 AFWEBGPU_MSA_F16=1 AFWEBGPU_TRIANGLE_F16=1 \
+  npx tsx tools/predict-a3m.ts alignment.a3m 508 1024 3
+```
+
+On the Linux GB10, packing the pair alone left mean pLDDT and pTM unchanged to
+two decimals on four proteins of 164 to 396 residues, and lowered the peak by
+5 to 10 per cent. All three options together took a synthetic 512-residue
+shape from 544 to 320 MiB live. Report both numbers per protein: if Metal's
+rounding differs, it will show as a pLDDT difference here first.
+
+`AFWEBGPU_MEMORY=1` on `tools/benchmark-shape.ts` now prints what was live at
+the peak, largest first. Send that list for one long shape; it is the fastest
+way to see whether Metal holds anything the Linux run does not.
+
 ## 8. Reading a complex
 
 Predict a homodimer (paste the default 59-residue chain twice, separated by a
@@ -324,7 +361,9 @@ that `unzip -t` reports no errors.
    a rerun cleared it.
 4. Browser: preflight text, the 59-residue pLDDT/pTM/time, the long-sequence
    allocator peak, and the Chrome GPU process peak from Activity Monitor.
-5. Whether the complex views agreed on the chains, and whether clicking the
+5. The exact and packed pLDDT/pTM pairs from step 7b, and the live-at-peak
+   list for one long shape.
+6. Whether the complex views agreed on the chains, and whether clicking the
    alignment-error matrix isolated the interface.
-6. Whether the result archive unzipped cleanly in each browser you tried.
-7. The chip (M1/M2/M3/M4, Pro/Max) and its memory.
+7. Whether the result archive unzipped cleanly in each browser you tried.
+8. The chip (M1/M2/M3/M4, Pro/Max) and its memory.
