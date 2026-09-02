@@ -1,6 +1,7 @@
 import type { Precision, TriangleShape } from "./types.js";
 import type { WeightOffsets } from "./weights.js";
 import { createTiledGemmShader } from "../runtime/gemm.js";
+import { type ActivationStorage, storageArray, storedElement } from "../runtime/storage.js";
 
 export interface TriangleShaders {
   /** Mean and inverse standard deviation of every pair row, computed once. */
@@ -79,9 +80,18 @@ export function createTriangleShaders(
   direction: TriangleDirection = "outgoing",
   blockRows = shape.length,
   wholeStorage: TriangleWholeStorage = "f32",
+  pairStorage: ActivationStorage = "f32",
+  residualOutput = false,
 ): TriangleShaders {
+  if (pairStorage === "f16" && precision !== "f32") {
+    throw new RangeError("a packed pair needs f32 weight precision: both would claim the same halves of a word");
+  }
   const common = prelude(shape, precision, offsets, epsilon, blockRows);
   const t = scalar(precision);
+  // The pair may be stored packed, whatever precision the weights are in.
+  const pairArray = pairStorage === "f16" ? "u32" : t;
+  const pairElement = (index: string): string => pairStorage === "f16"
+    ? storedElement("f16", "z", index) : read(precision, `z[${index}]`);
   const outgoing = direction === "outgoing";
   // Outgoing contracts over the second residue index and blocks the output by
   // rows i: its block operand a holds pair rows (i, k) of the block. Incoming
@@ -98,7 +108,7 @@ export function createTriangleShaders(
   // across lanes. The statistics let every later consumer normalize the raw
   // pair on the fly instead of materializing a normalized copy.
   const inputStatistics = `${common}
-@group(0) @binding(0) var<storage, read> source: array<${t}>;
+@group(0) @binding(0) var<storage, read> source: array<${pairStorage === "f16" ? "u32" : t}>;
 @group(0) @binding(1) var<storage, read_write> statistics: array<f32>;
 var<workgroup> partial: array<f32, 64>;
 
@@ -108,7 +118,8 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
   let base = row * CZ;
   var sum = 0.0;
   if (row < PAIRS) {
-    for (var c = local.x; c < CZ; c += 64u) { sum += ${read(precision, "source[base + c]")}; }
+    for (var c = local.x; c < CZ; c += 64u) { sum += ${pairStorage === "f16"
+      ? storedElement("f16", "source", "base + c") : read(precision, "source[base + c]")}; }
   }
   partial[local.x] = sum;
   workgroupBarrier();
@@ -121,7 +132,8 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
   var squared = 0.0;
   if (row < PAIRS) {
     for (var c = local.x; c < CZ; c += 64u) {
-      let centered = ${read(precision, "source[base + c]")} - mean;
+      let centered = ${pairStorage === "f16"
+        ? storedElement("f16", "source", "base + c") : read(precision, "source[base + c]")} - mean;
       squared += centered * centered;
     }
   }
@@ -141,7 +153,7 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
   // contraction inputs it normalizes the raw pair while loading it.
   const projectGate = createTiledGemmShader({
     preamble: `${common}
-@group(0) @binding(0) var<storage, read> z: array<${t}>;
+@group(0) @binding(0) var<storage, read> z: array<${pairArray}>;
 @group(0) @binding(1) var<storage, read> weights: array<${t}>;
 @group(0) @binding(2) var<storage, read> statistics: array<f32>;
 @group(0) @binding(3) var<storage, read_write> gate: array<f32>;
@@ -152,7 +164,7 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
 fn pair_row_of(row: u32) -> u32 { return ${blockPairRow}; }
 
 fn normalized_input(pair_row: u32, k: u32) -> f32 {
-  return (${read(precision, "z[pair_row * CZ + k]")} - statistics[2u * pair_row]) * statistics[2u * pair_row + 1u]
+  return (${pairElement("pair_row * CZ + k")} - statistics[2u * pair_row]) * statistics[2u * pair_row + 1u]
     * ${read(precision, "weights[W_LAYERNORMINWEIGHT + k]")} + ${read(precision, "weights[W_LAYERNORMINBIAS + k]")};
 }`,
     rows: "block.y",
@@ -182,7 +194,7 @@ fn normalized_input(pair_row: u32, k: u32) -> f32 {
       read(precision, `weights[W_LINEAR${upper}${kind}BIAS + ${channel}]`);
     return createTiledGemmShader({
       preamble: `${common}
-@group(0) @binding(0) var<storage, read> z: array<${t}>;
+@group(0) @binding(0) var<storage, read> z: array<${pairArray}>;
 @group(0) @binding(1) var<storage, read> mask: array<f32>;
 @group(0) @binding(2) var<storage, read> weights: array<${t}>;
 @group(0) @binding(3) var<storage, read> statistics: array<f32>;
@@ -194,7 +206,7 @@ fn normalized_input(pair_row: u32, k: u32) -> f32 {
 fn pair_row_of(row: u32) -> u32 { return ${pairRow}; }
 
 fn normalized_input(pair_row: u32, k: u32) -> f32 {
-  return (${read(precision, "z[pair_row * CZ + k]")} - statistics[2u * pair_row]) * statistics[2u * pair_row + 1u]
+  return (${pairElement("pair_row * CZ + k")} - statistics[2u * pair_row]) * statistics[2u * pair_row + 1u]
     * ${read(precision, "weights[W_LAYERNORMINWEIGHT + k]")} + ${read(precision, "weights[W_LAYERNORMINBIAS + k]")};
 }`,
       rows: "block.y",
@@ -314,7 +326,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 @group(0) @binding(1) var<storage, read> contracted: array<f32>;
 @group(0) @binding(2) var<storage, read> weights: array<${t}>;
 @group(0) @binding(3) var<storage, read> statistics: array<f32>;
-@group(0) @binding(4) var<storage, read_write> output: array<f32>;
+@group(0) @binding(4) var<storage, read_write> output: array<${storageArray(pairStorage)}>;
 @group(0) @binding(5) var<uniform> block: vec4<u32>;
 
 fn pair_row_of(row: u32) -> u32 { return ${blockPairRow}; }
@@ -328,8 +340,25 @@ fn normalized_hidden(row: u32, h: u32) -> f32 {
     columns: "CZ",
     sourceElement: "normalized_hidden(row, k)",
     weightElement: read(precision, "weights[W_LINEARZWEIGHT + column * CH + k]"),
-    store: `let index = pair_row_of(row) * CZ + column;
-          output[index] = (element + ${read(precision, "weights[W_LINEARZBIAS + column]")}) * gate[row * CZ + column];`,
+    // A packed pair is written a word at a time, so the four adjacent columns
+    // an invocation holds become two words; an unpacked one keeps the scalar
+    // store, which callers may still rewrite into a residual add.
+    ...(pairStorage === "f16" ? {
+      storeVector: `let index = pair_row_of(row) * CZ + column;
+      let gates = vec4<f32>(gate[row * CZ + column], gate[row * CZ + column + 1u],
+        gate[row * CZ + column + 2u], gate[row * CZ + column + 3u]);
+      let biases = vec4<f32>(weights[W_LINEARZBIAS + column], weights[W_LINEARZBIAS + column + 1u],
+        weights[W_LINEARZBIAS + column + 2u], weights[W_LINEARZBIAS + column + 3u]);
+      var stored = (values + biases) * gates;
+      let word = index >> 1u;
+      ${residualOutput ? `stored += vec4<f32>(unpack2x16float(output[word]), unpack2x16float(output[word + 1u]));` : ""}
+      output[word] = pack2x16float(stored.xy);
+      output[word + 1u] = pack2x16float(stored.zw);`,
+      store: "",
+    } : {
+      store: `let index = pair_row_of(row) * CZ + column;
+          output[index] ${residualOutput ? "+=" : "="} (element + ${read(precision, "weights[W_LINEARZBIAS + column]")}) * gate[row * CZ + column];`,
+    }),
   });
 
   // The block operand is stored block-relative, the whole operand at its pair row.

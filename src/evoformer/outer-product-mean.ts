@@ -288,7 +288,9 @@ export const OUTER_PRODUCT_MEAN_CONTRACT_SHADER = createTiledGemmShader({
  * above makes contiguous per residue pair, so this is a plain GEMM followed by
  * the shared pair normalizer.
  */
-function createOuterProductMeanProjectOutputShader(residual: boolean): string {
+export function createOuterProductMeanProjectOutputShader(
+  residual: boolean, storage: ActivationStorage = "f32",
+): string {
   return createTiledGemmShader({
     preamble: `${OPM_TILE_COMMON}
 @group(0) @binding(0) var<storage, read> outer: array<f32>;
@@ -296,16 +298,32 @@ function createOuterProductMeanProjectOutputShader(residual: boolean): string {
 @group(0) @binding(2) var<storage, read> weights: array<f32>;
 @group(0) @binding(3) var<uniform> p: Parameters;
 @group(0) @binding(4) var<uniform> tile: TileParameters;
-@group(0) @binding(5) var<storage, read_write> output: array<f32>;`,
+@group(0) @binding(5) var<storage, read_write> output: array<${storageArray(storage)}>;`,
     rows: "tile.count * p.length",
     inner: "p.c_outer * p.c_outer",
     columns: "p.c_z",
     sourceElement: "outer[row * p.c_outer * p.c_outer + k]",
     weightElement: "weights[p.output_weight + k * p.c_z + column]",
-    store: `let pair = tile.offset * p.length + row;
+    // A packed pair takes the four adjacent columns an invocation holds as two
+    // words; the pair channel count is a multiple of four, so the group never
+    // runs past the row.
+    ...(storage === "f16" ? {
+      storeVector: `let pair = tile.offset * p.length + row;
+      let scale = 1.0 / (p.normalization_epsilon + pair_count[pair]);
+      let biases = vec4<f32>(weights[p.output_bias + column], weights[p.output_bias + column + 1u],
+        weights[p.output_bias + column + 2u], weights[p.output_bias + column + 3u]);
+      var stored = (values + biases) * scale;
+      let word = (pair * p.c_z + column) >> 1u;
+      ${residual ? "stored += vec4<f32>(unpack2x16float(output[word]), unpack2x16float(output[word + 1u]));" : ""}
+      output[word] = pack2x16float(stored.xy);
+      output[word + 1u] = pack2x16float(stored.zw);`,
+      store: "",
+    } : {
+      store: `let pair = tile.offset * p.length + row;
           let projected = element + weights[p.output_bias + column];
           output[pair * p.c_z + column] ${residual ? "+=" : "="}
             projected / (p.normalization_epsilon + pair_count[pair]);`,
+    }),
   });
 }
 

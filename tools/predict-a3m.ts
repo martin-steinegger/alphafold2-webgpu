@@ -42,6 +42,7 @@ const extra = Math.max(1, Math.min(extraRows, Math.max(0, depth - clustered)));
 const memoryOptions = {
   ...(process.env.AFWEBGPU_TRIANGLE_F16 === "1" ? { triangleWholeStorage: "f16" as const } : {}),
   ...(process.env.AFWEBGPU_MSA_F16 === "1" ? { msaStorage: "f16" as const } : {}),
+  ...(process.env.AFWEBGPU_PAIR_F16 === "1" ? { pairStorage: "f16" as const } : {}),
 };
 const plan = planMonomerDevice(adapter, length, clustered, extra, undefined, false, memoryOptions);
 const device = await requestAlphaFoldDevice(adapter, plan.requirements);

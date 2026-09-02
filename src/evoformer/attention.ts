@@ -270,10 +270,28 @@ export const ATTENTION_NORMALIZE_SHADER = createAttentionNormalizeShader("f32");
  * before any invocation stores, and each invocation stores only elements it
  * alone read in the final loop.
  */
-export const ATTENTION_NORMALIZE_IN_PLACE_SHADER = ATTENTION_NORMALIZE_SHADER
-  .replace("var<storage, read> source", "var<storage, read_write> source")
-  .replace("@group(0) @binding(3) var<storage, read_write> output: array<f32>;\n", "")
-  .replace(/\boutput\[/g, "source[");
+export function createAttentionNormalizeInPlaceShader(storage: ActivationStorage = "f32"): string {
+  const shader = createAttentionNormalizeShader(storage)
+    .replace("var<storage, read> source", "var<storage, read_write> source")
+    .replace(`@group(0) @binding(3) var<storage, read_write> output: array<f32>;\n`, "")
+    .replace(/\boutput\[/g, "source[");
+  if (storage === "f32") return shader;
+  // Packed, an invocation owns whole words rather than single channels:
+  // two invocations sharing a word would otherwise race to write it.
+  return shader.replace(`  for (var c = local.x; c < p.channels; c += 64u) {
+    source[output_base + c] = (${storedElement(storage, "source", "input_base + c")} - row_mean[0]) * inverse_std
+      * weights[p.scale + c] + weights[p.offset + c];
+  }`, `  for (var word = local.x; word < p.channels / 2u; word += 64u) {
+    let c = word * 2u;
+    let low = (${storedElement(storage, "source", "input_base + c")} - row_mean[0]) * inverse_std
+      * weights[p.scale + c] + weights[p.offset + c];
+    let high = (${storedElement(storage, "source", "input_base + c + 1u")} - row_mean[0]) * inverse_std
+      * weights[p.scale + c + 1u] + weights[p.offset + c + 1u];
+    source[(output_base + c) >> 1u] = pack2x16float(vec2<f32>(low, high));
+  }`);
+}
+
+export const ATTENTION_NORMALIZE_IN_PLACE_SHADER = createAttentionNormalizeInPlaceShader("f32");
 
 const COMMON = `
 struct Parameters {

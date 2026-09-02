@@ -1,3 +1,4 @@
+import { CLUSTERED_MSA_CHANNELS } from "../input/msa-features.js";
 import {
   ConfidenceHeadsGpu,
   type ConfidenceSummaryResult,
@@ -130,6 +131,13 @@ export interface MonomerGpuOptions {
   readonly triangleWholeStorage?: TriangleWholeStorage;
   /** Storage of the MSA activations; `f16` halves them inexactly. Monomer only. */
   readonly msaStorage?: ActivationStorage;
+  /**
+   * Storage of the pair; `f16` halves it inexactly. Monomer only.
+   *
+   * The pair is one of the three tensors that set the trunk's peak, beside the
+   * MSA activations and the triangle multiplication's whole projection.
+   */
+  readonly pairStorage?: ActivationStorage;
   /** Caps reusable scratch retained between blocks; compact mode uses the bounded shared default. */
   readonly maxPooledBytes?: number;
   /** Internal model architecture selector used by AlphaFoldMultimerGpu. */
@@ -196,6 +204,7 @@ export class AlphaFoldMonomerGpu {
   readonly maxPooledBytes: number | undefined;
   readonly triangleWholeStorage: TriangleWholeStorage;
   readonly msaStorage: ActivationStorage;
+  readonly pairStorage: ActivationStorage;
   readonly multimer: boolean;
   readonly recycleEarlyStopTolerance: number;
   readonly returnFinalPair: boolean;
@@ -214,11 +223,18 @@ export class AlphaFoldMonomerGpu {
     this.collapseQueryOnlyTemplate = options.collapseQueryOnlyTemplate ?? true;
     this.triangleWholeStorage = options.triangleWholeStorage ?? "f32";
     this.msaStorage = options.msaStorage ?? "f32";
+    this.pairStorage = options.pairStorage ?? "f32";
     if (this.triangleWholeStorage !== "f32" && this.triangleWholeStorage !== "f16") {
       throw new RangeError("triangle whole storage must be f32 or f16");
     }
     if (this.msaStorage !== "f32" && this.msaStorage !== "f16") {
       throw new RangeError("MSA storage must be f32 or f16");
+    }
+    if (this.pairStorage !== "f32" && this.pairStorage !== "f16") {
+      throw new RangeError("pair storage must be f32 or f16");
+    }
+    if (this.multimer && this.pairStorage !== "f32") {
+      throw new RangeError("packed pair storage is not supported for Multimer, whose template adds into the pair");
     }
     if (this.multimer && this.msaStorage !== "f32") {
       throw new RangeError("packed MSA storage is not supported for Multimer, which merges template rows into the MSA");
@@ -292,6 +308,11 @@ export class AlphaFoldMonomerGpu {
     }
     const templateModule = templateWeights === undefined || templateConstantApplied
       ? undefined : new QueryOnlyTemplateGpu(this.device);
+    if (templateModule !== undefined && this.pairStorage !== "f32") {
+      // The module's update is added into the pair as f32. It only runs when
+      // the constant does not apply, which a packed run has no path to handle.
+      throw new RangeError("packed pair storage needs the collapsed query-only template and an unpadded chain");
+    }
     const recomputeTemplate = length * length * 128 * 4 >= TEMPLATE_RECOMPUTE_BYTES;
     const templateUpdateValue = templateModule !== undefined && templateWeights !== undefined && !recomputeTemplate
       ? (await templateModule.run({
@@ -363,7 +384,8 @@ export class AlphaFoldMonomerGpu {
       // nothing.
       let previousMsa = execution.allocate("monomer.recycle-msa-zero", length * 256,
         GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
-      let previousPair = execution.allocate("monomer.recycle-pair-zero", length * length * 128,
+      let previousPair = execution.allocate("monomer.recycle-pair-zero",
+        storageWords(length * length * 128, this.pairStorage),
         GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST);
       let previousPositions = execution.allocate("monomer.recycle-positions-zero", length * 37 * 3,
         GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
@@ -380,9 +402,10 @@ export class AlphaFoldMonomerGpu {
       while (!featureStep.done) {
         const features = featureStep.value;
         if (features.aatype.length !== length) throw new RangeError("all recycle feature lengths must match");
-        if (this.multimer && (features.targetChannels !== 21 || features.msaFeatureChannels !== 49
+        if (this.multimer && (features.targetChannels !== 21
+          || features.msaFeatureChannels !== CLUSTERED_MSA_CHANNELS
           || features.chainRelative === undefined)) {
-          throw new RangeError("Multimer-v3 requires 21 target channels, 49 MSA channels, and chain identifiers");
+          throw new RangeError("Multimer-v3 requires 21 target channels, compact MSA features, and chain identifiers");
         }
         const recycleStart = performance.now();
         const msaMask = execution.upload(`monomer.msa-mask-${recycle}`, features.msaMask);
@@ -394,7 +417,7 @@ export class AlphaFoldMonomerGpu {
           previousMsaFirstRow: new Float32Array(0), previousPair: new Float32Array(0),
           previousPositions: new Float32Array(0), length,
           msaChannels: 256, pairChannels: 128, extraMsaChannels: 64, weights: embeddingWeights,
-          msaStorage: this.msaStorage,
+          msaStorage: this.msaStorage, pairStorage: this.pairStorage,
           ...(features.chainRelative === undefined ? {} : { chainRelative: features.chainRelative }),
         }, previousMsa, previousPair, previousPositions);
         // The clustered MSA is embedded only after the extra stack, which never
@@ -470,6 +493,7 @@ export class AlphaFoldMonomerGpu {
           cOuter: weights.extraStack[0]!.outerProductMean.leftBias.length,
           triangleHidden: weights.extraStack[0]!.triangleMultiplicationOutgoing.linearAPBias.length,
           triangleWholeStorage: this.triangleWholeStorage, msaStorage: this.msaStorage,
+          pairStorage: this.pairStorage,
           ...(this.multimer ? { outerProductMeanFirst: true } : {}),
         };
         const shouldProfileRecycle = this.profile && recycle === this.profileRecycle;
@@ -548,6 +572,7 @@ export class AlphaFoldMonomerGpu {
           cOuter: weights.mainStack[0]!.outerProductMean.leftBias.length,
           triangleHidden: weights.mainStack[0]!.triangleMultiplicationOutgoing.linearAPBias.length,
           triangleWholeStorage: this.triangleWholeStorage, msaStorage: this.msaStorage,
+          pairStorage: this.pairStorage,
           ...(this.multimer ? { outerProductMeanFirst: true } : {}),
         };
         let mainProfile: MonomerBlockGpuProfile | undefined;
@@ -620,9 +645,21 @@ export class AlphaFoldMonomerGpu {
         // recycle recreates its handful of large buffers once.
         execution.allocator.destroyPooled();
 
+        // The structure module and the confidence heads read an f32 pair, and
+        // their phases peak well below the trunk, so a packed pair is expanded
+        // once here instead of every head kernel learning to unpack.
+        let headsPair = embedding.pairWithoutTemplates;
+        if (this.pairStorage === "f16") {
+          const unpackEncoder = this.device.createCommandEncoder({ label: `monomer.pair-unpack-${recycle}` });
+          headsPair = execution.allocate(`monomer.pair-unpacked-${recycle}`, length * length * 128);
+          this.device.pushErrorScope("validation");
+          await execution.unpackHalves(unpackEncoder, embedding.pairWithoutTemplates, headsPair,
+            length * length * 128, `monomer.pair-unpack-${recycle}`);
+          await submit(unpackEncoder, `pair unpack recycle ${recycle}`);
+        }
         const structure = await new StructureModuleGpu(this.device).run({
           msaFirstRow, pair: new Float32Array(0), mask: features.seqMask, aatype: features.aatype,
-          pairBuffer: embedding.pairWithoutTemplates.allocation.buffer,
+          pairBuffer: headsPair.allocation.buffer,
           atom37ToAtom14: features.atom37ToAtom14, atom37Mask: features.atom37Mask,
           length, weights: weights.structure, geometry: weights.geometry,
           ...(this.multimer ? { multimer: true } : {}),
@@ -635,8 +672,9 @@ export class AlphaFoldMonomerGpu {
         );
         const confidence = await new ConfidenceHeadsGpu(this.device).runReduced(
           structure.finalRepresentation, new Float32Array(0), length, weights.lddt, weights.pae, paeBreaks,
-          { pairBuffer: embedding.pairWithoutTemplates.allocation.buffer },
+          { pairBuffer: headsPair.allocation.buffer },
         );
+        if (headsPair !== embedding.pairWithoutTemplates) releaseTensor(headsPair);
         const confidencePeak = confidence.memory?.peakResidentBytes ?? 0;
         confidencePeakResidentBytes = Math.max(confidencePeakResidentBytes, confidencePeak);
         combinedPeakResidentBytes = Math.max(
@@ -696,7 +734,10 @@ export class AlphaFoldMonomerGpu {
         );
         this.device.pushErrorScope("validation");
         await submit(finalReadbackEncoder, "final pair readback");
-        finalPair = await execution.mapFloat32(finalPairReadback);
+        const mapped = await execution.mapFloat32(finalPairReadback);
+        finalPair = this.pairStorage === "f32" ? mapped
+          : unpackHalfWords(new Uint32Array(mapped.buffer, mapped.byteOffset, mapped.length),
+            length * length * 128);
         releaseTensor(finalPairReadback);
       }
       const finalResult: MonomerRecycleResult = { ...finalDetails, pair: finalPair };

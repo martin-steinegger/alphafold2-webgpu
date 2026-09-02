@@ -188,6 +188,16 @@ describe.skipIf(!enabled)("complete Evoformer block WebGPU", () => {
     expect(packedPair.meanAbsoluteError).toBeLessThan(1e-2);
     expect(packedPair.maxAbsoluteError).toBeLessThan(0.2);
 
+    // Packed pair storage rounds every write to the pair the same way. The pair
+    // is one of the three tensors that set the trunk's peak, so this pins what
+    // halving it costs on one block, where the pair reaches magnitudes near
+    // 300 and a half-precision step there is 0.25. Measured: max 0.60.
+    const packedPairBlock = await new EvoformerBlockGpu(device).run({ ...descriptor, pairStorage: "f16" });
+    const packedPairOnly = errorMetrics(packedPairBlock.pair, expectedPair);
+    expect(errorMetrics(packedPairBlock.msa, expectedMsa).maxAbsoluteError).toBeLessThan(1e-2);
+    expect(packedPairOnly.meanAbsoluteError).toBeLessThan(2e-2);
+    expect(packedPairOnly.maxAbsoluteError).toBeLessThan(1);
+
     // Longer chains cover the attention batch, and the outer-product mean's
     // normalized MSA, in windows. Neither path runs at 59 residues, so force
     // both: windowing partitions its axis and must not change any value,

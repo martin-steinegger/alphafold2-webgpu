@@ -1,6 +1,20 @@
+/** One label's share of the live working set. */
+export interface AllocationShare {
+  readonly label: string;
+  readonly bytes: number;
+  readonly count: number;
+}
+
 export interface AllocationSnapshot {
   readonly currentBytes: number;
   readonly peakBytes: number;
+  /**
+   * What was live when the peak was reached, largest first.
+   *
+   * The peak is what a device has to fit, so knowing which tensors made it is
+   * the difference between guessing at a reduction and choosing one.
+   */
+  readonly peakComposition: readonly AllocationShare[];
   /** Bytes held by live and pooled GPUBuffer objects. */
   readonly residentBytes: number;
   /** Maximum physical GPUBuffer storage retained by this allocator. */
@@ -94,6 +108,9 @@ export interface AllocateOptions {
   readonly requireSubmitted?: boolean;
 }
 
+/** Labels differing only by a block or recycle index share one group. */
+const allocationGroup = (label: string): string => (label === "" ? "unlabelled" : label).replace(/-?\d+$/, "");
+
 export class AllocatedGpuBuffer {
   readonly buffer: GPUBuffer;
   /** Logical range requested by the tensor using this buffer. */
@@ -102,23 +119,33 @@ export class AllocatedGpuBuffer {
   readonly usage: GPUBufferUsageFlags;
   readonly #allocationByteLength: number;
   readonly #allocationUsage: GPUBufferUsageFlags;
+  /**
+   * The label this allocation was made under.
+   *
+   * A pooled buffer keeps the GPUBuffer label of whoever created it, so the
+   * live-composition accounting has to remember who is holding it now.
+   */
+  readonly #label: string;
   #allocator: GpuBufferAllocator | undefined;
 
   constructor(allocator: GpuBufferAllocator, buffer: GPUBuffer, byteLength: number,
-    allocationByteLength: number, usage: GPUBufferUsageFlags, allocationUsage: GPUBufferUsageFlags = usage) {
+    allocationByteLength: number, usage: GPUBufferUsageFlags, allocationUsage: GPUBufferUsageFlags = usage,
+    label = "") {
     this.#allocator = allocator;
     this.buffer = buffer;
     this.byteLength = byteLength;
     this.#allocationByteLength = allocationByteLength;
     this.usage = usage;
     this.#allocationUsage = allocationUsage;
+    this.#label = label;
   }
 
   release(): void {
     const allocator = this.#allocator;
     if (allocator === undefined) return;
     this.#allocator = undefined;
-    allocator.noteRelease(this.buffer, this.byteLength, this.#allocationByteLength, this.#allocationUsage);
+    allocator.noteRelease(this.buffer, this.byteLength, this.#allocationByteLength, this.#allocationUsage,
+      this.#label);
   }
 }
 
@@ -126,6 +153,9 @@ export class GpuBufferAllocator {
   readonly device: GPUDevice;
   #currentBytes = 0;
   #peakBytes = 0;
+  /** Live bytes by label, and the copy of it taken when the peak was last raised. */
+  readonly #liveByLabel = new Map<string, { bytes: number; count: number }>();
+  #peakComposition: readonly AllocationShare[] = [];
   #residentBytes = 0;
   #peakResidentBytes = 0;
   #allocationCount = 0;
@@ -198,9 +228,20 @@ export class GpuBufferAllocator {
       this.#bufferCount += 1;
     }
     this.#currentBytes += byteLength;
-    this.#peakBytes = Math.max(this.#peakBytes, this.#currentBytes);
+    // Labels carry a block or recycle index; grouping without it keeps the
+    // composition readable across the forty-eight blocks of a stack.
+    const group = allocationGroup(label);
+    const live = this.#liveByLabel.get(group) ?? { bytes: 0, count: 0 };
+    live.bytes += byteLength; live.count += 1;
+    this.#liveByLabel.set(group, live);
+    if (this.#currentBytes > this.#peakBytes) {
+      this.#peakBytes = this.#currentBytes;
+      this.#peakComposition = [...this.#liveByLabel]
+        .map(([name, entry]) => ({ label: name, bytes: entry.bytes, count: entry.count }))
+        .sort((left, right) => right.bytes - left.bytes);
+    }
     this.#allocationCount += 1;
-    return new AllocatedGpuBuffer(this, buffer, byteLength, allocationByteLength, usage, allocationUsage);
+    return new AllocatedGpuBuffer(this, buffer, byteLength, allocationByteLength, usage, allocationUsage, label);
   }
 
   upload(label: string, data: ArrayBufferView, usage: GPUBufferUsageFlags): AllocatedGpuBuffer {
@@ -219,9 +260,15 @@ export class GpuBufferAllocator {
   }
 
   noteRelease(buffer: GPUBuffer, byteLength: number, allocationByteLength: number,
-    usage: GPUBufferUsageFlags): void {
+    usage: GPUBufferUsageFlags, label = ""): void {
     this.#currentBytes -= byteLength;
     if (this.#currentBytes < 0) throw new Error("GPU allocator accounting underflow");
+    const live = this.#liveByLabel.get(allocationGroup(label));
+    const group = allocationGroup(label);
+    if (live !== undefined) {
+      live.bytes -= byteLength; live.count -= 1;
+      if (live.count <= 0) this.#liveByLabel.delete(group);
+    }
     if (this.#pooling) {
       // A tensor can become dead while its command encoder is still being
       // populated. Keep the physical buffer reusable until the caller marks a
@@ -305,6 +352,7 @@ export class GpuBufferAllocator {
     return {
       currentBytes: this.#currentBytes,
       peakBytes: this.#peakBytes,
+      peakComposition: this.#peakComposition,
       residentBytes: this.#residentBytes,
       peakResidentBytes: this.#peakResidentBytes,
       pooledBytes: this.#pooledBytes,

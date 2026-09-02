@@ -56,6 +56,7 @@ if (adapter === null) throw new Error("no WebGPU adapter");
 const memoryOptions = {
   ...(process.env.AFWEBGPU_TRIANGLE_F16 === "1" ? { triangleWholeStorage: "f16" as const } : {}),
   ...(process.env.AFWEBGPU_MSA_F16 === "1" ? { msaStorage: "f16" as const } : {}),
+  ...(process.env.AFWEBGPU_PAIR_F16 === "1" ? { pairStorage: "f16" as const } : {}),
 };
 // Match what the page does: size the device to the shape, not to the base tier.
 const plan = planMonomerDevice(adapter, length, msaRows, extraRows, undefined, false, memoryOptions);
@@ -97,6 +98,16 @@ try {
     peakConcurrentMiB: Math.round(prediction.memory.peakBytes / 1024 ** 2),
     meanPlddt: Number(prediction.final.confidence.meanPlddt.toFixed(3)),
   }));
+  // What was actually live when the trunk hit its peak, which is the list a
+  // memory reduction has to work down.
+  const composition = prediction.memory.peakComposition;
+  if (composition.length > 0) {
+    console.error(`\nLive at the trunk peak (${(prediction.memory.peakBytes / 1024 ** 2).toFixed(0)} MiB):`);
+    for (const share of composition.slice(0, 16)) {
+      console.error(`  ${(share.bytes / 1024 ** 2).toFixed(1).padStart(8)} MiB  x${String(share.count).padStart(3)}`
+        + `  ${share.label}`);
+    }
+  }
   if (tally.size > 0) {
     const total = [...tally.values()].reduce((sum, entry) => sum + entry.bytes, 0);
     console.error(`\nGPU buffers created (total ${(total / 1024 ** 2).toFixed(0)} MiB):`);

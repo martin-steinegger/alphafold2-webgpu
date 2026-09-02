@@ -212,7 +212,7 @@ export async function runInference(job: InferenceJob, reporter: InferenceReporte
   // the triangle projection can be packed there.
   const memoryOptions = {
     ...(job.packedStorage ? { triangleWholeStorage: "f16" as const } : {}),
-    ...(job.packedStorage && !input.multimer ? { msaStorage: "f16" as const } : {}),
+    ...(job.packedStorage && !input.multimer ? { msaStorage: "f16" as const, pairStorage: "f16" as const } : {}),
     ...(input.multimer ? { multimer: true, templateRows: multimerTemplate?.templateRows ?? 4 } : {}),
   };
   const memoryBudget = unifiedMemoryBudget(appleUnifiedMemory);
@@ -222,7 +222,7 @@ export async function runInference(job: InferenceJob, reporter: InferenceReporte
   reporter.log(job.packedStorage
     ? `Activation storage: packed f16 ${input.multimer
       ? "for the triangle projection (approximate; Multimer keeps f32 MSA activations)"
-      : "for the MSA activations and the triangle projection (approximate, reduced memory)"}.`
+      : "for the MSA activations, the pair and the triangle projection (approximate, reduced memory)"}.`
     : `Activation storage: exact f32${input.multimer ? " (Multimer-v3)" : ""}.`);
   reporter.log(`Estimated peak GPU allocations: ${formatMib(devicePlan.memory.estimatedPeakBytes)} `
     + `(${formatMib(devicePlan.memory.persistentBytes)} persistent, `

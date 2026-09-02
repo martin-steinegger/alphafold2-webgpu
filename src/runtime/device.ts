@@ -62,6 +62,8 @@ export interface MonomerMemoryOptions {
   readonly triangleWholeStorage?: TriangleWholeStorage;
   /** Storage of the MSA activations; `f16` halves them. */
   readonly msaStorage?: ActivationStorage;
+  /** Storage of the pair; `f16` halves it inexactly. */
+  readonly pairStorage?: ActivationStorage;
   /**
    * Multimer-v3: the main-stack MSA carries `templateRows` extra rows, and the
    * template module runs every recycle over the pair with its own scratch.
@@ -83,7 +85,11 @@ export function estimateMonomerMemory(
   }
   void transitionMode;
   const bytes = Float32Array.BYTES_PER_ELEMENT;
-  const pair = checkedBytes("pair representation", length, length, 128, bytes);
+  const pairBytes = options.pairStorage === "f16" ? 2 : bytes;
+  const pair = checkedBytes("pair representation", length, length, 128, pairBytes);
+  // The structure module and the confidence heads read the pair as f32, so a
+  // packed run expands it once after the trunk.
+  const unpackedPair = checkedBytes("unpacked pair", length, length, 128, bytes);
   const activationBytes = options.msaStorage === "f16" ? 2 : bytes;
   const templateRows = options.multimer === true ? (options.templateRows ?? 4) : 0;
   const msa = checkedBytes("MSA representation", msaSequences + templateRows, length, 256, activationBytes);
@@ -150,8 +156,12 @@ export function estimateMonomerMemory(
   // Readbacks, uniforms and allocation padding, none of which scale with the
   // shape, plus headroom for the operator this model does not enumerate.
   const scratchBytes = Math.ceil(operatorScratch * 1.15) + 16 * 1024 ** 2;
+  // A packed run also holds the pair twice for one pass after the trunk, while
+  // it is expanded for the structure module and the confidence heads.
+  const headsBytes = options.pairStorage === "f16" ? pair + unpackedPair + 16 * 1024 ** 2 : 0;
   const livePeakBytes = Math.max(
     persistentBytes + scratchBytes, embedderBytes + 16 * 1024 ** 2, templateModuleBytes + 16 * 1024 ** 2,
+    headsBytes,
   );
   // The browser has to retain physical GPUBuffer objects, not only logically
   // live tensors. Whole-MiB allocation rounding and the reusable scratch pool
@@ -160,7 +170,7 @@ export function estimateMonomerMemory(
   // their measured resident/live gap is wider and gets its own calibration.
   // The fixed allowance keeps small shapes conservative as well.
   const packedStorageCount = Number(options.msaStorage === "f16")
-    + Number(options.triangleWholeStorage === "f16");
+    + Number(options.triangleWholeStorage === "f16") + Number(options.pairStorage === "f16");
   const residentScale = packedStorageCount === 2 ? 0.40 : packedStorageCount === 1 ? 0.30 : 0.25;
   const residentHeadroomBytes = Math.ceil(livePeakBytes * residentScale) + 16 * 1024 ** 2;
   const estimatedPeakBytes = livePeakBytes + residentHeadroomBytes;

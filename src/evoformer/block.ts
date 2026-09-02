@@ -1,6 +1,5 @@
 import {
   createAttentionNormalizeShader, createAttentionOutputShader,
-  ATTENTION_NORMALIZE_SHADER,
   ATTENTION_OUTPUT_SHADER,
   ATTENTION_OUTPUT_RESIDUAL_SHADER,
   ATTENTION_PAIR_BIAS_SHADER,
@@ -25,7 +24,7 @@ import {
   outerProductMeanNormalizeWindow,
   outerProductMeanRowBlock,
   OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_SHADER,
-  OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_RESIDUAL_SHADER,
+  OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_RESIDUAL_SHADER, createOuterProductMeanProjectOutputShader,
   OUTER_PRODUCT_MEAN_NORMALIZE_SHADER,
   OUTER_PRODUCT_MEAN_PROJECT_SHADER,
   packOuterProductMeanWeights,
@@ -95,6 +94,12 @@ export interface EvoformerBlockInput {
   readonly triangleWholeStorage?: TriangleWholeStorage;
   /** Storage of the MSA activations this block reads and updates; `f16` halves them inexactly. */
   readonly msaStorage?: ActivationStorage;
+  /**
+   * Storage of the pair this block reads and updates; `f16` halves it
+   * inexactly. The pair is one of the three tensors that set the trunk's peak,
+   * beside the MSA and the triangle multiplication's whole projection.
+   */
+  readonly pairStorage?: ActivationStorage;
   readonly weights: EvoformerBlockWeights;
 }
 
@@ -153,7 +158,7 @@ export type TemplatePairBlockWeights = Omit<EvoformerPairBlockWeights, "outerPro
 type EvoformerShape = Pick<
   EvoformerBlockInput,
   "sequences" | "length" | "cM" | "cZ" | "cOuter" | "triangleHidden" | "outerProductMeanFirst"
-  | "scratchWindowBytes" | "triangleWholeStorage" | "msaStorage"
+  | "scratchWindowBytes" | "triangleWholeStorage" | "msaStorage" | "pairStorage"
 >;
 
 const GLOBAL_ATTENTION_COMMON = `
@@ -475,6 +480,8 @@ interface EncodeAttentionOptions {
   readonly windowBytes?: number | undefined;
   /** Storage of `source` (and of `residualTarget`, which is the same tensor when set). */
   readonly storage?: ActivationStorage | undefined;
+  /** Storage of `pairSource`, which the bias projection normalizes window by window. */
+  readonly pairStorage?: ActivationStorage | undefined;
 }
 
 async function encodeAttention(
@@ -502,8 +509,10 @@ async function encodeAttention(
       `block:attention:output${options.residualTarget === undefined ? "" : "-residual"}:${storage}`,
       createAttentionOutputShader(options.residualTarget !== undefined, storage),
     ),
-    // The pair bias source is always f32, whatever the attention source's storage.
-    execution.pipelines.get("block:attention:normalize:f32", ATTENTION_NORMALIZE_SHADER),
+    // The pair bias source has its own storage, which need not match the
+    // attention source's: MSA row attention reads a pair, not an MSA.
+    execution.pipelines.get(`block:attention:normalize:${options.pairStorage ?? "f32"}`,
+      createAttentionNormalizeShader(options.pairStorage ?? "f32")),
   ]);
   const wholeRows = options.batch * options.queries;
   const weights = execution.upload(`${options.label}.weights`, packed.data);
@@ -564,8 +573,11 @@ async function encodeAttention(
           ));
         const target = execution.view(normalizedPair, 0, rows * channels);
         const pairGrid = execution.linearGrid(rows, 1);
+        const pairStorage = options.pairStorage ?? "f32";
         execution.dispatch(encoder, pairNormalize, [
-          execution.view(options.pairSource, offset * rowElements, rows * channels), weights, pairNormParams, target,
+          execution.view(options.pairSource, storageWords(offset * rowElements, pairStorage),
+            storageWords(rows * channels, pairStorage)),
+          weights, pairNormParams, target,
         ], pairGrid[0], pairGrid[1], 1, `${options.label}.pair-normalize-${offset}`);
         const params = uniform(execution, `${options.label}.pair-parameters-${offset}`,
           createAttentionParameters(descriptor, packed.offsets, { offset, count }));
@@ -710,9 +722,8 @@ async function encodeOuterProductMean(
     execution.pipelines.get("block:opm:contract", OUTER_PRODUCT_MEAN_CONTRACT_SHADER),
     execution.pipelines.get("block:opm:pair-count", OUTER_PRODUCT_MEAN_PAIR_COUNT_SHADER),
     execution.pipelines.get(
-      residualTarget !== undefined ? "block:opm:project-output-residual" : "block:opm:project-output",
-      residualTarget !== undefined
-        ? OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_RESIDUAL_SHADER : OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_SHADER,
+      `block:opm:project-output${residualTarget === undefined ? "" : "-residual"}:${input.pairStorage ?? "f32"}`,
+      createOuterProductMeanProjectOutputShader(residualTarget !== undefined, input.pairStorage ?? "f32"),
     ),
   ]);
   const rows = input.sequences * input.length;
@@ -726,7 +737,8 @@ async function encodeOuterProductMean(
   const rowBlock = outerProductMeanRowBlock(input.length, input.cOuter);
   const outer = execution.allocate("opm.outer", rowBlock * input.length * input.cOuter * input.cOuter);
   const pairCount = execution.allocate("opm.pair-count", input.length * input.length);
-  const output = residualTarget ?? execution.allocate("opm.output", input.length * input.length * input.cZ);
+  const output = residualTarget ?? execution.allocate("opm.output",
+    storageWords(input.length * input.length * input.cZ, input.pairStorage ?? "f32"));
   // Both the normalization and the projection are row-wise, so a window of rows
   // needs only views of the whole-operation tensors and a shorter dispatch. The
   // shaders' own bounds checks are against the full row count, which a shorter
@@ -806,9 +818,11 @@ async function encodeTriangleMultiplication(
   const blockRows = triangleBlockRows(input.length, input.cZ, input.triangleHidden,
     input.scratchWindowBytes ?? TRIANGLE_BLOCK_TARGET_BYTES);
   const wholeStorage = input.triangleWholeStorage ?? "f32";
-  const shaders = createTriangleShaders(shape, "f32", packed.offsets, 1e-5, direction, blockRows, wholeStorage);
+  const pairStorage = input.pairStorage ?? "f32";
+  const shaders = createTriangleShaders(shape, "f32", packed.offsets, 1e-5, direction, blockRows, wholeStorage,
+    pairStorage, residualTarget !== undefined);
   const pipelineKey = `block:triangle:${direction}:${input.length}:${input.cZ}`
-    + `:${input.triangleHidden}:${blockRows}:${wholeStorage}`;
+    + `:${input.triangleHidden}:${blockRows}:${wholeStorage}:${pairStorage}`;
   const [inputStatistics, projectGate, projectBlockOperand, projectWholeOperand, contract, hiddenStatistics, projectOutput]
     = await Promise.all([
     execution.pipelines.get(`${pipelineKey}:input-statistics`, shaders.inputStatistics),
@@ -819,16 +833,14 @@ async function encodeTriangleMultiplication(
     execution.pipelines.get(`${pipelineKey}:hidden-statistics`, shaders.hiddenStatistics),
     execution.pipelines.get(
       `${pipelineKey}:project-output${residualTarget === undefined ? "" : "-residual"}`,
-      // The tiled GEMM emits the store once per lane and row.
-      residualTarget === undefined ? shaders.projectOutput : shaders.projectOutput.replaceAll(
-        "output[index] = (element", "output[index] += (element",
-      ),
+      shaders.projectOutput,
     ),
   ]);
   const pairs = input.length * input.length;
   const blockPairs = blockRows * input.length;
   const weights = execution.upload(`triangle.${direction}.weights`, packed.data);
-  const output = residualTarget ?? execution.allocate(`triangle.${direction}.output`, pairs * input.cZ);
+  const output = residualTarget
+    ?? execution.allocate(`triangle.${direction}.output`, storageWords(pairs * input.cZ, pairStorage));
   const blocks: { readonly offset: number; readonly count: number; readonly uniform: GpuTensor }[] = [];
   for (let offset = 0; offset < input.length; offset += blockRows) {
     const count = Math.min(blockRows, input.length - offset);
@@ -912,6 +924,7 @@ export async function encodeEvoformerBlock(
     },
     label: "msa-row-attention",
     windowBytes: shapeWindowBytes, residualTarget: msa, storage: input.msaStorage,
+    pairStorage: input.pairStorage,
   });
 
   const column = input.weights.msaColumnAttention;
@@ -942,7 +955,7 @@ export async function encodeEvoformerBlock(
     channels: input.cZ, heads: starting.heads, transpose: false, weights: starting.attention,
     pairBias: { source: "normalized-input", projectionWeight: starting.pairProjectionWeight },
     label: "triangle-attention-starting",
-    windowBytes: shapeWindowBytes, residualTarget: pair,
+    windowBytes: shapeWindowBytes, residualTarget: pair, storage: input.pairStorage,
   });
 
   const ending = input.weights.triangleAttentionEnding;
@@ -951,12 +964,12 @@ export async function encodeEvoformerBlock(
     channels: input.cZ, heads: ending.heads, transpose: true, weights: ending.attention,
     pairBias: { source: "normalized-input", projectionWeight: ending.pairProjectionWeight },
     label: "triangle-attention-ending",
-    windowBytes: shapeWindowBytes, residualTarget: pair,
+    windowBytes: shapeWindowBytes, residualTarget: pair, storage: input.pairStorage,
   });
 
   await encodeTransition(
     execution, encoder, pair, input.length * input.length, input.cZ,
-    input.weights.pairTransition, "pair-transition", pair,
+    input.weights.pairTransition, "pair-transition", pair, input.pairStorage ?? "f32",
   );
 }
 
@@ -992,7 +1005,7 @@ export async function encodeEvoformerPairBlock(
       source: "normalized-input", projectionWeight: weights.triangleAttentionStarting.pairProjectionWeight,
     },
     label: "extra.triangle-attention-starting",
-    windowBytes: shapeWindowBytes, residualTarget: pair,
+    windowBytes: shapeWindowBytes, residualTarget: pair, storage: shape.pairStorage,
   });
   await encodeAttention(execution, encoder, {
     source: pair, mask: pairMask, batch: shape.length, queries: shape.length,
@@ -1002,11 +1015,11 @@ export async function encodeEvoformerPairBlock(
       source: "normalized-input", projectionWeight: weights.triangleAttentionEnding.pairProjectionWeight,
     },
     label: "extra.triangle-attention-ending",
-    windowBytes: shapeWindowBytes, residualTarget: pair,
+    windowBytes: shapeWindowBytes, residualTarget: pair, storage: shape.pairStorage,
   });
   await encodeTransition(
     execution, encoder, pair, shape.length * shape.length, shape.cZ,
-    weights.pairTransition, "extra.pair-transition", pair,
+    weights.pairTransition, "extra.pair-transition", pair, shape.pairStorage ?? "f32",
   );
 }
 
@@ -1038,6 +1051,7 @@ export async function encodeExtraMsaBlock(
     },
     label: "extra.msa-row-attention",
     windowBytes: shapeWindowBytes, residualTarget: msa, storage: shape.msaStorage,
+    pairStorage: shape.pairStorage,
   });
   await encodeGlobalAttention(
     execution, encoder, msa, msaMask, shape, weights.msaColumnGlobalAttention,
@@ -1141,7 +1155,10 @@ export class EvoformerBlockGpu {
       const msaStorage = input.msaStorage ?? "f32";
       const msa = execution.upload("block.msa", msaStorage === "f16" ? packHalfWords(input.msa) : input.msa,
         GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
-      const pair = execution.upload("block.pair", input.pair, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+      const pairStorage = input.pairStorage ?? "f32";
+      const pair = execution.upload("block.pair",
+        pairStorage === "f16" ? packHalfWords(input.pair) : input.pair,
+        GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
       const msaMask = execution.upload("block.msa-mask", input.msaMask);
       const pairMask = execution.upload("block.pair-mask", input.pairMask);
       const encoder = this.device.createCommandEncoder({ label: "evoformer-block" });
@@ -1159,7 +1176,8 @@ export class EvoformerBlockGpu {
       const [msaOutput, pairOutput] = await Promise.all([
         execution.mapFloat32(msaReadback).then((words) => msaStorage === "f16"
           ? unpackHalfWords(new Uint32Array(words.buffer, words.byteOffset, words.length), msaElements) : words),
-        execution.mapFloat32(pairReadback),
+        execution.mapFloat32(pairReadback).then((words) => pairStorage === "f16"
+          ? unpackHalfWords(new Uint32Array(words.buffer, words.byteOffset, words.length), pairElements) : words),
       ]);
       return {
         msa: msaOutput,

@@ -1,7 +1,8 @@
 import {
   ATTENTION_NORMALIZE_IN_PLACE_SHADER, ATTENTION_NORMALIZE_SHADER, createAttentionNormParameters,
+  createAttentionNormalizeInPlaceShader,
 } from "./attention.js";
-import { type ActivationStorage, storageWords } from "../runtime/storage.js";
+import { type ActivationStorage, storageArray, storageWords, storedElement } from "../runtime/storage.js";
 import { GpuBufferAllocator, type AllocatedGpuBuffer, type AllocationSnapshot } from "../runtime/allocator.js";
 import { pipelineCacheForDevice, type ComputePipelineCache } from "../runtime/pipeline-cache.js";
 import { WebGpuExecution, type GpuTensor } from "../runtime/execution.js";
@@ -51,6 +52,8 @@ export interface InputEmbedderInput {
   readonly weights: InputEmbedderWeights;
   /** Storage of the MSA activations the embedder produces (GPU path only); `f16` halves them inexactly. */
   readonly msaStorage?: ActivationStorage;
+  /** Storage of the pair this writes and of the recycled pair it reads. */
+  readonly pairStorage?: ActivationStorage;
   /** Enables AlphaFold-Multimer's 73-channel chain-relative position encoding. */
   readonly chainRelative?: {
     readonly asymId: Float32Array;
@@ -262,6 +265,33 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 
 
+function createPairShader(storage: ActivationStorage): string {
+  const previous = storedElement(storage, "previous_pair", "index");
+  const body = PAIR_SHADER
+    .replace("var<storage, read> previous_pair: array<f32>", `var<storage, read> previous_pair: array<${storageArray(storage)}>`)
+    .replace("result += previous_pair[index];", `result += ${previous};`);
+  if (storage === "f32") return body;
+  // One invocation per word: two adjacent channels of one pair, which is what
+  // a packed store owns. The pair channel count is even, so a word never
+  // straddles two pairs.
+  return body
+    .replace("var<storage, read_write> output: array<f32>", "var<storage, read_write> output: array<u32>")
+    .replace(`@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x + id.y * GRID_WIDTH * 64u;
+  if (index >= p.length * p.length * p.pair_channels) { return; }
+  output[index] = pair_element(index / p.pair_channels, index % p.pair_channels);
+}`, `@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let word = id.x + id.y * GRID_WIDTH * 64u;
+  if (word >= p.length * p.length * p.pair_channels / 2u) { return; }
+  let channels = p.pair_channels / 2u;
+  let pair = word / channels;
+  let channel = (word % channels) * 2u;
+  output[word] = pack2x16float(vec2<f32>(pair_element(pair, channel), pair_element(pair, channel + 1u)));
+}`);
+}
+
 const PAIR_SHADER = `${COMMON}
 @group(0) @binding(0) var<storage, read> target_features: array<f32>;
 @group(0) @binding(1) var<storage, read> previous_pair: array<f32>;
@@ -278,12 +308,8 @@ fn pseudo_beta_coordinate(residue: u32, coordinate: u32) -> f32 {
   return previous_positions[(residue * 37u + atom) * 3u + coordinate];
 }
 
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x + id.y * GRID_WIDTH * 64u;
-  if (index >= p.length * p.length * p.pair_channels) { return; }
-  let channel = index % p.pair_channels;
-  let pair = index / p.pair_channels;
+fn pair_element(pair: u32, channel: u32) -> f32 {
+  let index = pair * p.pair_channels + channel;
   let i = pair / p.length;
   let j = pair % p.length;
   var result = weights[p.left_bias + channel] + weights[p.right_bias + channel];
@@ -324,7 +350,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   } else {
     result += weights[p.relative_weight + relative * p.pair_channels + channel];
   }
-  output[index] = result;
+  return result;
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x + id.y * GRID_WIDTH * 64u;
+  if (index >= p.length * p.length * p.pair_channels) { return; }
+  output[index] = pair_element(index / p.pair_channels, index % p.pair_channels);
 }`;
 
 /**
@@ -332,10 +365,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
  * reads `previous_pair` only at the element it stores, so a single read-write
  * binding is exact and one pair-shaped tensor serves as input and output.
  */
-const PAIR_IN_PLACE_SHADER = PAIR_SHADER
-  .replace("var<storage, read> previous_pair", "var<storage, read_write> previous_pair")
-  .replace("@group(0) @binding(8) var<storage, read_write> output: array<f32>;\n", "")
-  .replace(/\boutput\[/g, "previous_pair[");
+function createPairInPlaceShader(storage: ActivationStorage): string {
+  return createPairShader(storage)
+    .replace("var<storage, read> previous_pair", "var<storage, read_write> previous_pair")
+    .replace(`@group(0) @binding(8) var<storage, read_write> output: array<${storageArray(storage)}>;\n`, "")
+    .replace(/\boutput\[/g, "previous_pair[");
+}
+
+const PAIR_IN_PLACE_SHADER = createPairInPlaceShader("f32");
 
 function validateChainRelative(input: InputEmbedderInput): void {
   const chain = input.chainRelative;
@@ -397,19 +434,28 @@ export async function encodeInputEmbedder(
   const expectedPreviousMsa = input.length * input.msaChannels;
   const expectedPreviousPair = input.length * input.length * input.pairChannels;
   const expectedPreviousPositions = input.length * 37 * 3;
-  if (previousMsa.elements < expectedPreviousMsa || previousPair.elements !== expectedPreviousPair
+  const pairStorage = input.pairStorage ?? "f32";
+  if (previousMsa.elements < expectedPreviousMsa
+      || previousPair.elements !== storageWords(expectedPreviousPair, pairStorage)
       || previousPositions.elements !== expectedPreviousPositions) {
     throw new RangeError("resident recycle tensor shape mismatch");
   }
   const packed = packWeights(input);
   const storage = input.msaStorage ?? "f32";
+  if (pairStorage === "f16" && input.pairChannels % 2 !== 0) {
+    throw new RangeError("packed pair storage needs an even channel count");
+  }
   if (storage === "f16" && (input.msaChannels % 2 !== 0 || input.extraMsaChannels % 2 !== 0)) {
     throw new RangeError("packed MSA storage needs even channel counts");
   }
-  const [normalize, msaPipeline, pairPipeline, extraPipeline] = await Promise.all([
-    execution.pipelines.get("embed:normalize-in-place", ATTENTION_NORMALIZE_IN_PLACE_SHADER),
+  // The recycled pair and the recycled MSA row are normalized in place by the
+  // same kernel but need not share a storage: the MSA row is always f32.
+  const [normalizePair, normalizeMsa, msaPipeline, pairPipeline, extraPipeline] = await Promise.all([
+    execution.pipelines.get(`embed:normalize-in-place:${pairStorage}`,
+      createAttentionNormalizeInPlaceShader(pairStorage)),
+    execution.pipelines.get("embed:normalize-in-place:f32", ATTENTION_NORMALIZE_IN_PLACE_SHADER),
     execution.pipelines.get(`embed:msa:${storage}`, createMsaEmbedShader(storage)),
-    execution.pipelines.get("embed:pair-in-place", PAIR_IN_PLACE_SHADER),
+    execution.pipelines.get(`embed:pair-in-place:${pairStorage}`, createPairInPlaceShader(pairStorage)),
     execution.pipelines.get(`embed:extra:${storage}`, createExtraEmbedShader(storage)),
   ]);
   const temporaries: GpuTensor[] = [];
@@ -448,8 +494,9 @@ export async function encodeInputEmbedder(
   const pair = previousPair;
   const extra = execution.allocate("embed.extra", storageWords(extraElements, storage));
   let grid = execution.linearGrid(input.length * input.length, 1);
-  execution.dispatch(encoder, normalize, [previousPair, weights, previousPairNormParams], grid[0], grid[1]);
-  grid = execution.linearGrid(pairElements);
+  execution.dispatch(encoder, normalizePair, [previousPair, weights, previousPairNormParams], grid[0], grid[1]);
+  // A packed pair is written a word at a time, two channels per invocation.
+  grid = execution.linearGrid(storageWords(pairElements, pairStorage));
   execution.dispatch(encoder, pairPipeline,
     [target, previousPair, previousPositions, aatype, residueIndex, chainIds, weights, params],
     grid[0], grid[1]);
@@ -462,7 +509,7 @@ export async function encodeInputEmbedder(
     const msa = execution.allocate("embed.msa", storageWords(msaElements, storage),
       GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
     let msaGrid = execution.linearGrid(input.length, 1);
-    execution.dispatch(msaEncoder, normalize, [previousMsa, weights, previousMsaNormParams], msaGrid[0], msaGrid[1]);
+    execution.dispatch(msaEncoder, normalizeMsa, [previousMsa, weights, previousMsaNormParams], msaGrid[0], msaGrid[1]);
     msaGrid = execution.linearGrid(storageWords(msaElements, storage));
     execution.dispatch(msaEncoder, msaPipeline, [target, msaFeatures, previousMsa, weights, params, msa],
       msaGrid[0], msaGrid[1]);
