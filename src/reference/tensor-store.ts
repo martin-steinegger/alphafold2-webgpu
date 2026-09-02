@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import { readTensor, readTensorRange, tensorByteLength, tensorElements } from "./dtype.js";
+import { blockRange, readTensor, readTensorRange, tensorByteLength, tensorElements } from "./dtype.js";
 
 export interface BinaryTensorRecord {
   readonly file: string;
@@ -35,17 +35,6 @@ export interface BinaryTensorManifest {
   readonly tensors: Readonly<Record<string, BinaryTensorRecord>>;
   readonly bundle?: BinaryTensorBundle;
   readonly [metadata: string]: unknown;
-}
-
-/** Element range of one block of a tensor stacked along its first axis, or the whole tensor. */
-export function blockRange(elements: number, block?: number, blocks?: number): readonly [number, number] {
-  if (block === undefined) return [0, elements];
-  if (blocks === undefined || !Number.isSafeInteger(blocks) || blocks <= 0 || elements % blocks !== 0
-    || !Number.isSafeInteger(block) || block < 0 || block >= blocks) {
-    throw new RangeError("stacked parameter block is out of range");
-  }
-  const size = elements / blocks;
-  return [block * size, size];
 }
 
 export class FileTensorStore {

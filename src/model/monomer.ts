@@ -62,6 +62,8 @@ export interface MonomerRecycleResult {
 /** Full per-recycle data used transiently before the final pair readback. */
 export type MonomerRecycleDetails = Omit<MonomerRecycleResult, "pair" | "confidence"> & {
   readonly confidence: ReducedConfidenceResult;
+  /** Wall time of the monomer's per-recycle template update, when it ran. */
+  readonly templateMilliseconds?: number;
 };
 
 type MonomerFinalDetails = Omit<MonomerRecycleResult, "pair">;
@@ -69,9 +71,18 @@ type MonomerFinalDetails = Omit<MonomerRecycleResult, "pair">;
 /** Evoformer command buffers the host may run ahead of the GPU. */
 const BLOCKS_IN_FLIGHT = 4;
 
+/**
+ * Pair size from which the monomer's template update is recomputed per recycle
+ * rather than kept on the host: 32 MiB, about 256 residues. Below it the copy
+ * is small and the template stack is a sizeable share of a short recycle.
+ */
+const TEMPLATE_RECOMPUTE_BYTES = 32 * 1024 ** 2;
+
 export interface MonomerRecycleSummary {
   readonly confidence: Pick<ConfidenceSummaryResult, "meanPlddt" | "ptm">;
   readonly elapsedMilliseconds: number;
+  /** Wall time of the monomer's per-recycle template update, when it ran. */
+  readonly templateMilliseconds?: number;
   readonly trunkSubmissions: MonomerTrunkSubmissionCounts;
   readonly gpuProfile?: MonomerRecycleGpuProfile;
 }
@@ -145,6 +156,7 @@ export function summarizeMonomerRecycle(result: MonomerRecycleDetails): MonomerR
     confidence: { meanPlddt: result.confidence.meanPlddt, ptm: result.confidence.ptm },
     elapsedMilliseconds: result.elapsedMilliseconds,
     trunkSubmissions: result.trunkSubmissions,
+    ...(result.templateMilliseconds === undefined ? {} : { templateMilliseconds: result.templateMilliseconds }),
     ...(result.gpuProfile === undefined ? {} : { gpuProfile: result.gpuProfile }),
   };
 }
@@ -213,14 +225,23 @@ export class AlphaFoldMonomerGpu {
     for (let i = 0; i < length; i += 1) for (let j = 0; j < length; j += 1) {
       pairMask[i * length + j] = featureStep.value.seqMask[i]! * featureStep.value.seqMask[j]!;
     }
-    // The monomer's template update depends only on the length and mask; it is
-    // recomputed on the GPU each recycle and added into the resident pair, so
-    // no pair-sized copy of it lives on the host or the device between uses.
+    // The monomer's template update depends only on the length and mask. For
+    // long chains it is recomputed on the GPU each recycle and added into the
+    // resident pair, so no pair-sized copy of it lives on the host or the
+    // device between uses; for short chains, where that copy is small and the
+    // template stack is a sizeable share of a recycle, it is computed once and
+    // uploaded per recycle instead.
     const templateWeights = this.multimer ? undefined : (weights as MonomerModelWeights).template;
     if (!this.multimer && templateWeights === undefined) {
       throw new Error("AlphaFold monomer weights require a template module");
     }
     const templateModule = templateWeights === undefined ? undefined : new QueryOnlyTemplateGpu(this.device);
+    const recomputeTemplate = length * length * 128 * 4 >= TEMPLATE_RECOMPUTE_BYTES;
+    const templateUpdateValue = templateModule !== undefined && templateWeights !== undefined && !recomputeTemplate
+      ? (await templateModule.run({
+        length, templateChannels: 64, pairChannels: 128, pairMask, weights: templateWeights,
+      })).pairUpdate
+      : undefined;
     if (weights.extraStack.length === 0 || weights.mainStack.length === 0) {
       throw new RangeError("AlphaFold monomer requires non-empty extra and main Evoformer stacks");
     }
@@ -317,10 +338,23 @@ export class AlphaFoldMonomerGpu {
         // The new pair was written over `previousPair`, which therefore stays live.
         for (const temporary of embedding.temporaries) releaseTensor(temporary);
         releaseTensor(previousPositions);
-        if (templateModule !== undefined && templateWeights !== undefined) {
+        let templateMilliseconds: number | undefined;
+        if (templateUpdateValue !== undefined) {
+          const templateStart = performance.now();
+          const templateUpdate = execution.upload(`monomer.template-update-${recycle}`, templateUpdateValue);
+          const templateEncoder = this.device.createCommandEncoder({ label: `monomer.template-residual-${recycle}` });
+          this.device.pushErrorScope("validation");
+          await execution.addInPlace(templateEncoder, embedding.pairWithoutTemplates, templateUpdate,
+            `monomer.template-residual-${recycle}`);
+          await submit(templateEncoder, `template residual recycle ${recycle}`);
+          releaseTensor(templateUpdate);
+          templateMilliseconds = performance.now() - templateStart;
+        } else if (templateModule !== undefined && templateWeights !== undefined) {
+          const templateStart = performance.now();
           await templateModule.run({
             length, templateChannels: 64, pairChannels: 128, pairMask, weights: templateWeights,
           }, { execution, pair: embedding.pairWithoutTemplates, pairMask: pairMaskTensor });
+          templateMilliseconds = performance.now() - templateStart;
           // The template stack's scratch shapes recur only next recycle.
           execution.allocator.destroyPooled();
         }
@@ -549,6 +583,7 @@ export class AlphaFoldMonomerGpu {
           ? undefined : { extraMsa: extraProfile, mainEvoformer: mainProfile };
         const recycleDetails = { msaFirstRow, structure, confidence,
           elapsedMilliseconds: performance.now() - recycleStart, trunkSubmissions,
+          ...(templateMilliseconds === undefined ? {} : { templateMilliseconds }),
           ...(gpuProfile === undefined ? {} : { gpuProfile }),
         };
         const recycleSummary = summarizeMonomerRecycle(recycleDetails);

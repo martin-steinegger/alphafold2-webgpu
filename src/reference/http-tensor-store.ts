@@ -1,6 +1,5 @@
 import type { BinaryTensorManifest, BinaryTensorShard } from "./tensor-store.js";
-import { readTensor, readTensorRange, tensorByteLength, tensorElements } from "./dtype.js";
-import { blockRange } from "./tensor-store.js";
+import { blockRange, readTensor, readTensorRange, tensorByteLength, tensorElements } from "./dtype.js";
 
 const MAX_CONCURRENT_DOWNLOADS = 8;
 const MAX_MODEL_BYTES = 1024 ** 3;

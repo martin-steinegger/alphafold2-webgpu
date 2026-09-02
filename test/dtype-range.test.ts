@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { readTensor, readTensorRange } from "../src/reference/dtype.js";
-import { blockRange } from "../src/reference/tensor-store.js";
+import { blockRange, readTensor, readTensorRange } from "../src/reference/dtype.js";
 
 function float16Bits(value: number): number {
   // Enough for the small positive scales used here: normal range only.

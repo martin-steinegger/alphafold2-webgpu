@@ -97,3 +97,14 @@ export function readTensorRange(record: BinaryTensorRecord, buffer: ArrayBufferL
   }
   return output;
 }
+
+/** Element range of one block of a tensor stacked along its first axis, or the whole tensor. */
+export function blockRange(elements: number, block?: number, blocks?: number): readonly [number, number] {
+  if (block === undefined) return [0, elements];
+  if (blocks === undefined || !Number.isSafeInteger(blocks) || blocks <= 0 || elements % blocks !== 0
+    || !Number.isSafeInteger(block) || block < 0 || block >= blocks) {
+    throw new RangeError("stacked parameter block is out of range");
+  }
+  const size = elements / blocks;
+  return [block * size, size];
+}

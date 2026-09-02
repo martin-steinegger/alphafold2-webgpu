@@ -117,21 +117,16 @@ export class QueryOnlyTemplateGpu {
       const pairMask = resident?.pairMask ?? execution.upload("template.pair-mask", input.pairMask);
       const bias = execution.upload("template.embedding-bias", input.weights.embeddingBias);
       const init = await execution.pipelines.get("template:init", INIT_SHADER);
-      let encoder = this.device.createCommandEncoder({ label: "template.initialize" });
+      // One command buffer and one validation scope for the whole module: every
+      // submission awaited from the page is a round trip to the GPU process.
+      const encoder = this.device.createCommandEncoder({ label: "template" });
       this.device.pushErrorScope("validation");
       let grid = execution.linearGrid(pair.elements);
       execution.dispatch(encoder, init, [bias, pair], grid[0], grid[1], 1, "template.initialize");
-      execution.endComputePass(encoder);
-      this.device.queue.submit([encoder.finish()]);
-      execution.noteSubmitted();
-      const initError = await this.device.popErrorScope();
-      if (initError !== null) throw new Error(`WebGPU template initialization failed: ${initError.message}`);
       const persistentCheckpoint = execution.checkpoint();
       const start = performance.now();
 
       for (let block = 0; block < input.weights.blockWeights.length; block += 1) {
-        encoder = this.device.createCommandEncoder({ label: `template.block-${block}` });
-        this.device.pushErrorScope("validation");
         await encodeTemplatePairBlock(execution, encoder, {
           sequences: 1,
           length: input.length,
@@ -140,11 +135,6 @@ export class QueryOnlyTemplateGpu {
           cOuter: 0,
           triangleHidden: input.weights.blockWeights[block]!.triangleMultiplicationOutgoing.linearAPBias.length,
         }, input.weights.blockWeights[block]!, pair, pairMask);
-        execution.endComputePass(encoder);
-        this.device.queue.submit([encoder.finish()]);
-        execution.noteSubmitted();
-        const error = await this.device.popErrorScope();
-        if (error !== null) throw new Error(`WebGPU template block ${block} failed: ${error.message}`);
         execution.releaseSince(persistentCheckpoint);
       }
 
@@ -173,8 +163,6 @@ export class QueryOnlyTemplateGpu {
         execution.pipelines.get(resident === undefined ? "template:output" : "template:output-residual",
           resident === undefined ? OUTPUT_SHADER : OUTPUT_SHADER.replace("output[index] = result;", "output[index] += result;")),
       ]);
-      encoder = this.device.createCommandEncoder({ label: "template.pointwise-attention" });
-      this.device.pushErrorScope("validation");
       grid = execution.linearGrid(pairs, 1);
       execution.dispatch(encoder, normalize, [pair, normWeightBuffer, normParams, normalized],
         grid[0], grid[1], 1,
@@ -190,7 +178,7 @@ export class QueryOnlyTemplateGpu {
       this.device.queue.submit([encoder.finish()]);
       execution.noteSubmitted();
       const error = await this.device.popErrorScope();
-      if (error !== null) throw new Error(`WebGPU template output failed: ${error.message}`);
+      if (error !== null) throw new Error(`WebGPU template module failed: ${error.message}`);
       return {
         pairUpdate: readback === undefined ? new Float32Array(0) : await execution.mapFloat32(readback),
         elapsedMilliseconds: performance.now() - start,
