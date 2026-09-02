@@ -28,6 +28,34 @@ export interface TensorStore {
   readonly manifest: BinaryTensorManifest;
   tensor(name: string): Promise<Float32Array>;
   shape(name: string): readonly number[];
+  /** Retain the shard holding `name` in its stored form so `read` can decode from it synchronously. */
+  ensureLoaded(name: string): Promise<void>;
+  /** Decode `name`, or block `block` of its `blocks` stacked blocks, from a retained shard. */
+  read(name: string, block?: number, blocks?: number): Float32Array;
+}
+
+/**
+ * A weight object whose tensors are decoded from the stored shards on every
+ * access. The Evoformer stacks are 94% of the model; holding them decoded
+ * would keep a float32 copy of the whole model on the host for the session,
+ * where a compressed model is a quarter of that. A block's tensors are read
+ * once when its weights are packed for upload, so the float32 values exist
+ * only for that moment. The getters are enumerable, and objects are composed
+ * with `mergeLazy` rather than spread so they never materialize by accident.
+ */
+function lazyWeights<T extends object>(fields: { readonly [K in keyof T]: () => T[K] }): T {
+  const target = {} as T;
+  for (const key of Object.keys(fields) as (keyof T)[]) {
+    Object.defineProperty(target, key, { get: fields[key], enumerable: true });
+  }
+  return target;
+}
+
+function mergeLazy<A extends object, B extends object>(first: A, second: B): A & B {
+  const target = {} as A & B;
+  Object.defineProperties(target, Object.getOwnPropertyDescriptors(first));
+  Object.defineProperties(target, Object.getOwnPropertyDescriptors(second));
+  return target;
 }
 
 type ParameterMap = Readonly<Record<string, Readonly<Record<string, string>>>>;
@@ -84,6 +112,16 @@ export class AlphaFoldFixture {
     return value.subarray(block * size, (block + 1) * size);
   }
 
+  /** A thunk decoding block `block` of a stacked parameter from its retained shard. */
+  async #lazyParameter(
+    parameters: ParameterMap, module: string, name: string, block: number, blocks: number,
+  ): Promise<() => Float32Array> {
+    const tensorName = parameters[module]?.[name];
+    if (tensorName === undefined) throw new Error(`missing ${module}/${name}`);
+    await this.store.ensureLoaded(tensorName);
+    return () => this.store.read(tensorName, block, blocks);
+  }
+
   #parameterShape(parameters: ParameterMap, module: string, name: string, stacked: boolean): readonly number[] {
     const tensorName = parameters[module]?.[name];
     if (tensorName === undefined) throw new Error(`missing ${module}/${name}`);
@@ -94,10 +132,10 @@ export class AlphaFoldFixture {
   async #attention(
     parameters: ParameterMap, root: string, block: number, blocks: number,
   ): Promise<AttentionModuleWeights> {
-    const parameter = (module: string, name: string): Promise<Float32Array> =>
-      this.#parameter(parameters, module, name, block, blocks);
+    const parameter = (module: string, name: string): Promise<() => Float32Array> =>
+      this.#lazyParameter(parameters, module, name, block, blocks);
     const attentionRoot = `${root}/attention`;
-    const weights: AttentionWeights = {
+    const weights = lazyWeights<AttentionWeights>({
       queryNormScale: await parameter(`${root}/query_norm`, "scale"),
       queryNormOffset: await parameter(`${root}/query_norm`, "offset"),
       queryWeight: await parameter(attentionRoot, "query_w"),
@@ -107,7 +145,7 @@ export class AlphaFoldFixture {
       gatingBias: await parameter(attentionRoot, "gating_b"),
       outputWeight: await parameter(attentionRoot, "output_w"),
       outputBias: await parameter(attentionRoot, "output_b"),
-    };
+    });
     return {
       heads: this.#parameterShape(parameters, attentionRoot, "gating_b", true)[0]!,
       attention: weights,
@@ -118,36 +156,39 @@ export class AlphaFoldFixture {
     parameters: ParameterMap, root: string, block: number, blocks: number,
   ): Promise<TriangleAttentionModuleWeights> {
     const result = await this.#attention(parameters, root, block, blocks);
-    return {
-      ...result,
-      pairProjectionWeight: await this.#parameter(parameters, root, "feat_2d_weights", block, blocks),
-    };
+    return mergeLazy(result, lazyWeights<Pick<TriangleAttentionModuleWeights, "pairProjectionWeight">>({
+      pairProjectionWeight: await this.#lazyParameter(parameters, root, "feat_2d_weights", block, blocks),
+    }));
   }
 
   async #transition(
     parameters: ParameterMap, root: string, block: number, blocks: number,
   ): Promise<TransitionWeights> {
-    const parameter = (module: string, name: string): Promise<Float32Array> =>
-      this.#parameter(parameters, module, name, block, blocks);
-    return {
+    const parameter = (module: string, name: string): Promise<() => Float32Array> =>
+      this.#lazyParameter(parameters, module, name, block, blocks);
+    return lazyWeights<TransitionWeights>({
       layerNormScale: await parameter(`${root}/input_layer_norm`, "scale"),
       layerNormOffset: await parameter(`${root}/input_layer_norm`, "offset"),
       firstWeight: await parameter(`${root}/transition1`, "weights"),
       firstBias: await parameter(`${root}/transition1`, "bias"),
       secondWeight: await parameter(`${root}/transition2`, "weights"),
       secondBias: await parameter(`${root}/transition2`, "bias"),
-    };
+    });
   }
 
   async #triangle(
     parameters: ParameterMap, root: string, channels: number, block: number, blocks: number,
   ): Promise<TriangleMultiplicationWeights> {
-    const parameter = (module: string, name: string): Promise<Float32Array> =>
-      this.#parameter(parameters, module, name, block, blocks);
+    const parameter = (module: string, name: string): Promise<() => Float32Array> =>
+      this.#lazyParameter(parameters, module, name, block, blocks);
     const hidden = this.#parameterShape(parameters, `${root}/left_projection`, "bias", true)[0]!;
-    const projection = async (module: string, inputChannels: number, outputChannels: number): Promise<Float32Array> =>
-      transpose(await parameter(`${root}/${module}`, "weights"), inputChannels, outputChannels);
-    return {
+    const projection = async (
+      module: string, inputChannels: number, outputChannels: number,
+    ): Promise<() => Float32Array> => {
+      const stored = await parameter(`${root}/${module}`, "weights");
+      return () => transpose(stored(), inputChannels, outputChannels);
+    };
+    return lazyWeights<TriangleMultiplicationWeights>({
       layerNormInWeight: await parameter(`${root}/layer_norm_input`, "scale"),
       layerNormInBias: await parameter(`${root}/layer_norm_input`, "offset"),
       linearAPWeight: await projection("left_projection", channels, hidden),
@@ -164,15 +205,15 @@ export class AlphaFoldFixture {
       linearZBias: await parameter(`${root}/output_projection`, "bias"),
       linearGWeight: await projection("gating_linear", channels, channels),
       linearGBias: await parameter(`${root}/gating_linear`, "bias"),
-    };
+    });
   }
 
   async #outerProductMean(
     parameters: ParameterMap, block: number, blocks: number,
   ): Promise<OuterProductMeanWeights> {
-    const parameter = (module: string, name: string): Promise<Float32Array> =>
-      this.#parameter(parameters, module, name, block, blocks);
-    return {
+    const parameter = (module: string, name: string): Promise<() => Float32Array> =>
+      this.#lazyParameter(parameters, module, name, block, blocks);
+    return lazyWeights<OuterProductMeanWeights>({
       layerNormScale: await parameter("outer_product_mean/layer_norm_input", "scale"),
       layerNormOffset: await parameter("outer_product_mean/layer_norm_input", "offset"),
       leftWeight: await parameter("outer_product_mean/left_projection", "weights"),
@@ -181,26 +222,14 @@ export class AlphaFoldFixture {
       rightBias: await parameter("outer_product_mean/right_projection", "bias"),
       outputWeight: await parameter("outer_product_mean", "output_w"),
       outputBias: await parameter("outer_product_mean", "output_b"),
-    };
+    });
   }
 
   async mainStackWeights(pairChannels = 128): Promise<readonly EvoformerBlockWeights[]> {
     const { parameters, blocks } = this.manifest.evoformerStack;
     const result: EvoformerBlockWeights[] = [];
     for (let block = 0; block < blocks; block += 1) {
-      const rowBase = await this.#attention(parameters, "msa_row_attention_with_pair_bias", block, blocks);
-      const row: RowAttentionModuleWeights = {
-        ...rowBase,
-        pairLayerNormScale: await this.#parameter(
-          parameters, "msa_row_attention_with_pair_bias/feat_2d_norm", "scale", block, blocks,
-        ),
-        pairLayerNormOffset: await this.#parameter(
-          parameters, "msa_row_attention_with_pair_bias/feat_2d_norm", "offset", block, blocks,
-        ),
-        pairProjectionWeight: await this.#parameter(
-          parameters, "msa_row_attention_with_pair_bias", "feat_2d_weights", block, blocks,
-        ),
-      };
+      const row = await this.#rowAttention(parameters, block, blocks);
       result.push({
         msaRowAttention: row,
         msaColumnAttention: await this.#attention(parameters, "msa_column_attention", block, blocks),
@@ -222,6 +251,21 @@ export class AlphaFoldFixture {
       });
     }
     return result;
+  }
+
+  async #rowAttention(parameters: ParameterMap, block: number, blocks: number): Promise<RowAttentionModuleWeights> {
+    const base = await this.#attention(parameters, "msa_row_attention_with_pair_bias", block, blocks);
+    return mergeLazy(base, lazyWeights<Omit<RowAttentionModuleWeights, keyof AttentionModuleWeights>>({
+      pairLayerNormScale: await this.#lazyParameter(
+        parameters, "msa_row_attention_with_pair_bias/feat_2d_norm", "scale", block, blocks,
+      ),
+      pairLayerNormOffset: await this.#lazyParameter(
+        parameters, "msa_row_attention_with_pair_bias/feat_2d_norm", "offset", block, blocks,
+      ),
+      pairProjectionWeight: await this.#lazyParameter(
+        parameters, "msa_row_attention_with_pair_bias", "feat_2d_weights", block, blocks,
+      ),
+    }));
   }
 
   async extraPairStackWeights(pairChannels = 128): Promise<readonly EvoformerPairBlockWeights[]> {
@@ -253,27 +297,24 @@ export class AlphaFoldFixture {
     const pairWeights = await this.extraPairStackWeights(pairChannels);
     const result: ExtraMsaBlockWeights[] = [];
     for (let block = 0; block < blocks; block += 1) {
-      const rowBase = await this.#attention(parameters, "msa_row_attention_with_pair_bias", block, blocks);
       const root = "msa_column_global_attention";
       const attention = `${root}/attention`;
-      const parameter = (module: string, name: string) => this.#parameter(parameters, module, name, block, blocks);
+      const parameter = (module: string, name: string) => this.#lazyParameter(parameters, module, name, block, blocks);
+      type GlobalTensors = Omit<ExtraMsaBlockWeights["msaColumnGlobalAttention"], "heads">;
+      const globalTensors = lazyWeights<GlobalTensors>({
+        queryNormScale: await parameter(`${root}/query_norm`, "scale"),
+        queryNormOffset: await parameter(`${root}/query_norm`, "offset"),
+        queryWeight: await parameter(attention, "query_w"), keyWeight: await parameter(attention, "key_w"),
+        valueWeight: await parameter(attention, "value_w"), gatingWeight: await parameter(attention, "gating_w"),
+        gatingBias: await parameter(attention, "gating_b"), outputWeight: await parameter(attention, "output_w"),
+        outputBias: await parameter(attention, "output_b"),
+      });
       result.push({
         ...pairWeights[block]!,
-        msaRowAttention: {
-          ...rowBase,
-          pairLayerNormScale: await parameter("msa_row_attention_with_pair_bias/feat_2d_norm", "scale"),
-          pairLayerNormOffset: await parameter("msa_row_attention_with_pair_bias/feat_2d_norm", "offset"),
-          pairProjectionWeight: await parameter("msa_row_attention_with_pair_bias", "feat_2d_weights"),
-        },
-        msaColumnGlobalAttention: {
-          queryNormScale: await parameter(`${root}/query_norm`, "scale"),
-          queryNormOffset: await parameter(`${root}/query_norm`, "offset"),
-          queryWeight: await parameter(attention, "query_w"), keyWeight: await parameter(attention, "key_w"),
-          valueWeight: await parameter(attention, "value_w"), gatingWeight: await parameter(attention, "gating_w"),
-          gatingBias: await parameter(attention, "gating_b"), outputWeight: await parameter(attention, "output_w"),
-          outputBias: await parameter(attention, "output_b"),
+        msaRowAttention: await this.#rowAttention(parameters, block, blocks),
+        msaColumnGlobalAttention: mergeLazy(globalTensors, {
           heads: this.#parameterShape(parameters, attention, "gating_b", true)[0]!,
-        },
+        }),
         msaTransition: await this.#transition(parameters, "msa_transition", block, blocks),
       });
     }

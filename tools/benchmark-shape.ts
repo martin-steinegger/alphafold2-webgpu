@@ -38,8 +38,9 @@ for (let row = 1; row < msaRows + extraRows; row += 1) {
 }
 const a3m = `${rows.join("\n")}\n`;
 
+// AFWEBGPU_MODEL_MANIFEST selects another model (for example a quantized export).
 const model = AlphaFoldFixture.fromStore(await FileTensorStore.open(
-  "test/fixtures/evoformer/model1-query-59-stack/manifest.json",
+  process.env.AFWEBGPU_MODEL_MANIFEST ?? "test/fixtures/evoformer/model1-query-59-stack/manifest.json",
 ));
 const [embedding, template, extraStack, mainStack, structure, confidence, geometry, featureTables] = await Promise.all([
   model.embeddingWeights(), model.templateWeights(), model.extraStackWeights(), model.mainStackWeights(),

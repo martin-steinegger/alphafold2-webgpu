@@ -213,14 +213,14 @@ export class AlphaFoldMonomerGpu {
     for (let i = 0; i < length; i += 1) for (let j = 0; j < length; j += 1) {
       pairMask[i * length + j] = featureStep.value.seqMask[i]! * featureStep.value.seqMask[j]!;
     }
-    const templateUpdateValue = !this.multimer
-      ? (weights as MonomerModelWeights).template === undefined
-        ? (() => { throw new Error("AlphaFold monomer weights require a template module"); })()
-        : (await new QueryOnlyTemplateGpu(this.device).run({
-          length, templateChannels: 64, pairChannels: 128, pairMask,
-          weights: (weights as MonomerModelWeights).template,
-        })).pairUpdate
-      : undefined;
+    // The monomer's template update depends only on the length and mask; it is
+    // recomputed on the GPU each recycle and added into the resident pair, so
+    // no pair-sized copy of it lives on the host or the device between uses.
+    const templateWeights = this.multimer ? undefined : (weights as MonomerModelWeights).template;
+    if (!this.multimer && templateWeights === undefined) {
+      throw new Error("AlphaFold monomer weights require a template module");
+    }
+    const templateModule = templateWeights === undefined ? undefined : new QueryOnlyTemplateGpu(this.device);
     if (weights.extraStack.length === 0 || weights.mainStack.length === 0) {
       throw new RangeError("AlphaFold monomer requires non-empty extra and main Evoformer stacks");
     }
@@ -309,15 +309,6 @@ export class AlphaFoldMonomerGpu {
           msaStorage: this.msaStorage,
           ...(features.chainRelative === undefined ? {} : { chainRelative: features.chainRelative }),
         }, previousMsa, previousPair, previousPositions);
-        // The template update is constant across recycles but read only here, so
-        // it lives on the GPU for one command buffer per recycle instead of the
-        // whole prediction; the upload costs far less than holding a pair-shaped
-        // tensor through every Evoformer block.
-        const templateUpdate = templateUpdateValue === undefined ? undefined
-          : execution.upload(`monomer.template-update-${recycle}`, templateUpdateValue);
-        if (templateUpdate !== undefined) await execution.addInPlace(
-          embeddingEncoder, embedding.pairWithoutTemplates, templateUpdate, `monomer.template-residual-${recycle}`,
-        );
         // The clustered MSA is embedded only after the extra stack, which never
         // reads it, so the largest tensor of the prediction stays out of that
         // stack's peak. Multimer's template rows, which are merged into it, are
@@ -326,7 +317,13 @@ export class AlphaFoldMonomerGpu {
         // The new pair was written over `previousPair`, which therefore stays live.
         for (const temporary of embedding.temporaries) releaseTensor(temporary);
         releaseTensor(previousPositions);
-        if (templateUpdate !== undefined) releaseTensor(templateUpdate);
+        if (templateModule !== undefined && templateWeights !== undefined) {
+          await templateModule.run({
+            length, templateChannels: 64, pairChannels: 128, pairMask, weights: templateWeights,
+          }, { execution, pair: embedding.pairWithoutTemplates, pairMask: pairMaskTensor });
+          // The template stack's scratch shapes recur only next recycle.
+          execution.allocator.destroyPooled();
+        }
         const releaseMsaInputs = (): void => {
           for (const temporary of embedding.msaTemporaries) releaseTensor(temporary);
           releaseTensor(previousMsa);

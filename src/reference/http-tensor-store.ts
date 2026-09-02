@@ -1,5 +1,6 @@
 import type { BinaryTensorManifest, BinaryTensorShard } from "./tensor-store.js";
-import { readTensor, tensorByteLength, tensorElements } from "./dtype.js";
+import { readTensor, readTensorRange, tensorByteLength, tensorElements } from "./dtype.js";
+import { blockRange } from "./tensor-store.js";
 
 const MAX_CONCURRENT_DOWNLOADS = 8;
 const MAX_MODEL_BYTES = 1024 ** 3;
@@ -92,6 +93,9 @@ export class HttpTensorStore {
   readonly manifest: BinaryTensorManifest;
   readonly #cache = new Map<string, Promise<Float32Array>>();
   readonly #fileCache = new Map<string, Promise<ArrayBuffer>>();
+  /** Shards kept for synchronous `read`, in their stored (possibly compressed) form. */
+  readonly #retained = new Map<string, ArrayBuffer>();
+  readonly #ensured = new Set<string>();
   readonly #fileByteLengths = new Map<string, number>();
   readonly #fileRemainingTensors = new Map<string, number>();
   readonly #shards = new Map<string, BinaryTensorShard>();
@@ -139,6 +143,36 @@ export class HttpTensorStore {
   shape(name: string): readonly number[] {
     const record = this.manifest.tensors[name]; if (record === undefined) throw new Error(`missing tensor ${name}`);
     return record.shape;
+  }
+  /**
+   * Download and retain the shard holding `name` in its stored form, so `read`
+   * can decode ranges of it synchronously. A compressed shard retained this way
+   * is a quarter of the float32 copy that `tensor` would otherwise keep.
+   */
+  async ensureLoaded(name: string): Promise<void> {
+    const record = this.manifest.tensors[name];
+    if (record === undefined) throw new Error(`missing tensor ${name}`);
+    if (!this.#ensured.has(name)) {
+      this.#ensured.add(name);
+      this.#loadedTensors += 1;
+      this.#reportProgress(name);
+    }
+    if (this.#retained.has(record.file)) return;
+    let pendingFile = this.#fileCache.get(record.file);
+    if (pendingFile === undefined) {
+      pendingFile = this.#scheduleDownload(record.file, name);
+      this.#fileCache.set(record.file, pendingFile);
+    }
+    this.#retained.set(record.file, await pendingFile);
+  }
+  /** Decode `name`, or block `block` of `blocks`, from a shard retained by `ensureLoaded`. */
+  read(name: string, block?: number, blocks?: number): Float32Array {
+    const record = this.manifest.tensors[name];
+    if (record === undefined) throw new Error(`missing tensor ${name}`);
+    const buffer = this.#retained.get(record.file);
+    if (buffer === undefined) throw new Error(`${name} has not been loaded; call ensureLoaded first`);
+    const [start, count] = blockRange(tensorElements(record), block, blocks);
+    return readTensorRange(record, buffer, record.byteOffset ?? 0, start, count);
   }
   async #load(name: string): Promise<Float32Array> {
     const record = this.manifest.tensors[name];
