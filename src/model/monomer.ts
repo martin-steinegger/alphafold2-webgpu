@@ -66,6 +66,9 @@ export type MonomerRecycleDetails = Omit<MonomerRecycleResult, "pair" | "confide
 
 type MonomerFinalDetails = Omit<MonomerRecycleResult, "pair">;
 
+/** Evoformer command buffers the host may run ahead of the GPU. */
+const BLOCKS_IN_FLIGHT = 4;
+
 export interface MonomerRecycleSummary {
   readonly confidence: Pick<ConfidenceSummaryResult, "meanPlddt" | "ptm">;
   readonly elapsedMilliseconds: number;
@@ -243,6 +246,33 @@ export class AlphaFoldMonomerGpu {
       const error = await this.device.popErrorScope();
       if (error !== null) throw new Error(`WebGPU ${label} failed: ${error.message}`);
     };
+    // Evoformer blocks are submitted ahead of the GPU: a block's command buffer
+    // goes to the queue as soon as it is encoded, and the host encodes the next
+    // one while the GPU runs it. Waiting for each block's validation result
+    // before encoding the next left the GPU idle for a host round trip per
+    // block, which at short lengths is a sizeable share of the block itself.
+    // A rolling window bounds how far ahead the host runs, which also bounds the
+    // upload staging the implementation holds for the in-flight weights.
+    // Validation errors are collected and settled at the window's pace and
+    // before anything is read back; queue ordering keeps scratch reuse safe.
+    const pendingErrors: { readonly label: string; readonly error: Promise<GPUError | null> }[] = [];
+    const inFlight: Promise<undefined>[] = [];
+    const settleErrors = async (): Promise<void> => {
+      const pending = pendingErrors.splice(0);
+      for (const { label, error } of pending) {
+        const result = await error;
+        if (result !== null) throw new Error(`WebGPU ${label} failed: ${result.message}`);
+      }
+    };
+    const submitAhead = async (encoder: GPUCommandEncoder, label: string): Promise<void> => {
+      execution.endComputePass(encoder);
+      this.device.queue.submit([encoder.finish()]);
+      execution.noteSubmitted();
+      pendingErrors.push({ label, error: this.device.popErrorScope() });
+      inFlight.push(this.device.queue.onSubmittedWorkDone());
+      if (inFlight.length > BLOCKS_IN_FLIGHT) await inFlight.shift();
+      if (pendingErrors.length > BLOCKS_IN_FLIGHT) await settleErrors();
+    };
     const releaseTensor = (tensor: GpuTensor): void => {
       tensor.allocation.release();
       execution.allocator.trimPooled();
@@ -366,7 +396,8 @@ export class AlphaFoldMonomerGpu {
             embedding.extraMsa, embedding.pairWithoutTemplates, extraMsaMask, pairMaskTensor);
           const pendingProfile = profiling && timestampProfile
             ? execution.finishTimestampProfile(encoder) : undefined;
-          await submit(encoder, `extra-MSA recycle ${recycle} block ${block}`);
+          if (profiling) await submit(encoder, `extra-MSA recycle ${recycle} block ${block}`);
+          else await submitAhead(encoder, `extra-MSA recycle ${recycle} block ${block}`);
           if (profiling) {
             const entries = pendingProfile === undefined
               ? (await this.device.queue.onSubmittedWorkDone(), [{
@@ -381,6 +412,7 @@ export class AlphaFoldMonomerGpu {
           execution.releaseSince(checkpoint);
           extraSubmissions += 1;
         }
+        await settleErrors();
         releaseTensor(embedding.extraMsa); releaseTensor(extraMsaMask);
         // The extra stack's retired scratch would otherwise sit in the pool
         // beside the main stack's while the clustered MSA comes to life; the
@@ -421,7 +453,8 @@ export class AlphaFoldMonomerGpu {
           }, mainMsa, embedding.pairWithoutTemplates, mainMsaMask, pairMaskTensor);
           const pendingProfile = profiling && timestampProfile
             ? execution.finishTimestampProfile(encoder) : undefined;
-          await submit(encoder, `main Evoformer recycle ${recycle} block ${block}`);
+          if (profiling) await submit(encoder, `main Evoformer recycle ${recycle} block ${block}`);
+          else await submitAhead(encoder, `main Evoformer recycle ${recycle} block ${block}`);
           if (profiling) {
             const entries = pendingProfile === undefined
               ? (await this.device.queue.onSubmittedWorkDone(), [{
@@ -436,6 +469,7 @@ export class AlphaFoldMonomerGpu {
           execution.releaseSince(checkpoint);
           mainSubmissions += 1;
         }
+        await settleErrors();
         const readbackEncoder = this.device.createCommandEncoder({ label: `monomer.readback-${recycle}` });
         const firstRowWords = storageWords(length * 256, this.msaStorage);
         const msaFirstRowTensor = execution.allocate(
