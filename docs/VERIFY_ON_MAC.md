@@ -275,6 +275,22 @@ recycle instead of being kept on the host (shorter chains keep the one-time
 computation, where the copy is small and the stack a sizeable share of a
 recycle).
 
+## 8. The result archive
+
+After any prediction finishes, the results heading carries a "Download results
+ZIP" button. It should produce `<job>.result.zip` within a second or two, and
+unzipping it should leave one folder named after the job holding the structure,
+the scores, the alignment error in AlphaFold-DB's format, three PNG plots, the
+alignment, the settings, the run log and the citations:
+
+```bash
+unzip -l ~/Downloads/test.result.zip
+unzip -p ~/Downloads/test.result.zip 'test/config.json'
+```
+
+Safari writes the archive with its own compression path, so check there too
+that `unzip -t` reports no errors.
+
 ## What to report
 
 1. The three JSON lines from step 3 and whether live/resident matched exactly.
@@ -283,4 +299,5 @@ recycle).
    a rerun cleared it.
 4. Browser: preflight text, the 59-residue pLDDT/pTM/time, the long-sequence
    allocator peak, and the Chrome GPU process peak from Activity Monitor.
-5. The chip (M1/M2/M3/M4, Pro/Max) and its memory.
+5. Whether the result archive unzipped cleanly in each browser you tried.
+6. The chip (M1/M2/M3/M4, Pro/Max) and its memory.

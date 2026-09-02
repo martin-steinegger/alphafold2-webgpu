@@ -14,6 +14,7 @@ import {
 } from "./inference.js";
 import type { WorkerRequest, WorkerResponse } from "./prediction-worker.js";
 import { confidenceJson, predictionToPdb, safeJobName } from "./prediction-results.js";
+import { packageResults } from "./result-package.js";
 import { drawMsaCoverage } from "./msa-plot.js";
 import {
   browserPreflightEnvironment, preflightErrorMessage, runWebGpuPreflight, type PreflightStatus, type WebGpuPreflight,
@@ -130,11 +131,32 @@ function log(text: string, append = true): void {
   target.scrollTop = target.scrollHeight;
 }
 
-function download(filename: string, contents: string, type: string): void {
-  const url = URL.createObjectURL(new Blob([contents], { type }));
+function downloadBlob(filename: string, blob: Blob): void {
+  const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url; link.download = filename; link.click();
   setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function download(filename: string, contents: string, type: string): void {
+  downloadBlob(filename, new Blob([contents], { type }));
+}
+
+/**
+ * A plot as PNG bytes, composited onto white: the canvases are transparent
+ * where nothing was drawn, and a transparent plot is unreadable in the image
+ * viewers people open a downloaded archive with.
+ */
+async function canvasPng(canvas: HTMLCanvasElement): Promise<Uint8Array> {
+  const opaque = document.createElement("canvas");
+  opaque.width = canvas.width; opaque.height = canvas.height;
+  const context = opaque.getContext("2d");
+  if (context === null) throw new Error("this browser cannot render the plots to PNG");
+  context.fillStyle = "#ffffff"; context.fillRect(0, 0, opaque.width, opaque.height);
+  context.drawImage(canvas, 0, 0);
+  const blob = await new Promise<Blob | null>((resolve) => opaque.toBlob(resolve, "image/png"));
+  if (blob === null) throw new Error("this browser could not encode the plots as PNG");
+  return new Uint8Array(await blob.arrayBuffer());
 }
 
 function confidenceLabel(score: number): string {
@@ -226,8 +248,104 @@ async function showStructure(pdb: string): Promise<void> {
   }
 }
 
-function showResults(prediction: MonomerPrediction | MultimerPrediction, sequence: string, depth: number,
-  jobName: string, a3m: string, modelLoadMilliseconds: number, chainLengths?: readonly number[]): void {
+/** Everything the archive reports about a run beyond the prediction itself. */
+interface ResultContext {
+  readonly sequence: string;
+  readonly depth: number;
+  readonly jobName: string;
+  readonly a3m: string;
+  readonly modelLoadMilliseconds: number;
+  readonly chainLengths?: readonly number[];
+  readonly multimer: boolean;
+  /** The page's input mode, which names how the alignment was obtained. */
+  readonly inputMode: string;
+  readonly job: InferenceJob;
+  readonly adapterName: string;
+}
+
+const MSA_MODES: Readonly<Record<string, string>> = {
+  mmseqs2: "mmseqs2_uniref_env", single: "single_sequence", custom: "custom",
+};
+
+const round = (value: number, decimals: number): number => Number(value.toFixed(decimals));
+
+/** The settings and timings that produced this prediction, for the archive's config.json. */
+function runSettings(prediction: MonomerPrediction | MultimerPrediction, context: ResultContext): Record<string, unknown> {
+  const confidence = prediction.final.confidence as MonomerPrediction["final"]["confidence"] & { readonly iptm?: number };
+  const { job } = context;
+  return {
+    job_name: context.jobName,
+    date: new Date().toISOString(),
+    implementation: "alphafold2-webgpu",
+    model_type: context.multimer ? "alphafold2_multimer_v3" : "alphafold2_ptm",
+    model_number: 1,
+    model_manifest: job.manifestUrl,
+    num_recycles: job.recycles,
+    max_msa: `${job.maxMsaSequences}:${job.maxExtraSequences}`,
+    msa_mode: MSA_MODES[context.inputMode] ?? context.inputMode,
+    msa_depth: context.depth,
+    random_seed: job.randomSeed,
+    activation_storage: job.packedStorage ? "f16" : "f32",
+    length: context.sequence.length,
+    chain_lengths: context.chainLengths ?? [context.sequence.length],
+    adapter: context.adapterName,
+    user_agent: navigator.userAgent,
+    model_load_seconds: round(context.modelLoadMilliseconds / 1000, 2),
+    inference_seconds: round(prediction.elapsedMilliseconds / 1000, 2),
+    mean_plddt: round(confidence.meanPlddt, 2),
+    ptm: round(confidence.ptm, 4),
+    ...(confidence.iptm === undefined ? {} : { iptm: round(confidence.iptm, 4) }),
+    recycles: prediction.recycles.map((result, index) => ({
+      recycle: index,
+      mean_plddt: round(result.confidence.meanPlddt, 2),
+      ptm: round(result.confidence.ptm, 4),
+      ...((result as MultimerRecycleSummary).confidence.iptm === undefined
+        ? {} : { iptm: round((result as MultimerRecycleSummary).confidence.iptm, 4) }),
+      seconds: round(result.elapsedMilliseconds / 1000, 2),
+    })),
+  };
+}
+
+/**
+ * Collects the run into one ColabFold-shaped archive: structure, scores, the
+ * alignment error in AlphaFold-DB's format, the three plots, the alignment,
+ * the settings, the run log and the citations for the methods used.
+ */
+async function downloadResultPackage(
+  prediction: MonomerPrediction | MultimerPrediction, context: ResultContext,
+): Promise<void> {
+  const button = element<HTMLButtonElement>("download-results");
+  const label = button.textContent ?? "Download results";
+  button.disabled = true; button.textContent = "Packaging…";
+  try {
+    const plots = [["plddt", "plddt-plot"], ["pae", "pae-plot"], ["coverage", "msa-plot"]] as const;
+    const images = await Promise.all(plots.map(async ([suffix, id]) => (
+      { suffix, png: await canvasPng(element<HTMLCanvasElement>(id)) }
+    )));
+    const blob = await packageResults({
+      jobName: context.jobName,
+      sequence: context.sequence,
+      chainLengths: context.chainLengths ?? [context.sequence.length],
+      confidence: prediction.final.confidence,
+      pdb: currentPdb,
+      scoresJson: currentScores,
+      a3m: context.a3m,
+      depth: context.depth,
+      images,
+      settings: runSettings(prediction, context),
+      log: element<HTMLPreElement>("run-log").textContent ?? "",
+      usedMmseqs2: context.inputMode === "mmseqs2",
+      multimer: context.multimer,
+    });
+    downloadBlob(`${context.jobName}.result.zip`, blob);
+    log(`Packaged the results as ${context.jobName}.result.zip (${formatMib(blob.size)}).`);
+  } catch (error) {
+    log(`Could not package the results: ${error instanceof Error ? error.message : String(error)}.`);
+  } finally { button.disabled = false; button.textContent = label; }
+}
+
+function showResults(prediction: MonomerPrediction | MultimerPrediction, context: ResultContext): void {
+  const { sequence, depth, jobName, a3m, modelLoadMilliseconds, chainLengths } = context;
   const confidence = prediction.final.confidence;
   currentPdb = predictionToPdb(sequence, prediction.final.structure, confidence.plddt, chainLengths);
   currentScores = confidenceJson(sequence, confidence);
@@ -258,6 +376,9 @@ function showResults(prediction: MonomerPrediction | MultimerPrediction, sequenc
   void showStructure(currentPdb);
   element<HTMLButtonElement>("download-pdb").onclick = () => download(`${jobName}_unrelaxed_model_1.pdb`, currentPdb, "chemical/x-pdb");
   element<HTMLButtonElement>("download-scores").onclick = () => download(`${jobName}_scores.json`, currentScores, "application/json");
+  const packageButton = element<HTMLButtonElement>("download-results");
+  packageButton.hidden = false; packageButton.disabled = false;
+  packageButton.onclick = () => { void downloadResultPackage(prediction, context); };
   window.__AFWEBGPU_PREDICTION__ = {
     meanPlddt: confidence.meanPlddt, ptm: confidence.ptm,
     ...(multimerConfidence.iptm === undefined ? {} : { iptm: multimerConfidence.iptm }),
@@ -472,7 +593,8 @@ async function runPrediction(): Promise<void> {
   const button = element<HTMLButtonElement>("predict"); button.disabled = true;
   const stopButton = element<HTMLButtonElement>("stop");
   const clearCacheButton = element<HTMLButtonElement>("clear-model-cache"); clearCacheButton.disabled = true;
-  element<HTMLElement>("results-section").hidden = true; resetStages(); log("Starting prediction…", false); lastMsaStatus = "";
+  element<HTMLElement>("results-section").hidden = true;
+  element<HTMLButtonElement>("download-results").hidden = true; resetStages(); log("Starting prediction…", false); lastMsaStatus = "";
   try {
     stage("device", "active", "Checking WebGPU support"); setPredictionStatus("Preparing WebGPU");
     const preflight = await webGpuPreflight();
@@ -515,12 +637,15 @@ async function runPrediction(): Promise<void> {
         mainEvoformerBlock: Number(parameter("profileMainBlock", "0")),
       } } : {}),
     };
-    const { prediction, modelLoadMilliseconds } = await runner.run(job, domReporter);
+    const { prediction, modelLoadMilliseconds, adapterName } = await runner.run(job, domReporter);
 
     stage("results", "active", "Rendering"); setPredictionStatus("Preparing results");
     const jobName = safeJobName(element<HTMLInputElement>("job-name").value);
-    showResults(prediction, input.sequence, input.depth, jobName, input.a3m, modelLoadMilliseconds,
-      input.chains?.map((chain) => chain.length));
+    showResults(prediction, {
+      sequence: input.sequence, depth: input.depth, jobName, a3m: input.a3m, modelLoadMilliseconds,
+      ...(input.chains === undefined ? {} : { chainLengths: input.chains.map((chain) => chain.length) }),
+      multimer: input.multimer, inputMode: element<HTMLSelectElement>("input-mode").value, job, adapterName,
+    });
     stage("results", "done", "Ready"); setPredictionStatus("Prediction complete", "passed");
     log(`Finished in ${formatSeconds(prediction.elapsedMilliseconds)}.`);
     element<HTMLElement>("results-section").scrollIntoView({ behavior: "smooth", block: "start" });
