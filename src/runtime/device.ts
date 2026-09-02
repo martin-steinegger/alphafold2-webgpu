@@ -1,3 +1,4 @@
+import { CLUSTERED_MSA_CHANNELS } from "../input/msa-features.js";
 import { COMPACT_GPU_POOL_BYTES } from "./allocator.js";
 import {
   OUTER_PRODUCT_BLOCK_LIMIT_BYTES, outerProductMeanNormalizeWindow, outerProductMeanRowBlock,
@@ -90,7 +91,7 @@ export function estimateMonomerMemory(
   const masks = checkedBytes("model masks", length, msaSequences + extraSequences + length, bytes);
   const positions = checkedBytes("atom positions", length, 37, 3, bytes);
 
-  const msaFeatures = checkedBytes("MSA features", msaSequences, length, 49, bytes);
+  const msaFeatures = checkedBytes("MSA features", msaSequences, length, CLUSTERED_MSA_CHANNELS, bytes);
 
   // Only the pair and the masks are live in every phase. The clustered MSA is
   // embedded after the extra stack and released after the main stack, the

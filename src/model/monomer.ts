@@ -11,7 +11,9 @@ import { type ActivationStorage, storageWords, unpackHalfWords } from "../runtim
 import {
   encodeEvoformerBlock, encodeExtraMsaBlock, type EvoformerBlockWeights, type ExtraMsaBlockWeights,
 } from "../evoformer/block.js";
-import { QueryOnlyTemplateGpu, type QueryOnlyTemplateWeights } from "../evoformer/template.js";
+import {
+  QueryOnlyTemplateGpu, queryOnlyTemplateConstant, type QueryOnlyTemplateWeights,
+} from "../evoformer/template.js";
 import { MultimerMockTemplateGpu, type MultimerMockTemplateWeights } from "../evoformer/multimer-template.js";
 import { WebGpuExecution, type GpuTensor, type GpuTimestampEntry } from "../runtime/execution.js";
 import { StructureModuleGpu, type StructureModuleResult, type StructureModuleWeights } from "../structure/module.js";
@@ -51,8 +53,13 @@ export type MultimerCompatibleModelWeights = Omit<MonomerModelWeights, "template
 /** User-facing confidence tensors; raw categorical logits are transient implementation details. */
 export type PredictionConfidenceResult = ConfidenceSummaryResult;
 
+/** Stands in for the pair when a prediction did not ask to read it back. */
+const EMPTY_PAIR = new Float32Array(0);
+
 export interface MonomerRecycleResult {
-  readonly msaFirstRow: Float32Array; readonly pair: Float32Array;
+  readonly msaFirstRow: Float32Array;
+  /** The final pair, empty unless the model was built with `returnFinalPair`. */
+  readonly pair: Float32Array;
   readonly structure: StructureModuleResult; readonly confidence: PredictionConfidenceResult;
   readonly elapsedMilliseconds: number;
   readonly trunkSubmissions: MonomerTrunkSubmissionCounts;
@@ -129,6 +136,23 @@ export interface MonomerGpuOptions {
   readonly multimer?: boolean;
   /** Multimer CA-distance RMS threshold; negative disables early stopping. */
   readonly recycleEarlyStopTolerance?: number;
+  /**
+   * Reads the final pair representation back to the host.
+   *
+   * Only differential testing wants it: at 1000 residues the pair is 488 MiB,
+   * and returning it costs that much again in a mapped staging buffer and once
+   * more in the host copy, at the point where the run is otherwise done and
+   * the device is at its fullest. Predictions leave it off and get an empty
+   * array in `final.pair`.
+   */
+  readonly returnFinalPair?: boolean;
+  /**
+   * Collapses the query-only template module to the constant it computes.
+   *
+   * Off, the module runs on the real chain, which is what the differential
+   * tests compare against.
+   */
+  readonly collapseQueryOnlyTemplate?: boolean;
 }
 
 export interface MonomerBlockGpuProfile {
@@ -174,6 +198,8 @@ export class AlphaFoldMonomerGpu {
   readonly msaStorage: ActivationStorage;
   readonly multimer: boolean;
   readonly recycleEarlyStopTolerance: number;
+  readonly returnFinalPair: boolean;
+  readonly collapseQueryOnlyTemplate: boolean;
   constructor(device: GPUDevice, options: MonomerGpuOptions = {}) {
     this.device = device;
     this.profile = options.profile ?? false;
@@ -184,6 +210,8 @@ export class AlphaFoldMonomerGpu {
     this.maxPooledBytes = options.maxPooledBytes
       ?? (this.compactTransitions ? COMPACT_GPU_POOL_BYTES : undefined);
     this.multimer = options.multimer ?? false;
+    this.returnFinalPair = options.returnFinalPair ?? false;
+    this.collapseQueryOnlyTemplate = options.collapseQueryOnlyTemplate ?? true;
     this.triangleWholeStorage = options.triangleWholeStorage ?? "f32";
     this.msaStorage = options.msaStorage ?? "f32";
     if (this.triangleWholeStorage !== "f32" && this.triangleWholeStorage !== "f16") {
@@ -235,7 +263,35 @@ export class AlphaFoldMonomerGpu {
     if (!this.multimer && templateWeights === undefined) {
       throw new Error("AlphaFold monomer weights require a template module");
     }
-    const templateModule = templateWeights === undefined ? undefined : new QueryOnlyTemplateGpu(this.device);
+    // With no template search the module's update is one vector repeated over
+    // every pair, so it is computed once on a handful of residues and folded
+    // into the pair projection's bias, which the embedder already adds to
+    // every pair element. That removes the template stack from the trunk: no
+    // per-recycle pass over the pair, and none of the hundreds of MiB its own
+    // activations take at long lengths. It holds only for an unpadded chain,
+    // where the pair mask is everywhere one; anything else runs the module.
+    const uniformPairMask = pairMask.every((value) => value === 1);
+    let embeddingWeights = weights.embedding;
+    let templateConstantMilliseconds: number | undefined;
+    let templateConstantApplied = false;
+    if (this.collapseQueryOnlyTemplate && templateWeights !== undefined && uniformPairMask) {
+      const started = performance.now();
+      const constant = await queryOnlyTemplateConstant(this.device, templateWeights);
+      if (constant !== undefined) {
+        const leftSingleBias = Float32Array.from(weights.embedding.leftSingleBias);
+        if (leftSingleBias.length !== constant.length) {
+          throw new RangeError("template constant and pair projection bias disagree on channels");
+        }
+        for (let channel = 0; channel < leftSingleBias.length; channel += 1) {
+          leftSingleBias[channel] = leftSingleBias[channel]! + constant[channel]!;
+        }
+        embeddingWeights = { ...weights.embedding, leftSingleBias };
+        templateConstantApplied = true;
+        templateConstantMilliseconds = performance.now() - started;
+      }
+    }
+    const templateModule = templateWeights === undefined || templateConstantApplied
+      ? undefined : new QueryOnlyTemplateGpu(this.device);
     const recomputeTemplate = length * length * 128 * 4 >= TEMPLATE_RECOMPUTE_BYTES;
     const templateUpdateValue = templateModule !== undefined && templateWeights !== undefined && !recomputeTemplate
       ? (await templateModule.run({
@@ -300,12 +356,23 @@ export class AlphaFoldMonomerGpu {
     };
     try {
       const pairMaskTensor = execution.upload("monomer.pair-mask", pairMask);
-      let previousMsa = execution.upload("monomer.recycle-msa-zero", new Float32Array(length * 256));
-      let previousPair = execution.upload("monomer.recycle-pair-zero", new Float32Array(length * length * 128),
+      // The first recycle reads zeros. A pooled buffer carries whatever the
+      // last allocation left in it, so the zeros are written on the device:
+      // uploading them would cost a pair-sized host array (488 MiB at 1000
+      // residues) and a copy of it, to send across what the GPU can clear for
+      // nothing.
+      let previousMsa = execution.allocate("monomer.recycle-msa-zero", length * 256,
+        GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+      let previousPair = execution.allocate("monomer.recycle-pair-zero", length * length * 128,
         GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST);
-      let previousPositions = execution.upload(
-        "monomer.recycle-positions-zero", new Float32Array(length * 37 * 3),
-      );
+      let previousPositions = execution.allocate("monomer.recycle-positions-zero", length * 37 * 3,
+        GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+      const clearEncoder = this.device.createCommandEncoder({ label: "monomer.recycle-zero" });
+      for (const tensor of [previousMsa, previousPair, previousPositions]) {
+        clearEncoder.clearBuffer(tensor.allocation.buffer, 0, tensor.allocation.byteLength);
+      }
+      this.device.pushErrorScope("validation");
+      await submit(clearEncoder, "recycle zero");
       let stopAfterRecycle = Number.POSITIVE_INFINITY;
       let previousConvergencePositions: Float32Array | undefined;
 
@@ -326,7 +393,7 @@ export class AlphaFoldMonomerGpu {
           ...features,
           previousMsaFirstRow: new Float32Array(0), previousPair: new Float32Array(0),
           previousPositions: new Float32Array(0), length,
-          msaChannels: 256, pairChannels: 128, extraMsaChannels: 64, weights: weights.embedding,
+          msaChannels: 256, pairChannels: 128, extraMsaChannels: 64, weights: embeddingWeights,
           msaStorage: this.msaStorage,
           ...(features.chainRelative === undefined ? {} : { chainRelative: features.chainRelative }),
         }, previousMsa, previousPair, previousPositions);
@@ -338,7 +405,8 @@ export class AlphaFoldMonomerGpu {
         // The new pair was written over `previousPair`, which therefore stays live.
         for (const temporary of embedding.temporaries) releaseTensor(temporary);
         releaseTensor(previousPositions);
-        let templateMilliseconds: number | undefined;
+        let templateMilliseconds: number | undefined = templateConstantMilliseconds;
+        templateConstantMilliseconds = undefined;
         if (templateUpdateValue !== undefined) {
           const templateStart = performance.now();
           const templateUpdate = execution.upload(`monomer.template-update-${recycle}`, templateUpdateValue);
@@ -620,14 +688,17 @@ export class AlphaFoldMonomerGpu {
         featureStep = featureIterator.next();
       }
       if (finalDetails === undefined) throw new Error("monomer prediction produced no recycle result");
-      const finalReadbackEncoder = this.device.createCommandEncoder({ label: "monomer.final-pair-readback" });
-      const finalPairReadback = execution.createReadback(
-        "monomer.final-pair-readback", previousPair, finalReadbackEncoder,
-      );
-      this.device.pushErrorScope("validation");
-      await submit(finalReadbackEncoder, "final pair readback");
-      const finalPair = await execution.mapFloat32(finalPairReadback);
-      releaseTensor(finalPairReadback);
+      let finalPair: Float32Array = EMPTY_PAIR;
+      if (this.returnFinalPair) {
+        const finalReadbackEncoder = this.device.createCommandEncoder({ label: "monomer.final-pair-readback" });
+        const finalPairReadback = execution.createReadback(
+          "monomer.final-pair-readback", previousPair, finalReadbackEncoder,
+        );
+        this.device.pushErrorScope("validation");
+        await submit(finalReadbackEncoder, "final pair readback");
+        finalPair = await execution.mapFloat32(finalPairReadback);
+        releaseTensor(finalPairReadback);
+      }
       const finalResult: MonomerRecycleResult = { ...finalDetails, pair: finalPair };
       const mainMemory = execution.snapshot();
       return {

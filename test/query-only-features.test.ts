@@ -1,3 +1,4 @@
+import { expandClusteredMsaFeatures } from "../src/input/msa-features.js";
 import { describe, expect, it } from "vitest";
 import { makeQueryOnlyFeatures } from "../src/input/query-only-features.js";
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
@@ -29,7 +30,9 @@ describe("query-only feature construction", () => {
     for (let recycle = 0; recycle < 4; recycle += 1) {
       const actual = generated[recycle]!;
       expect(errorMetrics(actual.targetFeatures, await fixture.tensor(`feature_target_feat_recycle${recycle}`)).maxAbsoluteError).toBe(0);
-      expect(errorMetrics(actual.msaFeatures, await fixture.tensor(`feature_msa_feat_recycle${recycle}`)).maxAbsoluteError).toBeLessThan(1e-7);
+      // The builder emits the compact layout; the reference is AlphaFold's dense one.
+      const dense = expandClusteredMsaFeatures(actual.msaFeatures, SEQUENCE.length);
+      expect(errorMetrics(dense, await fixture.tensor(`feature_msa_feat_recycle${recycle}`)).maxAbsoluteError).toBeLessThan(1e-7);
       expect(errorMetrics(actual.aatype, await fixture.tensor(`feature_aatype_recycle${recycle}`)).maxAbsoluteError).toBe(0);
       expect(errorMetrics(actual.atom37ToAtom14, await fixture.tensor(`feature_residx_atom37_to_atom14_recycle${recycle}`)).maxAbsoluteError).toBe(0);
       expect(errorMetrics(actual.atom37Mask, await fixture.tensor(`feature_atom37_atom_exists_recycle${recycle}`)).maxAbsoluteError).toBe(0);

@@ -1,3 +1,4 @@
+import { CLUSTERED_MSA_CHANNELS, MSA_CODE_NONE } from "./msa-features.js";
 import { parseA3m } from "./a3m.js";
 import {
   jaxPaddingConsistentUniform, multimerMsaKeys, type JaxKey,
@@ -127,12 +128,16 @@ function makeColabFoldMultimerFeatures(
       centerCodes[center * length + residue] = bestCode;
     }
 
-    const profile = new Float32Array(centers.length * length * 23);
+    // The profile accumulates straight into the feature array's profile
+    // channels, so the run never holds a second copy of it.
+    const msaFeatures = new Float32Array(centers.length * length * CLUSTERED_MSA_CHANNELS);
     const deletionSums = new Float32Array(centers.length * length);
     const counts = new Float32Array(centers.length * length).fill(1);
     for (let center = 0; center < centers.length; center += 1) for (let residue = 0; residue < length; residue += 1) {
       const slot = center * length + residue;
-      if (rowMask[centers[center]!] !== 0) profile[slot * 23 + centerCodes[slot]!] = 1;
+      if (rowMask[centers[center]!] !== 0) {
+        msaFeatures[slot * CLUSTERED_MSA_CHANNELS + 3 + centerCodes[slot]!] = 1;
+      }
       deletionSums[slot] = deletionMatrix[centers[center]! * length + residue]!;
     }
     for (const extraRow of extras) {
@@ -153,26 +158,26 @@ function makeColabFoldMultimerFeatures(
       for (const center of nearest) for (let residue = 0; residue < length; residue += 1) {
         const slot = center * length + residue;
         counts[slot] = counts[slot]! + assignment;
-        const profileSlot = slot * 23 + encoded[extraRow * length + residue]!;
-        profile[profileSlot] = profile[profileSlot]! + assignment;
+        const profileSlot = slot * CLUSTERED_MSA_CHANNELS + 3 + encoded[extraRow * length + residue]!;
+        msaFeatures[profileSlot] = msaFeatures[profileSlot]! + assignment;
         deletionSums[slot] = deletionSums[slot]!
           + assignment * deletionMatrix[extraRow * length + residue]!;
       }
     }
 
-    const msaFeatures = new Float32Array(centers.length * length * 49);
     const msaMask = new Float32Array(centers.length * length);
     for (let center = 0; center < centers.length; center += 1) for (let residue = 0; residue < length; residue += 1) {
-      const slot = center * length + residue; const output = slot * 49;
+      const slot = center * length + residue; const output = slot * CLUSTERED_MSA_CHANNELS;
       msaMask[slot] = rowMask[centers[center]!]!;
-      msaFeatures[output + centerCodes[slot]!] = rowMask[centers[center]!]!;
+      // A masked row contributes no one-hot at all, which the code says.
+      msaFeatures[output] = msaMask[slot] === 0 ? MSA_CODE_NONE : centerCodes[slot]!;
       const deletion = deletionMatrix[centers[center]! * length + residue]!;
-      msaFeatures[output + 23] = Math.min(deletion, 1) * msaMask[slot]!;
-      msaFeatures[output + 24] = deletionValue(deletion) * msaMask[slot]!;
+      msaFeatures[output + 1] = Math.min(deletion, 1) * msaMask[slot]!;
+      msaFeatures[output + 2] = deletionValue(deletion) * msaMask[slot]!;
       for (let code = 0; code < 23; code += 1) {
-        msaFeatures[output + 25 + code] = profile[slot * 23 + code]! / counts[slot]!;
+        msaFeatures[output + 3 + code] = msaFeatures[output + 3 + code]! / counts[slot]!;
       }
-      msaFeatures[output + 48] = deletionValue(deletionSums[slot]! / counts[slot]!);
+      msaFeatures[output + 26] = deletionValue(deletionSums[slot]! / counts[slot]!);
     }
 
     const selectedExtras = extras.slice(0, maxExtra);
@@ -194,7 +199,8 @@ function makeColabFoldMultimerFeatures(
       extraMsa, extraHasDeletion, extraDeletionValue, extraMsaMask,
       residueIndex: base.residueIndex, aatype: base.aatype, seqMask: base.seqMask,
       atom37ToAtom14: base.atom37ToAtom14, atom37Mask: base.atom37Mask,
-      msaSequences: centers.length, extraSequences, targetChannels: 22, msaFeatureChannels: 49,
+      msaSequences: centers.length, extraSequences, targetChannels: 22,
+      msaFeatureChannels: CLUSTERED_MSA_CHANNELS,
     };
     }
   });
@@ -205,9 +211,12 @@ export function iterateA3mFeatures(a3mText: string, tables: QueryOnlyFeatureTabl
   options: A3mFeatureOptions = {}): RecycleFeatureSource<MonomerRecycleFeatures> {
   const alignment = parseA3m(a3mText);
   const length = alignment.length; const depth = alignment.depth;
-  const alignmentMask = options.alignmentMask ?? new Float32Array(depth * length).fill(1);
-  if (alignmentMask.length !== depth * length
-    || alignmentMask.some((value) => value !== 0 && value !== 1)) {
+  // No mask means every position is maskable. Materialising that as ones would
+  // cost depth by length floats, 31 MiB for an 8,000-row alignment of 1,000
+  // residues, to say what its absence already says.
+  const alignmentMask = options.alignmentMask;
+  if (alignmentMask !== undefined && (alignmentMask.length !== depth * length
+    || alignmentMask.some((value) => value !== 0 && value !== 1))) {
     throw new RangeError("A3M alignment mask must have shape [depth, length] and contain only zero or one");
   }
   const encoded = new Uint8Array(depth * length);
@@ -240,7 +249,7 @@ export function iterateA3mFeatures(a3mText: string, tables: QueryOnlyFeatureTabl
     }
     for (let index = 0; index < centerCodes.length; index += 1) {
       const center = Math.floor(index / length); const residue = index % length;
-      if (alignmentMask[centers[center]! * length + residue] === 0) continue;
+      if (alignmentMask?.[centers[center]! * length + residue] === 0) continue;
       if (random() >= 0.15) continue;
       const original = centerCodes[index]!; const draw = random();
       if (draw < 0.7) centerCodes[index] = 22;
@@ -260,12 +269,12 @@ export function iterateA3mFeatures(a3mText: string, tables: QueryOnlyFeatureTabl
       }
       assignments[extraIndex] = best;
     }
-    const profile = new Float32Array(centers.length * length * 23);
+    const msaFeatures = new Float32Array(centers.length * length * CLUSTERED_MSA_CHANNELS);
     const deletionSums = new Float32Array(centers.length * length);
     const counts = new Float32Array(centers.length * length).fill(1 + 1e-6);
     for (let center = 0; center < centers.length; center += 1) for (let residue = 0; residue < length; residue += 1) {
       const slot = center * length + residue;
-      profile[slot * 23 + centerCodes[slot]!] = 1;
+      msaFeatures[slot * CLUSTERED_MSA_CHANNELS + 3 + centerCodes[slot]!] = 1;
       deletionSums[slot] = alignment.deletionMatrix[centers[center]!]![residue]!;
     }
     for (let extraIndex = 0; extraIndex < extras.length; extraIndex += 1) {
@@ -273,19 +282,20 @@ export function iterateA3mFeatures(a3mText: string, tables: QueryOnlyFeatureTabl
       for (let residue = 0; residue < length; residue += 1) {
         const slot = center * length + residue;
         counts[slot] = counts[slot]! + 1;
-        const profileSlot = slot * 23 + encoded[row * length + residue]!;
-        profile[profileSlot] = profile[profileSlot]! + 1;
+        const profileSlot = slot * CLUSTERED_MSA_CHANNELS + 3 + encoded[row * length + residue]!;
+        msaFeatures[profileSlot] = msaFeatures[profileSlot]! + 1;
         deletionSums[slot] = deletionSums[slot]! + alignment.deletionMatrix[row]![residue]!;
       }
     }
-    const msaFeatures = new Float32Array(centers.length * length * 49);
     for (let center = 0; center < centers.length; center += 1) for (let residue = 0; residue < length; residue += 1) {
-      const slot = center * length + residue; const output = slot * 49;
-      msaFeatures[output + centerCodes[slot]!] = 1;
+      const slot = center * length + residue; const output = slot * CLUSTERED_MSA_CHANNELS;
+      msaFeatures[output] = centerCodes[slot]!;
       const deletion = alignment.deletionMatrix[centers[center]!]![residue]!;
-      msaFeatures[output + 23] = Math.min(deletion, 1); msaFeatures[output + 24] = deletionValue(deletion);
-      for (let code = 0; code < 23; code += 1) msaFeatures[output + 25 + code] = profile[slot * 23 + code]! / counts[slot]!;
-      msaFeatures[output + 48] = deletionValue(deletionSums[slot]! / counts[slot]!);
+      msaFeatures[output + 1] = Math.min(deletion, 1); msaFeatures[output + 2] = deletionValue(deletion);
+      for (let code = 0; code < 23; code += 1) {
+        msaFeatures[output + 3 + code] = msaFeatures[output + 3 + code]! / counts[slot]!;
+      }
+      msaFeatures[output + 26] = deletionValue(deletionSums[slot]! / counts[slot]!);
     }
     const extraSequences = Math.max(1, extras.length);
     const extraMsa = new Float32Array(extraSequences * length);
@@ -305,7 +315,8 @@ export function iterateA3mFeatures(a3mText: string, tables: QueryOnlyFeatureTabl
       extraMsa, extraHasDeletion, extraDeletionValue, extraMsaMask,
       residueIndex: base.residueIndex, aatype: base.aatype, seqMask: base.seqMask,
       atom37ToAtom14: base.atom37ToAtom14, atom37Mask: base.atom37Mask,
-      msaSequences: centers.length, extraSequences, targetChannels: 22, msaFeatureChannels: 49,
+      msaSequences: centers.length, extraSequences, targetChannels: 22,
+      msaFeatureChannels: CLUSTERED_MSA_CHANNELS,
     };
     }
   });

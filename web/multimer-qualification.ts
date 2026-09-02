@@ -1,3 +1,4 @@
+import { CLUSTERED_MSA_CHANNELS, compactClusteredMsaFeatures } from "../src/input/msa-features.js";
 import { AlphaFoldMultimerGpu, type MultimerModelWeights } from "../src/model/multimer.js";
 import type { MultimerRecycleFeatures } from "../src/input/multimer-features.js";
 import { AlphaFoldFixture, type TensorStore } from "../src/reference/alphafold-fixture.js";
@@ -67,7 +68,9 @@ async function capturedFeatures(reference: TensorStore, model: AlphaFoldFixture,
       atom37Mask.set(tables.atom37Mask.subarray(aa * 37, (aa + 1) * 37), residue * 37);
     }
     results.push({
-      targetFeatures: await tensor("target_feat"), msaFeatures: await tensor("msa_feat"),
+      targetFeatures: await tensor("target_feat"),
+      msaFeatures: compactClusteredMsaFeatures(await tensor("msa_feat"),
+        reference.shape(msaName)[0]! * reference.shape(msaName)[1]!),
       msaMask: await tensor("msa_mask"), extraMsa: await tensor("extra_msa"),
       extraHasDeletion: await tensor("extra_has_deletion"),
       extraDeletionValue: await tensor("extra_deletion_value"), extraMsaMask: await tensor("extra_msa_mask"),
@@ -75,7 +78,7 @@ async function capturedFeatures(reference: TensorStore, model: AlphaFoldFixture,
       atom37ToAtom14, atom37Mask,
       msaSequences: reference.shape(msaName)[0]!, extraSequences: reference.shape(extraName)[0]!,
       targetChannels: reference.shape(`feature_target_feat_recycle${recycle}`).at(-1)!,
-      msaFeatureChannels: reference.shape(msaName).at(-1)!,
+      msaFeatureChannels: CLUSTERED_MSA_CHANNELS,
       chainRelative: {
         asymId: await tensor("asym_id"), entityId: await tensor("entity_id"), symId: await tensor("sym_id"),
       },
@@ -172,7 +175,9 @@ export async function qualifyMultimer(referenceManifestUrl: string,
       ));
     }
     const prediction = await new AlphaFoldMultimerGpu(device, {
-      compactTransitions: true, recycleEarlyStopTolerance: -1,
+      // Qualification compares the pair against the reference, so it pays for
+      // the readback a prediction skips.
+      compactTransitions: true, recycleEarlyStopTolerance: -1, returnFinalPair: true,
     }).predict(features, weights, breaks);
     const initialized = await new StructureInitializeGpu(device).run(
       prediction.final.msaFirstRow, features[0]!.aatype.length, 256, 384, weights.structure.initialize,

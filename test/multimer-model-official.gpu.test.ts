@@ -1,3 +1,4 @@
+import { CLUSTERED_MSA_CHANNELS, compactClusteredMsaFeatures } from "../src/input/msa-features.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { create, globals } from "webgpu";
 import {
@@ -61,7 +62,9 @@ async function capturedFeatures(
       atom37Mask.set(tables.atom37Mask.subarray(aa * 37, (aa + 1) * 37), residue * 37);
     }
     results.push({
-      targetFeatures: await tensor("target_feat"), msaFeatures: await tensor("msa_feat"),
+      targetFeatures: await tensor("target_feat"),
+      msaFeatures: compactClusteredMsaFeatures(await tensor("msa_feat"),
+        reference.shape(msaName)[0]! * reference.shape(msaName)[1]!),
       msaMask: await tensor("msa_mask"), extraMsa: await tensor("extra_msa"),
       extraHasDeletion: await tensor("extra_has_deletion"),
       extraDeletionValue: await tensor("extra_deletion_value"), extraMsaMask: await tensor("extra_msa_mask"),
@@ -69,7 +72,7 @@ async function capturedFeatures(
       atom37ToAtom14, atom37Mask,
       msaSequences: reference.shape(msaName)[0]!, extraSequences: reference.shape(extraName)[0]!,
       targetChannels: reference.shape(`feature_target_feat_recycle${recycle}`).at(-1)!,
-      msaFeatureChannels: reference.shape(msaName).at(-1)!,
+      msaFeatureChannels: CLUSTERED_MSA_CHANNELS,
       chainRelative: {
         asymId: await tensor("asym_id"), entityId: await tensor("entity_id"), symId: await tensor("sym_id"),
       },

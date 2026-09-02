@@ -1,3 +1,4 @@
+import { CLUSTERED_MSA_CHANNELS, compactClusteredMsaFeatures } from "../src/input/msa-features.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { create, globals } from "webgpu";
 import { InputEmbedderGpu } from "../src/evoformer/input-embedder.js";
@@ -26,9 +27,10 @@ describe.skipIf(!enabled)("query-only AlphaFold trunk WebGPU", () => {
   it("runs recycle 0 from processed sequence features through all 54 pair blocks", async () => {
     const fixture = AlphaFoldFixture.fromStore(await FileTensorStore.open(MANIFEST));
     const target = await fixture.tensor("feature_target_feat_recycle0");
-    const msaFeatures = await fixture.tensor("feature_msa_feat_recycle0");
-    const targetShape = fixture.shape("feature_target_feat_recycle0");
     const msaFeatureShape = fixture.shape("feature_msa_feat_recycle0");
+    const msaFeatures = compactClusteredMsaFeatures(
+      await fixture.tensor("feature_msa_feat_recycle0"), msaFeatureShape[0]! * msaFeatureShape[1]!);
+    const targetShape = fixture.shape("feature_target_feat_recycle0");
     const extraShape = fixture.shape("feature_extra_msa_recycle0");
     const length = targetShape[0]!;
     const [embeddingWeights, templateWeights, extraWeights, mainWeights] = await Promise.all([
@@ -49,7 +51,7 @@ describe.skipIf(!enabled)("query-only AlphaFold trunk WebGPU", () => {
       msaSequences: msaFeatureShape[0]!,
       extraSequences: extraShape[0]!,
       targetChannels: targetShape[1]!,
-      msaFeatureChannels: msaFeatureShape[2]!,
+      msaFeatureChannels: CLUSTERED_MSA_CHANNELS,
       msaChannels: 256,
       pairChannels: 128,
       extraMsaChannels: 64,

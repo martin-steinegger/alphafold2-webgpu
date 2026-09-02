@@ -190,3 +190,39 @@ export class QueryOnlyTemplateGpu {
     }
   }
 }
+
+/** Residues used to probe the update; large enough to exercise every kernel, small enough to be free. */
+const TEMPLATE_PROBE_LENGTH = 8;
+
+/**
+ * The query-only template update as the single pair vector it turns out to be.
+ *
+ * With template search off the module has no sequence input at all: it sees a
+ * length, the pair mask and the weights. Every pair of an unpadded chain
+ * therefore receives the same vector, which measurement confirms is identical
+ * to the last bit within a run and stable across lengths to about 2e-7 out of
+ * values around 0.28. So the whole module can run once on a handful of
+ * residues instead of once per recycle on the real chain, and its result can
+ * be carried as 128 numbers rather than an L by L by 128 tensor.
+ *
+ * Returns undefined when the probe's own rows disagree, which would mean the
+ * assumption does not hold for these weights and the caller should run the
+ * module for real.
+ */
+export async function queryOnlyTemplateConstant(
+  device: GPUDevice, weights: QueryOnlyTemplateWeights,
+  templateChannels = 64, pairChannels = 128,
+): Promise<Float32Array | undefined> {
+  const length = TEMPLATE_PROBE_LENGTH;
+  const { pairUpdate } = await new QueryOnlyTemplateGpu(device).run({
+    length, templateChannels, pairChannels,
+    pairMask: new Float32Array(length * length).fill(1), weights,
+  });
+  const constant = pairUpdate.slice(0, pairChannels);
+  for (let pair = 1; pair < length * length; pair += 1) {
+    for (let channel = 0; channel < pairChannels; channel += 1) {
+      if (pairUpdate[pair * pairChannels + channel] !== constant[channel]) return undefined;
+    }
+  }
+  return constant;
+}

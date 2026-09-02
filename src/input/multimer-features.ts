@@ -1,3 +1,4 @@
+import { CLUSTERED_MSA_CHANNELS } from "./msa-features.js";
 import type { QueryOnlyFeatureTables } from "./query-only-features.js";
 import {
   iterateA3mFeatures, recycleFeatureSource, type A3mFeatureOptions, type RecycleFeatureSource,
@@ -196,11 +197,11 @@ export function iterateMultimerQueryOnlyFeatures(
       if (draw < 0.7) msaCodes[residue] = 22;
       else if (draw >= 0.9) msaCodes[residue] = Math.floor(random() * 20);
     }
-    const msaFeatures = new Float32Array(length * 49);
+    const msaFeatures = new Float32Array(length * CLUSTERED_MSA_CHANNELS);
     for (let residue = 0; residue < length; residue += 1) {
       const code = msaCodes[residue]!;
-      msaFeatures[residue * 49 + code] = 1;
-      msaFeatures[residue * 49 + 25 + code] = 1 / (1 + 1e-6);
+      msaFeatures[residue * CLUSTERED_MSA_CHANNELS] = code;
+      msaFeatures[residue * CLUSTERED_MSA_CHANNELS + 3 + code] = 1 / (1 + 1e-6);
     }
     yield {
       targetFeatures: sequence.targetFeatures,
@@ -218,7 +219,7 @@ export function iterateMultimerQueryOnlyFeatures(
       msaSequences: 1,
       extraSequences: 1,
       targetChannels: 21,
-      msaFeatureChannels: 49,
+      msaFeatureChannels: CLUSTERED_MSA_CHANNELS,
       chainRelative: {
         asymId: sequence.asymId, entityId: sequence.entityId, symId: sequence.symId,
       },

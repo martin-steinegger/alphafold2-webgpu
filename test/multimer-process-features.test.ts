@@ -1,3 +1,4 @@
+import { expandClusteredMsaFeatures } from "../src/input/msa-features.js";
 import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import { makeMultimerA3mFeatures } from "../src/input/multimer-features.js";
@@ -35,7 +36,8 @@ describe("ColabFold Multimer process_features", () => {
       expect(actual.extraMsa).toEqual(await tensor("extra_msa"));
       expect(actual.extraMsaMask).toEqual(await tensor("extra_msa_mask"));
       const expectedMsa = await tensor("msa_feat");
-      const msaError = errorMetrics(actual.msaFeatures, expectedMsa);
+      const msaError = errorMetrics(
+        expandClusteredMsaFeatures(actual.msaFeatures, actual.msaSequences * actual.aatype.length), expectedMsa);
       // JAX's GPU einsum uses reduced-precision accumulation for a three-way
       // nearest-neighbor tie; discrete rows/codes above must still match exactly.
       expect(msaError.meanAbsoluteError).toBeLessThan(2e-6);

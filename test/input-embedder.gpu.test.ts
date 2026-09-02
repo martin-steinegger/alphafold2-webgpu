@@ -1,3 +1,4 @@
+import { CLUSTERED_MSA_CHANNELS, compactClusteredMsaFeatures } from "../src/input/msa-features.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { create, globals } from "webgpu";
 import { encodeInputEmbedder, InputEmbedderGpu, type InputEmbedderWeights } from "../src/evoformer/input-embedder.js";
@@ -55,9 +56,10 @@ describe.skipIf(!enabled)("AlphaFold input/recycling embedder WebGPU", () => {
       extraMsaBias: await parameter("extra_msa_activations", "bias"),
     };
     const target = await store.tensor("feature_target_feat_recycle0");
-    const msaFeatures = await store.tensor("feature_msa_feat_recycle0");
-    const targetShape = store.shape("feature_target_feat_recycle0");
     const msaShape = store.shape("feature_msa_feat_recycle0");
+    const msaFeatures = compactClusteredMsaFeatures(
+      await store.tensor("feature_msa_feat_recycle0"), msaShape[0]! * msaShape[1]!);
+    const targetShape = store.shape("feature_target_feat_recycle0");
     const extraShape = store.shape("feature_extra_msa_recycle0");
     const length = targetShape[0]!;
     const result = await new InputEmbedderGpu(device).run({
@@ -75,7 +77,7 @@ describe.skipIf(!enabled)("AlphaFold input/recycling embedder WebGPU", () => {
       msaSequences: msaShape[0]!,
       extraSequences: extraShape[0]!,
       targetChannels: targetShape[1]!,
-      msaFeatureChannels: msaShape[2]!,
+      msaFeatureChannels: CLUSTERED_MSA_CHANNELS,
       msaChannels: 256,
       pairChannels: 128,
       extraMsaChannels: 64,
@@ -160,7 +162,8 @@ describe.skipIf(!enabled)("AlphaFold input embedder in-place encoder WebGPU", ()
     const previousPositions = noise(length * 37 * 3, 3);
     const input = {
       targetFeatures: await store.tensor("feature_target_feat_recycle0"),
-      msaFeatures: await store.tensor("feature_msa_feat_recycle0"),
+      msaFeatures: compactClusteredMsaFeatures(await store.tensor("feature_msa_feat_recycle0"),
+        msaShape[0]! * msaShape[1]!),
       extraMsa: await store.tensor("feature_extra_msa_recycle0"),
       extraHasDeletion: await store.tensor("feature_extra_has_deletion_recycle0"),
       extraDeletionValue: await store.tensor("feature_extra_deletion_value_recycle0"),
@@ -168,7 +171,7 @@ describe.skipIf(!enabled)("AlphaFold input embedder in-place encoder WebGPU", ()
       aatype: await store.tensor("feature_aatype_recycle0"),
       previousMsaFirstRow, previousPair, previousPositions, length,
       msaSequences: msaShape[0]!, extraSequences: extraShape[0]!,
-      targetChannels: targetShape[1]!, msaFeatureChannels: msaShape[2]!,
+      targetChannels: targetShape[1]!, msaFeatureChannels: CLUSTERED_MSA_CHANNELS,
       msaChannels: 256, pairChannels: 128, extraMsaChannels: 64, weights,
     };
     const separate = await new InputEmbedderGpu(device).run(input);

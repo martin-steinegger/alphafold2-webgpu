@@ -1,3 +1,4 @@
+import { CLUSTERED_MSA_CHANNELS } from "./msa-features.js";
 import type { QueryOnlyRecycleFeatures } from "../model/query-only.js";
 
 const RESTYPES = "ARNDCQEGHILKMFPSTWYV";
@@ -76,12 +77,12 @@ export function makeQueryOnlyFeatures(
   for (let recycle = 0; recycle <= recycles; recycle += 1) {
     const codes = options.maskedMsaCodes?.[recycle] ?? maskedCodes(aatype, recycle, options.randomSeed ?? 0);
     if (codes.length !== length) throw new RangeError(`masked MSA row ${recycle} has the wrong length`);
-    const msaFeatures = new Float32Array(length * 49);
+    const msaFeatures = new Float32Array(length * CLUSTERED_MSA_CHANNELS);
     for (let residue = 0; residue < length; residue += 1) {
       const code = codes[residue]!;
       if (!Number.isSafeInteger(code) || code < 0 || code > 22) throw new RangeError("invalid masked MSA code");
-      msaFeatures[residue * 49 + code] = 1;
-      msaFeatures[residue * 49 + 25 + code] = 1 / (1 + 1e-6);
+      msaFeatures[residue * CLUSTERED_MSA_CHANNELS] = code;
+      msaFeatures[residue * CLUSTERED_MSA_CHANNELS + 3 + code] = 1 / (1 + 1e-6);
     }
     result.push({
       targetFeatures: targetFeatures.slice(), msaFeatures, msaMask: msaMask.slice(),
@@ -89,7 +90,7 @@ export function makeQueryOnlyFeatures(
       extraDeletionValue: new Float32Array(length), extraMsaMask: new Float32Array(length),
       residueIndex: residueIndex.slice(), aatype: aatype.slice(), seqMask: seqMask.slice(),
       atom37ToAtom14: atom37ToAtom14.slice(), atom37Mask: atom37Mask.slice(),
-      targetChannels: 22, msaFeatureChannels: 49, extraSequences: 1,
+      targetChannels: 22, msaFeatureChannels: CLUSTERED_MSA_CHANNELS, extraSequences: 1,
     });
   }
   return result;

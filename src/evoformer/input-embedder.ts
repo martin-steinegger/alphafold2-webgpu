@@ -29,6 +29,7 @@ export interface InputEmbedderWeights {
 
 export interface InputEmbedderInput {
   readonly targetFeatures: Float32Array;
+  /** Clustered MSA in the compact layout of `src/input/msa-features.ts`. */
   readonly msaFeatures: Float32Array;
   readonly extraMsa: Float32Array;
   readonly extraHasDeletion: Float32Array;
@@ -42,6 +43,7 @@ export interface InputEmbedderInput {
   readonly msaSequences: number;
   readonly extraSequences: number;
   readonly targetChannels: number;
+  /** Channels per row and position of `msaFeatures`; the compact layout has 27. */
   readonly msaFeatureChannels: number;
   readonly msaChannels: number;
   readonly pairChannels: number;
@@ -140,10 +142,22 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     result += target_features[residue * p.target_channels + c]
       * weights[p.preprocess_1d_weight + c * p.msa_channels + channel];
   }
-  for (var c = 0u; c < p.msa_feature_channels; c += 1u) {
-    result += msa_features[row * p.msa_feature_channels + c]
-      * weights[p.preprocess_msa_weight + c * p.msa_channels + channel];
+  // Compact features: a cluster code that indexes the same weight matrix in
+  // place of a 23-way one-hot, then the deletion scalars, the profile and the
+  // cluster's deletion mean. The terms the one-hot dropped were all zero.
+  let feature_base = row * p.msa_feature_channels;
+  let code = u32(msa_features[feature_base]);
+  if (code < 23u) { result += weights[p.preprocess_msa_weight + code * p.msa_channels + channel]; }
+  result += msa_features[feature_base + 1u]
+    * weights[p.preprocess_msa_weight + 23u * p.msa_channels + channel];
+  result += msa_features[feature_base + 2u]
+    * weights[p.preprocess_msa_weight + 24u * p.msa_channels + channel];
+  for (var c = 0u; c < 23u; c += 1u) {
+    result += msa_features[feature_base + 3u + c]
+      * weights[p.preprocess_msa_weight + (25u + c) * p.msa_channels + channel];
   }
+  result += msa_features[feature_base + 26u]
+    * weights[p.preprocess_msa_weight + 48u * p.msa_channels + channel];
   if (sequence == 0u) { result += previous_msa[residue * p.msa_channels + channel]; }
   output[index] = result;
 }`;
@@ -173,10 +187,22 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let base = p.preprocess_1d_weight + c * p.msa_channels + channel;
     result += target_features[residue * p.target_channels + c] * vec2<f32>(weights[base], weights[base + 1u]);
   }
-  for (var c = 0u; c < p.msa_feature_channels; c += 1u) {
-    let base = p.preprocess_msa_weight + c * p.msa_channels + channel;
-    result += msa_features[row * p.msa_feature_channels + c] * vec2<f32>(weights[base], weights[base + 1u]);
+  let feature_base = row * p.msa_feature_channels;
+  let code = u32(msa_features[feature_base]);
+  if (code < 23u) {
+    let one_hot = p.preprocess_msa_weight + code * p.msa_channels + channel;
+    result += vec2<f32>(weights[one_hot], weights[one_hot + 1u]);
   }
+  for (var c = 23u; c < 25u; c += 1u) {
+    let base = p.preprocess_msa_weight + c * p.msa_channels + channel;
+    result += msa_features[feature_base + c - 22u] * vec2<f32>(weights[base], weights[base + 1u]);
+  }
+  for (var c = 0u; c < 23u; c += 1u) {
+    let base = p.preprocess_msa_weight + (25u + c) * p.msa_channels + channel;
+    result += msa_features[feature_base + 3u + c] * vec2<f32>(weights[base], weights[base + 1u]);
+  }
+  let mean_base = p.preprocess_msa_weight + 48u * p.msa_channels + channel;
+  result += msa_features[feature_base + 26u] * vec2<f32>(weights[mean_base], weights[mean_base + 1u]);
   if (sequence == 0u) {
     let base = residue * p.msa_channels + channel;
     result += vec2<f32>(previous_msa[base], previous_msa[base + 1u]);

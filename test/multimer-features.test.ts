@@ -1,3 +1,4 @@
+import { CLUSTERED_MSA_CHANNELS } from "../src/input/msa-features.js";
 import { describe, expect, it } from "vitest";
 import {
   MULTIMER_RELATIVE_CHANNELS, makeMultimerA3mFeatures, makeMultimerQueryOnlyFeatures, makeMultimerSequenceFeatures,
@@ -101,7 +102,7 @@ describe("AlphaFold-Multimer sequence features", () => {
     const recycles = makeMultimerQueryOnlyFeatures("AC:GG", tables, { recycles: 1, randomSeed: 7 });
     expect(recycles).toHaveLength(2);
     expect(recycles[0]!.targetFeatures).toHaveLength(4 * 21);
-    expect(recycles[0]!.msaFeatures).toHaveLength(4 * 49);
+    expect(recycles[0]!.msaFeatures).toHaveLength(4 * CLUSTERED_MSA_CHANNELS);
     expect([...recycles[0]!.chainRelative.asymId]).toEqual([1, 1, 2, 2]);
     expect([...recycles[0]!.chainRelative.entityId]).toEqual([1, 1, 2, 2]);
     expect(recycles[0]!.msaFeatures).not.toEqual(recycles[1]!.msaFeatures);
@@ -120,7 +121,7 @@ describe("AlphaFold-Multimer sequence features", () => {
       { recycles: 0, maxMsaSequences: 3, randomSeed: 0 },
     )[0]!;
     expect(features.targetChannels).toBe(21);
-    expect(features.msaFeatureChannels).toBe(49);
+    expect(features.msaFeatureChannels).toBe(CLUSTERED_MSA_CHANNELS);
     expect(features.msaSequences).toBe(3);
     expect([...features.msaMask]).toEqual(new Array(12).fill(1));
     expect([...features.chainRelative.asymId]).toEqual([1, 1, 2, 2]);
@@ -145,7 +146,7 @@ describe("AlphaFold-Multimer sequence features", () => {
     )[0]!;
     expect(features.msaSequences).toBe(2);
     expect(features.extraSequences).toBe(3);
-    expect(features.msaFeatures).toHaveLength(2 * 4 * 49);
+    expect(features.msaFeatures).toHaveLength(2 * 4 * CLUSTERED_MSA_CHANNELS);
     expect(features.extraMsa).toHaveLength(3 * 4);
     expect(features.msaMask).toHaveLength(2 * 4);
     expect(features.extraMsaMask).toHaveLength(3 * 4);

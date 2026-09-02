@@ -1,3 +1,4 @@
+import { CLUSTERED_MSA_CHANNELS, compactClusteredMsaFeatures } from "../src/input/msa-features.js";
 import { create, globals } from "webgpu";
 import { AlphaFoldMonomerGpu, type MonomerRecycleFeatures } from "../src/model/monomer.js";
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
@@ -17,7 +18,8 @@ for (let recycle = 0; recycle < 4; recycle += 1) {
   const extra = `feature_extra_msa_recycle${recycle}`;
   features.push({
     targetFeatures: await input.tensor(`feature_target_feat_recycle${recycle}`),
-    msaFeatures: await input.tensor(msa),
+    msaFeatures: compactClusteredMsaFeatures(await input.tensor(msa),
+          input.shape(msa)[0]! * input.shape(msa)[1]!),
     msaMask: await input.tensor(`feature_msa_mask_recycle${recycle}`),
     extraMsa: await input.tensor(extra),
     extraHasDeletion: await input.tensor(`feature_extra_has_deletion_recycle${recycle}`),
@@ -29,7 +31,7 @@ for (let recycle = 0; recycle < 4; recycle += 1) {
     atom37ToAtom14: await input.tensor(`feature_residx_atom37_to_atom14_recycle${recycle}`),
     atom37Mask: await input.tensor(`feature_atom37_atom_exists_recycle${recycle}`),
     msaSequences: input.shape(msa)[0]!, extraSequences: input.shape(extra)[0]!,
-    targetChannels: 22, msaFeatureChannels: 49,
+    targetChannels: 22, msaFeatureChannels: CLUSTERED_MSA_CHANNELS,
   });
 }
 const [embedding, template, extraStack, mainStack, structure, confidence, geometry] = await Promise.all([

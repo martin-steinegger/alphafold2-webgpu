@@ -1,3 +1,4 @@
+import { CLUSTERED_MSA_CHANNELS, expandClusteredMsaFeatures } from "../src/input/msa-features.js";
 import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import { iterateA3mFeatures, makeA3mFeatures } from "../src/input/a3m-features.js";
@@ -29,8 +30,10 @@ describe("A3M model feature preprocessing", () => {
     });
     const features = result[0]!;
     expect([...features.msaMask]).toEqual(new Array(8).fill(1));
-    expect(features.msaFeatures[6 * 49 + 21]).toBe(1);
-    expect(features.msaFeatures[7 * 49 + 21]).toBe(1);
+    // Rows six and seven are block padding: gaps, and never masked-augmented.
+    const dense = expandClusteredMsaFeatures(features.msaFeatures, features.msaSequences * 4);
+    expect(dense[6 * 49 + 21]).toBe(1);
+    expect(dense[7 * 49 + 21]).toBe(1);
   });
 
   it("clusters the uploaded 8,076-row alignment into model-1 tensors", async () => {
@@ -41,7 +44,7 @@ describe("A3M model feature preprocessing", () => {
     const features = result[0]!;
     expect(features.msaSequences).toBe(508);
     expect(features.extraSequences).toBe(1024);
-    expect(features.msaFeatures.length).toBe(508 * 59 * 49);
+    expect(features.msaFeatures.length).toBe(508 * 59 * CLUSTERED_MSA_CHANNELS);
     expect(features.extraMsa.length).toBe(1024 * 59);
     expect(features.msaMask.every((value) => value === 1)).toBe(true);
     expect(features.extraMsaMask.every((value) => value === 1)).toBe(true);
