@@ -260,6 +260,21 @@ AFWEBGPU_GPU_TESTS=1 AFWEBGPU_MULTIMER_F32_MANIFEST=<path> AFWEBGPU_MULTIMER_COM
 They could not run on the Linux machine, which has no multimer weights, so the
 deferred MSA embedding for multimer is verified only by review until they do.
 
+## 7. Worker, host memory and Stop
+
+The page now runs the pipeline in a dedicated worker when the browser exposes
+WebGPU there (Chrome does), and falls back to the main thread otherwise; the
+run log's first lines say which. During a long prediction the page should
+keep painting progress and the Stop button should end the run within a second
+or two, discarding the worker and its GPU device (the next run reloads the
+model). Also watch the renderer process in Activity Monitor: the Evoformer
+weights are now decoded from the int8 shards on demand, so a q8 model should
+hold about 100 MB on the host instead of 355, and for chains of about 256
+residues and more the monomer template update is recomputed on the GPU each
+recycle instead of being kept on the host (shorter chains keep the one-time
+computation, where the copy is small and the stack a sizeable share of a
+recycle).
+
 ## What to report
 
 1. The three JSON lines from step 3 and whether live/resident matched exactly.

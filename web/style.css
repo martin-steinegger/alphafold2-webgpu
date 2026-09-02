@@ -110,3 +110,7 @@ footer { display: flex; justify-content: space-between; padding: 1.5rem 1rem 2.5
 @media (max-width: 900px) { .workspace { grid-template-columns: 1fr; } .result-grid { grid-template-columns: 1fr; grid-template-areas: "structure" "plddt" "msa" "pae" "recycle"; } .about { grid-template-columns: 1fr; } }
 @media (max-width: 680px) { body { padding-left: 0; } .side-rail { display: none; } .site-header { padding-inline: 12px; } .header-links a:not(:first-child) { display: none; } .header-links { gap: .8rem; } main, footer { width: calc(100% - 12px); } .two-columns, .advanced-grid { grid-template-columns: 1fr; } .advanced-grid .wide { grid-column: auto; } .score-grid { grid-template-columns: 1fr 1fr; } .primary { width: 100%; } textarea { min-height: 76px; } }
 @media (max-width: 430px) { .brand { font-size: 1rem; } .score-grid { grid-template-columns: 1fr; } footer { display: grid; gap: .5rem; } #structure-viewer { height: 390px; } }
+
+.submit-row { display: flex; gap: 0.6rem; align-items: stretch; }
+.submit-row .primary { flex: 1; }
+.submit-row .secondary { width: auto; margin-top: 0; padding: .9rem 1rem; font-size: .8rem; }

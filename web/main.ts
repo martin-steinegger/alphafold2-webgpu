@@ -1,11 +1,3 @@
-import { AlphaFoldMonomerGpu, type MonomerPrediction, type MonomerRecycleSummary } from "../src/model/monomer.js";
-import {
-  AlphaFoldMultimerGpu, type MultimerPrediction, type MultimerRecycleSummary,
-} from "../src/model/multimer.js";
-import { iterateA3mFeatures } from "../src/input/a3m-features.js";
-import {
-  iterateMultimerA3mFeatures, iterateMultimerQueryOnlyFeatures, type MultimerRecycleFeatures,
-} from "../src/input/multimer-features.js";
 import { parseA3m } from "../src/input/a3m.js";
 import { parseColabFoldComplexA3m } from "../src/input/colabfold-complex-a3m.js";
 import { parseSequenceExpression } from "../src/input/sequence-expression.js";
@@ -13,13 +5,14 @@ import {
   generateMmseqs2ComplexMsa, generateMmseqs2Msa, type Mmseqs2ComplexMsaResult,
   type Mmseqs2MsaProgress, type Mmseqs2MsaResult,
 } from "../src/input/mmseqs2-api.js";
-import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
-import { HttpTensorStore } from "../src/reference/http-tensor-store.js";
 import type { TensorDownloadProgress } from "../src/reference/http-tensor-store.js";
+import type { MonomerPrediction, MonomerRecycleSummary } from "../src/model/monomer.js";
+import type { MultimerPrediction, MultimerRecycleSummary } from "../src/model/multimer.js";
 import {
-  planMonomerDevice, requestAlphaFoldDevice, suggestMonomerRows, type AlphaFoldDeviceRequirements,
-} from "../src/runtime/device.js";
-import { setGpuMemoryBudget } from "../src/runtime/allocator.js";
+  clearInferenceCaches, isMemoryFailure, resetInferenceDevice, runInference,
+  type InferenceJob, type InferenceOutcome, type InferenceReporter, type InferenceStage, type InferenceStageState,
+} from "./inference.js";
+import type { WorkerRequest, WorkerResponse } from "./prediction-worker.js";
 import { confidenceJson, predictionToPdb, safeJobName } from "./prediction-results.js";
 import { drawMsaCoverage } from "./msa-plot.js";
 import {
@@ -64,8 +57,8 @@ const inputUsesMultimer = (): boolean => element<HTMLSelectElement>("input-mode"
 const formatSeconds = (milliseconds: number): string => `${(milliseconds / 1000).toFixed(2)} s`;
 const formatMib = (bytes: number): string => `${(bytes / 1024 ** 2).toFixed(0)} MiB`;
 const stageOrder = ["device", "msa", "model", "features", "inference", "results"] as const;
-type Stage = typeof stageOrder[number];
-type StageState = "active" | "done" | "error";
+type Stage = InferenceStage;
+type StageState = InferenceStageState;
 
 let currentPdb = "";
 let currentScores = "";
@@ -75,93 +68,6 @@ let generatedMsa: {
 let lastMsaStatus = "";
 let viewerLoader: Promise<ThreeDmolApi> | undefined;
 let viewerResizeObserver: ResizeObserver | undefined;
-let sharedPredictionDevice: GPUDevice | undefined;
-
-function browserPlatform(): string {
-  const userAgentData = (navigator as Navigator & { readonly userAgentData?: { readonly platform?: string } })
-    .userAgentData;
-  return userAgentData?.platform ?? navigator.platform ?? "unknown";
-}
-
-function isAppleUnifiedMemory(adapter: GPUAdapter): boolean {
-  const identity = `${adapter.info.vendor} ${adapter.info.architecture} ${adapter.info.device} ${adapter.info.description}`
-    .toLowerCase();
-  return identity.includes("apple") || /mac/i.test(browserPlatform());
-}
-
-function unifiedMemoryBudget(appleUnifiedMemory: boolean): number | undefined {
-  if (!appleUnifiedMemory) return undefined;
-  const deviceMemory = (navigator as Navigator & { readonly deviceMemory?: number }).deviceMemory;
-  if (deviceMemory === undefined || !Number.isFinite(deviceMemory) || deviceMemory <= 0) return undefined;
-  // Apple GPUs share system RAM, and Metal accepts allocations well past the
-  // point where macOS starts paging, which freezes the machine rather than
-  // failing the prediction. navigator.deviceMemory is privacy-rounded and capped
-  // at 8 GB in Chromium, so this cannot see a larger machine; a third of what
-  // it reports leaves room for Chrome, Dawn/Metal, the page and the rest of the
-  // system. The same figure caps the allocator, so an underestimate becomes an
-  // error rather than a freeze.
-  return Math.floor(deviceMemory * 1024 ** 3 * 0.35);
-}
-
-async function loadModelWeights(manifestValue: string) {
-  const store = await HttpTensorStore.open(manifestValue, updateModelProgress);
-  const fixture = AlphaFoldFixture.fromStore(store);
-  const manifestModel = store.manifest.model as { readonly type?: string; readonly number?: number } | undefined;
-  const multimer = manifestModel?.type === "alphafold2_multimer_v3";
-  if (multimer && manifestModel.number !== 1) {
-    throw new Error("Only AlphaFold-Multimer-v3 model 1 manifests are supported");
-  }
-  const [embedding, extraStack, mainStack, structure, confidence, geometry, featureTables, paeBreaks] = await Promise.all([
-    multimer ? fixture.multimerEmbeddingWeights() : fixture.embeddingWeights(),
-    fixture.extraStackWeights(), fixture.mainStackWeights(),
-    multimer ? fixture.multimerStructureWeights() : fixture.structureWeights(),
-    fixture.confidenceWeights(), fixture.geometryTables(), fixture.queryOnlyFeatureTables(),
-    fixture.tensor("confidencePaeBreaks"),
-  ] as const);
-  const template = multimer ? undefined : await fixture.templateWeights();
-  const multimerTemplate = multimer ? await fixture.multimerTemplateWeights() : undefined;
-  return { multimer, embedding, template, multimerTemplate, extraStack, mainStack, structure,
-    confidence, geometry, featureTables, paeBreaks };
-}
-
-type LoadedModelWeights = Awaited<ReturnType<typeof loadModelWeights>>;
-let cachedModel: { readonly manifestValue: string; readonly promise: Promise<LoadedModelWeights> } | undefined;
-
-function modelWeights(manifestValue: string): {
-  readonly promise: Promise<LoadedModelWeights>; readonly cached: boolean;
-} {
-  if (cachedModel?.manifestValue === manifestValue) return { promise: cachedModel.promise, cached: true };
-  const promise = loadModelWeights(manifestValue);
-  const entry = { manifestValue, promise };
-  cachedModel = entry;
-  void promise.catch(() => { if (cachedModel === entry) cachedModel = undefined; });
-  return { promise, cached: false };
-}
-
-async function predictionDevice(adapter: GPUAdapter, requirements: AlphaFoldDeviceRequirements): Promise<{
-  readonly device: GPUDevice; readonly cached: boolean;
-}> {
-  if (sharedPredictionDevice !== undefined
-    && sharedPredictionDevice.limits.maxBufferSize >= requirements.maxBufferSize
-    && sharedPredictionDevice.limits.maxStorageBufferBindingSize >= requirements.maxStorageBufferBindingSize) {
-    return { device: sharedPredictionDevice, cached: true };
-  }
-  sharedPredictionDevice?.destroy();
-  sharedPredictionDevice = undefined;
-  const device = await requestAlphaFoldDevice(adapter, requirements);
-  sharedPredictionDevice = device;
-  device.addEventListener("uncapturederror", (event) => {
-    const error = (event as GPUUncapturedErrorEvent).error;
-    log(`WebGPU uncaptured error: ${error.message}`);
-  });
-  void device.lost.then((info) => {
-    if (sharedPredictionDevice === device) sharedPredictionDevice = undefined;
-    if (info.reason !== "destroyed") {
-      log(`WebGPU device lost (${info.reason || "unknown"}): ${info.message || "no driver message"}.`);
-    }
-  });
-  return { device, cached: false };
-}
 
 function stage(stageName: Stage, state: StageState, detail: string): void {
   const item = document.querySelector<HTMLElement>(`[data-stage="${stageName}"]`);
@@ -429,8 +335,142 @@ async function predictionInput(): Promise<PredictionInput> {
 
 element<HTMLFormElement>("prediction-form").addEventListener("submit", (event) => { event.preventDefault(); void runPrediction(); });
 
+/**
+ * The pipeline runs in a dedicated worker when the browser exposes WebGPU
+ * there, so the document keeps painting and the Stop button keeps working
+ * through a long prediction; otherwise it runs here, on the main thread.
+ */
+class PredictionRunner {
+  #worker: Worker | undefined;
+  #ready: Promise<boolean> | undefined;
+  #nextId = 1;
+  readonly #pending = new Map<number, {
+    readonly reporter: InferenceReporter;
+    readonly resolve: (outcome: InferenceOutcome) => void;
+    readonly reject: (error: Error) => void;
+  }>();
+  #useWorker: boolean | undefined;
+
+  /** Whether the worker path is available; resolved once per page. */
+  async available(): Promise<boolean> {
+    if (this.#useWorker !== undefined) return this.#useWorker;
+    // ?worker=0 keeps the pipeline on the main thread, for comparison.
+    if (typeof Worker === "undefined" || parameter("worker", "1") === "0") { this.#useWorker = false; return false; }
+    try {
+      this.#useWorker = await this.#ensureWorker();
+    } catch { this.#useWorker = false; }
+    if (!this.#useWorker) this.#dispose();
+    return this.#useWorker;
+  }
+
+  #ensureWorker(): Promise<boolean> {
+    if (this.#worker !== undefined && this.#ready !== undefined) return this.#ready;
+    const worker = new Worker(new URL("./prediction-worker.ts", import.meta.url), { type: "module" });
+    this.#worker = worker;
+    this.#ready = new Promise<boolean>((resolve, reject) => {
+      const onReady = (event: MessageEvent<WorkerResponse>): void => {
+        if (event.data.type !== "ready") return;
+        worker.removeEventListener("message", onReady);
+        resolve(event.data.webgpu);
+      };
+      worker.addEventListener("message", onReady);
+      worker.addEventListener("error", (event) => reject(new Error(event.message || "prediction worker failed to start")), { once: true });
+    });
+    worker.addEventListener("message", (event: MessageEvent<WorkerResponse>) => this.#onMessage(event.data));
+    worker.addEventListener("error", (event) => {
+      const error = new Error(event.message || "prediction worker failed");
+      for (const entry of this.#pending.values()) entry.reject(error);
+      this.#pending.clear();
+    });
+    return this.#ready;
+  }
+
+  #onMessage(message: WorkerResponse): void {
+    if (message.type === "ready") return;
+    const entry = this.#pending.get(message.id);
+    if (entry === undefined) return;
+    switch (message.type) {
+      case "stage": entry.reporter.stage(message.stage as InferenceStage, message.state as InferenceStageState, message.detail); break;
+      case "status": entry.reporter.status(message.text); break;
+      case "log": entry.reporter.log(message.text); break;
+      case "model-progress": entry.reporter.modelProgress(message.progress); break;
+      case "recycle": entry.reporter.recycle(message.summary, message.recycle); break;
+      case "result": this.#pending.delete(message.id); entry.resolve(message.outcome); break;
+      case "cleared": this.#pending.delete(message.id); break;
+      case "error": {
+        this.#pending.delete(message.id);
+        const error = new Error(message.message);
+        if (message.stack !== undefined) error.stack = message.stack;
+        entry.reject(error);
+        break;
+      }
+    }
+  }
+
+  #post(request: WorkerRequest): void { this.#worker?.postMessage(request); }
+
+  /** Start loading the model in the worker while the alignment is still being prepared. */
+  async prepare(manifestUrl: string, reporter: InferenceReporter): Promise<void> {
+    if (!(await this.available())) return;
+    const id = this.#nextId; this.#nextId += 1;
+    this.#pending.set(id, { reporter, resolve: () => { this.#pending.delete(id); }, reject: () => { this.#pending.delete(id); } });
+    this.#post({ type: "prepare", id, manifestUrl });
+  }
+
+  async run(job: InferenceJob, reporter: InferenceReporter): Promise<InferenceOutcome> {
+    if (!(await this.available())) return runInference(job, reporter);
+    const id = this.#nextId; this.#nextId += 1;
+    return new Promise<InferenceOutcome>((resolve, reject) => {
+      this.#pending.set(id, { reporter, resolve, reject });
+      this.#post({ type: "predict", id, job });
+    });
+  }
+
+  /** Stop whatever is running: the worker is terminated, which also frees its GPU device. */
+  stop(): void {
+    const error = new Error("Prediction stopped");
+    for (const entry of this.#pending.values()) entry.reject(error);
+    this.#pending.clear();
+    this.#dispose();
+  }
+
+  /** Forget the loaded model, both here and in the worker. */
+  async clearCaches(): Promise<boolean> {
+    const persistent = await clearInferenceCaches();
+    resetInferenceDevice();
+    if (this.#worker !== undefined) {
+      const id = this.#nextId; this.#nextId += 1;
+      this.#post({ type: "clear-caches", id });
+    }
+    return persistent;
+  }
+
+  /** After a memory failure the device is destroyed: here directly, in the worker by replacing it. */
+  resetDevice(): void {
+    resetInferenceDevice();
+    if (this.#worker !== undefined) this.#dispose();
+  }
+
+  #dispose(): void {
+    this.#worker?.terminate();
+    this.#worker = undefined;
+    this.#ready = undefined;
+  }
+}
+
+const runner = new PredictionRunner();
+
+const domReporter: InferenceReporter = {
+  stage: (stageName, state, detail) => stage(stageName, state, detail),
+  status: (text) => setPredictionStatus(text),
+  log: (text) => log(text),
+  modelProgress: (progress) => updateModelProgress(progress),
+  recycle: () => { /* the pipeline logs each recycle itself */ },
+};
+
 async function runPrediction(): Promise<void> {
   const button = element<HTMLButtonElement>("predict"); button.disabled = true;
+  const stopButton = element<HTMLButtonElement>("stop");
   const clearCacheButton = element<HTMLButtonElement>("clear-model-cache"); clearCacheButton.disabled = true;
   element<HTMLElement>("results-section").hidden = true; resetStages(); log("Starting prediction…", false); lastMsaStatus = "";
   try {
@@ -442,17 +482,10 @@ async function runPrediction(): Promise<void> {
       throw new Error(preflight.headline);
     }
     if (preflight.status === "warning") log(`Warning: ${preflight.headline}. ${preflight.detail}`);
-    stage("device", "active", "Requesting adapter");
-    const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
-    // A preflight-passing page can still lose its adapter (driver reset, GPU process crash); re-diagnose.
-    if (adapter === null) throw new Error(preflightErrorMessage(await webGpuPreflight(true)));
-    const adapterName = adapter.info.description || adapter.info.device || adapter.info.vendor || "WebGPU adapter";
-    const appleUnifiedMemory = isAppleUnifiedMemory(adapter);
-    const compactMemoryPolicy = appleUnifiedMemory || parameter("compact", "0") === "1";
-    stage("device", "active", `${adapterName} · sizing buffers`);
-    log(`GPU adapter: ${adapterName}`);
-    log(`Browser platform: ${browserPlatform()}${compactMemoryPolicy ? " · compact memory policy" : ""}.`);
-    log(`WebGPU features: ${[...adapter.features].sort().join(", ")}`);
+    const inWorker = await runner.available();
+    log(inWorker ? "Inference runs in a dedicated worker; the page stays responsive."
+      : "Inference runs on the page's main thread (this browser has no WebGPU in workers).");
+    stopButton.hidden = !inWorker; stopButton.disabled = false;
 
     stage("msa", "active", "Preparing input");
     stage("model", "active", "Downloading one model"); setPredictionStatus("Preparing alignment and model");
@@ -464,133 +497,25 @@ async function runPrediction(): Promise<void> {
     if (manifestValue === "") throw new Error("A model manifest URL is required");
     try { localStorage.setItem(`afwebgpu.${expectedMultimer ? "multimer" : "monomer"}ModelUrl`, manifestValue); }
     catch { /* storage may be unavailable */ }
-    const modelStart = performance.now();
-    const modelRequest = modelWeights(manifestValue);
-    if (modelRequest.cached) stage("model", "active", "Using in-memory model");
-    const measuredModel = modelRequest.promise.then((weights) => ({
-      weights, elapsedMilliseconds: performance.now() - modelStart,
-    }));
-    const [input, loadedModel] = await Promise.all([inputPromise, measuredModel]);
-    const { weights, elapsedMilliseconds: modelLoadMilliseconds } = loadedModel;
-    const { multimer: multimerModel, embedding, template, multimerTemplate, extraStack, mainStack, structure,
-      confidence, geometry, featureTables, paeBreaks } = weights;
-    if (input.multimer !== multimerModel) {
-      throw new Error(input.multimer
-        ? "Complex input requires an alphafold2_multimer_v3 model manifest"
-        : "This is a Multimer-v3 manifest, but the current input is a monomer");
-    }
-    stage("model", "done", `${multimerModel ? "Multimer-v3" : "Model 1 PTM"} · `
-      + `${modelRequest.cached ? "cached · " : ""}${formatSeconds(modelLoadMilliseconds)}`);
-    log(`${modelRequest.cached ? "Reused" : "Loaded"} the reduced ${multimerModel ? "Multimer-v3" : "model-1"} tensor bundle `
-      + `${modelRequest.cached ? "from memory " : ""}in ${formatSeconds(modelLoadMilliseconds)}.`);
-
-    stage("features", "active", "Parsing input"); setPredictionStatus("Building AF2 features");
-    const requestedMaxMsa = element<HTMLInputElement>("max-msa").valueAsNumber;
-    const requestedMaxExtra = element<HTMLInputElement>("max-extra").valueAsNumber;
-    const clusteredRows = Math.min(requestedMaxMsa, input.depth);
-    const extraRows = Math.max(1, Math.min(requestedMaxExtra, Math.max(0, input.depth - clusteredRows)));
-    const packedStorage = element<HTMLSelectElement>("monomer-storage").value === "f16";
-    // Multimer merges template rows into the MSA with buffer copies, so only
-    // the triangle projection can be packed there.
-    const memoryOptions = {
-      ...(packedStorage ? { triangleWholeStorage: "f16" as const } : {}),
-      ...(packedStorage && !input.multimer ? { msaStorage: "f16" as const } : {}),
-      ...(input.multimer ? { multimer: true, templateRows: multimerTemplate?.templateRows ?? 4 } : {}),
-    };
-    const memoryBudget = unifiedMemoryBudget(appleUnifiedMemory);
-    const devicePlan = planMonomerDevice(
-      adapter, input.sequence.length, clusteredRows, extraRows, memoryBudget, compactMemoryPolicy, memoryOptions,
-    );
-    log(packedStorage
-      ? `Activation storage: packed f16 ${input.multimer
-        ? "for the triangle projection (approximate; Multimer keeps f32 MSA activations)"
-        : "for the MSA activations and the triangle projection (approximate, reduced memory)"}.`
-      : `Activation storage: exact f32${input.multimer ? " (Multimer-v3)" : ""}.`);
-    log(`Estimated peak GPU allocations: ${formatMib(devicePlan.memory.estimatedPeakBytes)} `
-      + `(${formatMib(devicePlan.memory.persistentBytes)} persistent, `
-      + `${formatMib(devicePlan.memory.scratchBytes)} scratch, `
-      + `${formatMib(devicePlan.memory.residentHeadroomBytes)} resident allowance).`);
-    if (memoryBudget !== undefined) {
-      log(`Apple unified-memory safety budget: ${formatMib(memoryBudget)}; bounded transitions and scratch pooling enabled.`);
-      if (devicePlan.memory.estimatedPeakBytes > memoryBudget) {
-        const suggestion = suggestMonomerRows(
-          input.sequence.length, clusteredRows, extraRows, devicePlan.transitionMode, memoryBudget, memoryOptions,
-        );
-        const advice = suggestion === undefined
-          ? "This sequence is too large for the conservative safety budget even with one MSA row."
-          : `Set Clustered MSA rows to ${suggestion.msaSequences} and Extra MSA rows to `
-            + `${suggestion.extraSequences} or lower.`;
-        throw new RangeError(`Estimated peak GPU allocation ${formatMib(devicePlan.memory.estimatedPeakBytes)} `
-          + `exceeds this Mac's ${formatMib(memoryBudget)} safety budget. ${advice}`);
-      }
-    }
-    const deviceResult = await predictionDevice(adapter, devicePlan.requirements);
-    const device = deviceResult.device;
-    // An allocation past the budget fails with a message instead of paging the machine.
-    setGpuMemoryBudget(device, memoryBudget);
-    stage("device", "done", `${adapterName}${deviceResult.cached ? " · cached device" : ""}`);
-    log(`GPU: ${adapterName}${deviceResult.cached ? " (reusing device and pipelines)" : ""}`);
-    log(`WebGPU limits: invocations=${device.limits.maxComputeInvocationsPerWorkgroup} `
-      + `workgroupStorage=${device.limits.maxComputeWorkgroupStorageSize} `
-      + `storageBinding=${device.limits.maxStorageBufferBindingSize} buffer=${device.limits.maxBufferSize}`);
-    log(`Transition memory mode: ${devicePlan.transitionMode}.`);
-    const featureOptions = {
+    const manifestUrl = new URL(manifestValue, location.href).href;
+    // The model downloads while the alignment is being generated.
+    await runner.prepare(manifestUrl, domReporter);
+    const input = await inputPromise;
+    const job: InferenceJob = {
+      manifestUrl, input,
+      maxMsaSequences: element<HTMLInputElement>("max-msa").valueAsNumber,
+      maxExtraSequences: element<HTMLInputElement>("max-extra").valueAsNumber,
       recycles: Number(element<HTMLSelectElement>("recycles").value),
       randomSeed: element<HTMLInputElement>("seed").valueAsNumber,
-      maxMsaSequences: requestedMaxMsa,
-      maxExtraSequences: requestedMaxExtra,
+      packedStorage: element<HTMLSelectElement>("monomer-storage").value === "f16",
+      compactPolicy: parameter("compact", "0") === "1",
+      ...(parameter("profile", "0") === "1" ? { profile: {
+        recycle: Number(parameter("profileRecycle", "0")),
+        extraMsaBlock: Number(parameter("profileExtraBlock", "0")),
+        mainEvoformerBlock: Number(parameter("profileMainBlock", "0")),
+      } } : {}),
     };
-    const features = input.multimer
-      ? input.alignmentMask === undefined
-        ? iterateMultimerQueryOnlyFeatures(input.chains!, featureTables, featureOptions)
-        : iterateMultimerA3mFeatures(input.chains!, input.a3m, input.alignmentMask, featureTables, featureOptions)
-      : iterateA3mFeatures(input.a3m, featureTables, featureOptions);
-    stage("features", "done", `${input.sequence.length} aa · ${input.depth} rows`);
-    log(`Features: ${input.sequence.length} residues, ${input.multimer ? `${input.chains!.length} chains` : `A3M depth ${input.depth}`}.`);
-
-    stage("inference", "active", `Recycle 0/${featureOptions.recycles}`); setPredictionStatus("Running AlphaFold2 on WebGPU");
-    const reportRecycle = (result: MonomerRecycleSummary | MultimerRecycleSummary, recycle: number): void => {
-      stage("inference", "active", `Recycle ${recycle}/${featureOptions.recycles} · pLDDT ${result.confidence.meanPlddt.toFixed(1)}`);
-      const multimerResult = result as MultimerRecycleSummary;
-      log(`recycle=${recycle} pLDDT=${result.confidence.meanPlddt.toFixed(1)} `
-        + `pTM=${result.confidence.ptm.toFixed(3)}${multimerResult.confidence.iptm === undefined
-          ? "" : ` ipTM=${multimerResult.confidence.iptm.toFixed(3)}`} time=${formatSeconds(result.elapsedMilliseconds)} `
-        + `trunkSubmissions=${result.trunkSubmissions.total}`);
-      if (result.gpuProfile !== undefined) {
-        for (const [stack, profile] of [
-          ["extraMsa", result.gpuProfile.extraMsa],
-          ["mainEvoformer", result.gpuProfile.mainEvoformer],
-        ] as const) {
-          const gpuMilliseconds = profile.entries.reduce((sum, entry) => sum + entry.nanoseconds, 0) / 1e6;
-          log(`profile ${stack} block=${profile.block} method=${profile.method} `
-            + `gpu=${gpuMilliseconds.toFixed(3)}ms wall=${profile.wallMilliseconds.toFixed(3)}ms`);
-          for (const entry of profile.entries) log(`  ${entry.label} ${(entry.nanoseconds / 1e6).toFixed(3)}ms`);
-        }
-      }
-    };
-    const modelOptions = {
-      compactTransitions: devicePlan.transitionMode === "chunked",
-      profile: parameter("profile", "0") === "1",
-      profileRecycle: Number(parameter("profileRecycle", "0")),
-      profileExtraMsaBlock: Number(parameter("profileExtraBlock", "0")),
-      profileMainEvoformerBlock: Number(parameter("profileMainBlock", "0")),
-      ...memoryOptions,
-    } as const;
-    const commonWeights = {
-      embedding, extraStack, mainStack, structure, lddt: confidence.lddt, pae: confidence.pae, geometry,
-    };
-    const prediction: MonomerPrediction | MultimerPrediction = input.multimer
-      ? await new AlphaFoldMultimerGpu(device, modelOptions).predict(
-        features as Iterable<MultimerRecycleFeatures> & { readonly length: number },
-        { ...commonWeights, multimerTemplate: multimerTemplate! },
-        paeBreaks, reportRecycle,
-      )
-      : await new AlphaFoldMonomerGpu(device, modelOptions).predict(features, {
-        ...commonWeights, template: template!,
-      }, paeBreaks, reportRecycle);
-    stage("inference", "done", formatSeconds(prediction.elapsedMilliseconds));
-    log(`Measured allocator peak: ${formatMib(prediction.memory.combinedPeakResidentBytes)} combined resident `
-      + `(${formatMib(prediction.memory.mainPeakResidentBytes)} trunk).`);
+    const { prediction, modelLoadMilliseconds } = await runner.run(job, domReporter);
 
     stage("results", "active", "Rendering"); setPredictionStatus("Preparing results");
     const jobName = safeJobName(element<HTMLInputElement>("job-name").value);
@@ -603,14 +528,19 @@ async function runPrediction(): Promise<void> {
     const message = error instanceof Error ? error.message : String(error);
     const active = stageOrder.find((name) => document.querySelector<HTMLElement>(`[data-stage="${name}"]`)?.dataset.state === "active");
     if (active !== undefined) stage(active, "error", "Failed");
-    const memoryFailure = /out.?of.?memory|allocation|device (?:was )?lost/i.test(message);
-    if (memoryFailure) {
-      sharedPredictionDevice?.destroy(); sharedPredictionDevice = undefined;
+    if (isMemoryFailure(message)) {
+      runner.resetDevice();
       log("The WebGPU device could not retain this allocation set. Reduce clustered/extra MSA rows or sequence length, then retry.");
     }
-    setPredictionStatus("Prediction failed", "failed"); log(error instanceof Error ? error.stack ?? message : message);
-  } finally { button.disabled = false; clearCacheButton.disabled = false; }
+    setPredictionStatus(message === "Prediction stopped" ? "Prediction stopped" : "Prediction failed", "failed");
+    log(error instanceof Error ? error.stack ?? message : message);
+  } finally { button.disabled = false; clearCacheButton.disabled = false; stopButton.hidden = true; }
 }
+element<HTMLButtonElement>("stop").addEventListener("click", () => {
+  element<HTMLButtonElement>("stop").disabled = true;
+  log("Stopping the prediction; the worker and its GPU device are discarded.");
+  runner.stop();
+});
 
 const inputMode = element<HTMLSelectElement>("input-mode");
 function updateInputMode(): void {
@@ -670,9 +600,7 @@ if (parameter("precision", "") === "f16") element<HTMLSelectElement>("monomer-st
 element<HTMLButtonElement>("clear-model-cache").addEventListener("click", () => { void (async () => {
   const button = element<HTMLButtonElement>("clear-model-cache"); button.disabled = true;
   try {
-    const removed = await HttpTensorStore.clearPersistentCache();
-    cachedModel = undefined;
-    sharedPredictionDevice?.destroy(); sharedPredictionDevice = undefined;
+    const removed = await runner.clearCaches();
     log(removed ? "Cleared the persistent and in-memory model caches." : "Cleared the in-memory model cache; no persistent cache was present.", false);
   } finally { button.disabled = false; }
 })(); });
