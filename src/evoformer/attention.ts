@@ -293,6 +293,70 @@ export function createAttentionNormalizeInPlaceShader(storage: ActivationStorage
 
 export const ATTENTION_NORMALIZE_IN_PLACE_SHADER = createAttentionNormalizeInPlaceShader("f32");
 
+/**
+ * The same LayerNorm, keeping only each row's mean and inverse standard
+ * deviation.
+ *
+ * A consumer that reads whole rows can apply the normalization while it loads
+ * them, which costs two floats a row where the normalized tensor costs as many
+ * as the source. Statistics are stored at the row's index in the source, so
+ * every consumer indexes them the way it indexes the source.
+ */
+export function createAttentionStatisticsShader(storage: ActivationStorage = "f32"): string {
+  return `
+struct NormParameters {
+  rows: u32, channels: u32, scale: u32, offset: u32,
+  transpose: u32, batch: u32, queries: u32, epsilon: f32,
+  batch_offset: u32, batch_total: u32, padding: vec2<u32>,
+};
+const GRID_WIDTH: u32 = 32768u;
+@group(0) @binding(0) var<storage, read> source: array<${storageArray(storage)}>;
+@group(0) @binding(1) var<uniform> p: NormParameters;
+@group(0) @binding(2) var<storage, read_write> statistics: array<f32>;
+var<workgroup> partial: array<f32, 64>;
+var<workgroup> row_mean: array<f32, 1>;
+
+fn source_row(row: u32) -> u32 {
+  let b = p.batch_offset + row / p.queries;
+  let q = row % p.queries;
+  if (p.transpose == 0u) { return b * p.queries + q; }
+  return q * p.batch_total + b;
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) group: vec3<u32>) {
+  let row = group.x + group.y * GRID_WIDTH;
+  if (row >= p.rows) { return; }
+  let input_row = source_row(row);
+  let input_base = input_row * p.channels;
+  var sum = 0.0;
+  for (var c = local.x; c < p.channels; c += 64u) { sum += ${storedElement(storage, "source", "input_base + c")}; }
+  partial[local.x] = sum;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride /= 2u) {
+    if (local.x < stride) { partial[local.x] += partial[local.x + stride]; }
+    workgroupBarrier();
+  }
+  if (local.x == 0u) { row_mean[0] = partial[0] / f32(p.channels); }
+  workgroupBarrier();
+  var squared = 0.0;
+  for (var c = local.x; c < p.channels; c += 64u) {
+    let centered = ${storedElement(storage, "source", "input_base + c")} - row_mean[0];
+    squared += centered * centered;
+  }
+  partial[local.x] = squared;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride /= 2u) {
+    if (local.x < stride) { partial[local.x] += partial[local.x + stride]; }
+    workgroupBarrier();
+  }
+  if (local.x == 0u) {
+    statistics[2u * input_row] = row_mean[0];
+    statistics[2u * input_row + 1u] = inverseSqrt(partial[0] / f32(p.channels) + p.epsilon);
+  }
+}`;
+}
+
 const COMMON = `
 struct Parameters {
   // batch counts the entries in this window; batch_offset and batch_total

@@ -1,5 +1,7 @@
 import {
-  createAttentionNormalizeShader, createAttentionOutputShader,
+  createAttentionNormalizeShader,
+  createAttentionOutputShader,
+  createAttentionStatisticsShader,
   ATTENTION_OUTPUT_SHADER,
   ATTENTION_OUTPUT_RESIDUAL_SHADER,
   ATTENTION_PAIR_BIAS_SHADER,
@@ -42,7 +44,7 @@ import {
 import { WebGpuExecution, type GpuTensor } from "../runtime/execution.js";
 import { type TriangleWholeStorage, createTriangleShaders, type TriangleDirection } from "../triangle/shaders.js";
 import {
-  type ActivationStorage, packHalfWords, storageArray, storageWords, unpackHalfWords,
+  type ActivationStorage, packHalfWords, storageArray, storageWords, storedElement, unpackHalfWords,
 } from "../runtime/storage.js";
 import type { TriangleMultiplicationWeights } from "../triangle/types.js";
 import { packWeights as packTriangleWeights } from "../triangle/weights.js";
@@ -166,29 +168,53 @@ struct Parameters {
   length: u32, sequences: u32, channels: u32, heads: u32, head_dim: u32,
   query_weight: u32, key_weight: u32, value_weight: u32, gating_weight: u32,
   gating_bias: u32, output_weight: u32, output_bias: u32,
+  norm_scale: u32, norm_offset: u32, padding_0: u32, padding_1: u32,
 };
 const GRID_WIDTH: u32 = 32768u;
 `;
 
-const GLOBAL_ATTENTION_KV_SHADER = `${GLOBAL_ATTENTION_COMMON}
-@group(0) @binding(0) var<storage, read> normalized: array<f32>;
+/**
+ * Reads one normalized element of the extra MSA.
+ *
+ * The three consumers of the normalization used to share a tensor as large as
+ * the MSA itself, which packing the activations made the largest thing alive
+ * in the extra stack. Each now normalizes while loading, from the row
+ * statistics, so the row's mean and inverse standard deviation stand in for a
+ * whole normalized copy.
+ */
+function globalAttentionLoader(storage: ActivationStorage, binding = "source"): string {
+  return `
+fn normalized_element(source_row: u32, c: u32) -> f32 {
+  return (${storedElement(storage, binding, "source_row * p.channels + c")} - statistics[2u * source_row])
+    * statistics[2u * source_row + 1u] * weights[p.norm_scale + c] + weights[p.norm_offset + c];
+}`;
+}
+
+function createGlobalAttentionKvShader(storage: ActivationStorage): string {
+  return `${GLOBAL_ATTENTION_COMMON}
+@group(0) @binding(0) var<storage, read> source: array<${storageArray(storage)}>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> p: Parameters;
 @group(0) @binding(3) var<storage, read_write> keys: array<f32>;
 @group(0) @binding(4) var<storage, read_write> values: array<f32>;
+@group(0) @binding(5) var<storage, read> statistics: array<f32>;
+${globalAttentionLoader(storage)}
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let index = id.x + id.y * GRID_WIDTH * 64u;
   if (index >= p.length * p.sequences * p.head_dim) { return; }
   let d = index % p.head_dim; let row = index / p.head_dim;
+  // Rows here run column-major over the MSA, which is stored sequence-major.
+  let source_row = (row % p.sequences) * p.length + row / p.sequences;
   var key = 0.0; var value = 0.0;
   for (var c = 0u; c < p.channels; c += 1u) {
-    let x = normalized[row * p.channels + c];
+    let x = normalized_element(source_row, c);
     key += x * weights[p.key_weight + c * p.head_dim + d];
     value += x * weights[p.value_weight + c * p.head_dim + d];
   }
   keys[index] = key; values[index] = value;
 }`;
+}
 
 /**
  * Mask-weighted mean over sequences, shared by every query channel.
@@ -198,11 +224,15 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
  * head channel, so it is computed once here rather than once per projected
  * channel inside the query projection.
  */
-const GLOBAL_ATTENTION_COLUMN_MEAN_SHADER = `${GLOBAL_ATTENTION_COMMON}
-@group(0) @binding(0) var<storage, read> normalized: array<f32>;
+function createGlobalAttentionColumnMeanShader(storage: ActivationStorage): string {
+  return `${GLOBAL_ATTENTION_COMMON}
+@group(0) @binding(0) var<storage, read> source: array<${storageArray(storage)}>;
 @group(0) @binding(1) var<storage, read> mask: array<f32>;
 @group(0) @binding(2) var<uniform> p: Parameters;
 @group(0) @binding(3) var<storage, read_write> means: array<f32>;
+@group(0) @binding(4) var<storage, read> statistics: array<f32>;
+@group(0) @binding(5) var<storage, read> weights: array<f32>;
+${globalAttentionLoader(storage)}
 var<workgroup> column_denominator: array<f32, 1>;
 
 @compute @workgroup_size(64)
@@ -221,12 +251,12 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
   for (var c = local.x; c < p.channels; c += 64u) {
     var total = 0.0;
     for (var sequence = 0u; sequence < p.sequences; sequence += 1u) {
-      total += normalized[(column * p.sequences + sequence) * p.channels + c]
-        * mask[sequence * p.length + column];
+      total += normalized_element(sequence * p.length + column, c) * mask[sequence * p.length + column];
     }
     means[column * p.channels + c] = total * inverse_denominator;
   }
 }`;
+}
 
 /** Projects the per-column mean into every head's query. */
 const GLOBAL_ATTENTION_QUERY_SHADER = createTiledGemmShader({
@@ -331,25 +361,43 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
  * a tiled GEMM whose A element is the gated attention value evaluates each gate
  * exactly once, because the extra-MSA channel count is one column tile wide.
  */
-function createGlobalAttentionOutputShader(residual: boolean, storage: ActivationStorage = "f32"): string {
+/**
+ * The residual form reads and writes one buffer.
+ *
+ * Its gate needs every channel of a row, which is now read from the MSA
+ * itself rather than from a normalized copy, and WebGPU rejects a buffer bound
+ * read-only and read-write in one dispatch. A single read-write binding is
+ * exact here: the extra-MSA channel count is one column tile wide, so a
+ * workgroup owns whole rows, and the contraction's last barrier separates
+ * every gate read from every store.
+ */
+function createGlobalAttentionOutputShader(
+  residual: boolean, storage: ActivationStorage = "f32",
+): string {
+  const sourceBinding = residual ? "output" : "source";
+  // Bindings are numbered from zero in the order the dispatch passes them, so
+  // the residual form's list is one shorter rather than one hole longer.
+  let binding = 0;
+  const next = (): number => binding++;
+  const sourceDeclaration = residual
+    ? "" : `@group(0) @binding(${next()}) var<storage, read> source: array<${storageArray(storage)}>;`;
   return createTiledGemmShader({
     preamble: `${GLOBAL_ATTENTION_COMMON}
-@group(0) @binding(0) var<storage, read> normalized: array<f32>;
-@group(0) @binding(1) var<storage, read> attended: array<f32>;
-@group(0) @binding(2) var<storage, read> weights: array<f32>;
-@group(0) @binding(3) var<uniform> p: Parameters;
-@group(0) @binding(4) var<storage, read_write> output: array<${storageArray(storage)}>;
+${sourceDeclaration}
+@group(0) @binding(${next()}) var<storage, read> attended: array<f32>;
+@group(0) @binding(${next()}) var<storage, read> weights: array<f32>;
+@group(0) @binding(${next()}) var<uniform> p: Parameters;
+@group(0) @binding(${next()}) var<storage, read_write> output: array<${storageArray(storage)}>;
+@group(0) @binding(${next()}) var<storage, read> statistics: array<f32>;
+${globalAttentionLoader(storage, sourceBinding)}
 
-// Row is sequence-major; the normalized activations are column-major.
+// Rows and the MSA are both sequence-major here.
 fn gated_attention(row: u32, projected_channel: u32) -> f32 {
   let column = row % p.length;
-  let sequence = row / p.length;
-  let normalized_row = column * p.sequences + sequence;
   let projected = p.heads * p.head_dim;
   var gate = weights[p.gating_bias + projected_channel];
   for (var c = 0u; c < p.channels; c += 1u) {
-    gate += normalized[normalized_row * p.channels + c]
-      * weights[p.gating_weight + c * projected + projected_channel];
+    gate += normalized_element(row, c) * weights[p.gating_weight + c * projected + projected_channel];
   }
   return attended[column * projected + projected_channel] / (1.0 + exp(-gate));
 }`,
@@ -651,12 +699,16 @@ async function encodeGlobalAttention(
   const params = new Uint32Array([
     shape.length, shape.sequences, shape.cM, w.heads, headDim,
     offsets[2]!, offsets[3]!, offsets[4]!, offsets[5]!, offsets[6]!, offsets[7]!, offsets[8]!,
+    // The normalization the consumers apply while loading.
+    offsets[0]!, offsets[1]!, 0, 0,
   ]);
   const storage = shape.msaStorage ?? "f32";
-  const [normalize, kvPipeline, columnMeanPipeline, queryPipeline, flashPipeline, outputPipeline] = await Promise.all([
-    execution.pipelines.get(`block:attention:normalize:${storage}`, createAttentionNormalizeShader(storage)),
-    execution.pipelines.get("block:global-attention:kv", GLOBAL_ATTENTION_KV_SHADER),
-    execution.pipelines.get("block:global-attention:column-mean", GLOBAL_ATTENTION_COLUMN_MEAN_SHADER),
+  const [statisticsPipeline, kvPipeline, columnMeanPipeline, queryPipeline, flashPipeline, outputPipeline]
+    = await Promise.all([
+    execution.pipelines.get(`block:attention:statistics:${storage}`, createAttentionStatisticsShader(storage)),
+    execution.pipelines.get(`block:global-attention:kv:${storage}`, createGlobalAttentionKvShader(storage)),
+    execution.pipelines.get(`block:global-attention:column-mean:${storage}`,
+      createGlobalAttentionColumnMeanShader(storage)),
     execution.pipelines.get("block:global-attention:query", GLOBAL_ATTENTION_QUERY_SHADER),
     execution.pipelines.get("block:global-attention:flash", GLOBAL_ATTENTION_FLASH_SHADER),
     execution.pipelines.get(
@@ -672,21 +724,21 @@ async function encodeGlobalAttention(
     shape.length * shape.sequences, shape.cM, offsets[0]!, offsets[1]!, true,
     shape.length, shape.sequences, 1e-5,
   ));
-  const normalized = execution.allocate(`${label}.normalized`, shape.length * shape.sequences * shape.cM);
+  const statistics = execution.allocate(`${label}.statistics`, shape.length * shape.sequences * 2);
   const keys = execution.allocate(`${label}.keys`, shape.length * shape.sequences * headDim);
   const values = execution.allocate(`${label}.values`, shape.length * shape.sequences * headDim);
   const query = execution.allocate(`${label}.query`, shape.length * w.heads * headDim);
   const attended = execution.allocate(`${label}.attended`, shape.length * w.heads * headDim);
   const output = residualTarget ?? execution.allocate(`${label}.output`, shape.sequences * shape.length * shape.cM);
   let grid = execution.linearGrid(shape.length * shape.sequences, 1);
-  execution.dispatch(encoder, normalize, [source, weights, normParameters, normalized],
-    grid[0], grid[1], 1, `${label}.normalize`);
+  execution.dispatch(encoder, statisticsPipeline, [source, normParameters, statistics],
+    grid[0], grid[1], 1, `${label}.statistics`);
   grid = execution.linearGrid(shape.length * shape.sequences * headDim);
-  execution.dispatch(encoder, kvPipeline, [normalized, weights, parameters, keys, values],
+  execution.dispatch(encoder, kvPipeline, [source, weights, parameters, keys, values, statistics],
     grid[0], grid[1], 1, `${label}.kv`);
   const means = execution.allocate(`${label}.column-means`, shape.length * shape.cM);
   grid = execution.linearGrid(shape.length, 1);
-  execution.dispatch(encoder, columnMeanPipeline, [normalized, mask, parameters, means],
+  execution.dispatch(encoder, columnMeanPipeline, [source, mask, parameters, means, statistics, weights],
     grid[0], grid[1], 1, `${label}.column-mean`);
   const queryGrid = gemmGrid(shape.length, w.heads * headDim);
   execution.dispatch(encoder, queryPipeline, [means, weights, parameters, query],
@@ -694,9 +746,13 @@ async function encodeGlobalAttention(
   execution.dispatch(encoder, flashPipeline, [query, keys, values, mask, parameters, attended],
     shape.length, w.heads, 1, `${label}.flash`);
   const outputGrid = gemmGrid(shape.sequences * shape.length, shape.cM);
-  execution.dispatch(encoder, outputPipeline, [normalized, attended, weights, parameters, output],
+  // The residual form reads the output binding, so the source is not bound twice.
+  execution.dispatch(encoder, outputPipeline,
+    residualTarget === undefined
+      ? [source, attended, weights, parameters, output, statistics]
+      : [attended, weights, parameters, output, statistics],
     outputGrid[0], outputGrid[1], 1, `${label}.output`);
-  releaseScratch([normalized, means, keys, values, query, attended], output);
+  releaseScratch([statistics, means, keys, values, query, attended], output);
   return output;
 }
 

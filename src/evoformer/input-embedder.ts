@@ -466,7 +466,6 @@ export async function encodeInputEmbedder(
     const tensor = execution.allocate(label, elements); temporaries.push(tensor); return tensor;
   };
   const target = temporaryUpload("embed.target", input.targetFeatures);
-  const msaFeatures = temporaryUpload("embed.msa-features", input.msaFeatures);
   const extraMsaInput = temporaryUpload("embed.extra-codes", input.extraMsa);
   const hasDeletion = temporaryUpload("embed.extra-has-deletion", input.extraHasDeletion);
   const deletionValue = temporaryUpload("embed.extra-deletion-value", input.extraDeletionValue);
@@ -503,9 +502,14 @@ export async function encodeInputEmbedder(
   grid = execution.linearGrid(storageWords(extraElements, storage));
   execution.dispatch(encoder, extraPipeline, [extraMsaInput, hasDeletion, deletionValue, weights, params, extra],
     grid[0], grid[1]);
-  const msaTemporaries = [target, msaFeatures, weights, params, previousMsaNormParams];
+  const msaTemporaries = [target, weights, params, previousMsaNormParams];
   const pairTemporaries = temporaries.filter((tensor) => !msaTemporaries.includes(tensor));
   const encodeMsa = (msaEncoder: GPUCommandEncoder): GpuTensor => {
+    // The clustered features are read only here, after the extra stack has
+    // run, so they are uploaded here rather than sitting on the device
+    // through it.
+    const msaFeatures = execution.upload("embed.msa-features", input.msaFeatures);
+    msaTemporaries.push(msaFeatures);
     const msa = execution.allocate("embed.msa", storageWords(msaElements, storage),
       GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
     let msaGrid = execution.linearGrid(input.length, 1);
