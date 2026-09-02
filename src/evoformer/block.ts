@@ -39,7 +39,7 @@ import {
   type TransitionWeights,
 } from "./transition.js";
 import { WebGpuExecution, type GpuTensor } from "../runtime/execution.js";
-import { createTriangleShaders, type TriangleDirection } from "../triangle/shaders.js";
+import { type TriangleWholeStorage, createTriangleShaders, type TriangleDirection } from "../triangle/shaders.js";
 import type { TriangleMultiplicationWeights } from "../triangle/types.js";
 import { packWeights as packTriangleWeights } from "../triangle/weights.js";
 import type { AllocationSnapshot } from "../runtime/allocator.js";
@@ -86,6 +86,8 @@ export interface EvoformerBlockInput {
   readonly outerProductMeanFirst?: boolean;
   /** Overrides the scratch budget of every windowed operation, so tests can force windowing. */
   readonly scratchWindowBytes?: number;
+  /** Storage of the triangle multiplication's whole projection; `f16` halves it inexactly. */
+  readonly triangleWholeStorage?: TriangleWholeStorage;
   readonly weights: EvoformerBlockWeights;
 }
 
@@ -144,7 +146,7 @@ export type TemplatePairBlockWeights = Omit<EvoformerPairBlockWeights, "outerPro
 type EvoformerShape = Pick<
   EvoformerBlockInput,
   "sequences" | "length" | "cM" | "cZ" | "cOuter" | "triangleHidden" | "outerProductMeanFirst"
-  | "scratchWindowBytes"
+  | "scratchWindowBytes" | "triangleWholeStorage"
 >;
 
 const GLOBAL_ATTENTION_COMMON = `
@@ -755,7 +757,10 @@ export function triangleBlockRows(
     throw new RangeError("triangle block dimensions must be positive safe integers");
   }
   const bytesPerRow = length * Math.max(cZ, triangleHidden) * Float32Array.BYTES_PER_ELEMENT;
-  return Math.max(1, Math.min(length, Math.floor(budgetBytes / bytesPerRow)));
+  const rows = Math.max(1, Math.min(length, Math.floor(budgetBytes / bytesPerRow)));
+  // Blocks start on even pair rows so packed half-precision pairs never span
+  // two words; a single block covering every row starts at zero anyway.
+  return rows < length && (length % 2 === 1) ? Math.max(2, rows - (rows % 2)) : rows;
 }
 
 async function encodeTriangleMultiplication(
@@ -772,14 +777,16 @@ async function encodeTriangleMultiplication(
   const packed = packTriangleWeights(weightsValue, "f32");
   const blockRows = triangleBlockRows(input.length, input.cZ, input.triangleHidden,
     input.scratchWindowBytes ?? TRIANGLE_BLOCK_TARGET_BYTES);
-  const shaders = createTriangleShaders(shape, "f32", packed.offsets, 1e-5, direction, blockRows);
+  const wholeStorage = input.triangleWholeStorage ?? "f32";
+  const shaders = createTriangleShaders(shape, "f32", packed.offsets, 1e-5, direction, blockRows, wholeStorage);
   const pipelineKey = `block:triangle:${direction}:${input.length}:${input.cZ}`
-    + `:${input.triangleHidden}:${blockRows}`;
-  const [inputStatistics, projectGate, projectA, projectB, contract, hiddenStatistics, projectOutput] = await Promise.all([
+    + `:${input.triangleHidden}:${blockRows}:${wholeStorage}`;
+  const [inputStatistics, projectGate, projectBlockOperand, projectWholeOperand, contract, hiddenStatistics, projectOutput]
+    = await Promise.all([
     execution.pipelines.get(`${pipelineKey}:input-statistics`, shaders.inputStatistics),
     execution.pipelines.get(`${pipelineKey}:project-gate`, shaders.projectGate),
-    execution.pipelines.get(`${pipelineKey}:project-a`, shaders.projectA),
-    execution.pipelines.get(`${pipelineKey}:project-b`, shaders.projectB),
+    execution.pipelines.get(`${pipelineKey}:project-block-operand`, shaders.projectBlockOperand),
+    execution.pipelines.get(`${pipelineKey}:project-whole-operand`, shaders.projectWholeOperand),
     execution.pipelines.get(`${pipelineKey}:contract`, shaders.contract),
     execution.pipelines.get(`${pipelineKey}:hidden-statistics`, shaders.hiddenStatistics),
     execution.pipelines.get(
@@ -816,25 +823,23 @@ async function encodeTriangleMultiplication(
       grid[0], grid[1], 1, `triangle.${direction}.${label}-${block.offset}`);
   };
 
-  // Outgoing contracts over the second residue index, so the projection indexed
-  // by the first is blocked and the other has to be complete before any block
-  // contracts. Incoming contracts over the first index, so both projections are
-  // blocked and the output accumulates instead.
-  const outgoing = direction === "outgoing";
-  const wholeProjection = outgoing
-    ? execution.allocate(`triangle.${direction}.b`, pairs * input.triangleHidden) : undefined;
-  if (wholeProjection !== undefined) {
-    for (const block of blocks) project(projectB, wholeProjection, block, "project-whole");
-  }
-
-  const blockedA = execution.allocate(`triangle.${direction}.a`, blockPairs * input.triangleHidden);
-  const blockedB = outgoing
-    ? undefined : execution.allocate(`triangle.${direction}.b-block`, blockPairs * input.triangleHidden);
-  const contracted = execution.allocate(`triangle.${direction}.contracted`,
-    (outgoing ? blockPairs : pairs) * input.triangleHidden);
+  // Both directions block the output rows. The operand indexed by the output's
+  // first residue is projected per block; the other has to be complete before
+  // any block contracts and is filled block by block, in half precision when
+  // requested.
+  const wholeStride = pairs + (pairs % 2);
+  const wholeProjection = execution.allocate(`triangle.${direction}.whole`,
+    wholeStorage === "f16" ? wholeStride * input.triangleHidden / 2 : wholeStride * input.triangleHidden);
+  for (const block of blocks) project(projectWholeOperand, wholeProjection, block, "project-whole");
+  const blockedProjection = execution.allocate(`triangle.${direction}.blocked`, blockPairs * input.triangleHidden);
+  const contracted = execution.allocate(`triangle.${direction}.contracted`, blockPairs * input.triangleHidden);
   const hiddenStats = execution.allocate(`triangle.${direction}.hidden-statistics`, blockPairs * 2);
-  const finish = (block: (typeof blocks)[number]): void => {
+  for (const block of blocks) {
     const rows = block.count * input.length;
+    project(projectBlockOperand, blockedProjection, block, "project-block");
+    const contractGrid = gemmGrid(block.count, input.length);
+    execution.dispatch(encoder, contract, [blockedProjection, wholeProjection, contracted, block.uniform],
+      contractGrid[0], contractGrid[1], input.triangleHidden, `triangle.${direction}.contract-${block.offset}`);
     const stats = execution.view(hiddenStats, 0, rows * 2);
     execution.dispatch(encoder, hiddenStatistics, [contracted, stats, block.uniform],
       Math.ceil(rows / 64), 1, 1, `triangle.${direction}.hidden-statistics-${block.offset}`);
@@ -844,27 +849,10 @@ async function encodeTriangleMultiplication(
     const gateBlock = execution.view(gate, 0, rows * input.cZ);
     execution.dispatch(encoder, projectGate, [pair, weights, statistics, gateBlock, block.uniform],
       gateGrid[0], gateGrid[1], 1, `triangle.${direction}.project-gate-${block.offset}`);
-    execution.dispatch(encoder, projectOutput, [
-      gateBlock, contracted, weights, stats,
-      execution.view(output, block.offset * input.length * input.cZ, rows * input.cZ), block.uniform,
-    ], gateGrid[0], gateGrid[1], 1, `triangle.${direction}.project-output-${block.offset}`);
-  };
-
-  for (const block of blocks) {
-    project(projectA, blockedA, block, "project-a");
-    if (blockedB !== undefined) project(projectB, blockedB, block, "project-b");
-    const contractGrid = outgoing
-      ? gemmGrid(block.count, input.length) : gemmGrid(input.length, input.length);
-    execution.dispatch(encoder, contract,
-      [outgoing ? blockedA : blockedA, outgoing ? wholeProjection! : blockedB!, contracted, block.uniform],
-      contractGrid[0], contractGrid[1], input.triangleHidden, `triangle.${direction}.contract-${block.offset}`);
-    if (outgoing) finish(block);
+    execution.dispatch(encoder, projectOutput, [gateBlock, contracted, weights, stats, output, block.uniform],
+      gateGrid[0], gateGrid[1], 1, `triangle.${direction}.project-output-${block.offset}`);
   }
-  if (!outgoing) {
-    releaseScratch([blockedA, blockedB], output);
-    for (const block of blocks) finish(block);
-  }
-  releaseScratch([statistics, gate, blockedA, blockedB, wholeProjection, contracted, hiddenStats], output);
+  releaseScratch([statistics, gate, blockedProjection, wholeProjection, contracted, hiddenStats], output);
   return output;
 }
 

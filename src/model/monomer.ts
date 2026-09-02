@@ -6,6 +6,7 @@ import {
   type ReducedConfidenceResult,
 } from "../heads/confidence.js";
 import { encodeInputEmbedder, type InputEmbedderWeights } from "../evoformer/input-embedder.js";
+import type { TriangleWholeStorage } from "../triangle/shaders.js";
 import {
   encodeEvoformerBlock, encodeExtraMsaBlock, type EvoformerBlockWeights, type ExtraMsaBlockWeights,
 } from "../evoformer/block.js";
@@ -103,6 +104,8 @@ export interface MonomerGpuOptions {
   readonly profileMainEvoformerBlock?: number;
   /** Bounds transition scratch even when the device exposes larger binding limits. */
   readonly compactTransitions?: boolean;
+  /** Storage of the triangle multiplication's whole projection; `f16` halves it inexactly. */
+  readonly triangleWholeStorage?: TriangleWholeStorage;
   /** Caps reusable scratch retained between blocks; compact mode uses the bounded shared default. */
   readonly maxPooledBytes?: number;
   /** Internal model architecture selector used by AlphaFoldMultimerGpu. */
@@ -149,6 +152,7 @@ export class AlphaFoldMonomerGpu {
   readonly profileMainEvoformerBlock: number;
   readonly compactTransitions: boolean;
   readonly maxPooledBytes: number | undefined;
+  readonly triangleWholeStorage: TriangleWholeStorage;
   readonly multimer: boolean;
   readonly recycleEarlyStopTolerance: number;
   constructor(device: GPUDevice, options: MonomerGpuOptions = {}) {
@@ -161,6 +165,7 @@ export class AlphaFoldMonomerGpu {
     this.maxPooledBytes = options.maxPooledBytes
       ?? (this.compactTransitions ? COMPACT_GPU_POOL_BYTES : undefined);
     this.multimer = options.multimer ?? false;
+    this.triangleWholeStorage = options.triangleWholeStorage ?? "f32";
     this.recycleEarlyStopTolerance = options.recycleEarlyStopTolerance ?? -1;
     if (!Number.isFinite(this.recycleEarlyStopTolerance)) {
       throw new RangeError("recycleEarlyStopTolerance must be finite");
@@ -327,6 +332,7 @@ export class AlphaFoldMonomerGpu {
           sequences: features.extraSequences, length, cM: 64, cZ: 128,
           cOuter: weights.extraStack[0]!.outerProductMean.leftBias.length,
           triangleHidden: weights.extraStack[0]!.triangleMultiplicationOutgoing.linearAPBias.length,
+          triangleWholeStorage: this.triangleWholeStorage,
           ...(this.multimer ? { outerProductMeanFirst: true } : {}),
         };
         const shouldProfileRecycle = this.profile && recycle === this.profileRecycle;
@@ -382,6 +388,7 @@ export class AlphaFoldMonomerGpu {
           pairMask: new Float32Array(0), sequences: mainSequences, length, cM: 256, cZ: 128,
           cOuter: weights.mainStack[0]!.outerProductMean.leftBias.length,
           triangleHidden: weights.mainStack[0]!.triangleMultiplicationOutgoing.linearAPBias.length,
+          triangleWholeStorage: this.triangleWholeStorage,
           ...(this.multimer ? { outerProductMeanFirst: true } : {}),
         };
         let mainProfile: MonomerBlockGpuProfile | undefined;

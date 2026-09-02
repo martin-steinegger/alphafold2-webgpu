@@ -12,12 +12,11 @@ export interface TriangleShaders {
   readonly projectGate: string;
   /**
    * The two contraction inputs, each a gated projection of the normalized
-   * pair. Incoming blocks the contraction index, so both are block-sized;
-   * outgoing blocks the first residue index, so only `a` is, and `b` is
-   * filled block by block into a whole tensor before any block contracts.
+   * pair. `a` is projected one output block at a time; `b` is filled block
+   * by block into a whole tensor before any block contracts.
    */
-  readonly projectA: string;
-  readonly projectB: string;
+  readonly projectBlockOperand: string;
+  readonly projectWholeOperand: string;
   readonly contract: string;
   /** Mean and inverse standard deviation of each contracted row over the hidden channels. */
   readonly hiddenStatistics: string;
@@ -26,6 +25,14 @@ export interface TriangleShaders {
 }
 
 export type TriangleDirection = "outgoing" | "incoming";
+
+/**
+ * Storage of the whole projection. `f16` packs two half-precision values per
+ * 32-bit word with `pack2x16float`, needing no device feature; it halves the
+ * largest scratch tensor of the trunk and rounds the contraction inputs to
+ * about three significant digits, so it is not exact.
+ */
+export type TriangleWholeStorage = "f32" | "f16";
 
 const declaration = (precision: Precision): string => precision === "f16" ? "enable f16;\n" : "";
 const scalar = (precision: Precision): "f16" | "f32" => precision;
@@ -43,11 +50,15 @@ function prelude(
   const offsetConstants = Object.entries(offsets)
     .map(([name, offset]) => `const W_${name.toUpperCase()}: u32 = ${offset}u;`)
     .join("\n");
+  const pairs = shape.length * shape.length;
   return `${declaration(precision)}
 const L: u32 = ${shape.length}u;
 const CZ: u32 = ${shape.cZ}u;
 const CH: u32 = ${shape.cHidden}u;
 const PAIRS: u32 = L * L;
+// Channel stride of the whole projection, padded so a packed pair of values
+// never spans two channels.
+const WHOLE_STRIDE: u32 = ${pairs + (pairs % 2)}u;
 const BLOCK_ROWS: u32 = ${blockRows}u;
 const BLOCK_PAIRS: u32 = BLOCK_ROWS * L;
 const LINEAR_GRID_WIDTH: u32 = 32768u;
@@ -67,9 +78,21 @@ export function createTriangleShaders(
   epsilon = 1e-5,
   direction: TriangleDirection = "outgoing",
   blockRows = shape.length,
+  wholeStorage: TriangleWholeStorage = "f32",
 ): TriangleShaders {
   const common = prelude(shape, precision, offsets, epsilon, blockRows);
   const t = scalar(precision);
+  const outgoing = direction === "outgoing";
+  // Outgoing contracts over the second residue index and blocks the output by
+  // rows i: its block operand a holds pair rows (i, k) of the block. Incoming
+  // contracts over the first index and blocks the output by columns j: its
+  // block operand a holds pairs (k, j) with j in the block, entry r being
+  // (r / count, offset + r % count). Either way a finished block only
+  // overwrites pair entries no later block reads, so the output can be the
+  // pair itself, and the whole operand b is a plain projection in pair-row
+  // order.
+  const blockPairRow = outgoing
+    ? "block.x + row" : "(row / block.w) * L + block.x / L + row % block.w";
 
   // One workgroup per pair row, so the channel reads of a row are contiguous
   // across lanes. The statistics let every later consumer normalize the raw
@@ -126,6 +149,8 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
 // number of rows it spans.
 @group(0) @binding(4) var<uniform> block: vec4<u32>;
 
+fn pair_row_of(row: u32) -> u32 { return ${blockPairRow}; }
+
 fn normalized_input(pair_row: u32, k: u32) -> f32 {
   return (${read(precision, "z[pair_row * CZ + k]")} - statistics[2u * pair_row]) * statistics[2u * pair_row + 1u]
     * ${read(precision, "weights[W_LAYERNORMINWEIGHT + k]")} + ${read(precision, "weights[W_LAYERNORMINBIAS + k]")};
@@ -133,7 +158,7 @@ fn normalized_input(pair_row: u32, k: u32) -> f32 {
     rows: "block.y",
     inner: "CZ",
     columns: "CZ",
-    sourceElement: "normalized_input(block.x + row, k)",
+    sourceElement: "normalized_input(pair_row_of(row), k)",
     weightElement: read(precision, "weights[W_LINEARGWEIGHT + column * CZ + k]"),
     store: `gate[row * CZ + column] = logistic(element + ${read(precision, "weights[W_LINEARGBIAS + column]")});`,
   });
@@ -147,7 +172,9 @@ fn normalized_input(pair_row: u32, k: u32) -> f32 {
    * gate and the epilogue can combine them with the mask. The result is stored
    * channel-major, which is how the contraction consumes it.
    */
-  const project = (operand: "a" | "b", stride: string, offset: string): string => {
+  const project = (
+    operand: "a" | "b", stride: string, pairRow: string, storeRow: string, packed: boolean,
+  ): string => {
     const upper = operand.toUpperCase();
     const weight = (kind: "P" | "G"): string =>
       read(precision, `weights[W_LINEAR${upper}${kind}WEIGHT + (column >> 1u) * CZ + k]`);
@@ -159,10 +186,12 @@ fn normalized_input(pair_row: u32, k: u32) -> f32 {
 @group(0) @binding(1) var<storage, read> mask: array<f32>;
 @group(0) @binding(2) var<storage, read> weights: array<${t}>;
 @group(0) @binding(3) var<storage, read> statistics: array<f32>;
-@group(0) @binding(4) var<storage, read_write> ${operand}: array<f32>;
-// x is the first row of this block within the whole pair tensor, y the
-// number of rows it spans.
+@group(0) @binding(4) var<storage, read_write> ${operand}: array<${packed ? "u32" : "f32"}>;
+// x is the first pair row of this block, y the number of pair rows it spans,
+// w the residues it covers.
 @group(0) @binding(5) var<uniform> block: vec4<u32>;
+
+fn pair_row_of(row: u32) -> u32 { return ${pairRow}; }
 
 fn normalized_input(pair_row: u32, k: u32) -> f32 {
   return (${read(precision, "z[pair_row * CZ + k]")} - statistics[2u * pair_row]) * statistics[2u * pair_row + 1u]
@@ -171,7 +200,7 @@ fn normalized_input(pair_row: u32, k: u32) -> f32 {
       rows: "block.y",
       inner: "CZ",
       columns: "2u * CH",
-      sourceElement: "normalized_input(block.x + row, k)",
+      sourceElement: "normalized_input(pair_row_of(row), k)",
       weightElement: `select(${weight("G")}, ${weight("P")}, (column & 1u) == 0u)`,
       store: "",
       // The contraction reads the projection channel-major, so a direct store
@@ -192,69 +221,66 @@ ${Array.from({ length: 8 }, (_, index) => `      {
         let r_local = row_thread * 8u + ${index}u;
         let row = tile_row_origin + r_local;
         var pair_mask = 0.0;
-        if (row < gemm_rows) { pair_mask = mask[block.x + row]; }
+        if (row < gemm_rows) { pair_mask = mask[pair_row_of(row)]; }
         gemm_stage[h_local * 64u + r_local] = pair_mask * (acc${index}[0] + bias_p0) * logistic(acc${index}[1] + bias_g0);
         gemm_stage[(h_local + 1u) * 64u + r_local] = pair_mask * (acc${index}[2] + bias_p1) * logistic(acc${index}[3] + bias_g1);
       }`).join("\n")}
     }
     workgroupBarrier();
-    for (var item = 0u; item < 8u; item += 1u) {
+${packed ? `    // Two consecutive pair rows share a word. Blocks start on even pair rows
+    // and the channel stride is even, so a pair never spans two words.
+    for (var item = 0u; item < 4u; item += 1u) {
+      let element = (thread + item * 256u) * 2u;
+      let h_local = element / 64u;
+      let r_local = element % 64u;
+      let row = tile_row_origin + r_local;
+      let h = column_origin / 2u + half * 32u + h_local;
+      if (row < gemm_rows && h < CH) {
+        let second = select(0.0, gemm_stage[element + 1u], row + 1u < gemm_rows);
+        ${operand}[(h * ${stride} + ${storeRow}) >> 1u] = pack2x16float(vec2<f32>(gemm_stage[element], second));
+      }
+    }` : `    for (var item = 0u; item < 8u; item += 1u) {
       let element = thread + item * 256u;
       let h_local = element / 64u;
       let r_local = element % 64u;
       let row = tile_row_origin + r_local;
       let h = column_origin / 2u + half * 32u + h_local;
-      if (row < gemm_rows && h < CH) { ${operand}[h * ${stride} + ${offset} + row] = gemm_stage[element]; }
-    }
+      if (row < gemm_rows && h < CH) { ${operand}[h * ${stride} + ${storeRow}] = gemm_stage[element]; }
+    }`}
     workgroupBarrier();
   }`,
     });
   };
 
-  // out[h][i][j] = sum_k A[h][i][k] * B[h][j][k], one independent matrix per
-  // hidden channel, dispatched along z.
-  //
-  // The two directions contract over different indices, so they block
-  // differently. Outgoing contracts over the second index, so blocking the
-  // first leaves one projection whole and writes its own slice of the output.
-  // Incoming contracts over the first index, so blocking it shrinks both
-  // projections but every block contributes to every output element, and the
-  // output is accumulated across blocks instead of partitioned.
-  const contract = direction === "outgoing"
-    ? createTiledGemmShader({
-      preamble: `${common}
-@group(0) @binding(0) var<storage, read> a: array<f32>;
-@group(0) @binding(1) var<storage, read> b: array<f32>;
+  // One independent matrix per hidden channel, dispatched along z. Outgoing:
+  // out[i][j] = sum_k a[i][k] b[j][k] over a block of rows i. Incoming:
+  // out[i][j] = sum_k b[k][i] a[k][j] over a block of columns j, with the
+  // GEMM rows being the block's columns and its columns every i.
+  const packedWhole = wholeStorage === "f16";
+  const wholeElement = (index: string): string => packedWhole
+    ? `unpack2x16float(whole[(${index}) >> 1u])[(${index}) & 1u]` : `whole[${index}]`;
+  const contract = createTiledGemmShader({
+    preamble: `${common}
+@group(0) @binding(0) var<storage, read> blocked: array<f32>;
+@group(0) @binding(1) var<storage, read> whole: array<${packedWhole ? "u32" : "f32"}>;
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
 // x is the first pair row of the block, w the residue count it spans.
 @group(0) @binding(3) var<uniform> block: vec4<u32>;`,
-      rows: "block.w",
-      inner: "L",
-      columns: "L",
-      sourceElement: "a[group.z * BLOCK_PAIRS + row * L + k]",
-      weightElement: "b[group.z * PAIRS + column * L + k]",
-      store: "output[group.z * BLOCK_PAIRS + row * L + column] = element;",
-    })
-    : createTiledGemmShader({
-      preamble: `${common}
-@group(0) @binding(0) var<storage, read> a: array<f32>;
-@group(0) @binding(1) var<storage, read> b: array<f32>;
-@group(0) @binding(2) var<storage, read_write> output: array<f32>;
-// x is the first pair row of the block, w the contraction rows it spans.
-@group(0) @binding(3) var<uniform> block: vec4<u32>;`,
-      rows: "L",
-      inner: "block.w",
-      columns: "L",
-      sourceElement: "b[group.z * BLOCK_PAIRS + k * L + row]",
-      weightElement: "a[group.z * BLOCK_PAIRS + k * L + column]",
-      // z marks the first block, which overwrites rather than accumulating, so
-      // the output needs no separate clear and no copy-destination usage.
-      store: `let index = group.z * PAIRS + row * L + column;
-          output[index] = select(output[index], 0.0, block.z == 1u) + element;`,
-    });
+    rows: "block.w",
+    inner: "L",
+    columns: "L",
+    sourceElement: outgoing
+      ? "blocked[group.z * BLOCK_PAIRS + row * L + k]" : "blocked[group.z * BLOCK_PAIRS + k * block.w + row]",
+    weightElement: outgoing
+      ? wholeElement("group.z * WHOLE_STRIDE + column * L + k") : wholeElement("group.z * WHOLE_STRIDE + k * L + column"),
+    // The block's output entries are enumerated like its operand: by pair row
+    // (i, j) outgoing, by (i, block column j) incoming.
+    store: outgoing
+      ? "output[group.z * BLOCK_PAIRS + row * L + column] = element;"
+      : "output[group.z * BLOCK_PAIRS + column * block.w + row] = element;",
+  });
 
-  const contracted = direction === "outgoing"
-    ? { stride: "BLOCK_PAIRS", offset: "" } : { stride: "PAIRS", offset: "block.x + " };
+  const contracted = { stride: "BLOCK_PAIRS", offset: "" };
   // One invocation per contracted row: adjacent invocations read adjacent
   // addresses of the channel-major contraction.
   const hiddenStatistics = `${common}
@@ -280,8 +306,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   statistics[2u * row + 1u] = inverseSqrt(variance / f32(CH) + EPSILON);
 }`;
 
-  // The output is the projected, gated hidden block; `output` is a view of the
-  // rows this block produces.
+  // The output is the projected, gated hidden block, written at the pair rows
+  // the block covers; `output` is the whole pair-shaped tensor.
   const projectOutput = createTiledGemmShader({
     preamble: `${common}
 @group(0) @binding(0) var<storage, read> gate: array<f32>;
@@ -290,6 +316,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 @group(0) @binding(3) var<storage, read> statistics: array<f32>;
 @group(0) @binding(4) var<storage, read_write> output: array<f32>;
 @group(0) @binding(5) var<uniform> block: vec4<u32>;
+
+fn pair_row_of(row: u32) -> u32 { return ${blockPairRow}; }
 
 fn normalized_hidden(row: u32, h: u32) -> f32 {
   return (contracted[h * ${contracted.stride} + ${contracted.offset}row] - statistics[2u * row]) * statistics[2u * row + 1u]
@@ -300,12 +328,16 @@ fn normalized_hidden(row: u32, h: u32) -> f32 {
     columns: "CZ",
     sourceElement: "normalized_hidden(row, k)",
     weightElement: read(precision, "weights[W_LINEARZWEIGHT + column * CH + k]"),
-    store: `let index = row * CZ + column;
-          output[index] = (element + ${read(precision, "weights[W_LINEARZBIAS + column]")}) * gate[index];`,
+    store: `let index = pair_row_of(row) * CZ + column;
+          output[index] = (element + ${read(precision, "weights[W_LINEARZBIAS + column]")}) * gate[row * CZ + column];`,
   });
 
-  const projectA = project("a", "BLOCK_PAIRS", "0u");
-  const projectB = direction === "outgoing"
-    ? project("b", "PAIRS", "block.x") : project("b", "BLOCK_PAIRS", "0u");
-  return { inputStatistics, projectGate, projectA, projectB, contract, hiddenStatistics, projectOutput };
+  // The block operand is stored block-relative, the whole operand at its pair row.
+  // Outgoing contracts a's rows i against b's rows j; incoming contracts a's
+  // columns j against b's columns i. In both, a is the block operand.
+  const projectBlockOperand = project("a", "BLOCK_PAIRS", blockPairRow, "row", false);
+  const projectWholeOperand = project("b", "WHOLE_STRIDE", "block.x + row", "block.x + row", packedWhole);
+  return {
+    inputStatistics, projectGate, projectBlockOperand, projectWholeOperand, contract, hiddenStatistics, projectOutput,
+  };
 }

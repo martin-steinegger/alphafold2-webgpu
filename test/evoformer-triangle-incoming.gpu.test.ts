@@ -80,14 +80,29 @@ describe.skipIf(!enabled)("TriangleMultiplicationIncoming WebGPU", () => {
       linearGWeight: await projection("gating_linear", cZ, cZ),
       linearGBias: await parameter("gating_linear", "bias"),
     };
+    const mask = await store.tensor("blockPairMask");
     const result = await new TriangleMultiplicationIncomingGpu(device).run({
-      shape: { length, cZ, cHidden },
-      z,
-      mask: await store.tensor("blockPairMask"),
-      weights,
+      shape: { length, cZ, cHidden }, z, mask, weights,
     });
     const metrics = errorMetrics(result.output, expected);
     expect(metrics.meanAbsoluteError).toBeLessThan(1e-5);
     expect(metrics.maxAbsoluteError).toBeLessThan(1e-4);
+
+    // Blocking the output by columns must reproduce the whole result exactly.
+    for (const blockRows of [16, 2]) {
+      const blocked = await new TriangleMultiplicationIncomingGpu(device).run({
+        shape: { length, cZ, cHidden }, z, mask, weights,
+      }, { blockRows });
+      const blockedMetrics = errorMetrics(blocked.output, expected);
+      expect(blockedMetrics.meanAbsoluteError, `${blockRows} rows`).toBeLessThan(1e-5);
+      expect(blockedMetrics.maxAbsoluteError, `${blockRows} rows`).toBeLessThan(1e-4);
+    }
+    // The half-precision whole projection is inexact by design; this pins its error.
+    const half = await new TriangleMultiplicationIncomingGpu(device).run({
+      shape: { length, cZ, cHidden }, z, mask, weights,
+    }, { blockRows: 16, wholeStorage: "f16" });
+    const halfMetrics = errorMetrics(half.output, expected);
+    expect(halfMetrics.meanAbsoluteError).toBeLessThan(1e-3);
+    expect(halfMetrics.maxAbsoluteError).toBeLessThan(1e-2);
   });
 });

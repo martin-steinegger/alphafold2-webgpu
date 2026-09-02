@@ -4,6 +4,7 @@ import {
 } from "../evoformer/outer-product-mean.js";
 import { ATTENTION_WINDOW_TARGET_BYTES, attentionBatchWindow } from "../evoformer/attention.js";
 import { triangleBlockRows } from "../evoformer/block.js";
+import type { TriangleWholeStorage } from "../triangle/shaders.js";
 import { TRANSITION_CHUNK_TARGET_BYTES, transitionChunkRows } from "../evoformer/transition.js";
 import { recordSubgroupRange } from "./subgroups.js";
 
@@ -52,11 +53,17 @@ function checkedBytes(label: string, ...factors: number[]): number {
  * models simultaneously resident activations and the largest operator scratch
  * set; it is a preflight guard, not a claim about physical memory availability.
  */
+export interface MonomerMemoryOptions {
+  /** Storage of the triangle multiplication's whole projection; `f16` halves it. */
+  readonly triangleWholeStorage?: TriangleWholeStorage;
+}
+
 export function estimateMonomerMemory(
   length: number,
   msaSequences: number,
   extraSequences: number,
   transitionMode: "full" | "chunked",
+  options: MonomerMemoryOptions = {},
 ): MonomerMemoryEstimate {
   if (![length, msaSequences, extraSequences]
     .every((value) => Number.isSafeInteger(value) && value > 0)) {
@@ -111,8 +118,8 @@ export function estimateMonomerMemory(
     attentionScratch(extraSequences, length, 64, 5) + pairBias,
     attentionScratch(length, length, 128, 5) + pairBias,
     // Triangle multiplication keeps one projection whole and streams the
-    // other projection, the contraction and the output gate in row blocks.
-    pair + 3 * triangleBlock,
+    // other projection, the contraction and the output gate in blocks.
+    (options.triangleWholeStorage === "f16" ? pair / 2 : pair) + 3 * triangleBlock,
     transitionScratch(msaSequences * length, 256, 1024),
     transitionScratch(extraSequences * length, 64, 256),
     transitionScratch(length * length, 128, 512),

@@ -46,6 +46,30 @@ describe.skipIf(!enabled)("TriangleMultiplicationOutgoing WebGPU", () => {
     expect(metrics.maxAbsoluteError).toBeLessThan(1e-4);
   });
 
+  it.each([4, 2])("matches the reference with %i-row output blocks", async (blockRows) => {
+    const bundle = await loadTriangleReferenceBundleFromFiles(
+      resolve("test/fixtures/openfold-triangle-small/manifest.json"),
+    );
+    const result = await new TriangleMultiplicationOutgoingGpu(device).run(bundle.input, { blockRows });
+    const metrics = errorMetrics(result.output, bundle.expected);
+    expect(metrics.meanAbsoluteError).toBeLessThan(1e-5);
+    expect(metrics.maxAbsoluteError).toBeLessThan(1e-4);
+  });
+
+  it("rounds the whole projection to half precision when asked, within its documented error", async () => {
+    // Inexact by design: the contraction inputs carry about three significant
+    // digits. This pins the error of that option, not the exact path.
+    const bundle = await loadTriangleReferenceBundleFromFiles(
+      resolve("test/fixtures/openfold-triangle-small/manifest.json"),
+    );
+    const result = await new TriangleMultiplicationOutgoingGpu(device).run(bundle.input, {
+      blockRows: 2, wholeStorage: "f16",
+    });
+    const metrics = errorMetrics(result.output, bundle.expected);
+    expect(metrics.meanAbsoluteError).toBeLessThan(1e-3);
+    expect(metrics.maxAbsoluteError).toBeLessThan(1e-2);
+  });
+
   it("supports fp16 inputs and weights when shader-f16 is available", async (context) => {
     if (!hasF16) context.skip();
     const bundle = await loadTriangleReferenceBundleFromFiles(
