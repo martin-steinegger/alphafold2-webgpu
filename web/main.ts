@@ -93,8 +93,8 @@ function unifiedMemoryBudget(appleUnifiedMemory: boolean): number | undefined {
   const deviceMemory = (navigator as Navigator & { readonly deviceMemory?: number }).deviceMemory;
   if (deviceMemory === undefined || !Number.isFinite(deviceMemory) || deviceMemory <= 0) return undefined;
   // Apple GPUs share system RAM. navigator.deviceMemory is privacy-rounded and
-  // capped in Chromium, so reserve 30% while relying on the estimator's own
-  // calibrated 2.5x pooling/implementation safety allowance.
+  // capped in Chromium. The estimator covers measured allocator residency;
+  // reserve another 30% here for Chrome, Dawn/Metal and the rest of the page.
   return Math.floor(deviceMemory * 1024 ** 3 * 0.70);
 }
 
@@ -484,18 +484,26 @@ async function runPrediction(): Promise<void> {
     const requestedMaxExtra = element<HTMLInputElement>("max-extra").valueAsNumber;
     const clusteredRows = Math.min(requestedMaxMsa, input.depth);
     const extraRows = Math.max(1, Math.min(requestedMaxExtra, Math.max(0, input.depth - clusteredRows)));
+    const packedMonomerStorage = !input.multimer
+      && element<HTMLSelectElement>("monomer-storage").value === "f16";
+    const memoryOptions = packedMonomerStorage
+      ? { triangleWholeStorage: "f16" as const, msaStorage: "f16" as const } : {};
     const memoryBudget = unifiedMemoryBudget(appleUnifiedMemory);
     const devicePlan = planMonomerDevice(
-      adapter, input.sequence.length, clusteredRows, extraRows, memoryBudget, compactMemoryPolicy,
+      adapter, input.sequence.length, clusteredRows, extraRows, memoryBudget, compactMemoryPolicy, memoryOptions,
     );
+    log(packedMonomerStorage
+      ? "Monomer activation storage: packed f16 (approximate, reduced memory)."
+      : `Activation storage: exact f32${input.multimer ? " (Multimer-v3)" : ""}.`);
     log(`Estimated peak GPU allocations: ${formatMib(devicePlan.memory.estimatedPeakBytes)} `
       + `(${formatMib(devicePlan.memory.persistentBytes)} persistent, `
-      + `${formatMib(devicePlan.memory.scratchBytes)} scratch).`);
+      + `${formatMib(devicePlan.memory.scratchBytes)} scratch, `
+      + `${formatMib(devicePlan.memory.residentHeadroomBytes)} resident allowance).`);
     if (memoryBudget !== undefined) {
       log(`Apple unified-memory safety budget: ${formatMib(memoryBudget)}; bounded transitions and scratch pooling enabled.`);
       if (devicePlan.memory.estimatedPeakBytes > memoryBudget) {
         const suggestion = suggestMonomerRows(
-          input.sequence.length, clusteredRows, extraRows, devicePlan.transitionMode, memoryBudget,
+          input.sequence.length, clusteredRows, extraRows, devicePlan.transitionMode, memoryBudget, memoryOptions,
         );
         const advice = suggestion === undefined
           ? "This sequence is too large for the conservative safety budget even with one MSA row."
@@ -553,6 +561,7 @@ async function runPrediction(): Promise<void> {
       profileRecycle: Number(parameter("profileRecycle", "0")),
       profileExtraMsaBlock: Number(parameter("profileExtraBlock", "0")),
       profileMainEvoformerBlock: Number(parameter("profileMainBlock", "0")),
+      ...memoryOptions,
     } as const;
     const commonWeights = {
       embedding, extraStack, mainStack, structure, lddt: confidence.lddt, pae: confidence.pae, geometry,
@@ -611,6 +620,7 @@ function updateInputMode(): void {
     : multimer ? "Run Multimer-v3"
     : remote ? "Generate MSA & predict" : "Run prediction";
   element<HTMLInputElement>("max-msa").disabled = multimer && inputMode.value === "single";
+  element<HTMLSelectElement>("monomer-storage").disabled = multimer;
   const maxExtra = element<HTMLInputElement>("max-extra");
   maxExtra.disabled = multimer && inputMode.value === "single";
   maxExtra.max = multimer ? "2048" : "1024";
@@ -643,6 +653,7 @@ try {
     ?? "./model-multimer/manifest.json";
 } catch { /* storage may be unavailable */ }
 try { element<HTMLInputElement>("msa-api-url").value = localStorage.getItem("afwebgpu.msaApiUrl") ?? "https://api.colabfold.com"; } catch { /* storage may be unavailable */ }
+if (parameter("precision", "") === "f16") element<HTMLSelectElement>("monomer-storage").value = "f16";
 element<HTMLButtonElement>("clear-model-cache").addEventListener("click", () => { void (async () => {
   const button = element<HTMLButtonElement>("clear-model-cache"); button.disabled = true;
   try {

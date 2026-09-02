@@ -8,6 +8,7 @@
 import { readFileSync } from "node:fs";
 import { create, globals } from "webgpu";
 import { AlphaFoldMonomerGpu } from "../src/model/monomer.js";
+import { parseA3m } from "../src/input/a3m.js";
 import { makeA3mFeatures } from "../src/input/a3m-features.js";
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
@@ -19,8 +20,10 @@ const msaRows = Number(process.argv[3] ?? "508");
 const extraRows = Number(process.argv[4] ?? "1024");
 const recycles = Number(process.argv[5] ?? "4");
 const a3m = readFileSync(file, "utf8");
-const length = a3m.split("\n").find((line) => line !== "" && !line.startsWith(">"))!.replace(/[a-z]/g, "").length;
-const depth = a3m.split("\n").filter((line) => line.startsWith(">")).length;
+// Use the production parser for sizing as well as feature construction. MMseqs2
+// A3Ms begin with a `#length\tchains` metadata line, which is not a sequence.
+const alignment = parseA3m(a3m);
+const { length, depth } = alignment;
 const model = AlphaFoldFixture.fromStore(await FileTensorStore.open(
   "test/fixtures/evoformer/model1-query-59-stack/manifest.json",
 ));
@@ -36,12 +39,15 @@ const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" }
 if (adapter === null) throw new Error("no WebGPU adapter");
 const clustered = Math.min(msaRows, depth);
 const extra = Math.max(1, Math.min(extraRows, Math.max(0, depth - clustered)));
-const plan = planMonomerDevice(adapter, length, clustered, extra);
+const memoryOptions = {
+  ...(process.env.AFWEBGPU_TRIANGLE_F16 === "1" ? { triangleWholeStorage: "f16" as const } : {}),
+  ...(process.env.AFWEBGPU_MSA_F16 === "1" ? { msaStorage: "f16" as const } : {}),
+};
+const plan = planMonomerDevice(adapter, length, clustered, extra, undefined, false, memoryOptions);
 const device = await requestAlphaFoldDevice(adapter, plan.requirements);
 try {
   const prediction = await new AlphaFoldMonomerGpu(device, {
-    ...(process.env.AFWEBGPU_TRIANGLE_F16 === "1" ? { triangleWholeStorage: "f16" as const } : {}),
-    ...(process.env.AFWEBGPU_MSA_F16 === "1" ? { msaStorage: "f16" as const } : {}),
+    ...memoryOptions,
   }).predict(features, {
     embedding, template, extraStack, mainStack, structure,
     lddt: confidence.lddt, pae: confidence.pae, geometry,

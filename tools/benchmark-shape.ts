@@ -52,8 +52,12 @@ const features = makeA3mFeatures(a3m, featureTables, {
 const gpu = create([]);
 const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
 if (adapter === null) throw new Error("no WebGPU adapter");
+const memoryOptions = {
+  ...(process.env.AFWEBGPU_TRIANGLE_F16 === "1" ? { triangleWholeStorage: "f16" as const } : {}),
+  ...(process.env.AFWEBGPU_MSA_F16 === "1" ? { msaStorage: "f16" as const } : {}),
+};
 // Match what the page does: size the device to the shape, not to the base tier.
-const plan = planMonomerDevice(adapter, length, msaRows, extraRows);
+const plan = planMonomerDevice(adapter, length, msaRows, extraRows, undefined, false, memoryOptions);
 const device = await requestAlphaFoldDevice(adapter, plan.requirements);
 console.error(`device limits: buffer ${(plan.requirements.maxBufferSize / 1024 ** 2).toFixed(0)} MiB, `
   + `storage binding ${(plan.requirements.maxStorageBufferBindingSize / 1024 ** 2).toFixed(0)} MiB, `
@@ -75,8 +79,7 @@ try {
   const poolMib = Number(process.env.AFWEBGPU_POOL_MIB ?? "");
   const prediction = await new AlphaFoldMonomerGpu(device, {
     ...(profile ? { profile: true } : {}),
-    ...(process.env.AFWEBGPU_TRIANGLE_F16 === "1" ? { triangleWholeStorage: "f16" as const } : {}),
-    ...(process.env.AFWEBGPU_MSA_F16 === "1" ? { msaStorage: "f16" as const } : {}),
+    ...memoryOptions,
     ...(poolMib > 0 ? { maxPooledBytes: poolMib * 1024 ** 2 } : {}),
   }).predict(features, {
     embedding, template, extraStack, mainStack, structure,

@@ -32,6 +32,8 @@ export interface AlphaFoldDevicePlan {
 export interface MonomerMemoryEstimate {
   readonly persistentBytes: number;
   readonly scratchBytes: number;
+  /** Allowance for pooled buffers, physical allocation granularity, and other allocator residency. */
+  readonly residentHeadroomBytes: number;
   readonly estimatedPeakBytes: number;
 }
 
@@ -133,11 +135,22 @@ export function estimateMonomerMemory(
   // Readbacks, uniforms and allocation padding, none of which scale with the
   // shape, plus headroom for the operator this model does not enumerate.
   const scratchBytes = Math.ceil(operatorScratch * 1.15) + 16 * 1024 ** 2;
-  const estimatedPeakBytes = Math.max(persistentBytes + scratchBytes, embedderBytes + 16 * 1024 ** 2);
-  if (![persistentBytes, scratchBytes, estimatedPeakBytes].every(Number.isSafeInteger)) {
+  const livePeakBytes = Math.max(persistentBytes + scratchBytes, embedderBytes + 16 * 1024 ** 2);
+  // The browser has to retain physical GPUBuffer objects, not only logically
+  // live tensors. Whole-MiB allocation rounding and the reusable scratch pool
+  // measured above the live model from 59 through 1000 residues. Packed
+  // activations shrink logical tensors faster than they shrink that pool, so
+  // their measured resident/live gap is wider and gets its own calibration.
+  // The fixed allowance keeps small shapes conservative as well.
+  const packedStorageCount = Number(options.msaStorage === "f16")
+    + Number(options.triangleWholeStorage === "f16");
+  const residentScale = packedStorageCount === 2 ? 0.40 : packedStorageCount === 1 ? 0.30 : 0.25;
+  const residentHeadroomBytes = Math.ceil(livePeakBytes * residentScale) + 16 * 1024 ** 2;
+  const estimatedPeakBytes = livePeakBytes + residentHeadroomBytes;
+  if (![persistentBytes, scratchBytes, residentHeadroomBytes, estimatedPeakBytes].every(Number.isSafeInteger)) {
     throw new RangeError("monomer aggregate memory estimate exceeds JavaScript precision");
   }
-  return { persistentBytes, scratchBytes, estimatedPeakBytes };
+  return { persistentBytes, scratchBytes, residentHeadroomBytes, estimatedPeakBytes };
 }
 
 /** Reduces extra rows first, then clustered rows, to fit an explicit budget. */
@@ -147,13 +160,16 @@ export function suggestMonomerRows(
   extraSequences: number,
   transitionMode: "full" | "chunked",
   budgetBytes: number,
+  options: MonomerMemoryOptions = {},
 ): MonomerRowSuggestion | undefined {
   if (!Number.isSafeInteger(budgetBytes) || budgetBytes <= 0) throw new RangeError("memory budget must be positive");
   const fits = (msa: number, extra: number): boolean =>
-    estimateMonomerMemory(length, msa, extra, transitionMode).estimatedPeakBytes <= budgetBytes;
+    estimateMonomerMemory(length, msa, extra, transitionMode, options).estimatedPeakBytes <= budgetBytes;
   if (fits(msaSequences, extraSequences)) {
     return { msaSequences, extraSequences,
-      estimatedPeakBytes: estimateMonomerMemory(length, msaSequences, extraSequences, transitionMode).estimatedPeakBytes };
+      estimatedPeakBytes: estimateMonomerMemory(
+        length, msaSequences, extraSequences, transitionMode, options,
+      ).estimatedPeakBytes };
   }
   const maximize = (maximum: number, predicate: (value: number) => boolean): number => {
     let low = 1; let high = maximum; let best = 0;
@@ -166,12 +182,14 @@ export function suggestMonomerRows(
   const extra = maximize(extraSequences, (value) => fits(msaSequences, value));
   if (extra > 0) {
     return { msaSequences, extraSequences: extra,
-      estimatedPeakBytes: estimateMonomerMemory(length, msaSequences, extra, transitionMode).estimatedPeakBytes };
+      estimatedPeakBytes: estimateMonomerMemory(
+        length, msaSequences, extra, transitionMode, options,
+      ).estimatedPeakBytes };
   }
   const msa = maximize(msaSequences, (value) => fits(value, 1));
   if (msa === 0) return undefined;
   return { msaSequences: msa, extraSequences: 1,
-    estimatedPeakBytes: estimateMonomerMemory(length, msa, 1, transitionMode).estimatedPeakBytes };
+    estimatedPeakBytes: estimateMonomerMemory(length, msa, 1, transitionMode, options).estimatedPeakBytes };
 }
 
 /** Largest persistent monomer tensor; temporary transition tensors are processed in bounded chunks. */
@@ -179,19 +197,21 @@ export function monomerDeviceRequirements(
   length: number,
   msaSequences: number,
   extraSequences: number,
+  options: MonomerMemoryOptions = {},
 ): AlphaFoldDeviceRequirements {
   if (![length, msaSequences, extraSequences]
     .every((value) => Number.isSafeInteger(value) && value > 0)) {
     throw new RangeError("monomer device dimensions must be positive safe integers");
   }
   const bytes = Float32Array.BYTES_PER_ELEMENT;
+  const activationBytes = options.msaStorage === "f16" ? 2 : bytes;
   // The persistent activations, plus the largest scratch tensor, which every
   // operation now bounds against its own budget rather than letting it grow
   // with the shape: the outer-product contraction, the transition window and
   // the attention window are all capped.
   const largestTensor = Math.max(
-    msaSequences * length * 256 * bytes,
-    extraSequences * length * 64 * bytes,
+    msaSequences * length * 256 * activationBytes,
+    extraSequences * length * 64 * activationBytes,
     length * length * 128 * bytes,
     OUTER_PRODUCT_BLOCK_LIMIT_BYTES,
   );
@@ -210,12 +230,13 @@ export function planMonomerDevice(
   extraSequences: number,
   memoryBudgetBytes?: number,
   preferCompact = false,
+  options: MonomerMemoryOptions = {},
 ): AlphaFoldDevicePlan {
   if (memoryBudgetBytes !== undefined
     && (!Number.isSafeInteger(memoryBudgetBytes) || memoryBudgetBytes <= 0)) {
     throw new RangeError("memory budget must be a positive safe integer");
   }
-  const compact = monomerDeviceRequirements(length, msaSequences, extraSequences);
+  const compact = monomerDeviceRequirements(length, msaSequences, extraSequences, options);
   const bytes = Float32Array.BYTES_PER_ELEMENT;
   const largestFullTransition = Math.max(
     msaSequences * length * 1024 * bytes,
@@ -229,7 +250,7 @@ export function planMonomerDevice(
     maxBufferSize: Math.max(compact.maxBufferSize, largestFullTransition),
     maxStorageBufferBindingSize: Math.max(compact.maxStorageBufferBindingSize, largestFullTransition),
   };
-  const fullMemory = estimateMonomerMemory(length, msaSequences, extraSequences, "full");
+  const fullMemory = estimateMonomerMemory(length, msaSequences, extraSequences, "full", options);
   if (!preferCompact
     && fast.maxBufferSize <= adapter.limits.maxBufferSize
     && fast.maxStorageBufferBindingSize <= adapter.limits.maxStorageBufferBindingSize
@@ -238,7 +259,7 @@ export function planMonomerDevice(
       memory: fullMemory };
   }
   return { requirements: compact, transitionMode: "chunked",
-    memory: estimateMonomerMemory(length, msaSequences, extraSequences, "chunked") };
+    memory: estimateMonomerMemory(length, msaSequences, extraSequences, "chunked", options) };
 }
 
 /** Requests optional WebGPU features and only the buffer limits required by the selected shape. */

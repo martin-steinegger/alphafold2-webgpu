@@ -171,6 +171,12 @@ export class AlphaFoldMonomerGpu {
     this.multimer = options.multimer ?? false;
     this.triangleWholeStorage = options.triangleWholeStorage ?? "f32";
     this.msaStorage = options.msaStorage ?? "f32";
+    if (this.triangleWholeStorage !== "f32" && this.triangleWholeStorage !== "f16") {
+      throw new RangeError("triangle whole storage must be f32 or f16");
+    }
+    if (this.msaStorage !== "f32" && this.msaStorage !== "f16") {
+      throw new RangeError("MSA storage must be f32 or f16");
+    }
     if (this.multimer && this.msaStorage !== "f32") {
       throw new RangeError("packed MSA storage is not supported for Multimer, which merges template rows into the MSA");
     }

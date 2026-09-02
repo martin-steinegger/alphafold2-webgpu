@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { summarizeMonomerRecycle, type MonomerRecycleDetails } from "../src/model/monomer.js";
+import {
+  AlphaFoldMonomerGpu, summarizeMonomerRecycle, type MonomerRecycleDetails,
+} from "../src/model/monomer.js";
 
 describe("monomer recycle result retention", () => {
   it("retains metrics without pair, structure, or categorical logit tensors", () => {
@@ -23,5 +25,24 @@ describe("monomer recycle result retention", () => {
     expect(summary).not.toHaveProperty("msaFirstRow");
     expect(summary).not.toHaveProperty("structure");
     expect(summary.confidence).not.toHaveProperty("paeLogits");
+  });
+});
+
+describe("monomer storage options", () => {
+  const device = {} as GPUDevice;
+
+  it("rejects unsupported activation storage at the public boundary", () => {
+    expect(() => new AlphaFoldMonomerGpu(device, {
+      msaStorage: "bf16" as "f16",
+    })).toThrow(/MSA storage must be f32 or f16/);
+    expect(() => new AlphaFoldMonomerGpu(device, {
+      triangleWholeStorage: "bf16" as "f16",
+    })).toThrow(/triangle whole storage must be f32 or f16/);
+  });
+
+  it("keeps packed MSA storage unavailable to Multimer", () => {
+    expect(() => new AlphaFoldMonomerGpu(device, {
+      multimer: true, msaStorage: "f16",
+    })).toThrow(/packed MSA storage is not supported for Multimer/);
   });
 });

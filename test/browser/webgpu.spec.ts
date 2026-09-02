@@ -16,12 +16,16 @@ test("auto-detects monomers and multimers and switches to custom A3M", async ({ 
   await expect(page.locator("#sequence")).toHaveCSS("min-height", "80px");
   await page.getByText("Advanced settings").click();
   await expect(page.getByRole("button", { name: "Clear downloaded model" })).toBeVisible();
+  await expect(page.locator("#monomer-storage")).toHaveValue("f32");
+  await expect(page.locator("#monomer-storage")).toBeEnabled();
+  await page.locator("#monomer-storage").selectOption("f16");
   await page.locator("#sequence").fill(HOMODIMER);
   await expect(page.locator("#sequence-length")).toHaveText("118 residues · 2 chains");
   await expect(page.locator("#predict-label")).toHaveText("Generate complex MSA & predict");
   await expect(page.locator("#recycles")).toHaveValue("20");
   await expect(page.locator("#max-msa")).toBeEnabled();
   await expect(page.locator("#max-extra")).toHaveValue("2048");
+  await expect(page.locator("#monomer-storage")).toBeDisabled();
   await page.locator("#input-mode").selectOption("single");
   await expect(page.locator("#predict-label")).toHaveText("Run Multimer-v3");
   await expect(page.locator("#max-msa")).toBeDisabled();
@@ -30,6 +34,10 @@ test("auto-detects monomers and multimers and switches to custom A3M", async ({ 
   await page.locator("#input-mode").selectOption("custom");
   await expect(page.locator("#a3m-field")).toBeVisible();
   await expect(page.locator("#sequence-field")).toBeHidden();
+
+  await page.goto("/?precision=f16");
+  await page.getByText("Advanced settings").click();
+  await expect(page.locator("#monomer-storage")).toHaveValue("f16");
 });
 
 test("reports a WebGPU compatibility verdict before any prediction starts", async ({ page }) => {

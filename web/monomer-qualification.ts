@@ -1,5 +1,7 @@
 import { makeA3mFeatures } from "../src/input/a3m-features.js";
-import { AlphaFoldMonomerGpu, type MonomerModelWeights } from "../src/model/monomer.js";
+import {
+  AlphaFoldMonomerGpu, type MonomerGpuOptions, type MonomerModelWeights,
+} from "../src/model/monomer.js";
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { HttpTensorStore } from "../src/reference/http-tensor-store.js";
 import { requestAlphaFoldDevice } from "../src/runtime/device.js";
@@ -43,7 +45,11 @@ function summarize(prediction: Awaited<ReturnType<AlphaFoldMonomerGpu["predict"]
 }
 
 /** Runs the fixed query-only and deep-MSA monomer qualification cases in Chrome WebGPU. */
-export async function qualifyMonomer(modelManifestUrl: string, deepA3m: string): Promise<MonomerQualificationResult> {
+export async function qualifyMonomer(
+  modelManifestUrl: string,
+  deepA3m: string,
+  storageOptions: Pick<MonomerGpuOptions, "triangleWholeStorage" | "msaStorage"> = {},
+): Promise<MonomerQualificationResult> {
   const store = await HttpTensorStore.open(modelManifestUrl);
   const fixture = AlphaFoldFixture.fromStore(store);
   const weights = await monomerWeights(fixture);
@@ -54,7 +60,7 @@ export async function qualifyMonomer(modelManifestUrl: string, deepA3m: string):
   if (adapter === null) throw new Error("no WebGPU adapter");
   const device = await requestAlphaFoldDevice(adapter);
   try {
-    const runner = new AlphaFoldMonomerGpu(device, { compactTransitions: true });
+    const runner = new AlphaFoldMonomerGpu(device, { compactTransitions: true, ...storageOptions });
     const queryOnly = await runner.predict(
       makeA3mFeatures(`>query\n${QUERY}\n`, tables, {
         recycles: 3, randomSeed: 0, maxMsaSequences: 1, maxExtraSequences: 1,

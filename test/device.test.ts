@@ -57,6 +57,20 @@ describe("requestAlphaFoldDevice", () => {
     expect(requirement).toBeLessThan(256 * 1024 ** 2);
   });
 
+  it("accounts for packed MSA storage in monomer limits", () => {
+    expect(monomerDeviceRequirements(291, 508, 1024, { msaStorage: "f16" })).toEqual({
+      maxBufferSize: 256 * 1024 ** 2,
+      maxStorageBufferBindingSize: 128 * 1024 ** 2,
+    });
+    const constrained = adapterWithLimits(128 * 1024 ** 2, 256 * 1024 ** 2).adapter;
+    expect(planMonomerDevice(
+      constrained, 291, 508, 1024, undefined, true, { msaStorage: "f16", triangleWholeStorage: "f16" },
+    )).toMatchObject({
+      transitionMode: "chunked",
+      requirements: { maxBufferSize: 256 * 1024 ** 2, maxStorageBufferBindingSize: 128 * 1024 ** 2 },
+    });
+  });
+
   it("uses full transitions only when their shape fits the adapter", () => {
     const capable = adapterWithLimits(2 * 1024 ** 3, 2 * 1024 ** 3).adapter;
     expect(planMonomerDevice(capable, 291, 508, 1024)).toMatchObject({
@@ -110,26 +124,25 @@ describe("requestAlphaFoldDevice", () => {
 });
 
 describe("estimateMonomerMemory", () => {
-  // Working sets measured on GB10 with the allocator's live-bytes high-water
-  // mark. The estimate gates whether a prediction is allowed to start, so it
-  // has to stay an upper bound without drifting far above what runs: it was
-  // silently 3-5x over once every operation started bounding its own scratch.
+  // Combined resident peaks measured on GB10. The estimate gates whether a
+  // browser prediction is allowed to start, so it must cover physical pooled
+  // GPUBuffer residency rather than only the allocator's logically live bytes.
   const measured: ReadonlyArray<readonly [number, number, number, number]> = [
-    [59, 508, 1024, 73], [128, 256, 512, 87], [256, 256, 512, 159],
-    [384, 256, 512, 272], [512, 256, 512, 417],
+    [59, 508, 1024, 117], [128, 256, 512, 117], [256, 256, 512, 206],
+    [384, 256, 512, 351], [512, 256, 512, 504], [1_000, 256, 512, 1_447],
   ];
 
-  it("stays an upper bound on the measured working set", () => {
-    for (const [length, msa, extra, workingMib] of measured) {
+  it("stays an upper bound on measured combined residency", () => {
+    for (const [length, msa, extra, residentMib] of measured) {
       const estimate = estimateMonomerMemory(length, msa, extra, "full").estimatedPeakBytes / 1024 ** 2;
-      expect(estimate, `${length} residues`).toBeGreaterThan(workingMib);
+      expect(estimate, `${length} residues`).toBeGreaterThan(residentMib);
     }
   });
 
   it("does not drift far above what actually runs", () => {
-    for (const [length, msa, extra, workingMib] of measured) {
+    for (const [length, msa, extra, residentMib] of measured) {
       const estimate = estimateMonomerMemory(length, msa, extra, "full").estimatedPeakBytes / 1024 ** 2;
-      expect(estimate / workingMib, `${length} residues`).toBeLessThan(1.6);
+      expect(estimate / residentMib, `${length} residues`).toBeLessThan(1.4);
     }
   });
 
@@ -139,5 +152,33 @@ describe("estimateMonomerMemory", () => {
     const longer = estimateMonomerMemory(512, 64, 128, "full").estimatedPeakBytes;
     expect(deep).toBeGreaterThan(shallow);
     expect(longer).toBeGreaterThan(shallow);
+  });
+
+  it("reflects optional packed monomer storage", () => {
+    const mib = 1024 ** 2;
+    const exact = estimateMonomerMemory(384, 256, 512, "chunked").estimatedPeakBytes / mib;
+    const triangle = estimateMonomerMemory(
+      384, 256, 512, "chunked", { triangleWholeStorage: "f16" },
+    ).estimatedPeakBytes / mib;
+    const msa = estimateMonomerMemory(
+      384, 256, 512, "chunked", { msaStorage: "f16" },
+    ).estimatedPeakBytes / mib;
+    const combined = estimateMonomerMemory(384, 256, 512, "chunked", {
+      triangleWholeStorage: "f16", msaStorage: "f16",
+    }).estimatedPeakBytes / mib;
+    expect(triangle).toBeLessThan(exact);
+    expect(msa).toBeLessThan(exact);
+    expect(combined).toBeLessThan(triangle);
+    expect(combined).toBeLessThan(msa);
+    // L384 combined resident peaks measured for exact / triangle-f16 /
+    // MSA-f16 / both. Every admission estimate must remain above its physical
+    // GPUBuffer peak, including the pool floor shared by both packed options.
+    for (const [label, estimate, resident] of [
+      ["exact", exact, 351], ["triangle f16", triangle, 331],
+      ["MSA f16", msa, 307], ["combined f16", combined, 307],
+    ] as const) {
+      expect(estimate, label).toBeGreaterThan(resident);
+      expect(estimate / resident, label).toBeLessThan(1.35);
+    }
   });
 });
