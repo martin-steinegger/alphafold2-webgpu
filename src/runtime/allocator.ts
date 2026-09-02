@@ -33,6 +33,48 @@ export const POOL_IDLE_GENERATIONS = 4;
  */
 export const POOL_GRANULARITY_BYTES = 1024 ** 2;
 
+/**
+ * Resident GPU memory accounting shared by every allocator on a device, so one
+ * budget covers the trunk, the template module, the structure module and the
+ * confidence heads together. On unified-memory machines an allocation that the
+ * driver accepts can still push the system into paging; refusing it here turns
+ * a frozen machine into an error naming the tensor.
+ */
+interface DeviceMemoryTally { resident: number; budget: number; }
+const deviceTallies = new WeakMap<GPUDevice, DeviceMemoryTally>();
+function deviceTally(device: GPUDevice): DeviceMemoryTally {
+  let tally = deviceTallies.get(device);
+  if (tally === undefined) { tally = { resident: 0, budget: Number.POSITIVE_INFINITY }; deviceTallies.set(device, tally); }
+  return tally;
+}
+
+/** Cap the resident GPU bytes every allocator on `device` may hold together; `undefined` removes the cap. */
+export function setGpuMemoryBudget(device: GPUDevice, bytes: number | undefined): void {
+  if (bytes !== undefined && (!Number.isSafeInteger(bytes) || bytes <= 0)) {
+    throw new RangeError("GPU memory budget must be a positive safe integer");
+  }
+  deviceTally(device).budget = bytes ?? Number.POSITIVE_INFINITY;
+}
+
+/** Resident GPU bytes currently held by all allocators on `device`. */
+export function gpuMemoryResident(device: GPUDevice): number { return deviceTally(device).resident; }
+
+export class GpuMemoryBudgetError extends Error {
+  readonly label: string;
+  readonly requestedBytes: number;
+  readonly residentBytes: number;
+  readonly budgetBytes: number;
+  constructor(label: string, requestedBytes: number, residentBytes: number, budgetBytes: number) {
+    const mib = (value: number): string => (value / 1024 ** 2).toFixed(0);
+    super(`GPU memory budget exceeded: allocating ${mib(requestedBytes)} MiB for ${label} would bring resident `
+      + `GPU memory to ${mib(residentBytes + requestedBytes)} MiB, over the ${mib(budgetBytes)} MiB budget. `
+      + "Reduce the MSA rows, the sequence length, or the number of chains.");
+    this.name = "GpuMemoryBudgetError";
+    this.label = label; this.requestedBytes = requestedBytes;
+    this.residentBytes = residentBytes; this.budgetBytes = budgetBytes;
+  }
+}
+
 interface PooledGpuBuffer {
   readonly buffer: GPUBuffer;
   /** Physical size of the reusable GPUBuffer. */
@@ -145,7 +187,12 @@ export class GpuBufferAllocator {
     const allocationByteLength = pooledEntry?.byteLength ?? physicalBytes;
     const allocationUsage = pooledEntry?.usage ?? usage;
     if (buffer === undefined) {
+      const tally = deviceTally(this.device);
+      if (tally.resident + physicalBytes > tally.budget) {
+        throw new GpuMemoryBudgetError(label, physicalBytes, tally.resident, tally.budget);
+      }
       buffer = this.device.createBuffer({ label, size: physicalBytes, usage });
+      tally.resident += physicalBytes;
       this.#residentBytes += physicalBytes;
       this.#peakResidentBytes = Math.max(this.#peakResidentBytes, this.#residentBytes);
       this.#bufferCount += 1;
@@ -190,6 +237,7 @@ export class GpuBufferAllocator {
       this.#pooledBytes += allocationByteLength;
     } else {
       buffer.destroy();
+      deviceTally(this.device).resident -= allocationByteLength;
       this.#residentBytes -= allocationByteLength;
     }
   }
@@ -234,6 +282,7 @@ export class GpuBufferAllocator {
     pooled.splice(index, 1);
     if (pooled.length === 0) this.#pool.delete(entry.key);
     entry.buffer.destroy();
+    deviceTally(this.device).resident -= entry.byteLength;
     this.#residentBytes -= entry.byteLength;
     this.#pooledBytes -= entry.byteLength;
   }
@@ -241,6 +290,7 @@ export class GpuBufferAllocator {
   destroyPooled(): void {
     for (const entry of this.#pooledLru) {
       entry.buffer.destroy();
+      deviceTally(this.device).resident -= entry.byteLength;
       this.#residentBytes -= entry.byteLength;
       this.#pooledBytes -= entry.byteLength;
     }

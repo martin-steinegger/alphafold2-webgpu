@@ -124,6 +124,19 @@ describe("requestAlphaFoldDevice", () => {
 });
 
 describe("estimateMonomerMemory", () => {
+  it("charges Multimer-v3 for its template rows and template module", () => {
+    const monomer = estimateMonomerMemory(590, 508, 2048, "full");
+    const multimer = estimateMonomerMemory(590, 508, 2048, "full", { multimer: true, templateRows: 4 });
+    expect(multimer.estimatedPeakBytes).toBeGreaterThan(monomer.estimatedPeakBytes);
+    // The template module holds several pair-sized tensors beside the pair and
+    // the extra alignment, so at this size it sets the peak: about three pair
+    // representations (170 MiB each at 590 residues) above the trunk terms.
+    const pair = 590 * 590 * 128 * 4;
+    expect(multimer.estimatedPeakBytes - monomer.estimatedPeakBytes).toBeGreaterThan(pair);
+    // A ten-copy 59-mer at the page's multimer defaults is over a gigabyte live.
+    expect(multimer.estimatedPeakBytes).toBeGreaterThan(1000 * 1024 ** 2);
+  });
+
   // Combined resident peaks measured on GB10. The estimate gates whether a
   // browser prediction is allowed to start, so it must cover physical pooled
   // GPUBuffer residency rather than only the allocator's logically live bytes.

@@ -234,6 +234,32 @@ at 1000 residues that one f32 tensor is about 488 MiB, above the 128 MiB
 storage-binding limit reported by current Apple Chrome. On that adapter L512
 is the contiguous-pair ceiling. L1000 needs a separate pair-sharding design.
 
+## 6. Multimer on a notebook
+
+A ten-copy 59-mer (`PIAQ…ELASK` entered as ten chains separated by colons) at
+the page's multimer defaults froze a notebook in Chrome and errored in
+Firefox. Two things changed for it: the page's Apple budget is now 35% of the
+memory the browser reports (2.8 GiB at the 8 GB Chromium cap) and applies to a
+multimer-aware estimate, and every GPU allocation is checked against that
+budget so an overrun fails with a `GpuMemoryBudgetError` message naming the
+tensor instead of paging the machine. The multimer path also embeds the
+clustered MSA only after the extra stack now, like the monomer.
+
+Run the same ten-copy input again in Chrome. Expected: either the gate refuses
+it before the device is created with a row suggestion, or the prediction runs
+and the run log shows an allocator peak below the budget. Report which, the
+budget line from the run log, and the machine's memory. The multimer reference
+tests (`AFWEBGPU_MULTIMER_F32_MANIFEST` and `AFWEBGPU_MULTIMER_COMPRESSED_MANIFEST`
+pointing at your multimer model manifests) must also pass:
+
+```bash
+AFWEBGPU_GPU_TESTS=1 AFWEBGPU_MULTIMER_F32_MANIFEST=<path> AFWEBGPU_MULTIMER_COMPRESSED_MANIFEST=<path> \
+  npx vitest run test/multimer-model-official.gpu.test.ts
+```
+
+They could not run on the Linux machine, which has no multimer weights, so the
+deferred MSA embedding for multimer is verified only by review until they do.
+
 ## What to report
 
 1. The three JSON lines from step 3 and whether live/resident matched exactly.

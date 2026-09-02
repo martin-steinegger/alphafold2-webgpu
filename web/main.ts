@@ -19,6 +19,7 @@ import type { TensorDownloadProgress } from "../src/reference/http-tensor-store.
 import {
   planMonomerDevice, requestAlphaFoldDevice, suggestMonomerRows, type AlphaFoldDeviceRequirements,
 } from "../src/runtime/device.js";
+import { setGpuMemoryBudget } from "../src/runtime/allocator.js";
 import { confidenceJson, predictionToPdb, safeJobName } from "./prediction-results.js";
 import { drawMsaCoverage } from "./msa-plot.js";
 import {
@@ -92,10 +93,14 @@ function unifiedMemoryBudget(appleUnifiedMemory: boolean): number | undefined {
   if (!appleUnifiedMemory) return undefined;
   const deviceMemory = (navigator as Navigator & { readonly deviceMemory?: number }).deviceMemory;
   if (deviceMemory === undefined || !Number.isFinite(deviceMemory) || deviceMemory <= 0) return undefined;
-  // Apple GPUs share system RAM. navigator.deviceMemory is privacy-rounded and
-  // capped in Chromium. The estimator covers measured allocator residency;
-  // reserve another 30% here for Chrome, Dawn/Metal and the rest of the page.
-  return Math.floor(deviceMemory * 1024 ** 3 * 0.70);
+  // Apple GPUs share system RAM, and Metal accepts allocations well past the
+  // point where macOS starts paging, which freezes the machine rather than
+  // failing the prediction. navigator.deviceMemory is privacy-rounded and capped
+  // at 8 GB in Chromium, so this cannot see a larger machine; a third of what
+  // it reports leaves room for Chrome, Dawn/Metal, the page and the rest of the
+  // system. The same figure caps the allocator, so an underestimate becomes an
+  // error rather than a freeze.
+  return Math.floor(deviceMemory * 1024 ** 3 * 0.35);
 }
 
 async function loadModelWeights(manifestValue: string) {
@@ -484,16 +489,22 @@ async function runPrediction(): Promise<void> {
     const requestedMaxExtra = element<HTMLInputElement>("max-extra").valueAsNumber;
     const clusteredRows = Math.min(requestedMaxMsa, input.depth);
     const extraRows = Math.max(1, Math.min(requestedMaxExtra, Math.max(0, input.depth - clusteredRows)));
-    const packedMonomerStorage = !input.multimer
-      && element<HTMLSelectElement>("monomer-storage").value === "f16";
-    const memoryOptions = packedMonomerStorage
-      ? { triangleWholeStorage: "f16" as const, msaStorage: "f16" as const } : {};
+    const packedStorage = element<HTMLSelectElement>("monomer-storage").value === "f16";
+    // Multimer merges template rows into the MSA with buffer copies, so only
+    // the triangle projection can be packed there.
+    const memoryOptions = {
+      ...(packedStorage ? { triangleWholeStorage: "f16" as const } : {}),
+      ...(packedStorage && !input.multimer ? { msaStorage: "f16" as const } : {}),
+      ...(input.multimer ? { multimer: true, templateRows: multimerTemplate?.templateRows ?? 4 } : {}),
+    };
     const memoryBudget = unifiedMemoryBudget(appleUnifiedMemory);
     const devicePlan = planMonomerDevice(
       adapter, input.sequence.length, clusteredRows, extraRows, memoryBudget, compactMemoryPolicy, memoryOptions,
     );
-    log(packedMonomerStorage
-      ? "Monomer activation storage: packed f16 (approximate, reduced memory)."
+    log(packedStorage
+      ? `Activation storage: packed f16 ${input.multimer
+        ? "for the triangle projection (approximate; Multimer keeps f32 MSA activations)"
+        : "for the MSA activations and the triangle projection (approximate, reduced memory)"}.`
       : `Activation storage: exact f32${input.multimer ? " (Multimer-v3)" : ""}.`);
     log(`Estimated peak GPU allocations: ${formatMib(devicePlan.memory.estimatedPeakBytes)} `
       + `(${formatMib(devicePlan.memory.persistentBytes)} persistent, `
@@ -515,6 +526,8 @@ async function runPrediction(): Promise<void> {
     }
     const deviceResult = await predictionDevice(adapter, devicePlan.requirements);
     const device = deviceResult.device;
+    // An allocation past the budget fails with a message instead of paging the machine.
+    setGpuMemoryBudget(device, memoryBudget);
     stage("device", "done", `${adapterName}${deviceResult.cached ? " · cached device" : ""}`);
     log(`GPU: ${adapterName}${deviceResult.cached ? " (reusing device and pipelines)" : ""}`);
     log(`WebGPU limits: invocations=${device.limits.maxComputeInvocationsPerWorkgroup} `
@@ -620,7 +633,7 @@ function updateInputMode(): void {
     : multimer ? "Run Multimer-v3"
     : remote ? "Generate MSA & predict" : "Run prediction";
   element<HTMLInputElement>("max-msa").disabled = multimer && inputMode.value === "single";
-  element<HTMLSelectElement>("monomer-storage").disabled = multimer;
+  element<HTMLSelectElement>("monomer-storage").disabled = false;
   const maxExtra = element<HTMLInputElement>("max-extra");
   maxExtra.disabled = multimer && inputMode.value === "single";
   maxExtra.max = multimer ? "2048" : "1024";

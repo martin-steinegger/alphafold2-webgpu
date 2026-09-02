@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { GpuBufferAllocator } from "../src/runtime/allocator.js";
+import { GpuBufferAllocator, GpuMemoryBudgetError, gpuMemoryResident, setGpuMemoryBudget } from "../src/runtime/allocator.js";
 
 describe("GPU buffer pooling", () => {
   it("defers bounded eviction until a safe submitted boundary", () => {
@@ -100,6 +100,28 @@ describe("GPU buffer pooling", () => {
       .toBe(buffers[2]);
     expect(buffers.length).toBe(3);
     allocator.destroyPooled();
+  });
+
+  it("refuses an allocation that would take the device over its budget", () => {
+    const buffers: { destroy: ReturnType<typeof vi.fn> }[] = [];
+    const device = { createBuffer: vi.fn(() => {
+      const buffer = { destroy: vi.fn() }; buffers.push(buffer); return buffer;
+    }) } as unknown as GPUDevice;
+    setGpuMemoryBudget(device, 64);
+    // Two allocators on one device share the budget, as the trunk and the
+    // structure module do.
+    const first = new GpuBufferAllocator(device, true);
+    const second = new GpuBufferAllocator(device, false);
+    const held = first.allocate("trunk", 40, 1);
+    expect(gpuMemoryResident(device)).toBe(40);
+    expect(() => second.allocate("structure", 32, 1)).toThrow(GpuMemoryBudgetError);
+    expect(buffers.length).toBe(1);
+    second.allocate("structure", 24, 1).release();
+    expect(gpuMemoryResident(device)).toBe(40);
+    held.release();
+    first.destroyPooled();
+    expect(gpuMemoryResident(device)).toBe(0);
+    setGpuMemoryBudget(device, undefined);
   });
 
   it("never reuses an allocation whose usage flags differ", () => {

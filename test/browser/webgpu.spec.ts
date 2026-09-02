@@ -25,7 +25,8 @@ test("auto-detects monomers and multimers and switches to custom A3M", async ({ 
   await expect(page.locator("#recycles")).toHaveValue("20");
   await expect(page.locator("#max-msa")).toBeEnabled();
   await expect(page.locator("#max-extra")).toHaveValue("2048");
-  await expect(page.locator("#monomer-storage")).toBeDisabled();
+  // Multimer can pack the triangle projection, so the control stays available.
+  await expect(page.locator("#monomer-storage")).toBeEnabled();
   await page.locator("#input-mode").selectOption("single");
   await expect(page.locator("#predict-label")).toHaveText("Run Multimer-v3");
   await expect(page.locator("#max-msa")).toBeDisabled();

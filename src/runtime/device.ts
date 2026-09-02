@@ -61,6 +61,12 @@ export interface MonomerMemoryOptions {
   readonly triangleWholeStorage?: TriangleWholeStorage;
   /** Storage of the MSA activations; `f16` halves them. */
   readonly msaStorage?: ActivationStorage;
+  /**
+   * Multimer-v3: the main-stack MSA carries `templateRows` extra rows, and the
+   * template module runs every recycle over the pair with its own scratch.
+   */
+  readonly multimer?: boolean;
+  readonly templateRows?: number;
 }
 
 export function estimateMonomerMemory(
@@ -78,7 +84,8 @@ export function estimateMonomerMemory(
   const bytes = Float32Array.BYTES_PER_ELEMENT;
   const pair = checkedBytes("pair representation", length, length, 128, bytes);
   const activationBytes = options.msaStorage === "f16" ? 2 : bytes;
-  const msa = checkedBytes("MSA representation", msaSequences, length, 256, activationBytes);
+  const templateRows = options.multimer === true ? (options.templateRows ?? 4) : 0;
+  const msa = checkedBytes("MSA representation", msaSequences + templateRows, length, 256, activationBytes);
   const extra = checkedBytes("extra-MSA representation", extraSequences, length, 64, activationBytes);
   const masks = checkedBytes("model masks", length, msaSequences + extraSequences + length, bytes);
   const positions = checkedBytes("atom positions", length, 37, 3, bytes);
@@ -95,6 +102,13 @@ export function estimateMonomerMemory(
   // The embedder writes the new pair over the recycled one and adds the
   // template update while the extra alignment and the MSA features are live.
   const embedderBytes = 2 * pair + extra + msaFeatures + masks + 2 * positions;
+  // Multimer's template module runs before the extra stack, while the pair and
+  // the extra alignment are live: it normalizes the pair whole, builds a
+  // 64-channel template pair, normalizes it and projects a pair-sized update,
+  // and its blocks keep one whole 64-channel projection plus blocks.
+  const templateBlock = triangleBlockRows(length, 64, 64) * length * 64 * bytes;
+  const templateModuleBytes = options.multimer === true
+    ? pair + extra + masks + 2 * positions + 3 * pair + 3 * templateBlock : 0;
 
   // Every operation bounds its own scratch against an explicit budget, so the
   // peak is the largest single operation's working set, not a sum over the
@@ -135,7 +149,9 @@ export function estimateMonomerMemory(
   // Readbacks, uniforms and allocation padding, none of which scale with the
   // shape, plus headroom for the operator this model does not enumerate.
   const scratchBytes = Math.ceil(operatorScratch * 1.15) + 16 * 1024 ** 2;
-  const livePeakBytes = Math.max(persistentBytes + scratchBytes, embedderBytes + 16 * 1024 ** 2);
+  const livePeakBytes = Math.max(
+    persistentBytes + scratchBytes, embedderBytes + 16 * 1024 ** 2, templateModuleBytes + 16 * 1024 ** 2,
+  );
   // The browser has to retain physical GPUBuffer objects, not only logically
   // live tensors. Whole-MiB allocation rounding and the reusable scratch pool
   // measured above the live model from 59 through 1000 residues. Packed

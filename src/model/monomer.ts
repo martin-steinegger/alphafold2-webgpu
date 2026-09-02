@@ -318,12 +318,10 @@ export class AlphaFoldMonomerGpu {
         if (templateUpdate !== undefined) await execution.addInPlace(
           embeddingEncoder, embedding.pairWithoutTemplates, templateUpdate, `monomer.template-residual-${recycle}`,
         );
-        // Multimer merges template rows into the clustered MSA before the extra
-        // stack, so it embeds the MSA now. The monomer defers it until the extra
-        // stack has finished: nothing there reads it, and keeping the largest
-        // tensor of the prediction out of that stack's peak lowers the high-water
-        // mark of the whole run.
-        const multimerMsa = this.multimer ? embedding.encodeMsa(embeddingEncoder) : undefined;
+        // The clustered MSA is embedded only after the extra stack, which never
+        // reads it, so the largest tensor of the prediction stays out of that
+        // stack's peak. Multimer's template rows, which are merged into it, are
+        // kept aside until then.
         await submit(embeddingEncoder, `embedding recycle ${recycle}`);
         // The new pair was written over `previousPair`, which therefore stays live.
         for (const temporary of embedding.temporaries) releaseTensor(temporary);
@@ -333,24 +331,22 @@ export class AlphaFoldMonomerGpu {
           for (const temporary of embedding.msaTemporaries) releaseTensor(temporary);
           releaseTensor(previousMsa);
         };
-        if (multimerMsa !== undefined) releaseMsaInputs();
 
         let mainMsaMask = msaMask;
         let mainSequences = features.msaSequences;
         let multimerMainMsa: GpuTensor | undefined;
         let multimerMainMsaMask: GpuTensor | undefined;
+        let templateRows: GpuTensor | undefined;
         let templateSubmissions = 0;
         if (this.multimer) {
+          // The template module's pair update is needed before the extra stack;
+          // its MSA rows are not, so only they are kept (a few rows) and the
+          // rest of the module's tensors retire at once.
           const multimerWeights = weights as MultimerCompatibleModelWeights;
           mainSequences += multimerWeights.multimerTemplate.templateRows;
-          multimerMainMsa = execution.allocate(`multimer.main-msa-${recycle}`,
-            mainSequences * length * 256,
+          templateRows = execution.allocate(`multimer.template-msa-rows-${recycle}`,
+            multimerWeights.multimerTemplate.templateRows * length * 256,
             GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST);
-          const combinedMask = new Float32Array(
-            features.msaMask.length + multimerWeights.multimerTemplate.templateRows * length,
-          );
-          combinedMask.set(features.msaMask);
-          multimerMainMsaMask = execution.upload(`multimer.main-msa-mask-${recycle}`, combinedMask);
           const templateCheckpoint = execution.checkpoint();
           const template = await new MultimerMockTemplateGpu(this.device).run(
             new Float32Array(0), new Float32Array(0), length, multimerWeights.multimerTemplate, execution,
@@ -363,14 +359,11 @@ export class AlphaFoldMonomerGpu {
           await execution.addInPlace(templateEncoder, embedding.pairWithoutTemplates, templatePair,
             `multimer.template-pair-residual-${recycle}`);
           execution.endComputePass(templateEncoder);
-          templateEncoder.copyBufferToBuffer(multimerMsa!.allocation.buffer, 0,
-            multimerMainMsa.allocation.buffer, 0, multimerMsa!.elements * 4);
           templateEncoder.copyBufferToBuffer(templateMsa.allocation.buffer, 0,
-            multimerMainMsa.allocation.buffer, multimerMsa!.elements * 4, templateMsa.elements * 4);
-          await submit(templateEncoder, `Multimer template merge recycle ${recycle}`);
+            templateRows.allocation.buffer, 0, templateMsa.elements * 4);
+          await submit(templateEncoder, `Multimer template pair update recycle ${recycle}`);
           templateSubmissions = template.submissions + 1;
           execution.releaseSince(templateCheckpoint);
-          mainMsaMask = multimerMainMsaMask;
         }
 
         const extraShape = {
@@ -418,17 +411,37 @@ export class AlphaFoldMonomerGpu {
         // beside the main stack's while the clustered MSA comes to life; the
         // main stack recreates the shapes it shares once.
         execution.allocator.destroyPooled();
-        let clusteredMsa = multimerMsa;
-        if (clusteredMsa === undefined) {
-          const msaEncoder = this.device.createCommandEncoder({ label: `monomer.msa-embedding-${recycle}` });
-          this.device.pushErrorScope("validation");
-          clusteredMsa = embedding.encodeMsa(msaEncoder);
-          await submit(msaEncoder, `MSA embedding recycle ${recycle}`);
-          releaseMsaInputs();
-        }
+        const msaEncoder = this.device.createCommandEncoder({ label: `monomer.msa-embedding-${recycle}` });
+        this.device.pushErrorScope("validation");
+        const clusteredMsa = embedding.encodeMsa(msaEncoder);
+        await submit(msaEncoder, `MSA embedding recycle ${recycle}`);
+        releaseMsaInputs();
         // The embedder's inputs retired just now and nothing in the trunk fits them.
         execution.allocator.destroyPooled();
-        const mainMsa = multimerMainMsa ?? clusteredMsa;
+        let mainMsa = clusteredMsa;
+        if (templateRows !== undefined) {
+          // Multimer's main-stack MSA is the clustered rows followed by the
+          // template rows kept from before the extra stack.
+          const multimerWeights = weights as MultimerCompatibleModelWeights;
+          multimerMainMsa = execution.allocate(`multimer.main-msa-${recycle}`,
+            mainSequences * length * 256,
+            GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST);
+          const combinedMask = new Float32Array(
+            features.msaMask.length + multimerWeights.multimerTemplate.templateRows * length,
+          );
+          combinedMask.set(features.msaMask);
+          multimerMainMsaMask = execution.upload(`multimer.main-msa-mask-${recycle}`, combinedMask);
+          const mergeEncoder = this.device.createCommandEncoder({ label: `multimer.msa-merge-${recycle}` });
+          this.device.pushErrorScope("validation");
+          mergeEncoder.copyBufferToBuffer(clusteredMsa.allocation.buffer, 0,
+            multimerMainMsa.allocation.buffer, 0, clusteredMsa.elements * 4);
+          mergeEncoder.copyBufferToBuffer(templateRows.allocation.buffer, 0,
+            multimerMainMsa.allocation.buffer, clusteredMsa.elements * 4, templateRows.elements * 4);
+          await submit(mergeEncoder, `Multimer MSA merge recycle ${recycle}`);
+          releaseTensor(clusteredMsa); releaseTensor(templateRows);
+          mainMsaMask = multimerMainMsaMask;
+          mainMsa = multimerMainMsa;
+        }
 
         const mainDescriptor = {
           msa: new Float32Array(0), pair: new Float32Array(0), msaMask: new Float32Array(0),

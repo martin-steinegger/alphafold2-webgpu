@@ -1,4 +1,5 @@
 export { TriangleMultiplicationIncomingGpu, TriangleMultiplicationOutgoingGpu } from "./triangle/webgpu.js";
+export { GpuMemoryBudgetError, gpuMemoryResident, setGpuMemoryBudget } from "./runtime/allocator.js";
 export { TransitionGpu } from "./evoformer/transition.js";
 export type { TransitionInput, TransitionResult, TransitionWeights } from "./evoformer/transition.js";
 export { OuterProductMeanGpu } from "./evoformer/outer-product-mean.js";
