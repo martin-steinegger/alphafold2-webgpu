@@ -108,6 +108,15 @@ try {
         + `  ${share.label}`);
     }
   }
+  const structureShares = prediction.memory.structurePeakComposition ?? [];
+  if (structureShares.length > 0) {
+    console.error(`\nLive at the structure module's peak `
+      + `(${(prediction.memory.structureCorePeakResidentBytes / 1024 ** 2).toFixed(0)} MiB resident):`);
+    for (const share of structureShares.slice(0, 10)) {
+      console.error(`  ${(share.bytes / 1024 ** 2).toFixed(1).padStart(8)} MiB  x${String(share.count).padStart(3)}`
+        + `  ${share.label}`);
+    }
+  }
   if (tally.size > 0) {
     const total = [...tally.values()].reduce((sum, entry) => sum + entry.bytes, 0);
     console.error(`\nGPU buffers created (total ${(total / 1024 ** 2).toFixed(0)} MiB):`);

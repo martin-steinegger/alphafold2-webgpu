@@ -1,6 +1,8 @@
+import { type ActivationStorage, storageWords } from "../runtime/storage.js";
 import { ATTENTION_NORMALIZE_SHADER, createAttentionNormParameters } from "../evoformer/attention.js";
 import {
-  createTransitionShaders, TRANSITION_TILE_COLUMNS, TRANSITION_TILE_ROWS, type TransitionInput,
+  createLinearShader, createTransitionShaders, TRANSITION_TILE_COLUMNS, TRANSITION_TILE_ROWS,
+  type TransitionInput,
 } from "../evoformer/transition.js";
 import {
   GpuBufferAllocator, type AllocatedGpuBuffer, type AllocationSnapshot,
@@ -48,6 +50,8 @@ export interface ReducedConfidenceResult extends ConfidenceSummaryResult {
 
 export interface ReducedConfidenceOptions {
   readonly pairBuffer?: GPUBuffer;
+  /** Storage of that buffer; `f16` means packed half-precision words. */
+  readonly pairStorage?: ActivationStorage;
   /** Test/diagnostic override; production uses the fixed bounded target. */
   readonly maxPaeLogitsBytes?: number;
 }
@@ -373,7 +377,7 @@ export class ConfidenceHeadsGpu {
     pairBuffer?: GPUBuffer,
   ): Promise<ConfidenceResult> {
     return this.#run(structureRepresentation, pairRepresentation, length, lddtWeights, paeWeights,
-      breaks, pairBuffer, undefined) as Promise<ConfidenceResult>;
+      breaks, pairBuffer, undefined, "f32") as Promise<ConfidenceResult>;
   }
 
   /**
@@ -390,7 +394,8 @@ export class ConfidenceHeadsGpu {
     options: ReducedConfidenceOptions = {},
   ): Promise<ReducedConfidenceResult> {
     return this.#run(structureRepresentation, pairRepresentation, length, lddtWeights, paeWeights,
-      breaks, options.pairBuffer, options.maxPaeLogitsBytes ?? PAE_LOGITS_WINDOW_BYTES
+      breaks, options.pairBuffer, options.maxPaeLogitsBytes ?? PAE_LOGITS_WINDOW_BYTES,
+      options.pairStorage ?? "f32",
     ) as Promise<ReducedConfidenceResult>;
   }
 
@@ -403,6 +408,7 @@ export class ConfidenceHeadsGpu {
     breaks: Float32Array,
     pairBuffer: GPUBuffer | undefined,
     maxPaeLogitsBytes: number | undefined,
+    pairStorage: ActivationStorage,
   ): Promise<ConfidenceResult | ReducedConfidenceResult> {
     const reduced = maxPaeLogitsBytes !== undefined;
     const { structureChannels, pairChannels, hiddenChannels, lddtBins, paeBins }
@@ -431,8 +437,11 @@ export class ConfidenceHeadsGpu {
     const allocate = (label: string, elements: number, usage = GPUBufferUsage.STORAGE): AllocatedGpuBuffer =>
       keep(this.allocator.allocate(label, elements * 4, usage));
     try {
-      const [linear, normalize, relu, expectation] = await Promise.all([
+      const [linear, pairLinear, normalize, relu, expectation] = await Promise.all([
         this.pipelines.get("confidence:linear", LINEAR_SHADER),
+        // The alignment-error head projects the pair, which the trunk may hold packed.
+        this.pipelines.get(`confidence:pair-linear:${pairStorage}`,
+          createLinearShader(false, "f32", pairStorage)),
         this.pipelines.get("confidence:normalize", ATTENTION_NORMALIZE_SHADER),
         this.pipelines.get("confidence:relu", RELU_SHADER),
         reduced
@@ -479,8 +488,8 @@ export class ConfidenceHeadsGpu {
         pass.dispatchWorkgroups(x, y); pass.end();
       };
       const linearDispatch = (source: Binding, parameter: AllocatedGpuBuffer,
-        output: AllocatedGpuBuffer, rows: number, columns: number) =>
-        dispatch(linear, [source, weights, parameter, output],
+        output: AllocatedGpuBuffer, rows: number, columns: number, pipeline = linear) =>
+        dispatch(pipeline, [source, weights, parameter, output],
           Math.ceil(columns / TRANSITION_TILE_COLUMNS), Math.ceil(rows / TRANSITION_TILE_ROWS));
       dispatch(normalize, [structure, weights, normParams, normalized], length);
       linearDispatch(normalized, params[0]!, act0Raw, length, hiddenChannels);
@@ -498,7 +507,7 @@ export class ConfidenceHeadsGpu {
         const paeParams = linearParams(
           "confidence.pae-params", length * length, pairChannels, paeBins, offsets[8]!, offsets[9]!,
         );
-        linearDispatch(pair, paeParams, paeLogits, length * length, paeBins);
+        linearDispatch(pair, paeParams, paeLogits, length * length, paeBins, pairLinear);
       } else {
         const totalRows = length * length;
         const windowRows = paeWindowRows(
@@ -522,9 +531,9 @@ export class ConfidenceHeadsGpu {
           );
           linearDispatch({
             buffer: pair.buffer,
-            offset: rowOffset * pairChannels * Float32Array.BYTES_PER_ELEMENT,
-            size: rows * pairChannels * Float32Array.BYTES_PER_ELEMENT,
-          }, paeParams, paeLogitsWindow, rows, paeBins);
+            offset: storageWords(rowOffset * pairChannels, pairStorage) * Float32Array.BYTES_PER_ELEMENT,
+            size: storageWords(rows * pairChannels, pairStorage) * Float32Array.BYTES_PER_ELEMENT,
+          }, paeParams, paeLogitsWindow, rows, paeBins, pairLinear);
           const expectationParams = upload(
             `confidence.pae-expectation-params-${window}`,
             new Uint32Array([rows, paeBins, rowOffset, offsets[10]!, offsets[11]!, 0, 0, 0]),

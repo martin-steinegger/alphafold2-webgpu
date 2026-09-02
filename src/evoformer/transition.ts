@@ -85,7 +85,9 @@ export function transitionChunkRows(
  * The Evoformer/IPA/head projection: A x W + bias, optional ReLU, optionally
  * accumulated into an existing output tensor.
  */
-export function createLinearShader(residual: boolean, storage: ActivationStorage = "f32"): string {
+export function createLinearShader(
+  residual: boolean, storage: ActivationStorage = "f32", sourceStorage: ActivationStorage = "f32",
+): string {
   return createTiledGemmShader({
     preamble: `
 struct MatmulParameters {
@@ -97,14 +99,14 @@ struct MatmulParameters {
   activation: u32,
   padding: vec2<u32>,
 };
-@group(0) @binding(0) var<storage, read> source: array<f32>;
+@group(0) @binding(0) var<storage, read> source: array<${storageArray(sourceStorage)}>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> parameters: MatmulParameters;
 @group(0) @binding(3) var<storage, read_write> output: array<${storageArray(storage)}>;`,
     rows: "parameters.rows",
     inner: "parameters.inner",
     columns: "parameters.columns",
-    sourceElement: "source[row * parameters.inner + k]",
+    sourceElement: storedElement(sourceStorage, "source", "row * parameters.inner + k"),
     weightElement: "weights[parameters.weight_offset + k * parameters.columns + column]",
     store: `var stored = element + weights[parameters.bias_offset + column];
           if (parameters.activation == 1u) { stored = max(stored, 0.0); }

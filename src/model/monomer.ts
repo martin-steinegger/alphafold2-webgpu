@@ -24,7 +24,7 @@ import {
 } from "../input/a3m-features.js";
 import type { QueryOnlyFeatureTables } from "../input/query-only-features.js";
 import { TRANSITION_CHUNK_TARGET_BYTES } from "../evoformer/transition.js";
-import { COMPACT_GPU_POOL_BYTES, type AllocationSnapshot } from "../runtime/allocator.js";
+import { COMPACT_GPU_POOL_BYTES, type AllocationShare, type AllocationSnapshot } from "../runtime/allocator.js";
 import { multimerRecycleDistanceRms } from "./multimer-recycling.js";
 
 export interface MonomerRecycleFeatures {
@@ -107,6 +107,8 @@ export interface MonomerMemorySnapshot extends AllocationSnapshot {
   readonly mainPeakResidentBytes: number;
   /** Largest structure-core allocator peak across recycles. */
   readonly structureCorePeakResidentBytes: number;
+  /** What was live when the structure module reached its own peak. */
+  readonly structurePeakComposition?: readonly AllocationShare[];
   /** Largest confidence-head allocator peak across recycles. */
   readonly confidencePeakResidentBytes: number;
   /** Conservative simultaneous peak: live trunk residency plus the active auxiliary stage. */
@@ -334,6 +336,7 @@ export class AlphaFoldMonomerGpu {
     const results: MonomerRecycleSummary[] = [];
     let finalDetails: MonomerFinalDetails | undefined;
     let structureCorePeakResidentBytes = 0;
+    let structurePeakComposition: readonly AllocationShare[] | undefined;
     let confidencePeakResidentBytes = 0;
     let combinedPeakResidentBytes = 0;
     const start = performance.now();
@@ -645,36 +648,31 @@ export class AlphaFoldMonomerGpu {
         // recycle recreates its handful of large buffers once.
         execution.allocator.destroyPooled();
 
-        // The structure module and the confidence heads read an f32 pair, and
-        // their phases peak well below the trunk, so a packed pair is expanded
-        // once here instead of every head kernel learning to unpack.
-        let headsPair = embedding.pairWithoutTemplates;
-        if (this.pairStorage === "f16") {
-          const unpackEncoder = this.device.createCommandEncoder({ label: `monomer.pair-unpack-${recycle}` });
-          headsPair = execution.allocate(`monomer.pair-unpacked-${recycle}`, length * length * 128);
-          this.device.pushErrorScope("validation");
-          await execution.unpackHalves(unpackEncoder, embedding.pairWithoutTemplates, headsPair,
-            length * length * 128, `monomer.pair-unpack-${recycle}`);
-          await submit(unpackEncoder, `pair unpack recycle ${recycle}`);
-        }
+        // The structure module and the confidence heads read the trunk's pair
+        // where it lies, packed or not, so no expanded copy is ever made.
+        const headsPair = embedding.pairWithoutTemplates;
         const structure = await new StructureModuleGpu(this.device).run({
           msaFirstRow, pair: new Float32Array(0), mask: features.seqMask, aatype: features.aatype,
           pairBuffer: headsPair.allocation.buffer,
+          ...(this.pairStorage === "f32" ? {} : { pairStorage: this.pairStorage }),
           atom37ToAtom14: features.atom37ToAtom14, atom37Mask: features.atom37Mask,
           length, weights: weights.structure, geometry: weights.geometry,
           ...(this.multimer ? { multimer: true } : {}),
         });
         const trunkResidentBytes = execution.snapshot().residentBytes;
         const structurePeak = structure.memory?.peakResidentBytes ?? 0;
+        if (structurePeak > structureCorePeakResidentBytes) {
+          structurePeakComposition = structure.memory?.peakComposition;
+        }
         structureCorePeakResidentBytes = Math.max(structureCorePeakResidentBytes, structurePeak);
         combinedPeakResidentBytes = Math.max(
           combinedPeakResidentBytes, trunkResidentBytes + structurePeak,
         );
         const confidence = await new ConfidenceHeadsGpu(this.device).runReduced(
           structure.finalRepresentation, new Float32Array(0), length, weights.lddt, weights.pae, paeBreaks,
-          { pairBuffer: headsPair.allocation.buffer },
+          { pairBuffer: headsPair.allocation.buffer,
+            ...(this.pairStorage === "f32" ? {} : { pairStorage: this.pairStorage }) },
         );
-        if (headsPair !== embedding.pairWithoutTemplates) releaseTensor(headsPair);
         const confidencePeak = confidence.memory?.peakResidentBytes ?? 0;
         confidencePeakResidentBytes = Math.max(confidencePeakResidentBytes, confidencePeak);
         combinedPeakResidentBytes = Math.max(
@@ -748,6 +746,7 @@ export class AlphaFoldMonomerGpu {
           ...mainMemory,
           mainPeakResidentBytes: mainMemory.peakResidentBytes,
           structureCorePeakResidentBytes,
+          ...(structurePeakComposition === undefined ? {} : { structurePeakComposition }),
           confidencePeakResidentBytes,
           combinedPeakResidentBytes: Math.max(combinedPeakResidentBytes, mainMemory.peakResidentBytes),
         },

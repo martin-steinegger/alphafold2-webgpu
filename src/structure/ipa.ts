@@ -1,4 +1,4 @@
-import { ATTENTION_NORMALIZE_SHADER, createAttentionNormParameters } from "../evoformer/attention.js";
+import { type ActivationStorage, storageArray, storedElement } from "../runtime/storage.js";
 import {
   createTransitionShaders, TRANSITION_TILE_COLUMNS, TRANSITION_TILE_ROWS, type TransitionInput,
 } from "../evoformer/transition.js";
@@ -170,6 +170,8 @@ export interface InvariantPointAttentionInput {
   readonly pair: Float32Array;
   /** Optional device-resident pair tensor, avoiding a second pair-sized upload. */
   readonly pairBuffer?: GPUBuffer;
+  /** Storage of that tensor; `f16` means packed half-precision words. */
+  readonly pairStorage?: ActivationStorage;
   readonly mask: Float32Array;
   readonly affine: Float32Array;
   readonly length: number;
@@ -229,6 +231,9 @@ function validateInput(input: InvariantPointAttentionInput): void {
     }
   }
   if (input.pairBuffer === undefined) {
+    if (input.pairStorage === "f16") {
+      throw new RangeError("a packed pair must be passed as a device-resident buffer");
+    }
     checkedLength("pair", input.pair, input.length * input.length * input.pairChannels);
   } else if (input.pair.length !== 0
     && input.pair.length !== input.length * input.length * input.pairChannels) {
@@ -323,13 +328,100 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   output[output_base + 2u] = global.z;
 }`;
 
+/**
+ * Mean and inverse standard deviation of every pair row.
+ *
+ * The IPA's two pair consumers used to read a normalized copy of the pair,
+ * which is another pair-sized tensor and at 512 residues the whole structure
+ * phase's peak. From these statistics both can normalize while loading, the
+ * way the triangle multiplication does, for two floats a row instead of 128.
+ * The reduction is the one the LayerNorm kernel ran, so the values it feeds
+ * consumers are the ones they read before.
+ */
+function createPairStatisticsShader(storage: ActivationStorage): string {
+  return `${COMMON}
+const GRID_WIDTH: u32 = 32768u;
+@group(0) @binding(0) var<storage, read> pair: array<${storageArray(storage)}>;
+@group(0) @binding(1) var<uniform> p: Parameters;
+@group(0) @binding(2) var<storage, read_write> statistics: array<f32>;
+var<workgroup> partial: array<f32, 64>;
+var<workgroup> row_mean: array<f32, 1>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) group: vec3<u32>) {
+  let row = group.x + group.y * GRID_WIDTH;
+  if (row >= p.length * p.length) { return; }
+  let base = row * p.pair_channels;
+  var sum = 0.0;
+  for (var c = local.x; c < p.pair_channels; c += 64u) { sum += ${storedElement(storage, "pair", "base + c")}; }
+  partial[local.x] = sum;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride /= 2u) {
+    if (local.x < stride) { partial[local.x] += partial[local.x + stride]; }
+    workgroupBarrier();
+  }
+  if (local.x == 0u) { row_mean[0] = partial[0] / f32(p.pair_channels); }
+  workgroupBarrier();
+  var squared = 0.0;
+  for (var c = local.x; c < p.pair_channels; c += 64u) {
+    let centered = ${storedElement(storage, "pair", "base + c")} - row_mean[0];
+    squared += centered * centered;
+  }
+  partial[local.x] = squared;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride /= 2u) {
+    if (local.x < stride) { partial[local.x] += partial[local.x + stride]; }
+    workgroupBarrier();
+  }
+  if (local.x == 0u) {
+    statistics[2u * row] = row_mean[0];
+    statistics[2u * row + 1u] = inverseSqrt(partial[0] / f32(p.pair_channels) + 1e-5);
+  }
+}`;
+}
+
+/**
+ * The attention bias each head takes from the pair, projected once.
+ *
+ * It depends only on the pair, so the eight structure iterations share it, and
+ * the logits kernel reads one number per residue pair instead of walking 128
+ * pair channels every iteration.
+ */
+function createPairBiasShader(storage: ActivationStorage): string {
+  return `${COMMON}
+const GRID_WIDTH: u32 = 32768u;
+@group(0) @binding(0) var<storage, read> pair: array<${storageArray(storage)}>;
+@group(0) @binding(1) var<storage, read> statistics: array<f32>;
+@group(0) @binding(2) var<storage, read> weights: array<f32>;
+@group(0) @binding(3) var<uniform> p: Parameters;
+@group(0) @binding(4) var<storage, read_write> bias: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x + id.y * GRID_WIDTH * 64u;
+  if (index >= p.heads * p.length * p.length) { return; }
+  let row = index % (p.length * p.length);
+  let head = index / (p.length * p.length);
+  let mean = statistics[2u * row];
+  let inverse_std = statistics[2u * row + 1u];
+  let base = row * p.pair_channels;
+  var result = weights[p.attention_2d_bias + head];
+  for (var c = 0u; c < p.pair_channels; c += 1u) {
+    let normalized = (${storedElement(storage, "pair", "base + c")} - mean) * inverse_std
+      * weights[p.pair_norm_scale + c] + weights[p.pair_norm_offset + c];
+    result += normalized * weights[p.attention_2d_weight + c * p.heads + head];
+  }
+  bias[index] = result;
+}`;
+}
+
 const LOGITS_SHADER = `${COMMON}
 const GRID_WIDTH: u32 = 32768u;
 @group(0) @binding(0) var<storage, read> query_scalar: array<f32>;
 @group(0) @binding(1) var<storage, read> kv_scalar: array<f32>;
 @group(0) @binding(2) var<storage, read> query_point: array<f32>;
 @group(0) @binding(3) var<storage, read> kv_point: array<f32>;
-@group(0) @binding(4) var<storage, read> pair: array<f32>;
+@group(0) @binding(4) var<storage, read> pair_bias: array<f32>;
 @group(0) @binding(5) var<storage, read> mask: array<f32>;
 @group(0) @binding(6) var<storage, read> weights: array<f32>;
 @group(0) @binding(7) var<uniform> p: Parameters;
@@ -362,12 +454,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   }
   let point_weight = p.point_factor * log(1.0 + exp(weights[p.trainable_point_weights + head]));
   result -= 0.5 * point_weight * distance;
-  var pair_bias = weights[p.attention_2d_bias + head];
-  let pair_base = (query * p.length + key_index) * p.pair_channels;
-  for (var c = 0u; c < p.pair_channels; c += 1u) {
-    pair_bias += pair[pair_base + c] * weights[p.attention_2d_weight + c * p.heads + head];
-  }
-  result += p.attention_2d_factor * pair_bias;
+  result += p.attention_2d_factor * pair_bias[index];
   result -= p.mask_factor * 1e5 * (1.0 - mask[query] * mask[key_index]);
   output[index] = result;
 }`;
@@ -447,11 +534,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   features[base + scalar_size + 3u * point_size + point_index] = sqrt(1e-8 + dot(local, local));
 }`;
 
-const PAIR_FEATURE_SHADER = `${COMMON}
+function createPairFeatureShader(storage: ActivationStorage): string {
+  return `${COMMON}
 @group(0) @binding(0) var<storage, read> attention: array<f32>;
-@group(0) @binding(1) var<storage, read> pair: array<f32>;
+@group(0) @binding(1) var<storage, read> pair: array<${storageArray(storage)}>;
 @group(0) @binding(2) var<uniform> p: Parameters;
 @group(0) @binding(3) var<storage, read_write> features: array<f32>;
+@group(0) @binding(4) var<storage, read> statistics: array<f32>;
+@group(0) @binding(5) var<storage, read> weights: array<f32>;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let index = id.x;
@@ -460,13 +550,18 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let head = (index / p.pair_channels) % p.heads;
   let query = index / (p.pair_channels * p.heads);
   var result = 0.0;
+  let norm_scale = weights[p.pair_norm_scale + channel];
+  let norm_offset = weights[p.pair_norm_offset + channel];
   for (var key_index = 0u; key_index < p.length; key_index += 1u) {
-    result += attention[(head * p.length + query) * p.length + key_index]
-      * pair[(query * p.length + key_index) * p.pair_channels + channel];
+    let row = query * p.length + key_index;
+    let normalized = (${storedElement(storage, "pair", "row * p.pair_channels + channel")} - statistics[2u * row])
+      * statistics[2u * row + 1u] * norm_scale + norm_offset;
+    result += attention[(head * p.length + query) * p.length + key_index] * normalized;
   }
   let offset = p.heads * p.scalar_v + 4u * p.heads * p.point_v;
   features[query * p.feature_channels + offset + head * p.pair_channels + channel] = result;
 }`;
+}
 
 const GRID_WIDTH = 32_768;
 
@@ -475,7 +570,12 @@ interface PreparedFields {
   readonly weights: AllocatedGpuBuffer;
   readonly params: AllocatedGpuBuffer;
   readonly mask: AllocatedGpuBuffer;
-  readonly pair: AllocatedGpuBuffer;
+  /** Mean and inverse standard deviation of each pair row. */
+  readonly statistics: AllocatedGpuBuffer;
+  /** The pair's contribution to the attention logits, one value a head and pair. */
+  readonly pairBias: AllocatedGpuBuffer;
+  /** The raw pair every iteration normalizes while loading. */
+  readonly pair: GPUBuffer;
   readonly queryScalarColumns: number;
   readonly kvScalarColumns: number;
   readonly queryPointColumns: number;
@@ -496,7 +596,9 @@ export class PreparedInvariantPointAttention implements PreparedFields {
   readonly weights!: AllocatedGpuBuffer;
   readonly params!: AllocatedGpuBuffer;
   readonly mask!: AllocatedGpuBuffer;
-  readonly pair!: AllocatedGpuBuffer;
+  readonly statistics!: AllocatedGpuBuffer;
+  readonly pairBias!: AllocatedGpuBuffer;
+  readonly pair!: GPUBuffer;
   readonly queryScalarColumns!: number;
   readonly kvScalarColumns!: number;
   readonly queryPointColumns!: number;
@@ -564,15 +666,17 @@ export class InvariantPointAttentionGpu {
 
   async prepare(input: InvariantPointAttentionInput): Promise<PreparedInvariantPointAttention> {
     validateInput(input);
+    const pairStorage = input.pairStorage ?? "f32";
     const pipelines = await Promise.all([
-      this.pipelines.get("ipa:normalize", ATTENTION_NORMALIZE_SHADER),
+      this.pipelines.get(`ipa:pair-statistics:${pairStorage}`, createPairStatisticsShader(pairStorage)),
       this.pipelines.get("ipa:linear", LINEAR_SHADER),
       this.pipelines.get("ipa:point", POINT_SHADER),
       this.pipelines.get("ipa:logits", LOGITS_SHADER),
       this.pipelines.get("ipa:softmax", SOFTMAX_SHADER),
       this.pipelines.get("ipa:scalar-feature", SCALAR_FEATURE_SHADER),
       this.pipelines.get("ipa:point-feature", POINT_FEATURE_SHADER),
-      this.pipelines.get("ipa:pair-feature", PAIR_FEATURE_SHADER),
+      this.pipelines.get(`ipa:pair-feature:${pairStorage}`, createPairFeatureShader(pairStorage)),
+      this.pipelines.get(`ipa:pair-bias:${pairStorage}`, createPairBiasShader(pairStorage)),
     ]);
     const packed = packWeights(input);
     const allocations: AllocatedGpuBuffer[] = [];
@@ -591,12 +695,18 @@ export class InvariantPointAttentionGpu {
       const weights = upload("ipa.weights", packed.data);
       const params = upload("ipa.parameters", parameters(input, packed.offsets), GPUBufferUsage.UNIFORM);
       const mask = upload("ipa.mask", input.mask);
-      const pair = allocate("ipa.pair-normalized", input.length * input.length * input.pairChannels);
+      // Two floats a pair row, and one bias a head and residue pair, in place
+      // of a whole normalized pair.
+      const statistics = allocate("ipa.pair-statistics", input.length * input.length * 2);
+      const pairBias = allocate("ipa.pair-bias", input.heads * input.length * input.length);
       const linearParams = (label: string, columns: number, weight: number, bias: number): AllocatedGpuBuffer =>
         upload(label, new Uint32Array([input.length, input.channels, columns, weight, bias, 0, 0, 0]),
           GPUBufferUsage.UNIFORM);
+      const uploadedPair = input.pairBuffer === undefined
+        ? keep(this.allocator.upload("ipa.pair", input.pair, GPUBufferUsage.STORAGE)) : undefined;
       prepared = new PreparedInvariantPointAttention(this.device, input, {
-        pipelines, weights, params, mask, pair,
+        pipelines, weights, params, mask, statistics, pairBias,
+        pair: input.pairBuffer ?? uploadedPair!.buffer,
         queryScalarColumns, kvScalarColumns, queryPointColumns, kvPointColumns, featureChannels,
         qScalarParams: linearParams("ipa.q-scalar-params", queryScalarColumns, packed.offsets[2]!, packed.offsets[3]!),
         kvScalarParams: linearParams("ipa.kv-scalar-params", kvScalarColumns, packed.offsets[4]!, packed.offsets[5]!),
@@ -612,38 +722,35 @@ export class InvariantPointAttentionGpu {
           input.length, featureChannels, input.channels, packed.offsets[13]!, packed.offsets[14]!, 0, 0, 0,
         ]), GPUBufferUsage.UNIFORM),
       }, allocations);
-      let pairSource: AllocatedGpuBuffer | undefined;
-      let pairNormParams: AllocatedGpuBuffer | undefined;
-      try {
-        if (input.pairBuffer === undefined) {
-          pairSource = this.allocator.upload("ipa.pair", input.pair, GPUBufferUsage.STORAGE);
-        }
-        pairNormParams = this.allocator.upload("ipa.pair-norm-parameters", createAttentionNormParameters(
-          input.length * input.length, input.pairChannels, packed.offsets[0]!, packed.offsets[1]!,
-          false, 1, input.length * input.length, 1e-5,
-        ), GPUBufferUsage.UNIFORM);
+      {
+        const pairBuffer = prepared.pair;
         const encoder = this.device.createCommandEncoder({ label: "ipa.prepare" });
         const compute = encoder.beginComputePass();
-        compute.setPipeline(pipelines[0]!);
-        compute.setBindGroup(0, this.device.createBindGroup({
-          layout: pipelines[0]!.getBindGroupLayout(0),
-          entries: [input.pairBuffer ?? pairSource!.buffer, weights.buffer, pairNormParams.buffer, pair.buffer]
-            .map((buffer, binding) => ({ binding, resource: { buffer } })),
-        }));
         const rows = input.length * input.length;
-        compute.dispatchWorkgroups(Math.min(rows, GRID_WIDTH), Math.ceil(rows / GRID_WIDTH));
+        const bind = (pipeline: GPUComputePipeline, buffers: readonly GPUBuffer[],
+          x: number, y = 1): void => {
+          compute.setPipeline(pipeline);
+          compute.setBindGroup(0, this.device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer } })),
+          }));
+          compute.dispatchWorkgroups(x, y);
+        };
+        bind(pipelines[0]!, [pairBuffer, params.buffer, statistics.buffer],
+          Math.min(rows, GRID_WIDTH), Math.ceil(rows / GRID_WIDTH));
+        // The bias holds for every structure iteration, so it is projected once.
+        const biasGroups = Math.ceil(input.heads * rows / 64);
+        bind(pipelines[8]!, [pairBuffer, statistics.buffer, weights.buffer, params.buffer, pairBias.buffer],
+          Math.min(biasGroups, GRID_WIDTH), Math.ceil(biasGroups / GRID_WIDTH));
         compute.end();
         this.device.pushErrorScope("validation");
         this.device.queue.submit([encoder.finish()]);
-        // Deliberately not waiting for completion. The normalized pair is only
-        // read by dispatches submitted after this one, which the queue orders
-        // behind it, and WebGPU keeps a destroyed buffer's memory alive until
-        // the work already submitted against it has finished.
+        // Deliberately not waiting for completion. The statistics and the
+        // bias are only read by dispatches submitted after this one, which the
+        // queue orders behind it, and WebGPU keeps a destroyed buffer's memory
+        // alive until the work already submitted against it has finished.
         const error = await this.device.popErrorScope();
         if (error !== null) throw new Error(`WebGPU IPA preparation failed: ${error.message}`);
-      } finally {
-        pairNormParams?.release();
-        pairSource?.release();
       }
       return prepared;
     } catch (error) {
@@ -696,11 +803,14 @@ export class InvariantPointAttentionGpu {
       GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
     // One pass for the whole structure loop: a pass boundary per dispatch cost
     // more than the dispatches themselves at short chain lengths.
-    const dispatch = (pipeline: GPUComputePipeline, buffers: readonly AllocatedGpuBuffer[], x: number, y = 1): void => {
+    const dispatch = (pipeline: GPUComputePipeline,
+      buffers: readonly (AllocatedGpuBuffer | GPUBuffer)[], x: number, y = 1): void => {
       pass.setPipeline(pipeline);
       pass.setBindGroup(0, this.device.createBindGroup({
         layout: pipeline.getBindGroupLayout(0),
-        entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer: buffer.buffer } })),
+        entries: buffers.map((value, binding) => ({
+          binding, resource: { buffer: value instanceof GPUBuffer ? value : value.buffer },
+        })),
       }));
       pass.dispatchWorkgroups(x, y);
     };
@@ -720,14 +830,15 @@ export class InvariantPointAttentionGpu {
     dispatch(pipelines[2]!, [kvPointLocal, affine, shared.kvPointTransformParams, kvPoint],
       Math.ceil(kvPoint.byteLength / 4 / 3 / 64));
     const attentionGrid = gridFor(attentionElements);
-    dispatch(pipelines[3]!, [queryScalar, kvScalar, queryPoint, kvPoint, pair, mask, weights, params, logits],
+    dispatch(pipelines[3]!,
+      [queryScalar, kvScalar, queryPoint, kvPoint, shared.pairBias, mask, weights, params, logits],
       attentionGrid[0], attentionGrid[1]);
     dispatch(pipelines[4]!, [logits, params], input.heads * input.length);
     dispatch(pipelines[5]!, [logits, kvScalar, params, features],
       Math.ceil(input.length * input.heads * input.scalarV / 64));
     dispatch(pipelines[6]!, [logits, kvPoint, affine, params, features],
       Math.ceil(input.length * input.heads * input.pointV / 64));
-    dispatch(pipelines[7]!, [logits, pair, params, features],
+    dispatch(pipelines[7]!, [logits, pair, params, features, shared.statistics, weights],
       Math.ceil(input.length * input.heads * input.pairChannels / 64));
     dispatch(pipelines[1]!, [features, weights, shared.outputParams, output],
       Math.ceil(input.channels / TRANSITION_TILE_COLUMNS), Math.ceil(input.length / TRANSITION_TILE_ROWS));

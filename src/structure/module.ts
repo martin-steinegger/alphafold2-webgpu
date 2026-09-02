@@ -1,3 +1,4 @@
+import type { ActivationStorage } from "../runtime/storage.js";
 import { AtomGeometryGpu, type ResidueGeometryTables } from "./geometry.js";
 import { StructureCoreGpu } from "./core.js";
 import { StructureInitializeGpu, type StructureInitializeWeights } from "./initialize.js";
@@ -18,6 +19,8 @@ export interface StructureModuleInput {
   readonly pair: Float32Array;
   /** Pair activation already resident on this device. */
   readonly pairBuffer?: GPUBuffer;
+  /** Storage of that activation; `f16` means packed half-precision words. */
+  readonly pairStorage?: ActivationStorage;
   readonly mask: Float32Array;
   readonly aatype: Float32Array;
   readonly atom37ToAtom14: Float32Array;
@@ -61,6 +64,7 @@ export class StructureModuleGpu {
       activations: initialized.activations,
       pair: input.pair,
       ...(input.pairBuffer === undefined ? {} : { pairBuffer: input.pairBuffer }),
+      ...(input.pairStorage === undefined ? {} : { pairStorage: input.pairStorage }),
       mask: input.mask,
       affine: initialized.affine,
       length: input.length,

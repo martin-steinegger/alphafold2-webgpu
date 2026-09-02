@@ -12,18 +12,6 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   base[index] += update[index];
 }`;
 
-const UNPACK_HALVES_SHADER = `
-const GRID_WIDTH: u32 = 32768u;
-@group(0) @binding(0) var<storage, read> source: array<u32>;
-@group(0) @binding(1) var<storage, read_write> expanded: array<f32>;
-@group(0) @binding(2) var<uniform> count: vec4<u32>;
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x + id.y * GRID_WIDTH * 64u;
-  if (index >= count.x) { return; }
-  expanded[index] = unpack2x16float(source[index >> 1u])[index & 1u];
-}`;
-
 export interface GpuTensor {
   readonly allocation: AllocatedGpuBuffer;
   readonly elements: number;
@@ -167,27 +155,6 @@ export class WebGpuExecution {
     this.#activePass?.end();
     this.#activePass = undefined;
     this.#activeEncoder = undefined;
-  }
-
-  /**
-   * Expands packed half-precision words into f32 elements.
-   *
-   * A tensor kept packed through the trunk still has to reach consumers that
-   * read f32, and unpacking once costs one pass where teaching every one of
-   * them about packed storage would cost a shader each.
-   */
-  async unpackHalves(encoder: GPUCommandEncoder, source: GpuTensor, target: GpuTensor,
-    elements: number, label: string): Promise<void> {
-    if (target.elements < elements || source.elements < Math.ceil(elements / 2)) {
-      throw new RangeError("unpacking needs a target of the element count and a source of its words");
-    }
-    const pipeline = await this.pipelines.get("runtime:unpack-halves", UNPACK_HALVES_SHADER);
-    // The uniform stays alive until the execution releases it: a buffer freed
-    // while its command encoder is still open can be handed to another
-    // allocation before the dispatch ever runs.
-    const count = this.upload(`${label}.count`, new Uint32Array([elements, 0, 0, 0]), GPUBufferUsage.UNIFORM);
-    const grid = this.linearGrid(elements);
-    this.dispatch(encoder, pipeline, [source, target, count], grid[0], grid[1], 1, label);
   }
 
   async addInPlace(encoder: GPUCommandEncoder, base: GpuTensor, update: GpuTensor, label: string): Promise<void> {

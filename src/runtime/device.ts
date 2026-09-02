@@ -87,9 +87,6 @@ export function estimateMonomerMemory(
   const bytes = Float32Array.BYTES_PER_ELEMENT;
   const pairBytes = options.pairStorage === "f16" ? 2 : bytes;
   const pair = checkedBytes("pair representation", length, length, 128, pairBytes);
-  // The structure module and the confidence heads read the pair as f32, so a
-  // packed run expands it once after the trunk.
-  const unpackedPair = checkedBytes("unpacked pair", length, length, 128, bytes);
   const activationBytes = options.msaStorage === "f16" ? 2 : bytes;
   const templateRows = options.multimer === true ? (options.templateRows ?? 4) : 0;
   const msa = checkedBytes("MSA representation", msaSequences + templateRows, length, 256, activationBytes);
@@ -156,12 +153,8 @@ export function estimateMonomerMemory(
   // Readbacks, uniforms and allocation padding, none of which scale with the
   // shape, plus headroom for the operator this model does not enumerate.
   const scratchBytes = Math.ceil(operatorScratch * 1.15) + 16 * 1024 ** 2;
-  // A packed run also holds the pair twice for one pass after the trunk, while
-  // it is expanded for the structure module and the confidence heads.
-  const headsBytes = options.pairStorage === "f16" ? pair + unpackedPair + 16 * 1024 ** 2 : 0;
   const livePeakBytes = Math.max(
     persistentBytes + scratchBytes, embedderBytes + 16 * 1024 ** 2, templateModuleBytes + 16 * 1024 ** 2,
-    headsBytes,
   );
   // The browser has to retain physical GPUBuffer objects, not only logically
   // live tensors. Whole-MiB allocation rounding and the reusable scratch pool
@@ -232,14 +225,20 @@ export function monomerDeviceRequirements(
   }
   const bytes = Float32Array.BYTES_PER_ELEMENT;
   const activationBytes = options.msaStorage === "f16" ? 2 : bytes;
+  const pairBytes = options.pairStorage === "f16" ? 2 : bytes;
   // The persistent activations, plus the largest scratch tensor, which every
   // operation now bounds against its own budget rather than letting it grow
   // with the shape: the outer-product contraction, the transition window and
-  // the attention window are all capped.
+  // the attention window are all capped. A packed tensor asks for half the
+  // binding, which is what lets a packed run reach lengths an adapter's
+  // binding limit would otherwise refuse: the structure module and the
+  // confidence heads read the pair where the trunk left it.
   const largestTensor = Math.max(
     msaSequences * length * 256 * activationBytes,
     extraSequences * length * 64 * activationBytes,
-    length * length * 128 * bytes,
+    length * length * 128 * pairBytes,
+    // The triangle multiplication's whole projection matches the pair in size.
+    length * length * 128 * (options.triangleWholeStorage === "f16" ? 2 : bytes),
     OUTER_PRODUCT_BLOCK_LIMIT_BYTES,
   );
   if (!Number.isSafeInteger(largestTensor)) throw new RangeError("monomer tensor size exceeds JavaScript precision");

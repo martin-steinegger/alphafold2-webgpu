@@ -1,3 +1,4 @@
+import type { ActivationStorage } from "../runtime/storage.js";
 import {
   GpuBufferAllocator, type AllocatedGpuBuffer, type AllocationSnapshot,
 } from "../runtime/allocator.js";
@@ -14,6 +15,8 @@ export interface StructureCoreInput {
   readonly activations: Float32Array;
   readonly pair: Float32Array;
   readonly pairBuffer?: GPUBuffer;
+  /** Storage of that buffer; `f16` means packed half-precision words. */
+  readonly pairStorage?: ActivationStorage;
   readonly mask: Float32Array;
   readonly affine: Float32Array;
   readonly length: number;
@@ -58,6 +61,7 @@ export class StructureCoreGpu {
       activations, affine,
       pair: input.pair,
       ...(input.pairBuffer === undefined ? {} : { pairBuffer: input.pairBuffer }),
+      ...(input.pairStorage === undefined ? {} : { pairStorage: input.pairStorage }),
       mask: input.mask,
       length: input.length,
       channels: input.channels,
