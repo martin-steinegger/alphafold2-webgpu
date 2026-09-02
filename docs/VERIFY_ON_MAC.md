@@ -275,7 +275,32 @@ recycle instead of being kept on the host (shorter chains keep the one-time
 computation, where the copy is small and the stack a sizeable share of a
 recycle).
 
-## 8. The result archive
+## 8. Reading a complex
+
+Predict a homodimer (paste the default 59-residue chain twice, separated by a
+colon). The complex views should all agree on the same two chains:
+
+- the structure opens coloured by chain, with a key under it giving each
+  chain's length and mean pLDDT, and the colour control switches to pLDDT or
+  rainbow without reloading the model;
+- the confidence, alignment-error and coverage plots carry a black rule at
+  each chain boundary and a coloured chain letter;
+- the "Chains" card lists per-chain pLDDT and the mean alignment error of
+  every chain pair, whose off-diagonal figure is the interface;
+- clicking an off-diagonal block of the alignment-error matrix fades every
+  other chain in the structure and says which pair is shown; clicking the same
+  block again brings the whole complex back.
+
+The browser specs for this are opt-in because they need a served model:
+
+```bash
+AFWEBGPU_QUALIFICATION_ASSET_ROOT=$HOME/models \
+AFWEBGPU_BROWSER_MULTIMER_MANIFEST=/qualification-assets/model-multimer/manifest.json \
+AFWEBGPU_BROWSER_MONOMER_MANIFEST=/qualification-assets/model-q8/manifest.json \
+  npx playwright test multimer-visualization
+```
+
+## 9. The result archive
 
 After any prediction finishes, the results heading carries a "Download results
 ZIP" button. It should produce `<job>.result.zip` within a second or two, and
@@ -299,5 +324,7 @@ that `unzip -t` reports no errors.
    a rerun cleared it.
 4. Browser: preflight text, the 59-residue pLDDT/pTM/time, the long-sequence
    allocator peak, and the Chrome GPU process peak from Activity Monitor.
-5. Whether the result archive unzipped cleanly in each browser you tried.
-6. The chip (M1/M2/M3/M4, Pro/Max) and its memory.
+5. Whether the complex views agreed on the chains, and whether clicking the
+   alignment-error matrix isolated the interface.
+6. Whether the result archive unzipped cleanly in each browser you tried.
+7. The chip (M1/M2/M3/M4, Pro/Max) and its memory.

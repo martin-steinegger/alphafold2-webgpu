@@ -88,6 +88,15 @@ input:disabled, select:disabled { color: #888; background: #eee; }
 .quiet.inverse { border-color: #ffffff66; color: #fff; background: transparent; }
 .quiet.inverse:hover { border-color: #fff; color: #fff; background: #ffffff1f; }
 .quiet.inverse:disabled { border-color: #ffffff40; color: #ffffff99; cursor: wait; }
+.card-actions { display: flex; align-items: center; gap: .4rem; }
+.viewer-color { display: flex; align-items: center; gap: .35rem; margin: 0; color: #777; text-transform: uppercase; font-size: .68rem; letter-spacing: .04em; }
+.viewer-color select { width: auto; margin: 0; padding: .35rem .4rem; font-size: .7rem; }
+.chain-legend { display: flex; flex-wrap: wrap; gap: .35rem .9rem; margin-top: .8rem; }
+.chain-swatch { display: flex; align-items: center; gap: .4rem; color: #555; font: .68rem "Roboto Mono", monospace; }
+.chain-swatch i, .chain-dot { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }
+.chain-dot { margin-right: .45rem; vertical-align: -1px; }
+.pae-hint { display: block; margin-top: .6rem; color: #777; font: .68rem "Roboto Mono", monospace; }
+.chain-card .card-title small { color: #777; font: .66rem "Roboto Mono", monospace; text-align: right; }
 #msa-plot, #plddt-plot, #pae-plot { display: block; width: 100%; height: auto; margin-top: 1rem; background: #fff; }
 #msa-plot-summary { color: #777; font: .68rem "Roboto Mono", monospace; text-align: right; }
 .table-wrap { overflow: auto; margin-top: 1rem; } table { width: 100%; border-collapse: collapse; font: .7rem "Roboto Mono", monospace; }

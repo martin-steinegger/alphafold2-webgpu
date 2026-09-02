@@ -17,13 +17,16 @@ import { confidenceJson, predictionToPdb, safeJobName } from "./prediction-resul
 import { packageResults } from "./result-package.js";
 import { drawMsaCoverage } from "./msa-plot.js";
 import {
+  CHAIN_LETTERS, chainBoundaries, chainColor, chainMeanPlddt, chainPairError, chainSpans,
+} from "./chains.js";
+import {
   browserPreflightEnvironment, preflightErrorMessage, runWebGpuPreflight, type PreflightStatus, type WebGpuPreflight,
 } from "./webgpu-preflight.js";
 
 interface Viewer3D {
   addModel(data: string, format: string): void;
   setStyle(selection: object, style: object): void;
-  zoomTo(): void;
+  zoomTo(selection?: object): void;
   render(): void;
   resize(): void;
 }
@@ -69,6 +72,16 @@ let generatedMsa: {
 let lastMsaStatus = "";
 let viewerLoader: Promise<ThreeDmolApi> | undefined;
 let viewerResizeObserver: ResizeObserver | undefined;
+let currentViewer: Viewer3D | undefined;
+let currentChainCount = 1;
+/** The chain pair the alignment-error matrix was last clicked on, if any. */
+let currentInterface: readonly [number, number] | undefined;
+/** Where the last alignment-error matrix was drawn, so a click maps back to residues. */
+let paeGeometry: { left: number; top: number; size: number; length: number; chainLengths: readonly number[] } | undefined;
+/** The matrix itself, so the plot can be redrawn when a block is chosen. */
+let currentPae: {
+  values: Float32Array; length: number; maximum: number; chainLengths: readonly number[];
+} | undefined;
 
 function stage(stageName: Stage, state: StageState, detail: string): void {
   const item = document.querySelector<HTMLElement>(`[data-stage="${stageName}"]`);
@@ -173,26 +186,47 @@ function plddtColor(value: number): string {
   return "#ef6a62";
 }
 
-function drawPlddt(values: Float32Array): void {
+function drawPlddt(values: Float32Array, chainLengths: readonly number[]): void {
   const canvas = element<HTMLCanvasElement>("plddt-plot");
   const context = canvas.getContext("2d");
   if (context === null) return;
-  const { width, height } = canvas; const left = 46; const bottom = 30; const top = 18; const right = 12;
+  const complex = chainLengths.length > 1;
+  const { width, height } = canvas; const left = 46; const bottom = 30; const right = 12;
+  // A complex reserves a strip above the bars for its chain letters.
+  const top = complex ? 30 : 18;
+  const plotWidth = width - left - right; const plotHeight = height - top - bottom;
   context.clearRect(0, 0, width, height); context.fillStyle = "#ffffff"; context.fillRect(0, 0, width, height);
   context.strokeStyle = "#dddddd"; context.fillStyle = "#777777"; context.font = "12px Roboto Mono";
   for (const tick of [0, 50, 70, 90, 100]) {
-    const y = top + (100 - tick) / 100 * (height - top - bottom);
+    const y = top + (100 - tick) / 100 * plotHeight;
     context.beginPath(); context.moveTo(left, y); context.lineTo(width - right, y); context.stroke();
     context.fillText(String(tick), 8, y + 4);
   }
-  const barWidth = (width - left - right) / values.length;
+  const barWidth = plotWidth / values.length;
   for (let index = 0; index < values.length; index += 1) {
     const value = Math.max(0, Math.min(100, values[index]!));
-    const barHeight = value / 100 * (height - top - bottom);
+    const barHeight = value / 100 * plotHeight;
     context.fillStyle = plddtColor(value);
     context.fillRect(left + index * barWidth, height - bottom - barHeight, Math.max(1, barWidth), barHeight);
   }
-  context.fillStyle = "#777777"; context.fillText("Residue", width / 2 - 25, height - 7);
+  if (complex) {
+    // The bars keep the confidence palette, so the chains are told apart by a
+    // black rule at each boundary and a coloured letter over each stretch.
+    context.strokeStyle = "#111"; context.lineWidth = 1.5; context.beginPath();
+    for (const position of chainBoundaries(chainLengths)) {
+      const x = left + position * barWidth;
+      context.moveTo(x, top); context.lineTo(x, top + plotHeight);
+    }
+    context.stroke();
+    context.font = "600 12px Roboto Mono"; context.textAlign = "center";
+    for (const span of chainSpans(chainLengths)) {
+      context.fillStyle = span.color;
+      context.fillText(span.letter, left + (span.start + span.end) / 2 * barWidth, top - 10);
+    }
+    context.textAlign = "left";
+  }
+  context.fillStyle = "#777777"; context.font = "12px Roboto Mono";
+  context.fillText("Residue", width / 2 - 25, height - 7);
 }
 
 function paeColor(value: number, maximum: number): [number, number, number] {
@@ -203,9 +237,19 @@ function paeColor(value: number, maximum: number): [number, number, number] {
   const t = (fraction - .5) * 2; return [Math.round(134 + t * 105), Math.round(217 - t * 150), Math.round(206 - t * 122)];
 }
 
-function drawPae(values: Float32Array, length: number, maximum: number): void {
+function drawPae(values: Float32Array, length: number, maximum: number, chainLengths: readonly number[]): void {
   const canvas = element<HTMLCanvasElement>("pae-plot"); const context = canvas.getContext("2d");
   if (context === null) return;
+  const complex = chainLengths.length > 1;
+  const { width, height } = canvas;
+  // Margins hold the chain letters on both axes and the error scale on the right.
+  const left = complex ? 26 : 8; const top = complex ? 26 : 8; const right = 74; const bottom = 26;
+  const size = Math.min(width - left - right, height - top - bottom);
+  paeGeometry = { left, top, size, length, chainLengths };
+  currentPae = { values, length, maximum, chainLengths };
+  canvas.style.cursor = complex ? "pointer" : "default";
+  context.clearRect(0, 0, width, height); context.fillStyle = "#ffffff"; context.fillRect(0, 0, width, height);
+
   const image = context.createImageData(length, length);
   for (let index = 0; index < values.length; index += 1) {
     const [red, green, blue] = paeColor(values[index]!, maximum); const output = index * 4;
@@ -213,8 +257,43 @@ function drawPae(values: Float32Array, length: number, maximum: number): void {
   }
   const temporary = document.createElement("canvas"); temporary.width = length; temporary.height = length;
   temporary.getContext("2d")?.putImageData(image, 0, 0);
-  context.imageSmoothingEnabled = false; context.clearRect(0, 0, canvas.width, canvas.height);
-  context.drawImage(temporary, 0, 0, canvas.width, canvas.height);
+  context.imageSmoothingEnabled = false; context.drawImage(temporary, left, top, size, size);
+
+  if (complex) {
+    // Both axes are the same residue index, so one boundary rule per chain
+    // crosses the whole matrix and the off-diagonal blocks become the
+    // interfaces: the block for chains A and B is the pair's alignment error.
+    context.strokeStyle = "#111"; context.lineWidth = 1.5; context.beginPath();
+    for (const position of chainBoundaries(chainLengths)) {
+      const offset = position / length * size;
+      context.moveTo(left + offset, top); context.lineTo(left + offset, top + size);
+      context.moveTo(left, top + offset); context.lineTo(left + size, top + offset);
+    }
+    context.stroke();
+    context.font = "600 12px Roboto Mono";
+    for (const span of chainSpans(chainLengths)) {
+      const middle = (span.start + span.end) / 2 / length * size;
+      context.fillStyle = span.color;
+      context.textAlign = "center"; context.fillText(span.letter, left + middle, top - 9);
+      context.textAlign = "right"; context.fillText(span.letter, left - 8, top + middle + 4);
+    }
+  }
+  context.strokeStyle = "#777"; context.lineWidth = 1; context.strokeRect(left, top, size, size);
+
+  // The scale: without it the colours have no units, and the interface blocks
+  // of a complex are read against exactly these numbers.
+  const scaleX = left + size + 20; const scaleWidth = 13;
+  for (let pixel = 0; pixel < size; pixel += 1) {
+    const [red, green, blue] = paeColor(pixel / Math.max(1, size - 1) * maximum, maximum);
+    context.fillStyle = `rgb(${red},${green},${blue})`; context.fillRect(scaleX, top + pixel, scaleWidth, 1);
+  }
+  context.strokeRect(scaleX, top, scaleWidth, size);
+  context.fillStyle = "#666"; context.font = "11px Roboto Mono"; context.textAlign = "left";
+  context.fillText("0", scaleX + scaleWidth + 5, top + 9);
+  context.fillText(`${(maximum / 2).toFixed(0)} \u00c5`, scaleX + scaleWidth + 5, top + size / 2 + 4);
+  context.fillText(`${maximum.toFixed(0)} \u00c5`, scaleX + scaleWidth + 5, top + size - 2);
+  context.textAlign = "center";
+  context.fillText("Aligned residue", left + size / 2, height - 8);
 }
 
 function loadViewer(): Promise<ThreeDmolApi> {
@@ -229,22 +308,108 @@ function loadViewer(): Promise<ThreeDmolApi> {
   return viewerLoader;
 }
 
-async function showStructure(pdb: string): Promise<void> {
+/** Paints the viewer by confidence, by chain or along the sequence. */
+function applyViewerColoring(
+  viewer: Viewer3D, mode: string, chainCount: number, focus?: readonly number[],
+): void {
+  if (mode === "chain") {
+    // One call per chain: 3Dmol styles a selection at a time, and the colours
+    // are the ones the plots and the legend use for the same letters.
+    for (let index = 0; index < chainCount; index += 1) {
+      viewer.setStyle({ chain: CHAIN_LETTERS[index] }, { cartoon: { color: chainColor(index) } });
+    }
+  } else if (mode === "rainbow") {
+    viewer.setStyle({}, { cartoon: { color: "spectrum" } });
+  } else {
+    viewer.setStyle({}, { cartoon: { colorscheme: { prop: "b", gradient: "roygb", min: 50, max: 90 } } });
+  }
+  if (focus !== undefined) {
+    // Everything outside the chosen pair fades to a pale outline, so the
+    // interface the matrix pointed at is what the eye lands on.
+    const selection: string[] = [];
+    for (let index = 0; index < chainCount; index += 1) {
+      const letter = CHAIN_LETTERS[index]!;
+      if (focus.includes(index)) { selection.push(letter); continue; }
+      viewer.setStyle({ chain: letter }, { cartoon: { color: "#d8dee3", opacity: .35 } });
+    }
+    viewer.zoomTo({ chain: selection });
+  }
+  viewer.render();
+}
+
+async function showStructure(pdb: string, chainCount: number, mode: string): Promise<void> {
   const container = element<HTMLDivElement>("structure-viewer");
   viewerResizeObserver?.disconnect();
+  currentViewer = undefined;
   container.replaceChildren();
   try {
     const api = await loadViewer();
     const viewer = api.createViewer(container, { backgroundColor: "#ffffff" });
     viewer.addModel(pdb, "pdb");
-    viewer.setStyle({}, { cartoon: { colorscheme: { prop: "b", gradient: "roygb", min: 50, max: 90 } } });
+    applyViewerColoring(viewer, mode, chainCount);
     viewer.zoomTo(); viewer.render();
+    currentViewer = viewer;
     viewerResizeObserver = new ResizeObserver(() => { viewer.resize(); viewer.render(); });
     viewerResizeObserver.observe(container);
   } catch (error) {
     const message = document.createElement("p");
     message.textContent = `${error instanceof Error ? error.message : String(error)}. The PDB download is still available.`;
     container.append(message);
+  }
+}
+
+/** The colour key under the viewer, and for a complex what each chain scored. */
+function showChainLegend(chainLengths: readonly number[], plddt: Float32Array): void {
+  const legend = element<HTMLDivElement>("chain-legend");
+  legend.replaceChildren();
+  legend.hidden = chainLengths.length < 2;
+  if (chainLengths.length < 2) return;
+  const means = chainMeanPlddt(plddt, chainLengths);
+  for (const span of chainSpans(chainLengths)) {
+    const item = document.createElement("span");
+    item.className = "chain-swatch";
+    const dot = document.createElement("i"); dot.style.background = span.color;
+    const label = document.createElement("span");
+    label.textContent = `${span.letter} · ${span.length} aa · pLDDT ${means[span.index]!.toFixed(1)}`;
+    item.append(dot, label);
+    legend.append(item);
+  }
+}
+
+/**
+ * Per-chain confidence and the mean alignment error of every chain pair.
+ *
+ * The diagonal is how well a chain is folded on its own; an off-diagonal cell
+ * is how confidently the model placed that pair against each other, which is
+ * the figure to read before believing an interface.
+ */
+function showChainTable(
+  chainLengths: readonly number[], plddt: Float32Array, predictedAlignedError: Float32Array,
+): void {
+  const card = element<HTMLElement>("chain-card");
+  card.hidden = chainLengths.length < 2;
+  if (chainLengths.length < 2) return;
+  const spans = chainSpans(chainLengths);
+  const means = chainMeanPlddt(plddt, chainLengths);
+  const pairs = chainPairError(predictedAlignedError, chainLengths);
+  const head = element<HTMLTableRowElement>("chain-head");
+  head.replaceChildren();
+  for (const title of ["Chain", "Residues", "pLDDT", ...spans.map((span) => `PAE ${span.letter}`)]) {
+    const cell = document.createElement("th"); cell.textContent = title; head.append(cell);
+  }
+  const body = element<HTMLTableSectionElement>("chain-rows");
+  body.replaceChildren();
+  for (const span of spans) {
+    const row = document.createElement("tr");
+    const name = document.createElement("td");
+    const dot = document.createElement("i"); dot.className = "chain-dot"; dot.style.background = span.color;
+    name.append(dot, document.createTextNode(span.letter));
+    row.append(name);
+    for (const value of [String(span.length), means[span.index]!.toFixed(1),
+      ...pairs[span.index]!.map((error) => error.toFixed(1))]) {
+      const cell = document.createElement("td"); cell.textContent = value; row.append(cell);
+    }
+    body.append(row);
   }
 }
 
@@ -353,9 +518,16 @@ function showResults(prediction: MonomerPrediction | MultimerPrediction, context
   element<HTMLElement>("mean-plddt").textContent = confidence.meanPlddt.toFixed(1);
   element<HTMLElement>("plddt-label").textContent = confidenceLabel(confidence.meanPlddt);
   element<HTMLElement>("ptm").textContent = confidence.ptm.toFixed(3);
-  const multimerConfidence = confidence as typeof confidence & { readonly iptm?: number };
+  const multimerConfidence = confidence as typeof confidence
+    & { readonly iptm?: number; readonly rankingConfidence?: number };
   element<HTMLElement>("iptm-card").hidden = multimerConfidence.iptm === undefined;
   if (multimerConfidence.iptm !== undefined) element<HTMLElement>("iptm").textContent = multimerConfidence.iptm.toFixed(3);
+  // ColabFold ranks complexes by 0.8 ipTM + 0.2 pTM, so a complex shows the
+  // same figure people compare their ColabFold runs by.
+  const ranking = multimerConfidence.rankingConfidence
+    ?? (multimerConfidence.iptm === undefined ? undefined : .8 * multimerConfidence.iptm + .2 * confidence.ptm);
+  element<HTMLElement>("ranking-card").hidden = ranking === undefined;
+  if (ranking !== undefined) element<HTMLElement>("ranking").textContent = ranking.toFixed(3);
   element<HTMLElement>("result-length").textContent = String(sequence.length);
   element<HTMLElement>("msa-depth").textContent = String(depth);
   element<HTMLElement>("total-time").textContent = `WebGPU inference ${formatSeconds(prediction.elapsedMilliseconds)}`;
@@ -367,13 +539,24 @@ function showResults(prediction: MonomerPrediction | MultimerPrediction, context
     }
     rows.append(row);
   });
-  drawPlddt(confidence.plddt);
-  drawPae(confidence.predictedAlignedError, sequence.length, confidence.maxPredictedAlignedError);
-  const msa = drawMsaCoverage(element<HTMLCanvasElement>("msa-plot"), a3m);
+  const chains = chainLengths ?? [sequence.length];
+  currentChainCount = chains.length;
+  currentInterface = undefined;
+  drawPlddt(confidence.plddt, chains);
+  drawPae(confidence.predictedAlignedError, sequence.length, confidence.maxPredictedAlignedError, chains);
+  const msa = drawMsaCoverage(element<HTMLCanvasElement>("msa-plot"), a3m, chains);
   const meanCoverage = Array.from(msa.coverage).reduce((sum, value) => sum + value, 0) / msa.length;
   element<HTMLElement>("msa-plot-summary").textContent =
     `${msa.depth.toLocaleString()} sequences · mean ${meanCoverage.toFixed(0)} sequences/position`;
-  void showStructure(currentPdb);
+  element<HTMLElement>("pae-hint").hidden = chains.length < 2;
+  if (chains.length > 1) updateInterfaceSelection();
+  showChainLegend(chains, confidence.plddt);
+  showChainTable(chains, confidence.plddt, confidence.predictedAlignedError);
+  // A complex opens coloured by chain, which is what its viewer has to show
+  // first; a single chain opens by confidence, where pLDDT is the whole story.
+  const coloring = element<HTMLSelectElement>("viewer-color");
+  coloring.value = chains.length > 1 ? "chain" : "plddt";
+  void showStructure(currentPdb, chains.length, coloring.value);
   element<HTMLButtonElement>("download-pdb").onclick = () => download(`${jobName}_unrelaxed_model_1.pdb`, currentPdb, "chemical/x-pdb");
   element<HTMLButtonElement>("download-scores").onclick = () => download(`${jobName}_scores.json`, currentScores, "application/json");
   const packageButton = element<HTMLButtonElement>("download-results");
@@ -661,6 +844,73 @@ async function runPrediction(): Promise<void> {
     log(error instanceof Error ? error.stack ?? message : message);
   } finally { button.disabled = false; clearCacheButton.disabled = false; stopButton.hidden = true; }
 }
+element<HTMLSelectElement>("viewer-color").addEventListener("change", (event) => {
+  if (currentViewer !== undefined) {
+    applyViewerColoring(currentViewer, (event.currentTarget as HTMLSelectElement).value, currentChainCount,
+      currentInterface);
+  }
+});
+
+/**
+ * Clicking a block of the alignment-error matrix isolates that pair of chains
+ * in the structure: the off-diagonal blocks are the interfaces, so this turns
+ * the plot into the way to inspect one. Clicking the same block again, or
+ * anywhere off the matrix, brings the whole complex back.
+ */
+element<HTMLCanvasElement>("pae-plot").addEventListener("click", (event) => {
+  const canvas = element<HTMLCanvasElement>("pae-plot");
+  if (paeGeometry === undefined || paeGeometry.chainLengths.length < 2) return;
+  const bounds = canvas.getBoundingClientRect();
+  const scale = canvas.width / bounds.width;
+  const x = (event.clientX - bounds.left) * scale - paeGeometry.left;
+  const y = (event.clientY - bounds.top) * scale - paeGeometry.top;
+  const chainAt = (offset: number): number | undefined => {
+    if (offset < 0 || offset >= paeGeometry!.size) return undefined;
+    const residue = Math.floor(offset / paeGeometry!.size * paeGeometry!.length);
+    return chainSpans(paeGeometry!.chainLengths).find((span) => residue >= span.start && residue < span.end)?.index;
+  };
+  const row = chainAt(y); const column = chainAt(x);
+  const chosen = row === undefined || column === undefined ? undefined : [row, column] as const;
+  currentInterface = chosen !== undefined && currentInterface !== undefined
+    && currentInterface[0] === chosen[0] && currentInterface[1] === chosen[1] ? undefined : chosen;
+  updateInterfaceSelection();
+});
+
+/** Redraws the matrix highlight, the caption and the structure for the chosen pair. */
+function updateInterfaceSelection(): void {
+  const hint = element<HTMLElement>("pae-hint");
+  if (paeGeometry !== undefined && paeGeometry.chainLengths.length > 1) {
+    const spans = chainSpans(paeGeometry.chainLengths);
+    hint.textContent = currentInterface === undefined
+      ? "Click a block to isolate that pair of chains in the structure."
+      : currentInterface[0] === currentInterface[1]
+        ? `Chain ${spans[currentInterface[0]]!.letter} alone. Click the block again to show every chain.`
+        : `Chains ${spans[currentInterface[0]]!.letter} and ${spans[currentInterface[1]]!.letter}.`
+          + " Click the block again to show every chain.";
+    drawPaeHighlight();
+  }
+  if (currentViewer === undefined) return;
+  const mode = element<HTMLSelectElement>("viewer-color").value;
+  const focus = currentInterface === undefined ? undefined : [...new Set(currentInterface)];
+  applyViewerColoring(currentViewer, mode, currentChainCount, focus);
+  if (focus === undefined) currentViewer.zoomTo();
+}
+
+/** Outlines the chosen block on the matrix that is already drawn. */
+function drawPaeHighlight(): void {
+  if (paeGeometry === undefined) return;
+  const canvas = element<HTMLCanvasElement>("pae-plot"); const context = canvas.getContext("2d");
+  if (context === null || currentPae === undefined) return;
+  drawPae(currentPae.values, currentPae.length, currentPae.maximum, currentPae.chainLengths);
+  if (currentInterface === undefined) return;
+  const spans = chainSpans(paeGeometry.chainLengths);
+  const scale = paeGeometry.size / paeGeometry.length;
+  const row = spans[currentInterface[0]]!; const column = spans[currentInterface[1]]!;
+  context.strokeStyle = "#111"; context.lineWidth = 3;
+  context.strokeRect(paeGeometry.left + column.start * scale, paeGeometry.top + row.start * scale,
+    column.length * scale, row.length * scale);
+}
+
 element<HTMLButtonElement>("stop").addEventListener("click", () => {
   element<HTMLButtonElement>("stop").disabled = true;
   log("Stopping the prediction; the worker and its GPU device are discarded.");

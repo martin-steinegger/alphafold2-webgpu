@@ -1,15 +1,36 @@
 import { parseA3m } from "../src/input/a3m.js";
+import { chainBoundaries, chainSpans } from "./chains.js";
 
 export interface MsaCoverageData {
   readonly sequences: readonly string[];
   readonly identities: Float32Array;
+  /** Rows by ascending identity to the query. */
   readonly order: Uint32Array;
+  /** Rows in the order the plot draws them, top first. */
+  readonly rows: Uint32Array;
+  /**
+   * Indices into `rows` where a block of alignments covering a different set
+   * of chains begins. For a complex this separates the paired rows from each
+   * chain's own hits, which is the structure ColabFold's coverage plot shows.
+   */
+  readonly blockStarts: readonly number[];
   readonly coverage: Uint32Array;
   readonly depth: number;
   readonly length: number;
 }
 
-export function analyzeMsa(a3m: string): MsaCoverageData {
+/** Which chains a row has any residue in, as a bit set, and how many that is. */
+function chainCoverageKey(sequence: string, chainLengths: readonly number[]): { key: number; chains: number } {
+  let key = 0; let chains = 0;
+  chainSpans(chainLengths).forEach((span) => {
+    for (let position = span.start; position < span.end; position += 1) {
+      if (sequence[position] !== "-") { key |= 1 << span.index; chains += 1; return; }
+    }
+  });
+  return { key, chains };
+}
+
+export function analyzeMsa(a3m: string, chainLengths?: readonly number[]): MsaCoverageData {
   const alignment = parseA3m(a3m); const { sequences, depth, length } = alignment;
   const identities = new Float32Array(depth); const coverage = new Uint32Array(length);
   for (let row = 0; row < depth; row += 1) {
@@ -22,7 +43,32 @@ export function analyzeMsa(a3m: string): MsaCoverageData {
   }
   const sorted = Array.from({ length: depth }, (_, index) => index)
     .sort((left, right) => identities[left]! - identities[right]! || left - right);
-  return { sequences, identities, order: Uint32Array.from(sorted), coverage, depth, length };
+
+  // A complex draws its rows in blocks: first the rows that align to every
+  // chain, then the rows each chain matched on its own, each block sorted by
+  // identity. A monomer has one block, so this is just the sorted rows.
+  const chains = chainLengths !== undefined && chainLengths.length > 1 ? chainLengths : undefined;
+  const blocks = new Map<number, { readonly chains: number; readonly rows: number[] }>();
+  // Most similar first, and the query ahead of anything that ties with it.
+  const byIdentity = Array.from({ length: depth }, (_, index) => index)
+    .sort((left, right) => identities[right]! - identities[left]! || left - right);
+  for (const row of byIdentity) {
+    const { key, chains: covered } = chains === undefined ? { key: 0, chains: 1 } : chainCoverageKey(sequences[row]!, chains);
+    const block = blocks.get(key) ?? { chains: covered, rows: [] };
+    block.rows.push(row);
+    blocks.set(key, block);
+  }
+  const ordered = [...blocks.entries()].sort(([leftKey, left], [rightKey, right]) =>
+    right.chains - left.chains || leftKey - rightKey);
+  const rows: number[] = []; const blockStarts: number[] = [];
+  for (const [, block] of ordered) {
+    if (rows.length > 0) blockStarts.push(rows.length);
+    rows.push(...block.rows);
+  }
+  return {
+    sequences, identities, order: Uint32Array.from(sorted), rows: Uint32Array.from(rows), blockStarts,
+    coverage, depth, length,
+  };
 }
 
 function identityColor(value: number): readonly [number, number, number] {
@@ -37,10 +83,15 @@ function identityColor(value: number): readonly [number, number, number] {
   return [interpolate(0), interpolate(1), interpolate(2)];
 }
 
-export function drawMsaCoverage(canvas: HTMLCanvasElement, a3m: string): MsaCoverageData {
-  const data = analyzeMsa(a3m); const context = canvas.getContext("2d");
+export function drawMsaCoverage(
+  canvas: HTMLCanvasElement, a3m: string, chainLengths?: readonly number[],
+): MsaCoverageData {
+  const data = analyzeMsa(a3m, chainLengths); const context = canvas.getContext("2d");
   if (context === null) return data;
-  const { width, height } = canvas; const left = 56; const right = 82; const top = 18; const bottom = 38;
+  const boundaries = chainLengths === undefined || chainLengths.length < 2 ? [] : chainBoundaries(chainLengths);
+  const { width, height } = canvas; const left = 56; const right = 82; const bottom = 38;
+  // Complexes get a strip above the plot for the chain letters.
+  const top = boundaries.length === 0 ? 18 : 32;
   const plotWidth = width - left - right; const plotHeight = height - top - bottom;
   context.clearRect(0, 0, width, height); context.fillStyle = "#fff"; context.fillRect(0, 0, width, height);
 
@@ -48,9 +99,9 @@ export function drawMsaCoverage(canvas: HTMLCanvasElement, a3m: string): MsaCove
   const image = new ImageData(data.length, sampledRows);
   image.data.fill(255);
   for (let outputRow = 0; outputRow < sampledRows; outputRow += 1) {
-    const rank = sampledRows === 1 ? data.depth - 1
-      : Math.round((sampledRows - 1 - outputRow) / (sampledRows - 1) * (data.depth - 1));
-    const source = data.order[rank]!; const identity = data.identities[source]!; const color = identityColor(identity);
+    const rank = sampledRows === 1 ? 0
+      : Math.round(outputRow / (sampledRows - 1) * (data.depth - 1));
+    const source = data.rows[rank]!; const identity = data.identities[source]!; const color = identityColor(identity);
     for (let position = 0; position < data.length; position += 1) {
       if (data.sequences[source]![position] === "-") continue;
       const pixel = (outputRow * data.length + position) * 4;
@@ -67,7 +118,29 @@ export function drawMsaCoverage(canvas: HTMLCanvasElement, a3m: string): MsaCove
     const y = top + (1 - data.coverage[position]! / data.depth) * plotHeight;
     if (position === 0) context.moveTo(x, y); else context.lineTo(x, y);
   }
-  context.stroke(); context.strokeStyle = "#777"; context.lineWidth = 1; context.strokeRect(left, top, plotWidth, plotHeight);
+  context.stroke();
+
+  // Chain boundaries down the plot and block boundaries across it, both in
+  // black, the way ColabFold marks a complex's coverage.
+  if (boundaries.length > 0) {
+    context.strokeStyle = "#111"; context.lineWidth = 1.5; context.beginPath();
+    for (const position of boundaries) {
+      const x = left + position / data.length * plotWidth;
+      context.moveTo(x, top); context.lineTo(x, top + plotHeight);
+    }
+    for (const start of data.blockStarts) {
+      const y = top + start / data.depth * plotHeight;
+      context.moveTo(left, y); context.lineTo(left + plotWidth, y);
+    }
+    context.stroke();
+    context.font = "600 12px Roboto Mono"; context.textAlign = "center";
+    for (const span of chainSpans(chainLengths!)) {
+      context.fillStyle = span.color;
+      context.fillText(span.letter, left + (span.start + span.end) / 2 / data.length * plotWidth, top - 8);
+    }
+  }
+
+  context.strokeStyle = "#777"; context.lineWidth = 1; context.strokeRect(left, top, plotWidth, plotHeight);
   context.fillStyle = "#666"; context.font = "11px Roboto Mono"; context.textAlign = "center";
   context.fillText("Positions", left + plotWidth / 2, height - 8);
   context.save(); context.translate(13, top + plotHeight / 2); context.rotate(-Math.PI / 2);

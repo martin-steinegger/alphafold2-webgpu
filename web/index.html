@@ -114,20 +114,30 @@
           <article><span>Mean pLDDT</span><strong id="mean-plddt">—</strong><small id="plddt-label">Confidence</small></article>
           <article><span>pTM</span><strong id="ptm">—</strong><small>Predicted TM-score</small></article>
           <article id="iptm-card" hidden><span>ipTM</span><strong id="iptm">—</strong><small>Interface TM-score</small></article>
+          <article id="ranking-card" hidden><span>Ranking</span><strong id="ranking">—</strong><small>0.8 ipTM + 0.2 pTM</small></article>
           <article><span>Sequence</span><strong id="result-length">—</strong><small>Residues</small></article>
           <article><span>MSA depth</span><strong id="msa-depth">—</strong><small>Input rows</small></article>
         </div>
         <div class="result-grid">
           <article class="result-card structure-card">
-            <div class="card-title"><h3>3D structure</h3><div><button id="download-pdb" class="quiet" type="button">PDB</button><button id="download-scores" class="quiet" type="button">Scores JSON</button></div></div>
+            <div class="card-title"><h3>3D structure</h3><div class="card-actions"><label class="viewer-color">Colour<select id="viewer-color"><option value="plddt" selected>pLDDT</option><option value="chain">Chain</option><option value="rainbow">Rainbow</option></select></label><button id="download-pdb" class="quiet" type="button">PDB</button><button id="download-scores" class="quiet" type="button">Scores JSON</button></div></div>
             <div id="structure-viewer"><p>Structure viewer loads after prediction.</p></div>
+            <div id="chain-legend" class="chain-legend" hidden></div>
           </article>
           <article class="result-card plddt-card"><h3>Predicted lDDT</h3><canvas id="plddt-plot" width="720" height="300"></canvas></article>
           <article class="result-card msa-card">
             <div class="card-title"><h3>MSA sequence coverage</h3><small id="msa-plot-summary"></small></div>
             <canvas id="msa-plot" width="720" height="260" aria-label="MSA sequence coverage sorted by identity to the query"></canvas>
           </article>
-          <article class="result-card pae-card"><h3>Predicted aligned error</h3><canvas id="pae-plot" width="560" height="560"></canvas></article>
+          <article class="result-card pae-card">
+            <h3>Predicted aligned error</h3>
+            <canvas id="pae-plot" width="560" height="560" aria-label="Predicted aligned error between every pair of residues"></canvas>
+            <small id="pae-hint" class="pae-hint" hidden></small>
+          </article>
+          <article class="result-card chain-card" id="chain-card" hidden>
+            <div class="card-title"><h3>Chains</h3><small>Mean PAE between chains, in ångström</small></div>
+            <div class="table-wrap"><table><thead><tr id="chain-head"></tr></thead><tbody id="chain-rows"></tbody></table></div>
+          </article>
           <article class="result-card recycle-card"><h3>Recycle summary</h3><div class="table-wrap"><table><thead><tr><th>Pass</th><th>pLDDT</th><th>pTM</th><th>Time</th></tr></thead><tbody id="recycle-results"></tbody></table></div></article>
         </div>
       </section>
