@@ -108,6 +108,17 @@ There is no single portable limit. Available GPU memory, WebGPU buffer limits, M
 
 Weights are decoded once to float32 and every operation computes in float32. The activations the trunk carries between operations, the MSA, the pair, and the triangle multiplication's whole projection, are stored as half precision packed two to a 32-bit word, which needs no device feature. That is the only storage the model has: there is no exact mode to choose, and Multimer uses the same one. It halves the memory a prediction needs and, on real alignments of 164 to 396 residues, returned mean pLDDT and pTM identical to the float32 storage to two decimals; on a complex with a live ColabFold alignment, pLDDT 91.58 against 91.56 and ipTM 0.836 against 0.836. The float32 storage remains in the code as `EXACT_STORAGE` so the kernels can be compared against AlphaFold's own float32 tensors.
 
+### How long a sequence can it fold?
+
+The limits that decide this are how much a device may bind of one buffer at a
+time and how much memory the prediction needs. WebGPU gives a device 128 MiB
+bindings unless it asks for more, and at 1500 residues the pair is 549 MiB
+packed. Every kernel that reads a tensor by row binds only the rows it touches,
+and the ones that read across a whole tensor bind it as several windows at once
+and read through a generated accessor, so the binding limit no longer sets a
+maximum length. What remains is memory, and the page estimates a prediction's
+peak before it starts and says what to lower if it does not fit.
+
 ### Why is single-sequence confidence lower than the MSA prediction?
 
 This is expected for many proteins. For the 59-residue acceptance sequence below, model 1 PTM starts near 57 pLDDT with a single sequence but reaches approximately 97 pLDDT with a deep MSA.

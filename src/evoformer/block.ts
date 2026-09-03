@@ -634,8 +634,10 @@ async function encodeAttention(
   // weights and the parameters; the normalize binds them beside three more.
   const attentionSlots = sourceShards.count + 3;
   if (attentionSlots > execution.device.limits.maxStorageBuffersPerShaderStage) {
-    throw new RangeError(`${options.label} needs ${attentionSlots} storage bindings, past this device's limit `
-      + `of ${execution.device.limits.maxStorageBuffersPerShaderStage}`);
+    throw new RangeError(`${options.label} needs ${attentionSlots} storage bindings for ${sourceShards.count} `
+      + `windows of its input, past this device's limit of `
+      + `${execution.device.limits.maxStorageBuffersPerShaderStage}. Its `
+      + `${(execution.bindingLimitBytes / 1024 ** 2).toFixed(0)} MiB binding limit is what forces the windows.`);
   }
   const shardKey = `${storage}:${sourceShards.count}`;
   const [normalize, project, pairProject, flash, outputProject, pairNormalize] = await Promise.all([
@@ -816,8 +818,9 @@ async function encodeGlobalAttention(
   const key = `${storage}:${shards.count}`;
   const slots = shards.count * (residualTarget === undefined ? 2 : 1) + 3;
   if (slots > execution.device.limits.maxStorageBuffersPerShaderStage) {
-    throw new RangeError(`${label} needs ${slots} storage bindings, past this device's limit of `
-      + `${execution.device.limits.maxStorageBuffersPerShaderStage}`);
+    throw new RangeError(`${label} needs ${slots} storage bindings for ${shards.count} windows of the extra `
+      + `alignment, past this device's limit of `
+      + `${execution.device.limits.maxStorageBuffersPerShaderStage}. Fewer extra MSA rows will run.`);
   }
   const [statisticsPipeline, kvPipeline, columnMeanPipeline, queryPipeline, flashPipeline, outputPipeline]
     = await Promise.all([
@@ -1042,8 +1045,11 @@ async function encodeTriangleMultiplication(
   // more for the mask, the weights and the statistics.
   const slots = pairShards.count + wholeShards.count + 3;
   if (slots > execution.device.limits.maxStorageBuffersPerShaderStage) {
-    throw new RangeError(`a ${input.length}-residue pair needs ${slots} storage bindings in the triangle `
-      + `multiplication, past this device's limit of ${execution.device.limits.maxStorageBuffersPerShaderStage}`);
+    throw new RangeError(`A ${input.length}-residue pair needs ${slots} storage bindings in the triangle `
+      + `multiplication (${pairShards.count} windows of the pair and ${wholeShards.count} of its projection), `
+      + `past this device's limit of ${execution.device.limits.maxStorageBuffersPerShaderStage}. `
+      + `Its ${(execution.bindingLimitBytes / 1024 ** 2).toFixed(0)} MiB binding limit is what forces the `
+      + "windows: a shorter sequence, or a device that binds more of a buffer at once, will run.");
   }
   const shaders = createTriangleShaders(shape, "f32", packed.offsets, 1e-5, direction, blockRows, wholeStorage,
     pairStorage, residualTarget !== undefined, pairShards, wholeShards);

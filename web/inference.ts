@@ -145,9 +145,14 @@ export function resetInferenceDevice(): void {
 async function predictionDevice(
   adapter: GPUAdapter, requirements: AlphaFoldDeviceRequirements, reporter: InferenceReporter,
 ): Promise<{ readonly device: GPUDevice; readonly cached: boolean }> {
+  // A binding requirement past the adapter is met by windowing rather than by
+  // a larger binding, so the cached device is compared against what the
+  // adapter can actually give: otherwise every prediction rebuilds it.
+  const wantedBinding = Math.min(
+    requirements.maxStorageBufferBindingSize, adapter.limits.maxStorageBufferBindingSize);
   if (sharedPredictionDevice !== undefined
     && sharedPredictionDevice.limits.maxBufferSize >= requirements.maxBufferSize
-    && sharedPredictionDevice.limits.maxStorageBufferBindingSize >= requirements.maxStorageBufferBindingSize) {
+    && sharedPredictionDevice.limits.maxStorageBufferBindingSize >= wantedBinding) {
     return { device: sharedPredictionDevice, cached: true };
   }
   resetInferenceDevice();
