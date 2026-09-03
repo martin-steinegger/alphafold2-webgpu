@@ -424,3 +424,6 @@ that `unzip -t` reports no errors.
    alignment-error matrix isolated the interface.
 7. Whether the result archive unzipped cleanly in each browser you tried.
 8. The chip (M1/M2/M3/M4, Pro/Max) and its memory.
+9. From step 7c: the granted storage binding, the storage buffers a stage may
+   bind, whether the inference line kept counting blocks, and the minutes it
+   said were left against the minutes it took.
