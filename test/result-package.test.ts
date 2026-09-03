@@ -99,7 +99,10 @@ describe("resultPackageEntries", () => {
   it("writes the same text an array of arrays would, at a length worth streaming", () => {
     const length = 64;
     const pae = Float32Array.from({ length: length * length }, (_, index) => (index % 317) / 7);
-    const confidence = { predictedAlignedError: pae, maxPredictedAlignedError: 31.75 };
+    const confidence = {
+      predictedAlignedError: pae, maxPredictedAlignedError: 31.75,
+      plddt: new Float32Array(length), meanPlddt: 50, ptm: 0.5,
+    };
     const streamed = predictedAlignedErrorJson(confidence, length);
     const rows: number[][] = [];
     for (let row = 0; row < length; row += 1) {
