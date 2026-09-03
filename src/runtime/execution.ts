@@ -219,16 +219,21 @@ export class WebGpuExecution {
    * Records how long a command buffer took, and adjusts the limit.
    *
    * The caller measures the interval between two completions with the queue
-   * kept full, which is the device time of one buffer. The limit moves a third
-   * of the way to what that rate says would hit the target, so one slow buffer
-   * (a stack boundary, a readback) does not swing it.
+   * kept full, which is the device time of one buffer. A buffer over the
+   * target cuts the limit in proportion at once, and buffers under it raise it
+   * by a tenth: the cost of one buffer that runs long is a driver deciding the
+   * GPU has hung, so the control has to fall faster than it climbs. Averaging
+   * instead would let the many cheap dispatches of the MSA stack hide the few
+   * expensive ones of the pair stack, which is what sets the duration.
    */
   noteSubmissionDuration(milliseconds: number, dispatches: number): void {
     if (!(milliseconds > 0) || dispatches <= 0) return;
-    const wanted = SUBMISSION_TARGET_MILLISECONDS / (milliseconds / dispatches);
     const [low, high] = SUBMISSION_DISPATCH_RANGE;
-    const moved = this.#submissionDispatchLimit + (wanted - this.#submissionDispatchLimit) / 3;
-    this.#submissionDispatchLimit = Math.min(high, Math.max(low, Math.round(moved)));
+    const limit = this.#submissionDispatchLimit;
+    const adjusted = milliseconds > SUBMISSION_TARGET_MILLISECONDS
+      ? Math.min(limit, dispatches * SUBMISSION_TARGET_MILLISECONDS / milliseconds)
+      : limit + Math.max(1, limit / 10);
+    this.#submissionDispatchLimit = Math.min(high, Math.max(low, Math.round(adjusted)));
   }
 
   dispatch(
