@@ -8,10 +8,13 @@ test("finds the practical WebGPU allocation ceiling", async ({ page }) => {
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
     if (adapter === null) return { error: "no adapter" };
     const wanted = Math.min(adapter.limits.maxBufferSize, 2048 * mib);
+    // The prediction asks for the adapter's slot count, since the windows of
+    // one tensor take consecutive slots, so the probe reports what that gives.
     const device = await adapter.requestDevice({
       requiredLimits: {
         maxBufferSize: wanted,
         maxStorageBufferBindingSize: Math.min(adapter.limits.maxStorageBufferBindingSize, wanted),
+        maxStorageBuffersPerShaderStage: adapter.limits.maxStorageBuffersPerShaderStage,
       },
     });
     const lost = device.lost.then((info) => info.reason ?? "lost");
@@ -36,6 +39,7 @@ test("finds the practical WebGPU allocation ceiling", async ({ page }) => {
       adapterBindingMiB: adapter.limits.maxStorageBufferBindingSize / mib,
       grantedBufferMiB: device.limits.maxBufferSize / mib,
       grantedBindingMiB: device.limits.maxStorageBufferBindingSize / mib,
+      adapterStorageBuffersPerStage: adapter.limits.maxStorageBuffersPerShaderStage,
       storageBuffersPerStage: device.limits.maxStorageBuffersPerShaderStage,
       workgroupsPerDimension: device.limits.maxComputeWorkgroupsPerDimension,
       allocatedMiB, failure, deviceState: raced,
