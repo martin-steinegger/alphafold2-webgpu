@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { create, globals } from "webgpu";
-import { AlphaFoldMonomerGpu } from "../src/model/monomer.js";
+import { AlphaFoldMonomerGpu, EXACT_STORAGE } from "../src/model/monomer.js";
 import { iterateA3mFeatures } from "../src/input/a3m-features.js";
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
@@ -63,8 +63,10 @@ describe.skipIf(!enabled)("query-only template collapse", () => {
     const weights = { embedding, template, extraStack, mainStack, structure,
       lddt: confidence.lddt, pae: confidence.pae, geometry };
     const a3m = `>query\n${QUERY}\n`;
+    // Both runs use the exact storages so only the template differs; packing is
+    // compared on its own in test/pair-storage.gpu.test.ts.
     const run = async (collapseQueryOnlyTemplate: boolean) => new AlphaFoldMonomerGpu(device, {
-      collapseQueryOnlyTemplate,
+      collapseQueryOnlyTemplate, ...EXACT_STORAGE,
     }).predict(iterateA3mFeatures(a3m, tables, { recycles: 0, randomSeed: 0 }), weights, paeBreaks);
     const collapsed = await run(true);
     const exact = await run(false);

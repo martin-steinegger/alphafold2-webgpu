@@ -23,18 +23,9 @@ export interface QueryOnlyTemplateInput {
 }
 
 export interface QueryOnlyTemplateResult {
-  /** The pair update, or empty when it was added into a resident pair instead. */
   readonly pairUpdate: Float32Array;
   readonly elapsedMilliseconds: number;
   readonly memory: AllocationSnapshot;
-}
-
-export interface QueryOnlyTemplateResidentOptions {
-  /** Execution whose allocator and pipelines the module shares. */
-  readonly execution: WebGpuExecution;
-  /** The resident pair the update is added into, and its mask. */
-  readonly pair: GpuTensor;
-  readonly pairMask: GpuTensor;
 }
 
 const INIT_SHADER = `
@@ -94,27 +85,23 @@ export class QueryOnlyTemplateGpu {
   constructor(device: GPUDevice) { this.device = device; }
 
   /**
-   * Compute the template pair update. With `resident`, the update is added
-   * straight into the resident pair on the GPU, with no output tensor and no
-   * readback: the update depends only on the sequence length and mask, so
-   * recomputing it each recycle costs a few blocks of a 64-channel pair stack
-   * and spares holding a pair-sized copy on the host for the whole prediction.
+   * Computes the template pair update for one length and mask.
+   *
+   * A prediction does not call this: with no template search the update is a
+   * constant, which `queryOnlyTemplateConstant` probes once and the model
+   * folds into the pair projection's bias. The module runs for the
+   * differential tests, and for the padded masks the constant does not cover.
    */
   async run(
-    input: QueryOnlyTemplateInput, resident?: QueryOnlyTemplateResidentOptions,
+    input: QueryOnlyTemplateInput,
   ): Promise<QueryOnlyTemplateResult> {
-    const execution = resident?.execution ?? new WebGpuExecution(this.device);
-    const entryCheckpoint = execution.checkpoint();
+    const execution = new WebGpuExecution(this.device);
     try {
       const pairs = input.length * input.length;
-      if (resident !== undefined && (resident.pair.elements !== pairs * input.pairChannels
-        || resident.pairMask.elements !== pairs)) {
-        throw new RangeError("resident template pair tensors have the wrong shape");
-      }
       const pair = execution.allocate(
         "template.pair", pairs * input.templateChannels, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
       );
-      const pairMask = resident?.pairMask ?? execution.upload("template.pair-mask", input.pairMask);
+      const pairMask = execution.upload("template.pair-mask", input.pairMask);
       const bias = execution.upload("template.embedding-bias", input.weights.embeddingBias);
       const init = await execution.pipelines.get("template:init", INIT_SHADER);
       // One command buffer and one validation scope for the whole module: every
@@ -148,7 +135,7 @@ export class QueryOnlyTemplateGpu {
       const normalized = execution.allocate("template.normalized", pair.elements);
       const projected = input.weights.valueWeight.length / input.templateChannels;
       const value = execution.allocate("template.value", pairs * projected);
-      const output = resident?.pair ?? execution.allocate(
+      const output = execution.allocate(
         "template.output", pairs * input.pairChannels, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
       );
       const valueWeight = execution.upload("template.value-weight", input.weights.valueWeight);
@@ -160,8 +147,7 @@ export class QueryOnlyTemplateGpu {
       const [normalize, valuePipeline, outputPipeline] = await Promise.all([
         execution.pipelines.get("template:normalize", ATTENTION_NORMALIZE_SHADER),
         execution.pipelines.get("template:value", VALUE_SHADER),
-        execution.pipelines.get(resident === undefined ? "template:output" : "template:output-residual",
-          resident === undefined ? OUTPUT_SHADER : OUTPUT_SHADER.replace("output[index] = result;", "output[index] += result;")),
+        execution.pipelines.get("template:output", OUTPUT_SHADER),
       ]);
       grid = execution.linearGrid(pairs, 1);
       execution.dispatch(encoder, normalize, [pair, normWeightBuffer, normParams, normalized],
@@ -173,20 +159,19 @@ export class QueryOnlyTemplateGpu {
       grid = execution.linearGrid(output.elements);
       execution.dispatch(encoder, outputPipeline, [value, outputWeight, outputBias, params, output],
         grid[0], grid[1], 1, "template.output");
-      const readback = resident === undefined ? execution.createReadback("template.readback", output, encoder) : undefined;
+      const readback = execution.createReadback("template.readback", output, encoder);
       execution.endComputePass(encoder);
       this.device.queue.submit([encoder.finish()]);
       execution.noteSubmitted();
       const error = await this.device.popErrorScope();
       if (error !== null) throw new Error(`WebGPU template module failed: ${error.message}`);
       return {
-        pairUpdate: readback === undefined ? new Float32Array(0) : await execution.mapFloat32(readback),
+        pairUpdate: await execution.mapFloat32(readback),
         elapsedMilliseconds: performance.now() - start,
         memory: execution.snapshot(),
       };
     } finally {
-      if (resident === undefined) execution.release();
-      else execution.releaseSince(entryCheckpoint);
+      execution.release();
     }
   }
 }

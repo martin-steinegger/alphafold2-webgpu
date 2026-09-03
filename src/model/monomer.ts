@@ -92,13 +92,6 @@ type MonomerFinalDetails = Omit<MonomerRecycleResult, "pair">;
 /** Evoformer command buffers the host may run ahead of the GPU. */
 const BLOCKS_IN_FLIGHT = 4;
 
-/**
- * Pair size from which the monomer's template update is recomputed per recycle
- * rather than kept on the host: 32 MiB, about 256 residues. Below it the copy
- * is small and the template stack is a sizeable share of a short recycle.
- */
-const TEMPLATE_RECOMPUTE_BYTES = 32 * 1024 ** 2;
-
 export interface MonomerRecycleSummary {
   readonly confidence: Pick<ConfidenceSummaryResult, "meanPlddt" | "ptm">;
   readonly elapsedMilliseconds: number;
@@ -320,12 +313,13 @@ export class AlphaFoldMonomerGpu {
     const templateModule = templateWeights === undefined || templateConstantApplied
       ? undefined : new QueryOnlyTemplateGpu(this.device);
 
-    const recomputeTemplate = length * length * 128 * 4 >= TEMPLATE_RECOMPUTE_BYTES;
-    const templateUpdateValue = templateModule !== undefined && templateWeights !== undefined && !recomputeTemplate
-      ? (await templateModule.run({
+    // The module's update does not change between recycles, so the fallback
+    // computes it once and adds it in each time.
+    const templateUpdateValue = templateModule === undefined || templateWeights === undefined
+      ? undefined
+      : (await templateModule.run({
         length, templateChannels: 64, pairChannels: 128, pairMask, weights: templateWeights,
-      })).pairUpdate
-      : undefined;
+      })).pairUpdate;
     if (weights.extraStack.length === 0 || weights.mainStack.length === 0) {
       throw new RangeError("AlphaFold monomer requires non-empty extra and main Evoformer stacks");
     }
@@ -448,30 +442,6 @@ export class AlphaFoldMonomerGpu {
           await submit(templateEncoder, `template residual recycle ${recycle}`);
           releaseTensor(templateUpdate);
           templateMilliseconds = performance.now() - templateStart;
-        } else if (templateModule !== undefined && templateWeights !== undefined) {
-          const templateStart = performance.now();
-          const templateInput = {
-            length, templateChannels: 64, pairChannels: 128, pairMask, weights: templateWeights,
-          };
-          if (this.pairStorage === "f32") {
-            await templateModule.run(templateInput,
-              { execution, pair: embedding.pairWithoutTemplates, pairMask: pairMaskTensor });
-          } else {
-            // The module writes f32, so a packed pair takes its update through
-            // the packed residual add rather than letting it write the pair.
-            const update = await templateModule.run(templateInput);
-            const templateUpdate = execution.upload(`monomer.template-update-${recycle}`, update.pairUpdate);
-            const templateEncoder = this.device.createCommandEncoder(
-              { label: `monomer.template-residual-${recycle}` });
-            this.device.pushErrorScope("validation");
-            await execution.addInPlace(templateEncoder, embedding.pairWithoutTemplates, templateUpdate,
-              `monomer.template-residual-${recycle}`, this.pairStorage);
-            await submit(templateEncoder, `template residual recycle ${recycle}`);
-            releaseTensor(templateUpdate);
-          }
-          templateMilliseconds = performance.now() - templateStart;
-          // The template stack's scratch shapes recur only next recycle.
-          execution.allocator.destroyPooled();
         }
         const releaseMsaInputs = (): void => {
           for (const temporary of embedding.msaTemporaries) releaseTensor(temporary);
