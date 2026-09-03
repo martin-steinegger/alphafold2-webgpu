@@ -240,6 +240,10 @@ const CANDIDATES: readonly Candidate[] = [
 
 interface Shape { readonly name: string; readonly rows: number; readonly inner: number; readonly columns: number; }
 const SHAPES: readonly Shape[] = [
+  // The outer product mean's output projection: one column tile wide, so the
+  // grid is as many workgroups as it has row tiles and no more.
+  { name: "opm-out   M=4096 K=1024 N=128", rows: 4096, inner: 1024, columns: 128 },
+  { name: "opm-out2  M=3000 K=1024 N=128", rows: 3000, inner: 1024, columns: 128 },
   { name: "project   M=29972 K=256 N=1024", rows: 29972, inner: 256, columns: 1024 },
   { name: "output    M=29972 K=256 N=256", rows: 29972, inner: 256, columns: 256 },
   { name: "trans1    M=29972 K=256 N=1024", rows: 29972, inner: 256, columns: 1024 },
