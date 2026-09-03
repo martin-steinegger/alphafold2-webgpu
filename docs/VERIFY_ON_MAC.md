@@ -319,10 +319,12 @@ to see whether Metal holds anything the Linux run does not.
 
 The pair and the triangle multiplication's whole projection are 549 MiB each at
 1500 residues, well past the 128 MiB storage binding a WebGPU device gets by
-default, so the plan asks the adapter for what the shape needs. On the Linux
-GB10 Chrome granted a 1 GiB binding and the prediction ran: 1341 MiB live and
-1580 MiB resident in Node at 256 clustered and 512 extra rows, 191 seconds a
-recycle, and 160 seconds a recycle for a single sequence through the page.
+default. The plan asks the adapter for what the shape needs, and where the
+adapter cannot give it, the kernels bind those tensors as several windows
+instead. On the Linux GB10 the prediction ran under a 128 MiB binding cap,
+with 508 clustered and 1024 extra rows: 1527 MiB live and 1740 MiB resident in
+Node. Three tensors are 1470 MiB of that live figure, the pair at 549, the
+triangle's whole operand at 549 and the clustered MSA at 372.
 
 This is the check that matters most on Apple, because Metal's buffer and
 binding limits are the unknown:
