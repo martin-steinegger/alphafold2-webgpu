@@ -315,6 +315,29 @@ so please report the limit Chrome gives you and the longest chain that runs.
 peak, largest first. Send that list for one long shape; it is the fastest way
 to see whether Metal holds anything the Linux run does not.
 
+## 7c. A 1500-residue chain
+
+The pair and the triangle multiplication's whole projection are 549 MiB each at
+1500 residues, well past the 128 MiB storage binding a WebGPU device gets by
+default, so the plan asks the adapter for what the shape needs. On the Linux
+GB10 Chrome granted a 1 GiB binding and the prediction ran: 1341 MiB live and
+1580 MiB resident in Node at 256 clustered and 512 extra rows, 191 seconds a
+recycle, and 160 seconds a recycle for a single sequence through the page.
+
+This is the check that matters most on Apple, because Metal's buffer and
+binding limits are the unknown:
+
+```bash
+AFWEBGPU_QUALIFICATION_ASSET_ROOT="$QUAL_ROOT" \
+AFWEBGPU_BROWSER_MONOMER_MANIFEST=/qualification-assets/model/manifest.json \
+AFWEBGPU_BROWSER_LONG_CHAIN=1 npx playwright test long-chain
+```
+
+Report the granted `storageBinding` and `buffer` from the run log, the wall
+time, and the Chrome GPU process peak from Activity Monitor. If the device
+request is refused, the log says which limit fell short, and that is the
+number to send. `AFWEBGPU_LONG_CHAIN_LENGTH` sets a different length.
+
 ## 8. Reading a complex
 
 Predict a homodimer (paste the default 59-residue chain twice, separated by a
