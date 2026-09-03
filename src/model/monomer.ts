@@ -245,6 +245,8 @@ export class AlphaFoldMonomerGpu {
   readonly bindingBudgetBytes: number | undefined;
   /** Dispatch label to largest binding, for the labels above the budget. */
   oversizedBindings: ReadonlyMap<string, number> = new Map();
+  /** Dispatches a command buffer held by the end of the last prediction. */
+  submissionDispatchLimit = 0;
   readonly triangleWholeStorage: TriangleWholeStorage;
   readonly msaStorage: ActivationStorage;
   readonly pairStorage: ActivationStorage;
@@ -395,7 +397,12 @@ export class AlphaFoldMonomerGpu {
     // Validation errors are collected and settled at the window's pace and
     // before anything is read back; queue ordering keeps scratch reuse safe.
     const pendingErrors: { readonly label: string; readonly error: Promise<GPUError | null> }[] = [];
-    const inFlight: Promise<undefined>[] = [];
+    const inFlight: { readonly done: Promise<undefined>; readonly dispatches: number }[] = [];
+    // The interval between two completions with the queue kept full is one
+    // command buffer's device time, which sets how many dispatches the next
+    // buffers hold.
+    let submittedDispatches = 0;
+    let lastCompletion: number | undefined;
     const settleErrors = async (): Promise<void> => {
       const pending = pendingErrors.splice(0);
       for (const { label, error } of pending) {
@@ -408,8 +415,20 @@ export class AlphaFoldMonomerGpu {
       this.device.queue.submit([encoder.finish()]);
       execution.noteSubmitted();
       pendingErrors.push({ label, error: this.device.popErrorScope() });
-      inFlight.push(this.device.queue.onSubmittedWorkDone());
-      if (inFlight.length > BLOCKS_IN_FLIGHT) await inFlight.shift();
+      inFlight.push({
+        done: this.device.queue.onSubmittedWorkDone(),
+        dispatches: execution.dispatchCount - submittedDispatches,
+      });
+      submittedDispatches = execution.dispatchCount;
+      if (inFlight.length > BLOCKS_IN_FLIGHT) {
+        const oldest = inFlight.shift()!;
+        await oldest.done;
+        const completedAt = performance.now();
+        if (lastCompletion !== undefined) {
+          execution.noteSubmissionDuration(completedAt - lastCompletion, oldest.dispatches);
+        }
+        lastCompletion = completedAt;
+      }
       if (pendingErrors.length > BLOCKS_IN_FLIGHT) await settleErrors();
     };
     /**
@@ -812,6 +831,7 @@ export class AlphaFoldMonomerGpu {
         releaseTensor(finalPairReadback);
       }
       const finalResult: MonomerRecycleResult = { ...finalDetails, pair: finalPair };
+      this.submissionDispatchLimit = execution.submissionDispatchLimit;
       const mainMemory = execution.snapshot();
       return {
         recycles: results, final: finalResult, elapsedMilliseconds: performance.now() - start,

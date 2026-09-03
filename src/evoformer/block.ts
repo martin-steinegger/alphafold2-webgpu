@@ -89,9 +89,6 @@ export interface EvoformerBlockWeights {
  */
 export type SubmissionFlush = (label: string) => Promise<GPUCommandEncoder>;
 
-/** Dispatches one command buffer may hold before the loops that grow with the shape split it. */
-export const SUBMISSION_DISPATCH_LIMIT = 192;
-
 /**
  * Splits the command buffer once a loop has put enough dispatches in it.
  *
@@ -102,7 +99,7 @@ async function splitWhenLong(
   execution: WebGpuExecution, encoder: GPUCommandEncoder, since: number,
   flush: SubmissionFlush | undefined, label: string,
 ): Promise<readonly [GPUCommandEncoder, number]> {
-  if (flush === undefined || execution.dispatchCount - since < SUBMISSION_DISPATCH_LIMIT) {
+  if (flush === undefined || execution.dispatchCount - since < execution.submissionDispatchLimit) {
     return [encoder, since];
   }
   return [await flush(label), execution.dispatchCount];

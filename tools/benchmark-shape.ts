@@ -101,6 +101,7 @@ try {
     confidencePeakMiB: Math.round(prediction.memory.confidencePeakResidentBytes / 1024 ** 2),
     peakConcurrentMiB: Math.round(prediction.memory.peakBytes / 1024 ** 2),
     submissionsPerRecycle: prediction.recycles[0]?.trunkSubmissions.total,
+    dispatchesPerSubmission: monomer.submissionDispatchLimit,
     meanPlddt: Number(prediction.final.confidence.meanPlddt.toFixed(3)),
   }));
   if (monomer.oversizedBindings.size > 0) {

@@ -61,6 +61,23 @@ interface PendingTimestampReadback {
   readonly readback: GpuTensor;
 }
 
+/**
+ * How long one command buffer should take on the device.
+ *
+ * A driver that waits seconds for a command buffer to finish may decide the
+ * GPU has hung; on Apple that shows as a stalled or crashed browser rather
+ * than an error. Dispatches at 1500 residues are two orders of magnitude
+ * longer than at 59, so a fixed dispatch count per buffer cannot bound its
+ * duration: the count is measured and adjusted instead.
+ */
+const SUBMISSION_TARGET_MILLISECONDS = 250;
+
+/** Dispatches the first buffers hold, before any of them has been timed. */
+const SUBMISSION_START_DISPATCHES = 48;
+
+/** The range the measured limit stays inside. */
+const SUBMISSION_DISPATCH_RANGE = [8, 384] as const;
+
 export interface WebGpuExecutionOptions {
   readonly transitionBufferLimit?: number;
   readonly maxPooledBytes?: number;
@@ -81,6 +98,7 @@ export class WebGpuExecution {
   readonly transitionBufferLimit: number;
   /** Bytes one binding may cover: the device's limit unless a budget lowers it. */
   readonly bindingLimitBytes: number;
+  #submissionDispatchLimit = SUBMISSION_START_DISPATCHES;
   readonly #allocations: AllocatedGpuBuffer[] = [];
   #timestamps: TimestampCapture | undefined;
   #dispatchCount = 0;
@@ -189,6 +207,27 @@ export class WebGpuExecution {
 
   #bindingBudgetBytes: number | undefined;
   readonly #oversizedBindings = new Map<string, number>();
+
+  /** Dispatches a growing loop puts in one command buffer before splitting it. */
+  get submissionDispatchLimit(): number {
+    return this.#submissionDispatchLimit;
+  }
+
+  /**
+   * Records how long a command buffer took, and adjusts the limit.
+   *
+   * The caller measures the interval between two completions with the queue
+   * kept full, which is the device time of one buffer. The limit moves a third
+   * of the way to what that rate says would hit the target, so one slow buffer
+   * (a stack boundary, a readback) does not swing it.
+   */
+  noteSubmissionDuration(milliseconds: number, dispatches: number): void {
+    if (!(milliseconds > 0) || dispatches <= 0) return;
+    const wanted = SUBMISSION_TARGET_MILLISECONDS / (milliseconds / dispatches);
+    const [low, high] = SUBMISSION_DISPATCH_RANGE;
+    const moved = this.#submissionDispatchLimit + (wanted - this.#submissionDispatchLimit) / 3;
+    this.#submissionDispatchLimit = Math.min(high, Math.max(low, Math.round(moved)));
+  }
 
   dispatch(
     encoder: GPUCommandEncoder,
