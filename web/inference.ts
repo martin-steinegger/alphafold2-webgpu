@@ -235,16 +235,22 @@ export async function runInference(job: InferenceJob, reporter: InferenceReporte
       const suggestion = suggestMonomerRows(
         input.sequence.length, clusteredRows, extraRows, devicePlan.transitionMode, memoryBudget, memoryOptions,
       );
-      // Past a certain length the pair and the triangle's projection are the
-      // budget on their own, and the only rows that fit are too few to fold
-      // with. Saying so beats suggesting a depth that would predict badly.
+      // Past a certain length the pair and the triangle's projection are most
+      // of the budget on their own, and the rows that still fit are too few to
+      // fold with. Naming that beats suggesting a depth that would predict
+      // badly, and single-sequence input is the honest way to spend what is
+      // left.
       const degenerate = suggestion !== undefined
         && (suggestion.msaSequences < 32 || suggestion.extraSequences < 32);
-      const advice = suggestion === undefined || degenerate
+      const advice = suggestion === undefined
         ? `This sequence is too long for the conservative safety budget: at ${input.sequence.length} `
-          + "residues the pair representation alone is most of it, whatever the alignment depth."
-        : `Set Clustered MSA rows to ${suggestion.msaSequences} and Extra MSA rows to `
-          + `${suggestion.extraSequences} or lower.`;
+          + "residues the pair representation alone is past it."
+        : degenerate
+          ? `At ${input.sequence.length} residues the pair representation is most of the budget, so only `
+            + "a handful of alignment rows would fit. Predict from the single sequence instead, or "
+            + "shorten the input."
+          : `Set Clustered MSA rows to ${suggestion.msaSequences} and Extra MSA rows to `
+            + `${suggestion.extraSequences} or lower.`;
       throw new RangeError(`Estimated peak GPU allocation ${formatMib(devicePlan.memory.estimatedPeakBytes)} `
         + `exceeds this Mac's ${formatMib(memoryBudget)} safety budget. ${advice}`);
     }
