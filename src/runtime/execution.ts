@@ -80,6 +80,21 @@ const SUBMISSION_START_DISPATCHES = 48;
 /** The range the measured limit stays inside. */
 const SUBMISSION_DISPATCH_RANGE = [8, 384] as const;
 
+/**
+ * The dispatch count for the next command buffers, given how the last one
+ * went. See `noteSubmissionDuration` for why it falls faster than it climbs.
+ */
+export function nextSubmissionDispatchLimit(
+  limit: number, milliseconds: number, dispatches: number,
+): number {
+  if (!(milliseconds > 0) || dispatches <= 0) return limit;
+  const [low, high] = SUBMISSION_DISPATCH_RANGE;
+  const adjusted = milliseconds > SUBMISSION_TARGET_MILLISECONDS
+    ? Math.min(limit, dispatches * SUBMISSION_TARGET_MILLISECONDS / milliseconds)
+    : limit + Math.max(1, limit / 10);
+  return Math.min(high, Math.max(low, Math.round(adjusted)));
+}
+
 export interface WebGpuExecutionOptions {
   readonly transitionBufferLimit?: number;
   readonly maxPooledBytes?: number;
@@ -227,13 +242,8 @@ export class WebGpuExecution {
    * expensive ones of the pair stack, which is what sets the duration.
    */
   noteSubmissionDuration(milliseconds: number, dispatches: number): void {
-    if (!(milliseconds > 0) || dispatches <= 0) return;
-    const [low, high] = SUBMISSION_DISPATCH_RANGE;
-    const limit = this.#submissionDispatchLimit;
-    const adjusted = milliseconds > SUBMISSION_TARGET_MILLISECONDS
-      ? Math.min(limit, dispatches * SUBMISSION_TARGET_MILLISECONDS / milliseconds)
-      : limit + Math.max(1, limit / 10);
-    this.#submissionDispatchLimit = Math.min(high, Math.max(low, Math.round(adjusted)));
+    this.#submissionDispatchLimit = nextSubmissionDispatchLimit(
+      this.#submissionDispatchLimit, milliseconds, dispatches);
   }
 
   dispatch(
