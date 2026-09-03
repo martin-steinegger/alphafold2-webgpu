@@ -315,11 +315,15 @@ export async function runInference(job: InferenceJob, reporter: InferenceReporte
     measured.count += 1;
     blockSeconds.set(progress.phase, measured);
     blockStarted = now;
-    if (progress.completed < progress.total && now - lastProgress < 1000) return;
+    if (progress.phase !== "structure" && progress.completed < progress.total
+      && now - lastProgress < 1000) return;
     lastProgress = now;
-    const stack = progress.phase === "extra-msa" ? "Extra MSA" : "Evoformer";
-    reporter.stage("inference", "active", `Recycle ${progress.recycle}/${job.recycles} · `
-      + `${stack} block ${progress.completed}/${progress.total}${remaining(progress)}`);
+    const where = progress.phase === "structure"
+      ? "Structure module"
+      : `${progress.phase === "extra-msa" ? "Extra MSA" : "Evoformer"} block `
+        + `${progress.completed}/${progress.total}`;
+    reporter.stage("inference", "active",
+      `Recycle ${progress.recycle}/${job.recycles} · ${where}${remaining(progress)}`);
   };
   const remaining = (progress: MonomerProgress): string => {
     if (blockCounts === undefined) return "";

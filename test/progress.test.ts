@@ -25,6 +25,12 @@ describe("time remaining in the trunk", () => {
     expect(seconds).toBe(8 * 20);
   });
 
+  it("counts only the recycles left once the structure module runs", () => {
+    const seconds = remainingTrunkSeconds(
+      { phase: "structure", completed: 1, recycle: 1 }, shape, rates);
+    expect(seconds).toBe(2 * (4 * 10 + 48 * 20));
+  });
+
   it("reaches zero on the last block of the last recycle", () => {
     const seconds = remainingTrunkSeconds(
       { phase: "evoformer", completed: 48, recycle: 3 }, shape, rates);

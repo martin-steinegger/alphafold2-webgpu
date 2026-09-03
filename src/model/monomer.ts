@@ -760,6 +760,7 @@ export class AlphaFoldMonomerGpu {
         combinedPeakResidentBytes = Math.max(
           combinedPeakResidentBytes, trunkResidentBytes + structurePeak,
         );
+        this.onProgress?.({ recycle, phase: "structure", completed: 1, total: 1 });
         const confidence = await new ConfidenceHeadsGpu(this.device).runReduced(
           structure.finalRepresentation, new Float32Array(0), length, weights.lddt, weights.pae, paeBreaks,
           { pairBuffer: headsPair.allocation.buffer,

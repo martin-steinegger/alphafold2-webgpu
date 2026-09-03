@@ -40,7 +40,9 @@ export function remainingTrunkSeconds(
   const recycle = shape.extraBlocks * extraSeconds + shape.mainBlocks * mainSeconds;
   const thisRecycle = position.phase === "extra-msa"
     ? (shape.extraBlocks - position.completed) * extraSeconds + shape.mainBlocks * mainSeconds
-    : Math.max(0, shape.mainBlocks - position.completed) * mainSeconds;
+    : position.phase === "structure"
+      ? 0
+      : Math.max(0, shape.mainBlocks - position.completed) * mainSeconds;
   const later = Math.max(0, shape.recycles - position.recycle) * recycle;
   return thisRecycle + later;
 }
