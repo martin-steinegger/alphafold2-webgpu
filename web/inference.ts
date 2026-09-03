@@ -250,7 +250,8 @@ export async function runInference(job: InferenceJob, reporter: InferenceReporte
   reporter.log(`GPU: ${adapterName}${deviceResult.cached ? " (reusing device and pipelines)" : ""}`);
   reporter.log(`WebGPU limits: invocations=${device.limits.maxComputeInvocationsPerWorkgroup} `
     + `workgroupStorage=${device.limits.maxComputeWorkgroupStorageSize} `
-    + `storageBinding=${device.limits.maxStorageBufferBindingSize} buffer=${device.limits.maxBufferSize}`);
+    + `storageBinding=${device.limits.maxStorageBufferBindingSize} buffer=${device.limits.maxBufferSize} `
+    + `storageBuffersPerStage=${device.limits.maxStorageBuffersPerShaderStage}`);
   reporter.log(`Transition memory mode: ${devicePlan.transitionMode}.`);
   const featureOptions = {
     recycles: job.recycles, randomSeed: job.randomSeed,
