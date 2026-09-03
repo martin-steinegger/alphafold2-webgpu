@@ -62,7 +62,7 @@ describe.skipIf(!enabled)("InvariantPointAttention WebGPU", () => {
     const expectedShape = store.shape("structureStage_ipa");
     const length = actShape[1]!;
     const channels = actShape[2]!;
-    const result = await new InvariantPointAttentionGpu(device).run({
+    const descriptor = {
       activations: actStages.subarray(0, length * channels),
       pair: await store.tensor("structureInputPair"),
       mask: await store.tensor("feature_seq_mask_recycle3"),
@@ -76,7 +76,15 @@ describe.skipIf(!enabled)("InvariantPointAttention WebGPU", () => {
       pointQk: 4,
       pointV: 8,
       weights,
+    };
+    const result = await new InvariantPointAttentionGpu(device).run(descriptor);
+    // The pair is read by row here, and a whole pair is past what one binding
+    // may cover at long chain lengths. A small limit forces
+    // the same windows this fixture would take there; the answer must not move.
+    const windowed = await new InvariantPointAttentionGpu(device).run({
+      ...descriptor, bindingLimitBytes: 64 * 1024,
     });
+    expect(errorMetrics(windowed.output, result.output).maxAbsoluteError).toBe(0);
     const expected = expectedStages.subarray(0, expectedShape[1]! * expectedShape[2]!);
     const metrics = errorMetrics(result.output, expected);
     expect(metrics.meanAbsoluteError).toBeLessThan(2e-4);

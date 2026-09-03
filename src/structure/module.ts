@@ -21,6 +21,8 @@ export interface StructureModuleInput {
   readonly pairBuffer?: GPUBuffer;
   /** Storage of that activation; `f16` means packed half-precision words. */
   readonly pairStorage?: ActivationStorage;
+  /** Bytes one binding may cover of the pair; tests lower it. */
+  readonly bindingLimitBytes?: number;
   readonly mask: Float32Array;
   readonly aatype: Float32Array;
   readonly atom37ToAtom14: Float32Array;
@@ -65,6 +67,7 @@ export class StructureModuleGpu {
       pair: input.pair,
       ...(input.pairBuffer === undefined ? {} : { pairBuffer: input.pairBuffer }),
       ...(input.pairStorage === undefined ? {} : { pairStorage: input.pairStorage }),
+      ...(input.bindingLimitBytes === undefined ? {} : { bindingLimitBytes: input.bindingLimitBytes }),
       mask: input.mask,
       affine: initialized.affine,
       length: input.length,

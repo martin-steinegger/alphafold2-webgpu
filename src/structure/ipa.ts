@@ -1,4 +1,4 @@
-import { type ActivationStorage, storageArray, storedElement } from "../runtime/storage.js";
+import { type ActivationStorage, storageArray, storageWords, storedElement } from "../runtime/storage.js";
 import {
   createTransitionShaders, TRANSITION_TILE_COLUMNS, TRANSITION_TILE_ROWS, type TransitionInput,
 } from "../evoformer/transition.js";
@@ -172,6 +172,13 @@ export interface InvariantPointAttentionInput {
   readonly pairBuffer?: GPUBuffer;
   /** Storage of that tensor; `f16` means packed half-precision words. */
   readonly pairStorage?: ActivationStorage;
+  /**
+   * Bytes one binding may cover of the pair, at most the device's own limit.
+   *
+   * Only tests set it: it makes a short prediction take the windowed path a
+   * long one takes on a device with a small binding limit.
+   */
+  readonly bindingLimitBytes?: number;
   readonly mask: Float32Array;
   readonly affine: Float32Array;
   readonly length: number;
@@ -344,13 +351,17 @@ const GRID_WIDTH: u32 = 32768u;
 @group(0) @binding(0) var<storage, read> pair: array<${storageArray(storage)}>;
 @group(0) @binding(1) var<uniform> p: Parameters;
 @group(0) @binding(2) var<storage, read_write> statistics: array<f32>;
+// The pair rows this dispatch covers: x is the first and y how many. The pair
+// is bound at that row, since a whole pair is past what one binding reaches;
+// the statistics are two floats a row and stay whole.
+@group(0) @binding(3) var<uniform> w: vec4<u32>;
 var<workgroup> partial: array<f32, 64>;
 var<workgroup> row_mean: array<f32, 1>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) group: vec3<u32>) {
   let row = group.x + group.y * GRID_WIDTH;
-  if (row >= p.length * p.length) { return; }
+  if (row >= w.y) { return; }
   let base = row * p.pair_channels;
   var sum = 0.0;
   for (var c = local.x; c < p.pair_channels; c += 64u) { sum += ${storedElement(storage, "pair", "base + c")}; }
@@ -374,8 +385,8 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
     workgroupBarrier();
   }
   if (local.x == 0u) {
-    statistics[2u * row] = row_mean[0];
-    statistics[2u * row + 1u] = inverseSqrt(partial[0] / f32(p.pair_channels) + 1e-5);
+    statistics[2u * (w.x + row)] = row_mean[0];
+    statistics[2u * (w.x + row) + 1u] = inverseSqrt(partial[0] / f32(p.pair_channels) + 1e-5);
   }
 }`;
 }
@@ -395,15 +406,18 @@ const GRID_WIDTH: u32 = 32768u;
 @group(0) @binding(2) var<storage, read> weights: array<f32>;
 @group(0) @binding(3) var<uniform> p: Parameters;
 @group(0) @binding(4) var<storage, read_write> bias: array<f32>;
+// x is the first pair row this dispatch covers and y how many; the pair is
+// bound at that row, the statistics and the bias whole.
+@group(0) @binding(5) var<uniform> w: vec4<u32>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let index = id.x + id.y * GRID_WIDTH * 64u;
-  if (index >= p.heads * p.length * p.length) { return; }
-  let row = index % (p.length * p.length);
-  let head = index / (p.length * p.length);
-  let mean = statistics[2u * row];
-  let inverse_std = statistics[2u * row + 1u];
+  if (index >= p.heads * w.y) { return; }
+  let row = index % w.y;
+  let head = index / w.y;
+  let mean = statistics[2u * (w.x + row)];
+  let inverse_std = statistics[2u * (w.x + row) + 1u];
   let base = row * p.pair_channels;
   var result = weights[p.attention_2d_bias + head];
   for (var c = 0u; c < p.pair_channels; c += 1u) {
@@ -411,7 +425,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
       * weights[p.pair_norm_scale + c] + weights[p.pair_norm_offset + c];
     result += normalized * weights[p.attention_2d_weight + c * p.heads + head];
   }
-  bias[index] = result;
+  bias[head * p.length * p.length + w.x + row] = result;
 }`;
 }
 
@@ -542,20 +556,26 @@ function createPairFeatureShader(storage: ActivationStorage): string {
 @group(0) @binding(3) var<storage, read_write> features: array<f32>;
 @group(0) @binding(4) var<storage, read> statistics: array<f32>;
 @group(0) @binding(5) var<storage, read> weights: array<f32>;
+// x is the first query this dispatch covers and y how many; every pair row it
+// reads belongs to those queries, so the pair is bound at their first row and
+// the statistics, which are small, stay whole.
+@group(0) @binding(6) var<uniform> w: vec4<u32>;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let index = id.x;
-  if (index >= p.length * p.heads * p.pair_channels) { return; }
+  if (index >= w.y * p.heads * p.pair_channels) { return; }
   let channel = index % p.pair_channels;
   let head = (index / p.pair_channels) % p.heads;
-  let query = index / (p.pair_channels * p.heads);
+  let local_query = index / (p.pair_channels * p.heads);
+  let query = w.x + local_query;
   var result = 0.0;
   let norm_scale = weights[p.pair_norm_scale + channel];
   let norm_offset = weights[p.pair_norm_offset + channel];
   for (var key_index = 0u; key_index < p.length; key_index += 1u) {
-    let row = query * p.length + key_index;
-    let normalized = (${storedElement(storage, "pair", "row * p.pair_channels + channel")} - statistics[2u * row])
-      * statistics[2u * row + 1u] * norm_scale + norm_offset;
+    let row = local_query * p.length + key_index;
+    let global_row = w.x * p.length + row;
+    let normalized = (${storedElement(storage, "pair", "row * p.pair_channels + channel")}
+      - statistics[2u * global_row]) * statistics[2u * global_row + 1u] * norm_scale + norm_offset;
     result += attention[(head * p.length + query) * p.length + key_index] * normalized;
   }
   let offset = p.heads * p.scalar_v + 4u * p.heads * p.point_v;
@@ -564,6 +584,48 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 
 const GRID_WIDTH = 32_768;
+
+/**
+ * Windows of pair rows, each inside one binding and starting where a binding
+ * offset may start.
+ *
+ * A binding covers a bounded slice of a buffer and must begin on a 256-byte
+ * boundary, so a window holds a whole number of those boundaries of every
+ * binding cut from it. Only the pair is windowed here: the row statistics are
+ * two floats a residue pair, small enough to stay whole at any length.
+ */
+export function pairRowWindows(
+  rows: number, bindingBytes: number, rowByteSizes: readonly number[],
+): readonly { readonly offset: number; readonly count: number }[] {
+  let alignment = 1;
+  for (const rowBytes of rowByteSizes) {
+    const rowsPerBoundary = 256 / greatestCommonDivisor(rowBytes, 256);
+    alignment = alignment * rowsPerBoundary / greatestCommonDivisor(alignment, rowsPerBoundary);
+  }
+  const widest = Math.max(...rowByteSizes);
+  const perBinding = Math.floor(bindingBytes / widest / alignment) * alignment;
+  if (perBinding <= 0) {
+    throw new RangeError("the structure module cannot fit an aligned pair window in one binding");
+  }
+  if (rows <= perBinding) return [{ offset: 0, count: rows }];
+  const windows: { offset: number; count: number }[] = [];
+  for (let offset = 0; offset < rows; offset += perBinding) {
+    windows.push({ offset, count: Math.min(perBinding, rows - offset) });
+  }
+  return windows;
+}
+
+function greatestCommonDivisor(a: number, b: number): number {
+  return b === 0 ? a : greatestCommonDivisor(b, a % b);
+}
+
+/** A run of queries whose pair rows one binding can cover. */
+export interface IpaQueryWindow {
+  readonly offset: number;
+  readonly count: number;
+  /** The offset and count as a uniform, for the shader. */
+  readonly bounds: GPUBuffer;
+}
 
 interface PreparedFields {
   readonly pipelines: readonly GPUComputePipeline[];
@@ -576,6 +638,10 @@ interface PreparedFields {
   readonly pairBias: AllocatedGpuBuffer;
   /** The raw pair every iteration normalizes while loading. */
   readonly pair: GPUBuffer;
+  /** Query windows the pair feature walks, each inside one binding. */
+  readonly queryWindows: readonly IpaQueryWindow[];
+  /** How the pair is stored, which sizes every window of it. */
+  readonly pairStorage: ActivationStorage;
   readonly queryScalarColumns: number;
   readonly kvScalarColumns: number;
   readonly queryPointColumns: number;
@@ -599,6 +665,8 @@ export class PreparedInvariantPointAttention implements PreparedFields {
   readonly statistics!: AllocatedGpuBuffer;
   readonly pairBias!: AllocatedGpuBuffer;
   readonly pair!: GPUBuffer;
+  readonly queryWindows!: readonly IpaQueryWindow[];
+  readonly pairStorage!: ActivationStorage;
   readonly queryScalarColumns!: number;
   readonly kvScalarColumns!: number;
   readonly queryPointColumns!: number;
@@ -667,6 +735,8 @@ export class InvariantPointAttentionGpu {
   async prepare(input: InvariantPointAttentionInput): Promise<PreparedInvariantPointAttention> {
     validateInput(input);
     const pairStorage = input.pairStorage ?? "f32";
+    const bindingLimit = Math.min(this.device.limits.maxStorageBufferBindingSize,
+      input.bindingLimitBytes ?? Number.MAX_SAFE_INTEGER);
     const pipelines = await Promise.all([
       this.pipelines.get(`ipa:pair-statistics:${pairStorage}`, createPairStatisticsShader(pairStorage)),
       this.pipelines.get("ipa:linear", LINEAR_SHADER),
@@ -704,8 +774,16 @@ export class InvariantPointAttentionGpu {
           GPUBufferUsage.UNIFORM);
       const uploadedPair = input.pairBuffer === undefined
         ? keep(this.allocator.upload("ipa.pair", input.pair, GPUBufferUsage.STORAGE)) : undefined;
+      // One window of queries at a time keeps the pair rows a feature pass
+      // reads inside a single binding.
+      const queryWindows = pairRowWindows(input.length, bindingLimit,
+        [storageWords(input.length * input.pairChannels, pairStorage) * 4]).map((window) => ({
+        offset: window.offset, count: window.count,
+        bounds: upload(`ipa.query-window-${window.offset}`,
+          new Uint32Array([window.offset, window.count, 0, 0]), GPUBufferUsage.UNIFORM).buffer,
+      }));
       prepared = new PreparedInvariantPointAttention(this.device, input, {
-        pipelines, weights, params, mask, statistics, pairBias,
+        pipelines, weights, params, mask, statistics, pairBias, queryWindows, pairStorage,
         pair: input.pairBuffer ?? uploadedPair!.buffer,
         queryScalarColumns, kvScalarColumns, queryPointColumns, kvPointColumns, featureChannels,
         qScalarParams: linearParams("ipa.q-scalar-params", queryScalarColumns, packed.offsets[2]!, packed.offsets[3]!),
@@ -727,21 +805,35 @@ export class InvariantPointAttentionGpu {
         const encoder = this.device.createCommandEncoder({ label: "ipa.prepare" });
         const compute = encoder.beginComputePass();
         const rows = input.length * input.length;
-        const bind = (pipeline: GPUComputePipeline, buffers: readonly GPUBuffer[],
+        const bind = (pipeline: GPUComputePipeline, buffers: readonly GPUBindingResource[],
           x: number, y = 1): void => {
           compute.setPipeline(pipeline);
           compute.setBindGroup(0, this.device.createBindGroup({
             layout: pipeline.getBindGroupLayout(0),
-            entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer } })),
+            entries: buffers.map((resource, binding) => ({ binding, resource })),
           }));
           compute.dispatchWorkgroups(x, y);
         };
-        bind(pipelines[0]!, [pairBuffer, params.buffer, statistics.buffer],
-          Math.min(rows, GRID_WIDTH), Math.ceil(rows / GRID_WIDTH));
-        // The bias holds for every structure iteration, so it is projected once.
-        const biasGroups = Math.ceil(input.heads * rows / 64);
-        bind(pipelines[8]!, [pairBuffer, statistics.buffer, weights.buffer, params.buffer, pairBias.buffer],
-          Math.min(biasGroups, GRID_WIDTH), Math.ceil(biasGroups / GRID_WIDTH));
+        // Both passes read the pair by row, and a whole pair is past what one
+        // binding may cover, so they walk it a window of rows at a time.
+        for (const window of pairRowWindows(rows, bindingLimit,
+          [storageWords(input.pairChannels, pairStorage) * 4])) {
+          const bounds = upload(`ipa.pair-window-${window.offset}`,
+            new Uint32Array([window.offset, window.count, 0, 0]), GPUBufferUsage.UNIFORM);
+          const pairWindow = {
+            buffer: pairBuffer,
+            offset: storageWords(window.offset * input.pairChannels, pairStorage) * 4,
+            size: storageWords(window.count * input.pairChannels, pairStorage) * 4,
+          };
+          const statisticsWindow = { buffer: statistics.buffer };
+          bind(pipelines[0]!, [pairWindow, { buffer: params.buffer }, statisticsWindow, { buffer: bounds.buffer }],
+            Math.min(window.count, GRID_WIDTH), Math.ceil(window.count / GRID_WIDTH));
+          // The bias holds for every structure iteration, so it is projected once.
+          const biasGroups = Math.ceil(input.heads * window.count / 64);
+          bind(pipelines[8]!, [pairWindow, statisticsWindow, { buffer: weights.buffer },
+            { buffer: params.buffer }, { buffer: pairBias.buffer }, { buffer: bounds.buffer }],
+            Math.min(biasGroups, GRID_WIDTH), Math.ceil(biasGroups / GRID_WIDTH));
+        }
         compute.end();
         this.device.pushErrorScope("validation");
         this.device.queue.submit([encoder.finish()]);
@@ -804,12 +896,16 @@ export class InvariantPointAttentionGpu {
     // One pass for the whole structure loop: a pass boundary per dispatch cost
     // more than the dispatches themselves at short chain lengths.
     const dispatch = (pipeline: GPUComputePipeline,
-      buffers: readonly (AllocatedGpuBuffer | GPUBuffer)[], x: number, y = 1): void => {
+      buffers: readonly (AllocatedGpuBuffer | GPUBuffer | GPUBufferBinding)[], x: number, y = 1): void => {
       pass.setPipeline(pipeline);
       pass.setBindGroup(0, this.device.createBindGroup({
         layout: pipeline.getBindGroupLayout(0),
         entries: buffers.map((value, binding) => ({
-          binding, resource: { buffer: value instanceof GPUBuffer ? value : value.buffer },
+          binding,
+          resource: value instanceof GPUBuffer
+            ? { buffer: value }
+            : ("buffer" in value && value.buffer instanceof GPUBuffer
+              ? value as GPUBufferBinding : { buffer: (value as AllocatedGpuBuffer).buffer }),
         })),
       }));
       pass.dispatchWorkgroups(x, y);
@@ -838,8 +934,17 @@ export class InvariantPointAttentionGpu {
       Math.ceil(input.length * input.heads * input.scalarV / 64));
     dispatch(pipelines[6]!, [logits, kvPoint, affine, params, features],
       Math.ceil(input.length * input.heads * input.pointV / 64));
-    dispatch(pipelines[7]!, [logits, pair, params, features, shared.statistics, weights],
-      Math.ceil(input.length * input.heads * input.pairChannels / 64));
+    // Every pair row this reads belongs to the query it is accumulating, so a
+    // window of queries needs only their rows: a whole pair is past what one
+    // binding may cover at long chain lengths.
+    for (const window of shared.queryWindows) {
+      dispatch(pipelines[7]!, [logits, {
+        buffer: pair,
+        offset: storageWords(window.offset * input.length * input.pairChannels, shared.pairStorage) * 4,
+        size: storageWords(window.count * input.length * input.pairChannels, shared.pairStorage) * 4,
+      }, params, features, shared.statistics, weights, window.bounds],
+        Math.ceil(window.count * input.heads * input.pairChannels / 64));
+    }
     dispatch(pipelines[1]!, [features, weights, shared.outputParams, output],
       Math.ceil(input.channels / TRANSITION_TILE_COLUMNS), Math.ceil(input.length / TRANSITION_TILE_ROWS));
     return { output, scratch };

@@ -727,6 +727,7 @@ export class AlphaFoldMonomerGpu {
           msaFirstRow, pair: new Float32Array(0), mask: features.seqMask, aatype: features.aatype,
           pairBuffer: headsPair.allocation.buffer,
           ...(this.pairStorage === "f32" ? {} : { pairStorage: this.pairStorage }),
+          ...(this.bindingBudgetBytes === undefined ? {} : { bindingLimitBytes: this.bindingBudgetBytes }),
           atom37ToAtom14: features.atom37ToAtom14, atom37Mask: features.atom37Mask,
           length, weights: weights.structure, geometry: weights.geometry,
           ...(this.multimer ? { multimer: true } : {}),
