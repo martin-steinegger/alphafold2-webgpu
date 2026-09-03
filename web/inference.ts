@@ -291,14 +291,40 @@ export async function runInference(job: InferenceJob, reporter: InferenceReporte
   // the device finishes it keeps the stage line moving, so a long prediction
   // reads as slow rather than stalled.
   let lastProgress = 0;
+  let blockStarted = performance.now();
+  // Mean seconds a block of each stack has taken, which is what turns blocks
+  // remaining into time remaining. The two differ by an order of magnitude.
+  const blockSeconds = new Map<string, { total: number; count: number }>();
   const onProgress = (progress: MonomerProgress): void => {
     const now = performance.now();
-    if (progress.completed < progress.total && now - lastProgress < 500) return;
+    const measured = blockSeconds.get(progress.phase) ?? { total: 0, count: 0 };
+    measured.total += (now - blockStarted) / 1000;
+    measured.count += 1;
+    blockSeconds.set(progress.phase, measured);
+    blockStarted = now;
+    if (progress.completed < progress.total && now - lastProgress < 1000) return;
     lastProgress = now;
     const stack = progress.phase === "extra-msa" ? "Extra MSA" : "Evoformer";
     reporter.stage("inference", "active", `Recycle ${progress.recycle}/${job.recycles} · `
-      + `${stack} block ${progress.completed}/${progress.total}`);
+      + `${stack} block ${progress.completed}/${progress.total}${remaining(progress)}`);
   };
+  /** What is left of the trunk, once both stacks have been timed. */
+  const remaining = (progress: MonomerProgress): string => {
+    const extra = blockSeconds.get("extra-msa");
+    const main = blockSeconds.get("evoformer");
+    if (extra === undefined || main === undefined || blockCounts === undefined) return "";
+    const perExtra = extra.total / extra.count;
+    const perMain = main.total / main.count;
+    const left = progress.phase === "extra-msa"
+      ? (blockCounts.extra - progress.completed) * perExtra + blockCounts.main * perMain
+      : (blockCounts.main - progress.completed) * perMain;
+    const recyclesLeft = job.recycles - progress.recycle;
+    const seconds = left + recyclesLeft * (blockCounts.extra * perExtra + blockCounts.main * perMain);
+    if (seconds < 30) return "";
+    const minutes = Math.round(seconds / 60);
+    return minutes < 1 ? " · under a minute left" : ` · about ${minutes} min left`;
+  };
+  let blockCounts: { readonly extra: number; readonly main: number } | undefined;
   const modelOptions = {
     onProgress,
     compactTransitions: devicePlan.transitionMode === "chunked",
@@ -311,6 +337,10 @@ export async function runInference(job: InferenceJob, reporter: InferenceReporte
   const commonWeights = {
     embedding, extraStack, mainStack, structure, lddt: confidence.lddt, pae: confidence.pae, geometry,
   };
+  blockCounts = { extra: extraStack.length, main: mainStack.length };
+  // The first block's time is measured from here, not from when the callback
+  // was built: loading the model and building features happen in between.
+  blockStarted = performance.now();
   const prediction: MonomerPrediction | MultimerPrediction = input.multimer
     ? await new AlphaFoldMultimerGpu(device, modelOptions).predict(
       features as Iterable<MultimerRecycleFeatures> & { readonly length: number },
