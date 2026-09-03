@@ -334,9 +334,26 @@ AFWEBGPU_BROWSER_LONG_CHAIN=1 npx playwright test long-chain
 ```
 
 Report the granted `storageBinding` and `buffer` from the run log, the wall
-time, and the Chrome GPU process peak from Activity Monitor. If the device
-request is refused, the log says which limit fell short, and that is the
-number to send. `AFWEBGPU_LONG_CHAIN_LENGTH` sets a different length.
+time, and the Chrome GPU process peak from Activity Monitor.
+`AFWEBGPU_LONG_CHAIN_LENGTH` sets a different length.
+
+A binding smaller than the shape no longer refuses the run: a tensor past the
+limit is bound as several windows of the same buffer, and the kernels read it
+through a generated accessor. If Chrome gives Metal a small binding, the run
+should still finish, and the interesting number is the wall time against the
+Linux figures above. What can still stop it is the number of storage bindings
+a stage may hold, since the windows of one tensor take consecutive slots: that
+failure names the kernel, the windows it needed and the device's limit, and
+that message is the one to send.
+
+To take the same path here, without a device that forces it:
+
+```bash
+AFWEBGPU_BINDING_MIB=128 AFWEBGPU_MEMORY=1 npm run bench:shape -- 1500 256 512 1
+```
+
+`AFWEBGPU_BINDING_MIB` caps what any binding may cover and lists every
+activation binding above the cap, which should be none.
 
 ## 8. Reading a complex
 
