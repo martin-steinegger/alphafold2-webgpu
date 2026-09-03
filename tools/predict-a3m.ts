@@ -5,6 +5,7 @@
  *
  * Usage: tsx tools/predict-a3m.ts <file.a3m> [msaRows] [extraRows] [recycles]
  */
+import { EXACT_STORAGE } from "../src/model/monomer.js";
 import { readFileSync } from "node:fs";
 import { create, globals } from "webgpu";
 import { AlphaFoldMonomerGpu } from "../src/model/monomer.js";
@@ -39,11 +40,9 @@ const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" }
 if (adapter === null) throw new Error("no WebGPU adapter");
 const clustered = Math.min(msaRows, depth);
 const extra = Math.max(1, Math.min(extraRows, Math.max(0, depth - clustered)));
-const memoryOptions = {
-  ...(process.env.AFWEBGPU_TRIANGLE_F16 === "1" ? { triangleWholeStorage: "f16" as const } : {}),
-  ...(process.env.AFWEBGPU_MSA_F16 === "1" ? { msaStorage: "f16" as const } : {}),
-  ...(process.env.AFWEBGPU_PAIR_F16 === "1" ? { pairStorage: "f16" as const } : {}),
-};
+// The model stores its activations packed. AFWEBGPU_EXACT=1 selects the f32
+// storages the differential tests use, for comparison.
+const memoryOptions = process.env.AFWEBGPU_EXACT === "1" ? { ...EXACT_STORAGE } : {};
 const plan = planMonomerDevice(adapter, length, clustered, extra, undefined, false, memoryOptions);
 const device = await requestAlphaFoldDevice(adapter, plan.requirements);
 try {

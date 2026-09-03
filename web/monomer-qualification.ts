@@ -1,3 +1,4 @@
+import { EXACT_STORAGE } from "../src/model/monomer.js";
 import { makeA3mFeatures } from "../src/input/a3m-features.js";
 import {
   AlphaFoldMonomerGpu, type MonomerGpuOptions, type MonomerModelWeights,
@@ -48,7 +49,7 @@ function summarize(prediction: Awaited<ReturnType<AlphaFoldMonomerGpu["predict"]
 export async function qualifyMonomer(
   modelManifestUrl: string,
   deepA3m: string,
-  storageOptions: Pick<MonomerGpuOptions, "triangleWholeStorage" | "msaStorage"> = {},
+  storageOptions: Pick<MonomerGpuOptions, "triangleWholeStorage" | "msaStorage" | "pairStorage"> = EXACT_STORAGE,
 ): Promise<MonomerQualificationResult> {
   const store = await HttpTensorStore.open(modelManifestUrl);
   const fixture = AlphaFoldFixture.fromStore(store);

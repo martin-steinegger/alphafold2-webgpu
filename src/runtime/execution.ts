@@ -1,3 +1,4 @@
+import { type ActivationStorage, storageWords } from "./storage.js";
 import { GpuBufferAllocator, type AllocatedGpuBuffer, type AllocationSnapshot } from "./allocator.js";
 import { pipelineCacheForDevice, type ComputePipelineCache } from "./pipeline-cache.js";
 
@@ -10,6 +11,31 @@ const GRID_WIDTH: u32 = 32768u;
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let index = id.x + id.y * GRID_WIDTH * 64u;
   base[index] += update[index];
+}`;
+
+const ADD_IN_PLACE_PACKED_SHADER = `
+const GRID_WIDTH: u32 = 32768u;
+@group(0) @binding(0) var<storage, read_write> base: array<u32>;
+@group(0) @binding(1) var<storage, read> update: array<f32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let word = id.x + id.y * GRID_WIDTH * 64u;
+  if (word >= arrayLength(&base)) { return; }
+  let element = word * 2u;
+  base[word] = pack2x16float(unpack2x16float(base[word])
+    + vec2<f32>(update[element], update[element + 1u]));
+}`;
+
+const PACK_HALVES_SHADER = `
+const GRID_WIDTH: u32 = 32768u;
+@group(0) @binding(0) var<storage, read> source: array<f32>;
+@group(0) @binding(1) var<storage, read_write> packed: array<u32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let word = id.x + id.y * GRID_WIDTH * 64u;
+  if (word >= arrayLength(&packed)) { return; }
+  let element = word * 2u;
+  packed[word] = pack2x16float(vec2<f32>(source[element], source[element + 1u]));
 }`;
 
 export interface GpuTensor {
@@ -157,11 +183,35 @@ export class WebGpuExecution {
     this.#activeEncoder = undefined;
   }
 
-  async addInPlace(encoder: GPUCommandEncoder, base: GpuTensor, update: GpuTensor, label: string): Promise<void> {
-    if (base.elements !== update.elements) throw new RangeError("residual tensors must have equal sizes");
-    const pipeline = await this.pipelines.get("runtime:add-in-place", ADD_IN_PLACE_SHADER);
+  /**
+   * Adds an f32 update into a base tensor, which may be packed.
+   *
+   * A packed base is written a word at a time, so one invocation owns the two
+   * elements sharing a word and no two invocations touch the same word.
+   */
+  async addInPlace(encoder: GPUCommandEncoder, base: GpuTensor, update: GpuTensor, label: string,
+    storage: ActivationStorage = "f32"): Promise<void> {
+    if (base.elements !== storageWords(update.elements, storage)) {
+      throw new RangeError("residual tensors must have equal sizes");
+    }
+    if (storage === "f16" && update.elements % 2 !== 0) {
+      throw new RangeError("a packed residual needs an even element count");
+    }
+    const pipeline = storage === "f32"
+      ? await this.pipelines.get("runtime:add-in-place", ADD_IN_PLACE_SHADER)
+      : await this.pipelines.get("runtime:add-in-place-packed", ADD_IN_PLACE_PACKED_SHADER);
     const grid = this.linearGrid(base.elements);
     this.dispatch(encoder, pipeline, [base, update], grid[0], grid[1], 1, label);
+  }
+
+  /** Packs f32 elements into half-precision words. */
+  async packHalves(encoder: GPUCommandEncoder, source: GpuTensor, packed: GpuTensor, label: string): Promise<void> {
+    if (packed.elements !== storageWords(source.elements, "f16")) {
+      throw new RangeError("packing needs a target of the source's word count");
+    }
+    const pipeline = await this.pipelines.get("runtime:pack-halves", PACK_HALVES_SHADER);
+    const grid = this.linearGrid(packed.elements);
+    this.dispatch(encoder, pipeline, [source, packed], grid[0], grid[1], 1, label);
   }
 
   createReadback(label: string, tensor: GpuTensor, encoder: GPUCommandEncoder): GpuTensor {

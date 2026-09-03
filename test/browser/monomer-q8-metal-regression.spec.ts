@@ -18,6 +18,7 @@ test("keeps exact and packed q8 deep-MSA confidence correct", async ({ page }) =
       qualifyMonomer(modelManifestUrl: string, deepA3m: string, storageOptions?: {
         readonly triangleWholeStorage?: "f32" | "f16";
         readonly msaStorage?: "f32" | "f16";
+        readonly pairStorage?: "f32" | "f16";
       }): Promise<{
         readonly bundleId: string;
         readonly deepMsa: { readonly recycles: readonly RecycleConfidence[] };
@@ -25,8 +26,9 @@ test("keeps exact and packed q8 deep-MSA confidence correct", async ({ page }) =
     };
     const deepA3m = await (await fetch("/qualification-assets/acceptance/test.a3m")).text();
     const exact = await module.qualifyMonomer("/qualification-assets/model/manifest.json", deepA3m);
+    // The storages every prediction runs with.
     const packed = await module.qualifyMonomer("/qualification-assets/model/manifest.json", deepA3m, {
-      triangleWholeStorage: "f16", msaStorage: "f16",
+      triangleWholeStorage: "f16", msaStorage: "f16", pairStorage: "f16",
     });
     return { exact, packed };
   });

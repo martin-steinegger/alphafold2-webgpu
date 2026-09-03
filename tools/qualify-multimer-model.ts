@@ -1,3 +1,4 @@
+import { EXACT_STORAGE } from "../src/model/monomer.js";
 import { CLUSTERED_MSA_CHANNELS, compactClusteredMsaFeatures } from "../src/input/msa-features.js";
 import { create, globals } from "webgpu";
 import { AlphaFoldMultimerGpu, type MultimerModelWeights } from "../src/model/multimer.js";
@@ -132,7 +133,7 @@ try {
     console.log("Multimer input embedding passed.");
     console.log(`Qualifying ${reference.path} against official JAX...`);
     const f32 = await new AlphaFoldMultimerGpu(device, {
-      compactTransitions: true, recycleEarlyStopTolerance: -1,
+      compactTransitions: true, recycleEarlyStopTolerance: -1, ...EXACT_STORAGE,
     }).predict(reference.features, float32Weights, float32Breaks);
     for (let recycle = 0; recycle < f32.recycles.length; recycle += 1) {
       const actual = f32.recycles[recycle]!.confidence;
@@ -152,7 +153,7 @@ try {
     if (compressedWeights === undefined || compressedBreaks === undefined) continue;
     console.log(`Qualifying compressed weights against f32 for ${reference.path}...`);
     const compressed = await new AlphaFoldMultimerGpu(device, {
-      compactTransitions: true, recycleEarlyStopTolerance: -1,
+      compactTransitions: true, recycleEarlyStopTolerance: -1, ...EXACT_STORAGE,
     }).predict(reference.features, compressedWeights, compressedBreaks);
     for (let recycle = 0; recycle < compressed.recycles.length; recycle += 1) {
       within(`compressed recycle ${recycle} mean pLDDT`, compressed.recycles[recycle]!.confidence.meanPlddt,

@@ -8,6 +8,7 @@
  *
  * Usage: tsx tools/benchmark-shape.ts [length] [msaRows] [extraRows] [recycles]
  */
+import { EXACT_STORAGE } from "../src/model/monomer.js";
 import { create, globals } from "webgpu";
 import { AlphaFoldMonomerGpu } from "../src/model/monomer.js";
 import { makeA3mFeatures } from "../src/input/a3m-features.js";
@@ -53,11 +54,9 @@ const features = makeA3mFeatures(a3m, featureTables, {
 const gpu = create([]);
 const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
 if (adapter === null) throw new Error("no WebGPU adapter");
-const memoryOptions = {
-  ...(process.env.AFWEBGPU_TRIANGLE_F16 === "1" ? { triangleWholeStorage: "f16" as const } : {}),
-  ...(process.env.AFWEBGPU_MSA_F16 === "1" ? { msaStorage: "f16" as const } : {}),
-  ...(process.env.AFWEBGPU_PAIR_F16 === "1" ? { pairStorage: "f16" as const } : {}),
-};
+// The model stores its activations packed. AFWEBGPU_EXACT=1 selects the f32
+// storages the differential tests use, for comparison.
+const memoryOptions = process.env.AFWEBGPU_EXACT === "1" ? { ...EXACT_STORAGE } : {};
 // Match what the page does: size the device to the shape, not to the base tier.
 const plan = planMonomerDevice(adapter, length, msaRows, extraRows, undefined, false, memoryOptions);
 const device = await requestAlphaFoldDevice(adapter, plan.requirements);

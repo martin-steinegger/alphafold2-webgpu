@@ -1,7 +1,7 @@
 import { CLUSTERED_MSA_CHANNELS, compactClusteredMsaFeatures } from "../src/input/msa-features.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { create, globals } from "webgpu";
-import { AlphaFoldMonomerGpu, type MonomerRecycleFeatures } from "../src/model/monomer.js";
+import { AlphaFoldMonomerGpu, EXACT_STORAGE, type MonomerRecycleFeatures } from "../src/model/monomer.js";
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
 import { requestAlphaFoldDevice } from "../src/runtime/device.js";
@@ -45,7 +45,7 @@ describe.skipIf(!enabled)("end-to-end uploaded A3M AlphaFold WebGPU", () => {
       model.embeddingWeights(), model.templateWeights(), model.extraStackWeights(), model.mainStackWeights(),
       model.structureWeights(), model.confidenceWeights(), model.geometryTables(),
     ]);
-    const prediction = await new AlphaFoldMonomerGpu(device).predict(features, {
+    const prediction = await new AlphaFoldMonomerGpu(device, { ...EXACT_STORAGE }).predict(features, {
       embedding, template, extraStack, mainStack, structure, lddt: confidence.lddt, pae: confidence.pae, geometry,
     }, await model.tensor("confidencePaeBreaks"));
     const reference = (input.store.manifest as unknown as Manifest).referencePrediction.recycleMetrics;

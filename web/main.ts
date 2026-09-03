@@ -450,7 +450,7 @@ function runSettings(prediction: MonomerPrediction | MultimerPrediction, context
     msa_mode: MSA_MODES[context.inputMode] ?? context.inputMode,
     msa_depth: context.depth,
     random_seed: job.randomSeed,
-    activation_storage: job.packedStorage ? "f16" : "f32",
+    activation_storage: "f16",
     length: context.sequence.length,
     chain_lengths: context.chainLengths ?? [context.sequence.length],
     adapter: context.adapterName,
@@ -812,7 +812,6 @@ async function runPrediction(): Promise<void> {
       maxExtraSequences: element<HTMLInputElement>("max-extra").valueAsNumber,
       recycles: Number(element<HTMLSelectElement>("recycles").value),
       randomSeed: element<HTMLInputElement>("seed").valueAsNumber,
-      packedStorage: element<HTMLSelectElement>("monomer-storage").value === "f16",
       compactPolicy: parameter("compact", "0") === "1",
       ...(parameter("profile", "0") === "1" ? { profile: {
         recycle: Number(parameter("profileRecycle", "0")),
@@ -938,7 +937,6 @@ function updateInputMode(): void {
     : multimer ? "Run Multimer-v3"
     : remote ? "Generate MSA & predict" : "Run prediction";
   element<HTMLInputElement>("max-msa").disabled = multimer && inputMode.value === "single";
-  element<HTMLSelectElement>("monomer-storage").disabled = false;
   const maxExtra = element<HTMLInputElement>("max-extra");
   maxExtra.disabled = multimer && inputMode.value === "single";
   maxExtra.max = multimer ? "2048" : "1024";
@@ -971,7 +969,6 @@ try {
     ?? "./model-multimer/manifest.json";
 } catch { /* storage may be unavailable */ }
 try { element<HTMLInputElement>("msa-api-url").value = localStorage.getItem("afwebgpu.msaApiUrl") ?? "https://api.colabfold.com"; } catch { /* storage may be unavailable */ }
-if (parameter("precision", "") === "f16") element<HTMLSelectElement>("monomer-storage").value = "f16";
 element<HTMLButtonElement>("clear-model-cache").addEventListener("click", () => { void (async () => {
   const button = element<HTMLButtonElement>("clear-model-cache"); button.disabled = true;
   try {

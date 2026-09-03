@@ -6,7 +6,11 @@
  */
 import { create, globals } from "webgpu";
 import { AlphaFoldMultimerGpu } from "../src/model/multimer.js";
-import { iterateMultimerQueryOnlyFeatures } from "../src/input/multimer-features.js";
+import { EXACT_STORAGE } from "../src/model/monomer.js";
+import {
+  iterateMultimerA3mFeatures, iterateMultimerQueryOnlyFeatures,
+} from "../src/input/multimer-features.js";
+import { generateMmseqs2ComplexMsa } from "../src/input/mmseqs2-api.js";
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
 import { planMonomerDevice, requestAlphaFoldDevice } from "../src/runtime/device.js";
@@ -29,13 +33,26 @@ const gpu = create([]);
 const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
 if (adapter === null) throw new Error("no WebGPU adapter");
 const plan = planMonomerDevice(adapter, length, 1, 1, undefined, false,
-  { multimer: true, templateRows: multimerTemplate.templateRows });
+  { multimer: true, templateRows: multimerTemplate.templateRows,
+    ...(process.env.AFWEBGPU_EXACT === "1" ? EXACT_STORAGE : {}) });
 console.error(`chains ${chains.map((chain) => chain.length).join("+")} = ${length} residues; estimated peak `
   + `${(plan.memory.estimatedPeakBytes / 1024 ** 2).toFixed(0)} MiB`);
 const device = await requestAlphaFoldDevice(adapter, plan.requirements);
 try {
-  const features = iterateMultimerQueryOnlyFeatures(chains, featureTables, { recycles: recycles - 1, randomSeed: 0 });
-  const prediction = await new AlphaFoldMultimerGpu(device, {}).predict(features, {
+  // AFWEBGPU_COMPLEX_MSA=1 searches the public ColabFold server for paired and
+  // unpaired alignments, which is the only way to judge a complex's confidence.
+  let features = iterateMultimerQueryOnlyFeatures(chains, featureTables, { recycles: recycles - 1, randomSeed: 0 });
+  if (process.env.AFWEBGPU_COMPLEX_MSA === "1") {
+    const search = await generateMmseqs2ComplexMsa(chains, {
+      onProgress: (progress) => console.error(`MMseqs2 ${progress.search ?? ""} ${progress.phase}`),
+    });
+    console.error(`complex alignment: ${search.depth} rows`);
+    features = iterateMultimerA3mFeatures(chains, search.a3m, search.mask, featureTables, {
+      recycles: recycles - 1, randomSeed: 0, maxMsaSequences: 252, maxExtraSequences: 1152,
+    });
+  }
+  const storage = process.env.AFWEBGPU_EXACT === "1" ? { ...EXACT_STORAGE } : {};
+const prediction = await new AlphaFoldMultimerGpu(device, storage).predict(features, {
     embedding, multimerTemplate, extraStack, mainStack, structure, lddt: confidence.lddt, pae: confidence.pae, geometry,
   }, paeBreaks, (summary, recycle) => {
     console.error(`recycle=${recycle} pLDDT=${summary.confidence.meanPlddt.toFixed(1)} pTM=${summary.confidence.ptm.toFixed(3)}`

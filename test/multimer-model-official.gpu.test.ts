@@ -1,3 +1,4 @@
+import { EXACT_STORAGE } from "../src/model/monomer.js";
 import { CLUSTERED_MSA_CHANNELS, compactClusteredMsaFeatures } from "../src/input/msa-features.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { create, globals } from "webgpu";
@@ -101,7 +102,7 @@ async function preparePrediction(
 
 async function predict(device: GPUDevice, prepared: PreparedPrediction): Promise<MultimerPrediction> {
   return new AlphaFoldMultimerGpu(device, {
-    compactTransitions: true, recycleEarlyStopTolerance: -1,
+    compactTransitions: true, recycleEarlyStopTolerance: -1, ...EXACT_STORAGE,
   }).predict(prepared.features, prepared.weights, prepared.paeBreaks);
 }
 

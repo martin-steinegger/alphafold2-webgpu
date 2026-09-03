@@ -39,8 +39,6 @@ export interface InferenceJob {
   readonly maxExtraSequences: number;
   readonly recycles: number;
   readonly randomSeed: number;
-  /** Packed half-precision activations where the model supports them. */
-  readonly packedStorage: boolean;
   /** Force the bounded-transition memory policy. */
   readonly compactPolicy: boolean;
   readonly profile?: {
@@ -208,22 +206,17 @@ export async function runInference(job: InferenceJob, reporter: InferenceReporte
   reporter.stage("features", "active", "Parsing input"); reporter.status("Building AF2 features");
   const clusteredRows = Math.min(job.maxMsaSequences, input.depth);
   const extraRows = Math.max(1, Math.min(job.maxExtraSequences, Math.max(0, input.depth - clusteredRows)));
-  // Multimer merges template rows into the MSA with buffer copies, so only
-  // the triangle projection can be packed there.
+  // The model keeps its activations packed, monomer and Multimer alike; the
+  // exact f32 storages exist only for the differential tests.
   const memoryOptions = {
-    ...(job.packedStorage ? { triangleWholeStorage: "f16" as const } : {}),
-    ...(job.packedStorage && !input.multimer ? { msaStorage: "f16" as const, pairStorage: "f16" as const } : {}),
+    triangleWholeStorage: "f16" as const, msaStorage: "f16" as const, pairStorage: "f16" as const,
     ...(input.multimer ? { multimer: true, templateRows: multimerTemplate?.templateRows ?? 4 } : {}),
   };
   const memoryBudget = unifiedMemoryBudget(appleUnifiedMemory);
   const devicePlan = planMonomerDevice(
     adapter, input.sequence.length, clusteredRows, extraRows, memoryBudget, compactMemoryPolicy, memoryOptions,
   );
-  reporter.log(job.packedStorage
-    ? `Activation storage: packed f16 ${input.multimer
-      ? "for the triangle projection (approximate; Multimer keeps f32 MSA activations)"
-      : "for the MSA activations, the pair and the triangle projection (approximate, reduced memory)"}.`
-    : `Activation storage: exact f32${input.multimer ? " (Multimer-v3)" : ""}.`);
+  reporter.log("Activations are stored as packed half precision: the MSA, the pair and the triangle projection.");
   reporter.log(`Estimated peak GPU allocations: ${formatMib(devicePlan.memory.estimatedPeakBytes)} `
     + `(${formatMib(devicePlan.memory.persistentBytes)} persistent, `
     + `${formatMib(devicePlan.memory.scratchBytes)} scratch, `

@@ -104,6 +104,10 @@ The loader accepts float32, float16, and mixed q8 bundles; neural-network arithm
 
 There is no single portable limit. Available GPU memory, WebGPU buffer limits, MSA depth, browser implementation, and adapter performance all matter. The application calculates both individual-buffer requirements and a conservative aggregate peak from sequence length and retained MSA depth instead of requesting a fixed limit. When the complete AF2 transition intermediate fits the adapter and memory budget it uses the fast path; otherwise it processes aligned row windows with at most 96 MiB of transition scratch. Chrome on macOS automatically uses bounded transitions and a bounded reusable-scratch pool even when adapter identity is hidden. Inputs that exceed a RAM-derived safety budget are rejected before GPU allocation with explicit suggested MSA row limits. Append `?compact=1` to force this policy on another platform. Persistent MSA memory grows as `Nseq × L`, while pair memory and compute grow at least as `L²`, so longer inputs can still take substantially longer.
 
+### How are activations stored?
+
+Weights are decoded once to float32 and every operation computes in float32. The activations the trunk carries between operations, the MSA, the pair, and the triangle multiplication's whole projection, are stored as half precision packed two to a 32-bit word, which needs no device feature. That is the only storage the model has: there is no exact mode to choose, and Multimer uses the same one. It halves the memory a prediction needs and, on real alignments of 164 to 396 residues, returned mean pLDDT and pTM identical to the float32 storage to two decimals; on a complex with a live ColabFold alignment, pLDDT 91.58 against 91.56 and ipTM 0.836 against 0.836. The float32 storage remains in the code as `EXACT_STORAGE` so the kernels can be compared against AlphaFold's own float32 tensors.
+
 ### Why is single-sequence confidence lower than the MSA prediction?
 
 This is expected for many proteins. For the 59-residue acceptance sequence below, model 1 PTM starts near 57 pLDDT with a single sequence but reaches approximately 97 pLDDT with a deep MSA.

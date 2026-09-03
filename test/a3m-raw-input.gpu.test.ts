@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { create, globals } from "webgpu";
-import { AlphaFoldMonomerGpu } from "../src/model/monomer.js";
+import { AlphaFoldMonomerGpu, EXACT_STORAGE } from "../src/model/monomer.js";
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
 import { requestAlphaFoldDevice } from "../src/runtime/device.js";
@@ -19,7 +19,7 @@ describe.skipIf(!enabled)("raw A3M input to WebGPU prediction", () => {
       fixture.embeddingWeights(), fixture.templateWeights(), fixture.extraStackWeights(), fixture.mainStackWeights(),
       fixture.structureWeights(), fixture.confidenceWeights(), fixture.geometryTables(), fixture.queryOnlyFeatureTables(),
     ]);
-    const prediction = await new AlphaFoldMonomerGpu(device).predictA3m(await readFile("test.a3m", "utf8"), {
+    const prediction = await new AlphaFoldMonomerGpu(device, { ...EXACT_STORAGE }).predictA3m(await readFile("test.a3m", "utf8"), {
       embedding, template, extraStack, mainStack, structure, lddt: confidence.lddt, pae: confidence.pae, geometry,
     }, featureTables, { recycles: 0, randomSeed: 0 }, await fixture.tensor("confidencePaeBreaks"));
     expect(prediction.final.confidence.meanPlddt).toBeGreaterThan(90);

@@ -1,3 +1,4 @@
+import { EXACT_STORAGE } from "../src/model/monomer.js";
 import { describe, expect, it, vi } from "vitest";
 import {
   estimateMonomerMemory, monomerDeviceRequirements, planMonomerDevice, requestAlphaFoldDevice,
@@ -31,20 +32,25 @@ describe("requestAlphaFoldDevice", () => {
   });
 
   it("sizes limits from persistent tensors rather than transition intermediates", () => {
-    // 291 residues over 508 clustered rows: the clustered MSA is the largest
-    // persistent tensor, and every scratch tensor is bounded below it.
+    // Activations are packed, so every persistent tensor asks for two bytes an
+    // element. 291 residues over 508 clustered rows: the clustered MSA is the
+    // largest of them, and every scratch tensor is bounded below it.
     expect(monomerDeviceRequirements(291, 508, 1024)).toEqual({
       maxBufferSize: 256 * 1024 ** 2,
-      maxStorageBufferBindingSize: 508 * 291 * 256 * 4,
+      maxStorageBufferBindingSize: 128 * 1024 ** 2,
     });
     // At 1000 residues the clustered MSA is still the larger of the two, and
     // the requirement follows it rather than any scratch tensor.
     expect(monomerDeviceRequirements(1_000, 508, 1024)).toEqual({
-      maxBufferSize: 508 * 1_000 * 256 * 4,
-      maxStorageBufferBindingSize: 508 * 1_000 * 256 * 4,
+      maxBufferSize: 256 * 1024 ** 2,
+      maxStorageBufferBindingSize: 508 * 1_000 * 256 * 2,
     });
     // With a shallow alignment the pair tensor is what the device must hold.
     expect(monomerDeviceRequirements(1_000, 32, 64).maxStorageBufferBindingSize)
+      .toBe(1_000 * 1_000 * 128 * 2);
+    // The exact storages ask for twice as much, which is why they are not the
+    // shipped path.
+    expect(monomerDeviceRequirements(1_000, 32, 64, EXACT_STORAGE).maxStorageBufferBindingSize)
       .toBe(1_000 * 1_000 * 128 * 4);
   });
 
@@ -52,20 +58,20 @@ describe("requestAlphaFoldDevice", () => {
     // The outer-product contraction, the transition window and the attention
     // window all cap themselves, so none of them may drive the requirement.
     const requirement = monomerDeviceRequirements(512, 256, 512).maxStorageBufferBindingSize;
-    expect(requirement).toBe(Math.max(256 * 512 * 256 * 4, 512 * 512 * 128 * 4));
-    // Scratch that grew with the shape would have asked for 256 MiB here.
-    expect(requirement).toBeLessThan(256 * 1024 ** 2);
+    // Both persistent tensors are 64 MiB packed, so the base tier covers them.
+    expect(Math.max(256 * 512 * 256 * 2, 512 * 512 * 128 * 2)).toBe(64 * 1024 ** 2);
+    expect(requirement).toBe(128 * 1024 ** 2);
+    // Scratch that grew with the shape would have asked for more than the tier.
+    expect(requirement).toBeLessThanOrEqual(128 * 1024 ** 2);
   });
 
-  it("accounts for packed MSA storage in monomer limits", () => {
-    expect(monomerDeviceRequirements(291, 508, 1024, { msaStorage: "f16" })).toEqual({
+  it("asks for twice the binding on the exact path the tests use", () => {
+    expect(monomerDeviceRequirements(291, 508, 1024, EXACT_STORAGE)).toEqual({
       maxBufferSize: 256 * 1024 ** 2,
-      maxStorageBufferBindingSize: 128 * 1024 ** 2,
+      maxStorageBufferBindingSize: 508 * 291 * 256 * 4,
     });
     const constrained = adapterWithLimits(128 * 1024 ** 2, 256 * 1024 ** 2).adapter;
-    expect(planMonomerDevice(
-      constrained, 291, 508, 1024, undefined, true, { msaStorage: "f16", triangleWholeStorage: "f16" },
-    )).toMatchObject({
+    expect(planMonomerDevice(constrained, 291, 508, 1024, undefined, true)).toMatchObject({
       transitionMode: "chunked",
       requirements: { maxBufferSize: 256 * 1024 ** 2, maxStorageBufferBindingSize: 128 * 1024 ** 2 },
     });
@@ -110,15 +116,15 @@ describe("requestAlphaFoldDevice", () => {
     expect(requestDevice).toHaveBeenCalledWith(expect.objectContaining({
       requiredLimits: {
         maxBufferSize: 256 * 1024 ** 2,
-        maxStorageBufferBindingSize: 256 * 1024 ** 2,
+        maxStorageBufferBindingSize: 128 * 1024 ** 2,
       },
     }));
   });
 
   it("rejects a shape that exceeds the adapter instead of silently lowering its requirements", async () => {
-    const { adapter, requestDevice } = adapterWithLimits(128 * 1024 ** 2, 256 * 1024 ** 2);
+    const { adapter, requestDevice } = adapterWithLimits(64 * 1024 ** 2, 256 * 1024 ** 2);
     const requirements = monomerDeviceRequirements(291, 508, 1024);
-    await expect(requestAlphaFoldDevice(adapter, requirements)).rejects.toThrow(/requires a 144 MiB storage binding/);
+    await expect(requestAlphaFoldDevice(adapter, requirements)).rejects.toThrow(/requires a 128 MiB storage binding/);
     expect(requestDevice).not.toHaveBeenCalled();
   });
 });
@@ -131,18 +137,19 @@ describe("estimateMonomerMemory", () => {
     // The template module holds several pair-sized tensors beside the pair and
     // the extra alignment, so at this size it sets the peak: about three pair
     // representations (170 MiB each at 590 residues) above the trunk terms.
-    const pair = 590 * 590 * 128 * 4;
+    const pair = 590 * 590 * 128 * 2;
     expect(multimer.estimatedPeakBytes - monomer.estimatedPeakBytes).toBeGreaterThan(pair);
     // A ten-copy 59-mer at the page's multimer defaults is over a gigabyte live.
     expect(multimer.estimatedPeakBytes).toBeGreaterThan(1000 * 1024 ** 2);
   });
 
-  // Combined resident peaks measured on GB10. The estimate gates whether a
-  // browser prediction is allowed to start, so it must cover physical pooled
-  // GPUBuffer residency rather than only the allocator's logically live bytes.
+  // Combined resident peaks measured on GB10 with the model's packed storage.
+  // The estimate gates whether a browser prediction is allowed to start, so it
+  // must cover physical pooled GPUBuffer residency rather than only the
+  // allocator's logically live bytes.
   const measured: ReadonlyArray<readonly [number, number, number, number]> = [
-    [59, 508, 1024, 117], [128, 256, 512, 117], [256, 256, 512, 206],
-    [384, 256, 512, 351], [512, 256, 512, 504], [1_000, 256, 512, 1_447],
+    [59, 508, 1024, 102], [128, 256, 512, 97], [256, 256, 512, 130],
+    [384, 256, 512, 231], [512, 256, 512, 312],
   ];
 
   it("stays an upper bound on measured combined residency", () => {
@@ -167,31 +174,19 @@ describe("estimateMonomerMemory", () => {
     expect(longer).toBeGreaterThan(shallow);
   });
 
-  it("reflects optional packed monomer storage", () => {
+  it("estimates the exact storages above the packed model", () => {
     const mib = 1024 ** 2;
-    const exact = estimateMonomerMemory(384, 256, 512, "chunked").estimatedPeakBytes / mib;
-    const triangle = estimateMonomerMemory(
-      384, 256, 512, "chunked", { triangleWholeStorage: "f16" },
-    ).estimatedPeakBytes / mib;
-    const msa = estimateMonomerMemory(
-      384, 256, 512, "chunked", { msaStorage: "f16" },
-    ).estimatedPeakBytes / mib;
-    const combined = estimateMonomerMemory(384, 256, 512, "chunked", {
-      triangleWholeStorage: "f16", msaStorage: "f16",
-    }).estimatedPeakBytes / mib;
-    expect(triangle).toBeLessThan(exact);
-    expect(msa).toBeLessThan(exact);
-    expect(combined).toBeLessThan(triangle);
-    expect(combined).toBeLessThan(msa);
-    // L384 combined resident peaks measured for exact / triangle-f16 /
-    // MSA-f16 / both. Every admission estimate must remain above its physical
-    // GPUBuffer peak, including the pool floor shared by both packed options.
+    const packed = estimateMonomerMemory(384, 256, 512, "chunked").estimatedPeakBytes / mib;
+    const exact = estimateMonomerMemory(384, 256, 512, "chunked", EXACT_STORAGE).estimatedPeakBytes / mib;
+    expect(packed).toBeLessThan(exact);
+    // Combined resident peaks measured at 384 residues for the model's packed
+    // storage and for the exact path the differential tests use. Every
+    // admission estimate must stay above its physical GPUBuffer peak.
     for (const [label, estimate, resident] of [
-      ["exact", exact, 351], ["triangle f16", triangle, 331],
-      ["MSA f16", msa, 307], ["combined f16", combined, 307],
+      ["packed", packed, 231], ["exact", exact, 351],
     ] as const) {
       expect(estimate, label).toBeGreaterThan(resident);
-      expect(estimate / resident, label).toBeLessThan(1.35);
+      expect(estimate / resident, label).toBeLessThan(1.4);
     }
   });
 });

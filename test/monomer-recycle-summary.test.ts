@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  AlphaFoldMonomerGpu, summarizeMonomerRecycle, type MonomerRecycleDetails,
+  AlphaFoldMonomerGpu, EXACT_STORAGE, summarizeMonomerRecycle, type MonomerRecycleDetails,
 } from "../src/model/monomer.js";
 
 describe("monomer recycle result retention", () => {
@@ -40,9 +40,16 @@ describe("monomer storage options", () => {
     })).toThrow(/triangle whole storage must be f32 or f16/);
   });
 
-  it("keeps packed MSA storage unavailable to Multimer", () => {
-    expect(() => new AlphaFoldMonomerGpu(device, {
-      multimer: true, msaStorage: "f16",
-    })).toThrow(/packed MSA storage is not supported for Multimer/);
+  it("stores activations packed, for Multimer as well", () => {
+    const monomer = new AlphaFoldMonomerGpu(device);
+    expect([monomer.msaStorage, monomer.pairStorage, monomer.triangleWholeStorage])
+      .toEqual(["f16", "f16", "f16"]);
+    const multimer = new AlphaFoldMonomerGpu(device, { multimer: true });
+    expect([multimer.msaStorage, multimer.pairStorage, multimer.triangleWholeStorage])
+      .toEqual(["f16", "f16", "f16"]);
+    // The exact path stays reachable for the differential tests.
+    const exact = new AlphaFoldMonomerGpu(device, EXACT_STORAGE);
+    expect([exact.msaStorage, exact.pairStorage, exact.triangleWholeStorage])
+      .toEqual(["f32", "f32", "f32"]);
   });
 });

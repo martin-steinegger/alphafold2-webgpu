@@ -85,9 +85,11 @@ export function estimateMonomerMemory(
   }
   void transitionMode;
   const bytes = Float32Array.BYTES_PER_ELEMENT;
-  const pairBytes = options.pairStorage === "f16" ? 2 : bytes;
+  // Storage defaults follow the model's: packed unless a caller asks for the
+  // exact path, so an estimate made without options describes a real run.
+  const pairBytes = options.pairStorage === "f32" ? bytes : 2;
   const pair = checkedBytes("pair representation", length, length, 128, pairBytes);
-  const activationBytes = options.msaStorage === "f16" ? 2 : bytes;
+  const activationBytes = options.msaStorage === "f32" ? bytes : 2;
   const templateRows = options.multimer === true ? (options.templateRows ?? 4) : 0;
   const msa = checkedBytes("MSA representation", msaSequences + templateRows, length, 256, activationBytes);
   const extra = checkedBytes("extra-MSA representation", extraSequences, length, 64, activationBytes);
@@ -111,8 +113,10 @@ export function estimateMonomerMemory(
   // 64-channel template pair, normalizes it and projects a pair-sized update,
   // and its blocks keep one whole 64-channel projection plus blocks.
   const templateBlock = triangleBlockRows(length, 64, 64) * length * 64 * bytes;
+  // That module is f32 throughout, whatever the pair it adds into is stored as.
+  const exactPair = checkedBytes("template pair", length, length, 128, bytes);
   const templateModuleBytes = options.multimer === true
-    ? pair + extra + masks + 2 * positions + 3 * pair + 3 * templateBlock : 0;
+    ? pair + extra + masks + 2 * positions + 3 * exactPair + 3 * templateBlock : 0;
 
   // Every operation bounds its own scratch against an explicit budget, so the
   // peak is the largest single operation's working set, not a sum over the
@@ -143,7 +147,8 @@ export function estimateMonomerMemory(
     attentionScratch(length, length, 128, 5) + pairBias,
     // Triangle multiplication keeps one projection whole and streams the
     // other projection, the contraction and the output gate in blocks.
-    (options.triangleWholeStorage === "f16" ? pair / 2 : pair) + 3 * triangleBlock,
+    (options.triangleWholeStorage === "f32" ? pair * (bytes / pairBytes) : pair * (2 / pairBytes))
+      + 3 * triangleBlock,
     transitionScratch(msaSequences * length, 256, 1024),
     transitionScratch(extraSequences * length, 64, 256),
     transitionScratch(length * length, 128, 512),
@@ -162,8 +167,8 @@ export function estimateMonomerMemory(
   // activations shrink logical tensors faster than they shrink that pool, so
   // their measured resident/live gap is wider and gets its own calibration.
   // The fixed allowance keeps small shapes conservative as well.
-  const packedStorageCount = Number(options.msaStorage === "f16")
-    + Number(options.triangleWholeStorage === "f16") + Number(options.pairStorage === "f16");
+  const packedStorageCount = Number(options.msaStorage !== "f32")
+    + Number(options.triangleWholeStorage !== "f32") + Number(options.pairStorage !== "f32");
   const residentScale = packedStorageCount === 2 ? 0.40 : packedStorageCount === 1 ? 0.30 : 0.25;
   const residentHeadroomBytes = Math.ceil(livePeakBytes * residentScale) + 16 * 1024 ** 2;
   const estimatedPeakBytes = livePeakBytes + residentHeadroomBytes;
@@ -224,8 +229,10 @@ export function monomerDeviceRequirements(
     throw new RangeError("monomer device dimensions must be positive safe integers");
   }
   const bytes = Float32Array.BYTES_PER_ELEMENT;
-  const activationBytes = options.msaStorage === "f16" ? 2 : bytes;
-  const pairBytes = options.pairStorage === "f16" ? 2 : bytes;
+  // Storage defaults follow the model's: packed unless a caller asks for the
+  // exact path, so an estimate made without options describes a real run.
+  const activationBytes = options.msaStorage === "f32" ? bytes : 2;
+  const pairBytes = options.pairStorage === "f32" ? bytes : 2;
   // The persistent activations, plus the largest scratch tensor, which every
   // operation now bounds against its own budget rather than letting it grow
   // with the shape: the outer-product contraction, the transition window and
@@ -238,7 +245,7 @@ export function monomerDeviceRequirements(
     extraSequences * length * 64 * activationBytes,
     length * length * 128 * pairBytes,
     // The triangle multiplication's whole projection matches the pair in size.
-    length * length * 128 * (options.triangleWholeStorage === "f16" ? 2 : bytes),
+    length * length * 128 * (options.triangleWholeStorage === "f32" ? bytes : 2),
     OUTER_PRODUCT_BLOCK_LIMIT_BYTES,
   );
   if (!Number.isSafeInteger(largestTensor)) throw new RangeError("monomer tensor size exceeds JavaScript precision");

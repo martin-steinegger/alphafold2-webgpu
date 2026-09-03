@@ -1,4 +1,7 @@
-import { ATTENTION_NORMALIZE_SHADER, createAttentionNormParameters } from "./attention.js";
+import {
+  ATTENTION_NORMALIZE_SHADER, createAttentionNormParameters, createAttentionStatisticsShader,
+} from "./attention.js";
+import { type ActivationStorage, storageArray, storageWords, storedElement } from "../runtime/storage.js";
 import { encodeMultimerTemplatePairBlock, type TemplatePairBlockWeights } from "./block.js";
 import { WebGpuExecution, type GpuTensor } from "../runtime/execution.js";
 
@@ -33,28 +36,47 @@ export interface MultimerMockTemplateResult {
 export interface MultimerMockTemplateResidentInput {
   readonly pair: GpuTensor;
   readonly pairMask: GpuTensor;
+  /** Storage of that pair; `f16` means packed half-precision words. */
+  readonly pairStorage?: ActivationStorage;
 }
 
-const PAIR_INIT_SHADER = `
+/**
+ * Projects the query pair into the template's channels, normalizing as it
+ * loads.
+ *
+ * The normalization used to be written out first, which is another
+ * pair-shaped tensor for a value each element is read once for. From the row
+ * statistics it costs two floats a row instead, and the pair can stay in
+ * whatever storage the trunk holds it in.
+ */
+function createPairInitShader(storage: ActivationStorage): string {
+  return `
 struct P { pairs: u32, input_channels: u32, output_channels: u32 };
 const GRID_WIDTH: u32 = 32768u;
-@group(0) @binding(0) var<storage, read> source: array<f32>;
+@group(0) @binding(0) var<storage, read> source: array<${storageArray(storage)}>;
 @group(0) @binding(1) var<storage, read> weight: array<f32>;
 @group(0) @binding(2) var<storage, read> bias: array<f32>;
 @group(0) @binding(3) var<uniform> p: P;
 @group(0) @binding(4) var<storage, read_write> output: array<f32>;
+@group(0) @binding(5) var<storage, read> statistics: array<f32>;
+@group(0) @binding(6) var<storage, read> norm_weights: array<f32>;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let index = id.x + id.y * GRID_WIDTH * 64u;
   if (index >= p.pairs * p.output_channels) { return; }
   let row = index / p.output_channels;
   let out = index % p.output_channels;
+  let mean = statistics[2u * row];
+  let inverse_std = statistics[2u * row + 1u];
   var value = bias[out];
   for (var c = 0u; c < p.input_channels; c += 1u) {
-    value += source[row * p.input_channels + c] * weight[c * p.output_channels + out];
+    let normalized = (${storedElement(storage, "source", "row * p.input_channels + c")} - mean) * inverse_std
+      * norm_weights[c] + norm_weights[p.input_channels + c];
+    value += normalized * weight[c * p.output_channels + out];
   }
   output[index] = value;
 }`;
+}
 
 const OUTPUT_SHADER = `
 struct P { rows: u32, input_channels: u32, output_channels: u32 };
@@ -123,7 +145,8 @@ export class MultimerMockTemplateGpu {
       if (pairMaskValue.length !== pairs) throw new RangeError("template pair mask must have shape [L, L]");
       validateFloat32("template pair tensor", pairValue, pairs * 128);
       validateFloat32("template pair mask", pairMaskValue, pairs);
-    } else if (sharedExecution === undefined || residentInput.pair.elements !== pairs * 128
+    } else if (sharedExecution === undefined
+      || residentInput.pair.elements !== storageWords(pairs * 128, residentInput.pairStorage ?? "f32")
       || residentInput.pairMask.elements !== pairs) {
       throw new RangeError("resident template pair tensors have the wrong shape or execution");
     }
@@ -158,24 +181,26 @@ export class MultimerMockTemplateGpu {
       const normParams = execution.upload("multimer-template.query-norm-params", createAttentionNormParameters(
         pairs, pairChannels, 0, pairChannels, false, 1, pairs, 1e-5,
       ), GPUBufferUsage.UNIFORM);
-      const normalized = execution.allocate("multimer-template.query-normalized", pairs * pairChannels);
+      const statistics = execution.allocate("multimer-template.query-statistics", pairs * 2);
       const templatePair = execution.allocate("multimer-template.pair", pairs * templateChannels,
         GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
       const inputWeight = execution.upload("multimer-template.input-weight", weightsValue.pairInputWeight);
       const inputBias = execution.upload("multimer-template.input-bias", weightsValue.pairInputBias);
       const inputParams = execution.upload("multimer-template.input-params",
         new Uint32Array([pairs, pairChannels, templateChannels]), GPUBufferUsage.UNIFORM);
-      const [normalize, pairInit] = await Promise.all([
-        execution.pipelines.get("multimer-template:normalize", ATTENTION_NORMALIZE_SHADER),
-        execution.pipelines.get("multimer-template:pair-init", PAIR_INIT_SHADER),
+      const pairStorage = residentInput?.pairStorage ?? "f32";
+      const [queryStatistics, pairInit] = await Promise.all([
+        execution.pipelines.get(`multimer-template:query-statistics:${pairStorage}`,
+          createAttentionStatisticsShader(pairStorage)),
+        execution.pipelines.get(`multimer-template:pair-init:${pairStorage}`, createPairInitShader(pairStorage)),
       ]);
       let encoder = this.device.createCommandEncoder({ label: "multimer-template.initialize" });
       this.device.pushErrorScope("validation");
       let grid = execution.linearGrid(pairs, 1);
-      execution.dispatch(encoder, normalize, [pair, normWeights, normParams, normalized], grid[0], grid[1]);
+      execution.dispatch(encoder, queryStatistics, [pair, normParams, statistics], grid[0], grid[1]);
       grid = execution.linearGrid(templatePair.elements);
-      execution.dispatch(encoder, pairInit, [normalized, inputWeight, inputBias, inputParams, templatePair],
-        grid[0], grid[1]);
+      execution.dispatch(encoder, pairInit,
+        [pair, inputWeight, inputBias, inputParams, templatePair, statistics, normWeights], grid[0], grid[1]);
       execution.endComputePass(encoder);
       this.device.queue.submit([encoder.finish()]);
       execution.noteSubmitted();
@@ -218,7 +243,8 @@ export class MultimerMockTemplateGpu {
         new Uint32Array([length, weightsValue.templateRows, 256]), GPUBufferUsage.UNIFORM);
       const msaRows = execution.allocate("multimer-template.msa-rows", weightsValue.templateRows * length * 256,
         GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
-      const [outputPipeline, msaPipeline] = await Promise.all([
+      const [normalize, outputPipeline, msaPipeline] = await Promise.all([
+        execution.pipelines.get("multimer-template:normalize", ATTENTION_NORMALIZE_SHADER),
         execution.pipelines.get("multimer-template:output", OUTPUT_SHADER),
         execution.pipelines.get("multimer-template:msa", MSA_SHADER),
       ]);

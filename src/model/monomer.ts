@@ -54,6 +54,19 @@ export type MultimerCompatibleModelWeights = Omit<MonomerModelWeights, "template
 /** User-facing confidence tensors; raw categorical logits are transient implementation details. */
 export type PredictionConfidenceResult = ConfidenceSummaryResult;
 
+/**
+ * The exact storages the differential tests compare the model against.
+ *
+ * Predictions run packed: measurement on real alignments put the difference
+ * below the confidence's own resolution, and the memory it saves is what
+ * decides whether a chain runs at all in a browser. The exact path stays
+ * reachable so the kernels can still be checked against AlphaFold's own
+ * tensors, which are f32.
+ */
+export const EXACT_STORAGE = {
+  triangleWholeStorage: "f32", msaStorage: "f32", pairStorage: "f32",
+} as const;
+
 /** Stands in for the pair when a prediction did not ask to read it back. */
 const EMPTY_PAIR = new Float32Array(0);
 
@@ -223,9 +236,9 @@ export class AlphaFoldMonomerGpu {
     this.multimer = options.multimer ?? false;
     this.returnFinalPair = options.returnFinalPair ?? false;
     this.collapseQueryOnlyTemplate = options.collapseQueryOnlyTemplate ?? true;
-    this.triangleWholeStorage = options.triangleWholeStorage ?? "f32";
-    this.msaStorage = options.msaStorage ?? "f32";
-    this.pairStorage = options.pairStorage ?? "f32";
+    this.triangleWholeStorage = options.triangleWholeStorage ?? "f16";
+    this.msaStorage = options.msaStorage ?? "f16";
+    this.pairStorage = options.pairStorage ?? "f16";
     if (this.triangleWholeStorage !== "f32" && this.triangleWholeStorage !== "f16") {
       throw new RangeError("triangle whole storage must be f32 or f16");
     }
@@ -235,12 +248,8 @@ export class AlphaFoldMonomerGpu {
     if (this.pairStorage !== "f32" && this.pairStorage !== "f16") {
       throw new RangeError("pair storage must be f32 or f16");
     }
-    if (this.multimer && this.pairStorage !== "f32") {
-      throw new RangeError("packed pair storage is not supported for Multimer, whose template adds into the pair");
-    }
-    if (this.multimer && this.msaStorage !== "f32") {
-      throw new RangeError("packed MSA storage is not supported for Multimer, which merges template rows into the MSA");
-    }
+
+
     this.recycleEarlyStopTolerance = options.recycleEarlyStopTolerance ?? -1;
     if (!Number.isFinite(this.recycleEarlyStopTolerance)) {
       throw new RangeError("recycleEarlyStopTolerance must be finite");
@@ -310,11 +319,7 @@ export class AlphaFoldMonomerGpu {
     }
     const templateModule = templateWeights === undefined || templateConstantApplied
       ? undefined : new QueryOnlyTemplateGpu(this.device);
-    if (templateModule !== undefined && this.pairStorage !== "f32") {
-      // The module's update is added into the pair as f32. It only runs when
-      // the constant does not apply, which a packed run has no path to handle.
-      throw new RangeError("packed pair storage needs the collapsed query-only template and an unpadded chain");
-    }
+
     const recomputeTemplate = length * length * 128 * 4 >= TEMPLATE_RECOMPUTE_BYTES;
     const templateUpdateValue = templateModule !== undefined && templateWeights !== undefined && !recomputeTemplate
       ? (await templateModule.run({
@@ -439,15 +444,31 @@ export class AlphaFoldMonomerGpu {
           const templateEncoder = this.device.createCommandEncoder({ label: `monomer.template-residual-${recycle}` });
           this.device.pushErrorScope("validation");
           await execution.addInPlace(templateEncoder, embedding.pairWithoutTemplates, templateUpdate,
-            `monomer.template-residual-${recycle}`);
+            `monomer.template-residual-${recycle}`, this.pairStorage);
           await submit(templateEncoder, `template residual recycle ${recycle}`);
           releaseTensor(templateUpdate);
           templateMilliseconds = performance.now() - templateStart;
         } else if (templateModule !== undefined && templateWeights !== undefined) {
           const templateStart = performance.now();
-          await templateModule.run({
+          const templateInput = {
             length, templateChannels: 64, pairChannels: 128, pairMask, weights: templateWeights,
-          }, { execution, pair: embedding.pairWithoutTemplates, pairMask: pairMaskTensor });
+          };
+          if (this.pairStorage === "f32") {
+            await templateModule.run(templateInput,
+              { execution, pair: embedding.pairWithoutTemplates, pairMask: pairMaskTensor });
+          } else {
+            // The module writes f32, so a packed pair takes its update through
+            // the packed residual add rather than letting it write the pair.
+            const update = await templateModule.run(templateInput);
+            const templateUpdate = execution.upload(`monomer.template-update-${recycle}`, update.pairUpdate);
+            const templateEncoder = this.device.createCommandEncoder(
+              { label: `monomer.template-residual-${recycle}` });
+            this.device.pushErrorScope("validation");
+            await execution.addInPlace(templateEncoder, embedding.pairWithoutTemplates, templateUpdate,
+              `monomer.template-residual-${recycle}`, this.pairStorage);
+            await submit(templateEncoder, `template residual recycle ${recycle}`);
+            releaseTensor(templateUpdate);
+          }
           templateMilliseconds = performance.now() - templateStart;
           // The template stack's scratch shapes recur only next recycle.
           execution.allocator.destroyPooled();
@@ -470,22 +491,28 @@ export class AlphaFoldMonomerGpu {
           const multimerWeights = weights as MultimerCompatibleModelWeights;
           mainSequences += multimerWeights.multimerTemplate.templateRows;
           templateRows = execution.allocate(`multimer.template-msa-rows-${recycle}`,
-            multimerWeights.multimerTemplate.templateRows * length * 256,
+            storageWords(multimerWeights.multimerTemplate.templateRows * length * 256, this.msaStorage),
             GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST);
           const templateCheckpoint = execution.checkpoint();
           const template = await new MultimerMockTemplateGpu(this.device).run(
             new Float32Array(0), new Float32Array(0), length, multimerWeights.multimerTemplate, execution,
-            { pair: embedding.pairWithoutTemplates, pairMask: pairMaskTensor },
+            { pair: embedding.pairWithoutTemplates, pairMask: pairMaskTensor, pairStorage: this.pairStorage },
           );
           const templatePair = template.pairUpdateTensor!;
           const templateMsa = template.msaRowsTensor!;
           const templateEncoder = this.device.createCommandEncoder({ label: `multimer.template-merge-${recycle}` });
           this.device.pushErrorScope("validation");
           await execution.addInPlace(templateEncoder, embedding.pairWithoutTemplates, templatePair,
-            `multimer.template-pair-residual-${recycle}`);
-          execution.endComputePass(templateEncoder);
-          templateEncoder.copyBufferToBuffer(templateMsa.allocation.buffer, 0,
-            templateRows.allocation.buffer, 0, templateMsa.elements * 4);
+            `multimer.template-pair-residual-${recycle}`, this.pairStorage);
+          if (this.msaStorage === "f32") {
+            execution.endComputePass(templateEncoder);
+            templateEncoder.copyBufferToBuffer(templateMsa.allocation.buffer, 0,
+              templateRows.allocation.buffer, 0, templateMsa.elements * 4);
+          } else {
+            // The rows join a packed MSA, so they are packed on the way.
+            await execution.packHalves(templateEncoder, templateMsa, templateRows,
+              `multimer.template-msa-pack-${recycle}`);
+          }
           await submit(templateEncoder, `Multimer template pair update recycle ${recycle}`);
           templateSubmissions = template.submissions + 1;
           execution.releaseSince(templateCheckpoint);
@@ -550,7 +577,7 @@ export class AlphaFoldMonomerGpu {
           // template rows kept from before the extra stack.
           const multimerWeights = weights as MultimerCompatibleModelWeights;
           multimerMainMsa = execution.allocate(`multimer.main-msa-${recycle}`,
-            mainSequences * length * 256,
+            storageWords(mainSequences * length * 256, this.msaStorage),
             GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST);
           const combinedMask = new Float32Array(
             features.msaMask.length + multimerWeights.multimerTemplate.templateRows * length,

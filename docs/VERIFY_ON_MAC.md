@@ -8,37 +8,32 @@ only runs and reports.
 
 ## What changed, in one paragraph
 
-Peak GPU memory of monomer inference was cut to the floor of the exact design:
-the pair, the MSA, one whole triangle projection and three 8 MiB blocks. The
-embedder writes the pair in place; the clustered MSA is embedded after the
-extra stack; the template update is uploaded per recycle; every operation's
-scratch is an 8 or 16 MiB chunk backed by whole mebibytes so the pool can hand
-one operation's chunks to the next; the triangle multiplication runs on the
-shared GEMM with its LayerNorms fused into operand loads, the incoming
-direction blocked by output columns. Two inexact options exist, off by
-default: `triangleWholeStorage: "f16"` and `msaStorage: "f16"`, both packed
-half precision via `pack2x16float` (no device feature needed). The page exposes
-them together as an explicit reduced-memory monomer option; exact f32 remains
-the default and Multimer remains f32.
+There is one model now. Activations are stored as packed half precision
+everywhere, monomer and Multimer alike: the MSA, the pair and the triangle
+multiplication's whole projection, packed two to a word with `pack2x16float`,
+which needs no device feature. The page has no storage control and no exact
+mode. The exact f32 storages remain reachable in code as `EXACT_STORAGE`, and
+in the tools as `AFWEBGPU_EXACT=1`, because the differential tests compare the
+kernels against AlphaFold's own f32 tensors; nothing a user runs takes that
+path.
 
-Since then the allocator records what was live when the peak was reached, and
-that list settled where the memory actually is. It also found the structure
-module holding a normalized copy of the pair, 128 MiB at 512 residues, and the
-extra stack's global column attention holding one of the extra MSA, another
-128 MiB. Both now normalize while loading from row statistics, which took the
-structure phase from 162 to 48 MiB and the packed trunk from 320 to 289, all
-exactly. At 512 residues with 508
-clustered rows the 544 MiB peak is the MSA activations at 254 MiB, the pair at
-128 and the triangle multiplication's whole projection at 128, with 34 MiB for
-everything else. The pair joined the packable tensors as `pairStorage: "f16"`,
-which the page's reduced-memory option now sets as well. Three exact changes
-also landed around the peak rather than in it: the recycle buffers are cleared
-on the device instead of being uploaded as zeros, the final pair is read back
-only when a caller asks, and the clustered MSA features carry 27 channels
-instead of 49. Those cut host memory at 384 residues from 1016 to 893 MiB and
-leave the device peak alone. Finally the query-only template module no longer
-runs during a prediction: its update is one constant vector, folded into the
-pair projection's bias.
+That decision rests on measurement: on real alignments of 164 to 396 residues
+the packed model returned mean pLDDT and pTM identical to the exact path to two
+decimals, per recycle as well as at the end, and the pair's magnitudes reach
+about 1050 against half precision's 65504, so what it costs is rounding rather
+than range. What it buys is roughly half the memory, which is what decides
+whether a chain runs in a browser at all.
+
+Around that, the allocator now records what was live when the peak was reached,
+and that list drove the rest of the work. It found two tensors that were
+nothing but written-out LayerNorms, a copy of the pair in the structure module
+and a copy of the extra MSA in the global column attention, 128 MiB each at 512
+residues; both now normalize while loading from row statistics. Several
+pair-sized host copies went too: the recycle buffers are cleared on the device
+instead of being uploaded as zeros, the final pair is read back only when a
+caller asks, and the clustered MSA features carry 27 channels instead of 49.
+Finally the query-only template module no longer runs during a prediction, its
+update being one constant vector folded into the pair projection's bias.
 
 ## Prerequisites
 
@@ -113,28 +108,26 @@ should match **exactly**:
 
 | args | admission estimate MiB | peakConcurrentMiB | peakResidentMiB | meanPlddt | GB10 ms/recycle |
 |---|---:|---:|---:|---:|---:|
-| 128 256 512 2 | 156 | 87 | 117 | 47.362 | 1314 |
-| 384 256 512 2 | 386 | 272 | 351 | 41.418 | 7782 |
-| 512 256 512 1 | 578 | 417 | 504 | 42.14 | 13895 |
+| 128 256 512 2 | 126 | 67 | 97 | 47.193 | 1314 |
+| 384 256 512 2 | 246 | 152 | 231 | 41.426 | 7782 |
+| 512 256 512 1 | 328 | 225 | 312 | 42.094 | 13895 |
 
-`meanPlddt` should match to three decimals (synthetic alignment, deterministic
-seed). `millisecondsPerRecycle` will differ; report it, and note the chip and
-the memory of the Mac.
+Live and resident should match exactly. `meanPlddt` may differ in the last
+decimals: `pack2x16float` rounding is implementation-defined, so Metal may
+round differently from Vulkan. A difference beyond the second decimal is worth
+reporting. `millisecondsPerRecycle` will differ; report it, and note the chip
+and the memory of the Mac. The timings above predate the packed model and are
+only a rough scale.
 
-Then the inexact options, same shapes:
+The exact storages, which no prediction uses, are one environment variable
+away and are the reference for how much the packing saves:
 
 ```bash
-AFWEBGPU_TRIANGLE_F16=1 npm run bench:shape -- 384 256 512 2
-AFWEBGPU_MSA_F16=1 npm run bench:shape -- 384 256 512 2
-AFWEBGPU_TRIANGLE_F16=1 AFWEBGPU_MSA_F16=1 npm run bench:shape -- 384 256 512 2
+AFWEBGPU_EXACT=1 npm run bench:shape -- 384 256 512 2
 ```
 
-GB10 values for 384: admission estimate 365 / 338 / 324 MiB, live
-236 / 224 / 191 MiB, resident 331 / 307 / 307, mean pLDDT
-41.419 / 41.382 / 41.372. Live and resident should again match exactly.
-pLDDT may differ in the last decimals here: `pack2x16float` rounding is
-implementation-defined, so Metal may round differently from Vulkan. A
-difference beyond the second decimal is worth reporting.
+GB10: admission estimate 386 MiB, live 272, resident 351, mean pLDDT 41.418,
+against 246 / 152 / 231 / 41.426 for the model as it ships.
 
 ## 4. Real alignments (optional but the best quality check)
 
@@ -144,25 +137,24 @@ with the tracked MMseqs2 acceptance alignment; this also proves that its
 
 ```bash
 npx tsx tools/predict-a3m.ts test.a3m 508 1024 4
-AFWEBGPU_TRIANGLE_F16=1 AFWEBGPU_MSA_F16=1 npx tsx tools/predict-a3m.ts test.a3m 508 1024 4
 ```
 
-Both lines must report `length: 59`, `depth: 8076`, mean pLDDT about 96.56 and
-pTM about 0.761. The GB10 exact run reports 73 MiB live / 117 MiB resident; the
-combined packed run 59 / 105 MiB. A low-confidence result around pLDDT 58-62
-is the Metal correctness regression this check is meant to catch.
+It must report `length: 59`, `depth: 8076`, mean pLDDT about 96.56 and pTM
+about 0.761, at 58 MiB live and 102 MiB resident on the GB10. A low-confidence
+result around pLDDT 58-62 is the Metal correctness regression this check is
+meant to catch.
 
 Then use another real A3M if available, for example:
 
 ```bash
 npx tsx tools/predict-a3m.ts my.a3m 256 512 4
-AFWEBGPU_TRIANGLE_F16=1 AFWEBGPU_MSA_F16=1 npx tsx tools/predict-a3m.ts my.a3m 256 512 4
+AFWEBGPU_EXACT=1 npx tsx tools/predict-a3m.ts my.a3m 256 512 4
 npx tsx tools/predict-a3m.ts my.a3m 128 256 4
 ```
 
-Compare `meanPlddt`, `ptm` and `recyclePlddt` between the exact run and the
-f16 run. On four alignments of 164–396 residues the GB10 saw identical values
-to two decimals. Report any protein where they differ by more than 0.1.
+Compare `meanPlddt`, `ptm` and `recyclePlddt` between the model and the exact
+path. On four alignments of 164–396 residues the GB10 saw identical values to
+two decimals. Report any protein where they differ by more than 0.1.
 
 ## 5. The browser
 
@@ -213,14 +205,14 @@ Open `http://127.0.0.1:4173/` in stable Chrome, then:
 1. Choose Custom A3M and upload the tracked `test.a3m`.
 2. Under Advanced settings set the monomer manifest to
    `/qualification-assets/model/manifest.json`.
-3. Keep `Exact f32`, 508 clustered rows, 1024 extra rows and 3 recycles.
+3. Keep 508 clustered rows, 1024 extra rows and 3 recycles.
 4. Predict and confirm all four passes stay above pLDDT 90 and pTM 0.65.
 5. Record the four pLDDT/pTM values, runtime, allocator peak, Chrome version,
    macOS version, chip and memory.
 
-Only after the exact run passes, select `Reduced-memory f16 (approximate)` and
-repeat. Report its confidence deltas and memory/runtime changes. The page log
-must explicitly say which activation storage was used.
+There is no storage choice to make: the page runs the packed model, and its
+log says so. If the confidence here falls short of the Node run in step 4,
+that is a Metal difference worth reporting, not a setting.
 
 ### 5c. A longer prediction through the page
 
@@ -294,35 +286,34 @@ recycle instead of being kept on the host (shorter chains keep the one-time
 computation, where the copy is small and the stack a sizeable share of a
 recycle).
 
-## 7b. The packed options, and what they cost
+## 7b. The packed model against the exact path
 
-Compare the exact path against each packed option on a real alignment, at a
-length where the pair matters. `tools/predict-a3m.ts` takes an A3M and the
-switches come from the environment:
+Every prediction runs packed. To see what that costs, run the same real
+alignment both ways, at a length where the pair matters:
 
 ```bash
 npx tsx tools/predict-a3m.ts alignment.a3m 508 1024 3
-AFWEBGPU_PAIR_F16=1 npx tsx tools/predict-a3m.ts alignment.a3m 508 1024 3
-AFWEBGPU_PAIR_F16=1 AFWEBGPU_MSA_F16=1 AFWEBGPU_TRIANGLE_F16=1 \
-  npx tsx tools/predict-a3m.ts alignment.a3m 508 1024 3
+AFWEBGPU_EXACT=1 npx tsx tools/predict-a3m.ts alignment.a3m 508 1024 3
 ```
 
-On the Linux GB10, packing the pair alone left mean pLDDT and pTM unchanged to
-two decimals on four proteins of 164 to 396 residues, and lowered the peak by
-5 to 10 per cent. All three options together took a synthetic 512-residue
-shape from 544 to 289 MiB live, and 663 to 407 MiB resident. On real
-alignments the same three took a 260-residue protein from 226 to 143 MiB and a
-396-residue one from 382 to 216 MiB, with pLDDT and pTM unchanged to two
-decimals in both. Packing also
-halves the largest storage binding, which is what an adapter limits: this
-Chrome reports 128 MiB, which an exact pair reaches at 512 residues and a
-packed one at about 724, so on Metal please report both the limit Chrome
-gives you and the longest chain that runs. Report both numbers per protein: if Metal's
-rounding differs, it will show as a pLDDT difference here first.
+On the Linux GB10 the two agreed on mean pLDDT and pTM to two decimals on four
+proteins of 164 to 396 residues, while the peak fell by 37 to 43 per cent: a
+260-residue protein from 226 to 143 MiB and a 396-residue one from 382 to 216.
+A complex behaves the same way where its confidence is real: on the acceptance
+homodimer with a live ColabFold alignment, exact gave pLDDT 91.56, pTM 0.842
+and ipTM 0.8359, packed 91.58, 0.843 and 0.8364, for 99 against 79 MiB live.
+Query-only complexes, whose structures never converge, move further; that is
+the input, not the storage.
 
-`AFWEBGPU_MEMORY=1` on `tools/benchmark-shape.ts` now prints what was live at
-the peak, largest first. Send that list for one long shape; it is the fastest
-way to see whether Metal holds anything the Linux run does not.
+Report both numbers per protein: if Metal rounds `pack2x16float` differently,
+it shows as a pLDDT difference here first. Packing also halves the largest
+storage binding, which is what an adapter limits: this Chrome reports 128 MiB,
+which the exact pair reaches at 512 residues and the packed one at about 724,
+so please report the limit Chrome gives you and the longest chain that runs.
+
+`AFWEBGPU_MEMORY=1` on `tools/benchmark-shape.ts` prints what was live at the
+peak, largest first. Send that list for one long shape; it is the fastest way
+to see whether Metal holds anything the Linux run does not.
 
 ## 8. Reading a complex
 
@@ -368,12 +359,12 @@ that `unzip -t` reports no errors.
 ## What to report
 
 1. The three JSON lines from step 3 and whether live/resident matched exactly.
-2. The f16 lines and their pLDDT deltas.
+2. The exact-path line from step 3 and how far the model sits below it.
 3. Any test failure with file, name and numbers; any worker crash and whether
    a rerun cleared it.
 4. Browser: preflight text, the 59-residue pLDDT/pTM/time, the long-sequence
    allocator peak, and the Chrome GPU process peak from Activity Monitor.
-5. The exact and packed pLDDT/pTM pairs from step 7b, and the live-at-peak
+5. The model and exact-path pLDDT/pTM pairs from step 7b, and the live-at-peak
    list for one long shape.
 6. Whether the complex views agreed on the chains, and whether clicking the
    alignment-error matrix isolated the interface.

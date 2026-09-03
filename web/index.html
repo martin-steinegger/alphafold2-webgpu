@@ -55,13 +55,6 @@
                 <label>Random seed<input id="seed" type="number" min="0" max="4294967295" value="0" /></label>
                 <label>Clustered MSA rows<input id="max-msa" type="number" min="1" max="508" value="508" /></label>
                 <label>Extra MSA rows<input id="max-extra" type="number" min="1" max="2048" value="1024" /></label>
-                <label>Activation storage
-                  <select id="monomer-storage">
-                    <option value="f32" selected>Exact f32 (recommended)</option>
-                    <option value="f16">Reduced-memory f16 (approximate)</option>
-                  </select>
-                  <span class="hint">Packed f16 lowers MSA and triangle scratch memory. It is opt-in because activation rounding can slightly change predictions; for Multimer only the triangle projection is packed.</span>
-                </label>
                 <label class="wide">Monomer model manifest URL
                   <input id="monomer-model-url" value="./model/manifest.json" spellcheck="false" />
                   <span class="hint">Used automatically for single-chain and monomer-A3M inputs.</span>
