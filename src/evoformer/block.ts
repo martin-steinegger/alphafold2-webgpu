@@ -88,6 +88,22 @@ export type SubmissionFlush = (label: string) => Promise<GPUCommandEncoder>;
 /** Dispatches one command buffer may hold before the loops that grow with the shape split it. */
 export const SUBMISSION_DISPATCH_LIMIT = 192;
 
+/**
+ * Splits the command buffer once a loop has put enough dispatches in it.
+ *
+ * Returns the encoder to keep using, which is a new one after a split, and the
+ * dispatch count the next split measures from.
+ */
+async function splitWhenLong(
+  execution: WebGpuExecution, encoder: GPUCommandEncoder, since: number,
+  flush: SubmissionFlush | undefined, label: string,
+): Promise<readonly [GPUCommandEncoder, number]> {
+  if (flush === undefined || execution.dispatchCount - since < SUBMISSION_DISPATCH_LIMIT) {
+    return [encoder, since];
+  }
+  return [await flush(label), execution.dispatchCount];
+}
+
 export interface EvoformerBlockInput {
   readonly msa: Float32Array;
   readonly pair: Float32Array;
@@ -448,7 +464,7 @@ function uniform(execution: WebGpuExecution, label: string, data: ArrayBufferVie
 
 async function encodeTransition(
   execution: WebGpuExecution,
-  encoder: GPUCommandEncoder,
+  encoderValue: GPUCommandEncoder,
   source: GpuTensor,
   rows: number,
   channels: number,
@@ -456,7 +472,9 @@ async function encodeTransition(
   label: string,
   residualTarget?: GpuTensor,
   storage: ActivationStorage = "f32",
+  flush?: SubmissionFlush,
 ): Promise<GpuTensor> {
+  let encoder = encoderValue;
   const hiddenChannels = weightsValue.firstBias.length;
   const descriptor = {
     activations: new Float32Array(0), rows, channels, hiddenChannels, weights: weightsValue,
@@ -500,7 +518,10 @@ async function encodeTransition(
   }
   const normalized = execution.allocate(`${label}.normalized-chunk`, chunkRows * channels);
   const hidden = execution.allocate(`${label}.hidden-chunk`, chunkRows * hiddenChannels);
+  let dispatchedAtSplit = execution.dispatchCount;
   for (let rowOffset = 0; rowOffset < rows; rowOffset += chunkRows) {
+    [encoder, dispatchedAtSplit] = await splitWhenLong(execution, encoder, dispatchedAtSplit, flush,
+      `${label}.flush-${rowOffset}`);
     const count = Math.min(chunkRows, rows - rowOffset);
     const chunkDescriptor = { ...descriptor, rows: count };
     const normalizeParams = uniform(execution, `${label}.normalize-parameters-${rowOffset}`,
@@ -681,13 +702,10 @@ async function encodeAttention(
   // it only after this window's output projection has read it.
   const weighted = normalized;
 
-  let dispatchedAtFlush = execution.dispatchCount;
+  let dispatchedAtSplit = execution.dispatchCount;
   for (const window of windowParameters) {
-    if (options.flush !== undefined
-      && execution.dispatchCount - dispatchedAtFlush >= SUBMISSION_DISPATCH_LIMIT) {
-      encoder = await options.flush(`${options.label}.flush-${window.offset}`);
-      dispatchedAtFlush = execution.dispatchCount;
-    }
+    [encoder, dispatchedAtSplit] = await splitWhenLong(execution, encoder, dispatchedAtSplit, options.flush,
+      `${options.label}.flush-${window.offset}`);
     const { offset, count } = window;
     const rows = count * options.queries;
     const params = window.attention;
@@ -787,7 +805,7 @@ async function encodeGlobalAttention(
 
 async function encodeOuterProductMean(
   execution: WebGpuExecution,
-  encoder: GPUCommandEncoder,
+  encoderValue: GPUCommandEncoder,
   msa: GpuTensor,
   msaMask: GpuTensor,
   input: EvoformerShape,
@@ -828,7 +846,11 @@ async function encodeOuterProductMean(
   // needs only views of the whole-operation tensors and a shorter dispatch. The
   // shaders' own bounds checks are against the full row count, which a shorter
   // dispatch never reaches.
+  let encoder = encoderValue;
+  let dispatchedAtSplit = execution.dispatchCount;
   for (let offset = 0; offset < rows; offset += normalizeRows) {
+    [encoder, dispatchedAtSplit] = await splitWhenLong(execution, encoder, dispatchedAtSplit, input.flush,
+      `opm.normalize-flush-${offset}`);
     const count = Math.min(normalizeRows, rows - offset);
     const msaWindow = execution.view(msa,
       storageWords(offset * input.cM, storage), storageWords(count * input.cM, storage));
@@ -848,6 +870,8 @@ async function encodeOuterProductMean(
   execution.dispatch(encoder, pairCountPipeline, [msaMask, params, pairCount],
     grid[0], grid[1], 1, "opm.pair-count");
   for (let offset = 0; offset < input.length; offset += rowBlock) {
+    [encoder, dispatchedAtSplit] = await splitWhenLong(execution, encoder, dispatchedAtSplit, input.flush,
+      `opm.contract-flush-${offset}`);
     const count = Math.min(rowBlock, input.length - offset);
     const tile = uniform(execution, `opm.block-${offset}`, new Uint32Array([offset, count, 0, 0]));
     const contractGrid = gemmGrid(count * input.cOuter, input.length * input.cOuter);
@@ -960,15 +984,10 @@ async function encodeTriangleMultiplication(
   const blockedProjection = execution.allocate(`triangle.${direction}.blocked`, blockPairs * input.triangleHidden);
   const contracted = execution.allocate(`triangle.${direction}.contracted`, blockPairs * input.triangleHidden);
   const hiddenStats = execution.allocate(`triangle.${direction}.hidden-statistics`, blockPairs * 2);
-  let dispatchedAtFlush = execution.dispatchCount;
-  const flushIfLong = async (label: string): Promise<void> => {
-    if (input.flush === undefined) return;
-    if (execution.dispatchCount - dispatchedAtFlush < SUBMISSION_DISPATCH_LIMIT) return;
-    encoder = await input.flush(label);
-    dispatchedAtFlush = execution.dispatchCount;
-  };
+  let dispatchedAtSplit = execution.dispatchCount;
   for (const block of blocks) {
-    await flushIfLong(`triangle.${direction}.flush-${block.offset}`);
+    [encoder, dispatchedAtSplit] = await splitWhenLong(execution, encoder, dispatchedAtSplit, input.flush,
+      `triangle.${direction}.flush-${block.offset}`);
     const rows = block.count * input.length;
     project(projectBlockOperand, blockedProjection, block, "project-block");
     const contractGrid = gemmGrid(block.count, input.length);
@@ -1031,7 +1050,7 @@ export async function encodeEvoformerBlock(
 
   await encodeTransition(
     execution, encoder, msa, input.sequences * input.length, input.cM,
-    input.weights.msaTransition, "msa-transition", msa, input.msaStorage ?? "f32",
+    input.weights.msaTransition, "msa-transition", msa, input.msaStorage ?? "f32", input.flush,
   );
 
   if (input.outerProductMeanFirst !== true) await applyOuterProductMean();
@@ -1063,7 +1082,7 @@ export async function encodeEvoformerBlock(
 
   await encodeTransition(
     execution, encoder, pair, input.length * input.length, input.cZ,
-    input.weights.pairTransition, "pair-transition", pair, input.pairStorage ?? "f32",
+    input.weights.pairTransition, "pair-transition", pair, input.pairStorage ?? "f32", input.flush,
   );
 }
 
@@ -1113,7 +1132,7 @@ export async function encodeEvoformerPairBlock(
   });
   await encodeTransition(
     execution, encoder, pair, shape.length * shape.length, shape.cZ,
-    weights.pairTransition, "extra.pair-transition", pair, shape.pairStorage ?? "f32",
+    weights.pairTransition, "extra.pair-transition", pair, shape.pairStorage ?? "f32", shape.flush,
   );
 }
 
@@ -1153,7 +1172,7 @@ export async function encodeExtraMsaBlock(
   );
   await encodeTransition(
     execution, encoder, msa, shape.sequences * shape.length, shape.cM, weights.msaTransition,
-    "extra.msa-transition", msa, shape.msaStorage ?? "f32",
+    "extra.msa-transition", msa, shape.msaStorage ?? "f32", shape.flush,
   );
   await encodeEvoformerPairBlock(
     execution, encoder, shape, weights, msa, pair, msaMask, pairMask,
