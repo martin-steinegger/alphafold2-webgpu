@@ -235,8 +235,14 @@ export async function runInference(job: InferenceJob, reporter: InferenceReporte
       const suggestion = suggestMonomerRows(
         input.sequence.length, clusteredRows, extraRows, devicePlan.transitionMode, memoryBudget, memoryOptions,
       );
-      const advice = suggestion === undefined
-        ? "This sequence is too large for the conservative safety budget even with one MSA row."
+      // Past a certain length the pair and the triangle's projection are the
+      // budget on their own, and the only rows that fit are too few to fold
+      // with. Saying so beats suggesting a depth that would predict badly.
+      const degenerate = suggestion !== undefined
+        && (suggestion.msaSequences < 32 || suggestion.extraSequences < 32);
+      const advice = suggestion === undefined || degenerate
+        ? `This sequence is too long for the conservative safety budget: at ${input.sequence.length} `
+          + "residues the pair representation alone is most of it, whatever the alignment depth."
         : `Set Clustered MSA rows to ${suggestion.msaSequences} and Extra MSA rows to `
           + `${suggestion.extraSequences} or lower.`;
       throw new RangeError(`Estimated peak GPU allocation ${formatMib(devicePlan.memory.estimatedPeakBytes)} `
