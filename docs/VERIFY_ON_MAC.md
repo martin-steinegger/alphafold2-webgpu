@@ -322,9 +322,16 @@ The pair and the triangle multiplication's whole projection are 549 MiB each at
 default. The plan asks the adapter for what the shape needs, and where the
 adapter cannot give it, the kernels bind those tensors as several windows
 instead. On the Linux GB10 the prediction ran under a 128 MiB binding cap,
-with 508 clustered and 1024 extra rows: 1527 MiB live and 1740 MiB resident in
+with 508 clustered and 1024 extra rows: 1527 MiB live and 1737 MiB resident in
 Node. Three tensors are 1470 MiB of that live figure, the pair at 549, the
 triangle's whole operand at 549 and the clustered MSA at 372.
+
+Command buffers there hold about 150 dispatches and take 264 ms, which the
+run measures and adjusts rather than fixing in advance: the same build takes
+337 dispatches a buffer at 384 residues. That is the number the Apple
+watchdog cares about, and it no longer grows with the sequence. The recycle
+took 759 seconds on a GB10 shared with another job, so treat it as an upper
+bound rather than a figure to compare against.
 
 This is the check that matters most on Apple, because Metal's buffer and
 binding limits are the unknown:
