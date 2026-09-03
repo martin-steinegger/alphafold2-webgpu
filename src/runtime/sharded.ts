@@ -54,6 +54,36 @@ export function planShards(
   return { count: Math.ceil(totalElements / perBinding), shardElements: perBinding, totalElements };
 }
 
+/**
+ * Windows of rows, each inside one binding and starting where a binding
+ * offset may start.
+ *
+ * This is the other half of the same problem `planShards` solves. A kernel
+ * that reads a tensor row by row can be given the rows it touches instead of
+ * the whole tensor, which costs a uniform rather than a binding slot; one that
+ * reads across the whole tensor cannot, and takes shards. Several bindings may
+ * be cut from one window, so it holds a whole number of 256-byte boundaries of
+ * every row size passed.
+ */
+export function rowWindows(
+  rows: number, bindingBytes: number, rowByteSizes: readonly number[],
+): readonly { readonly offset: number; readonly count: number }[] {
+  let alignment = 1;
+  for (const rowBytes of rowByteSizes) {
+    const rowsPerBoundary = BINDING_OFFSET_BYTES / greatestCommonDivisor(rowBytes, BINDING_OFFSET_BYTES);
+    alignment = alignment * rowsPerBoundary / greatestCommonDivisor(alignment, rowsPerBoundary);
+  }
+  const widest = Math.max(...rowByteSizes);
+  const perBinding = Math.floor(bindingBytes / widest / alignment) * alignment;
+  if (perBinding <= 0) throw new RangeError("an aligned window of rows does not fit one binding");
+  if (rows <= perBinding) return [{ offset: 0, count: rows }];
+  const windows: { offset: number; count: number }[] = [];
+  for (let offset = 0; offset < rows; offset += perBinding) {
+    windows.push({ offset, count: Math.min(perBinding, rows - offset) });
+  }
+  return windows;
+}
+
 /** WGSL binding declarations for one sharded tensor. */
 export function shardBindings(
   layout: ShardLayout, name: string, storage: ActivationStorage, firstBinding: number, writable: boolean,

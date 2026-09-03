@@ -1,6 +1,7 @@
 import {
   ATTENTION_NORMALIZE_SHADER, createAttentionNormParameters, createAttentionStatisticsShader,
 } from "./attention.js";
+import { rowWindows } from "../runtime/sharded.js";
 import { type ActivationStorage, storageArray, storageWords, storedElement } from "../runtime/storage.js";
 import { encodeMultimerTemplatePairBlock, type TemplatePairBlockWeights } from "./block.js";
 import { WebGpuExecution, type GpuTensor } from "../runtime/execution.js";
@@ -131,7 +132,12 @@ function validateFloat32(name: string, value: Float32Array, elements: number): v
 
 export class MultimerMockTemplateGpu {
   readonly device: GPUDevice;
-  constructor(device: GPUDevice) { this.device = device; }
+  /** Bytes one binding may cover; only tests lower it below the device's own. */
+  readonly bindingLimitBytes: number | undefined;
+  constructor(device: GPUDevice, bindingLimitBytes?: number) {
+    this.device = device;
+    this.bindingLimitBytes = bindingLimitBytes;
+  }
 
   async run(pairValue: Float32Array, pairMaskValue: Float32Array, length: number,
     weightsValue: MultimerMockTemplateWeights,
@@ -166,7 +172,8 @@ export class MultimerMockTemplateGpu {
     validateFloat32("template MSA output weight", weightsValue.msaOutputWeight, 256 * 256);
     validateFloat32("template MSA output bias", weightsValue.msaOutputBias, 256);
     if (weightsValue.blockWeights.length === 0) throw new RangeError("template pair stack must contain blocks");
-    const execution = sharedExecution ?? new WebGpuExecution(this.device);
+    const execution = sharedExecution ?? new WebGpuExecution(this.device,
+      this.bindingLimitBytes === undefined ? {} : { bindingBudgetBytes: this.bindingLimitBytes });
     const entryCheckpoint = execution.checkpoint();
     let retainResidentOutput = false;
     try {
@@ -196,11 +203,33 @@ export class MultimerMockTemplateGpu {
       ]);
       let encoder = this.device.createCommandEncoder({ label: "multimer-template.initialize" });
       this.device.pushErrorScope("validation");
+      // Both passes read the query pair by row and write the template pair by
+      // row, and at long chain lengths either is past what one binding may
+      // cover, so they walk them a window of rows at a time.
+      const queryRowBytes = storageWords(pairChannels, pairStorage) * 4;
+      const initWindows = rowWindows(pairs, execution.bindingLimitBytes,
+        [queryRowBytes, templateChannels * 4, 2 * 4]);
       let grid = execution.linearGrid(pairs, 1);
-      execution.dispatch(encoder, queryStatistics, [pair, normParams, statistics], grid[0], grid[1]);
-      grid = execution.linearGrid(templatePair.elements);
-      execution.dispatch(encoder, pairInit,
-        [pair, inputWeight, inputBias, inputParams, templatePair, statistics, normWeights], grid[0], grid[1]);
+      for (const window of initWindows) {
+        const queryWindow = execution.view(pair,
+          storageWords(window.offset * pairChannels, pairStorage),
+          storageWords(window.count * pairChannels, pairStorage));
+        const statisticsWindow = execution.view(statistics, window.offset * 2, window.count * 2);
+        const templateWindow = execution.view(templatePair,
+          window.offset * templateChannels, window.count * templateChannels);
+        const windowNormParams = execution.upload(`multimer-template.query-norm-params-${window.offset}`,
+          createAttentionNormParameters(window.count, pairChannels, 0, pairChannels, false, 1, window.count, 1e-5),
+          GPUBufferUsage.UNIFORM);
+        const windowInputParams = execution.upload(`multimer-template.input-params-${window.offset}`,
+          new Uint32Array([window.count, pairChannels, templateChannels]), GPUBufferUsage.UNIFORM);
+        grid = execution.linearGrid(window.count, 1);
+        execution.dispatch(encoder, queryStatistics, [queryWindow, windowNormParams, statisticsWindow],
+          grid[0], grid[1], 1, `multimer-template.query-statistics-${window.offset}`);
+        grid = execution.linearGrid(window.count * templateChannels);
+        execution.dispatch(encoder, pairInit,
+          [queryWindow, inputWeight, inputBias, windowInputParams, templateWindow, statisticsWindow, normWeights],
+          grid[0], grid[1], 1, `multimer-template.pair-init-${window.offset}`);
+      }
       execution.endComputePass(encoder);
       this.device.queue.submit([encoder.finish()]);
       execution.noteSubmitted();
@@ -250,12 +279,30 @@ export class MultimerMockTemplateGpu {
       ]);
       encoder = this.device.createCommandEncoder({ label: "multimer-template.output" });
       this.device.pushErrorScope("validation");
-      grid = execution.linearGrid(pairs, 1);
-      execution.dispatch(encoder, normalize, [templatePair, outputNormWeights, outputNormParams, outputNormalized],
-        grid[0], grid[1]);
-      grid = execution.linearGrid(pairUpdate.elements);
-      execution.dispatch(encoder, outputPipeline, [outputNormalized, outputWeight, outputBias, outputParams, pairUpdate],
-        grid[0], grid[1]);
+      // The same for the output projection, whose update is the widest row of
+      // the three at 128 channels.
+      for (const window of rowWindows(pairs, execution.bindingLimitBytes,
+        [templateChannels * 4, pairChannels * 4])) {
+        const templateWindow = execution.view(templatePair,
+          window.offset * templateChannels, window.count * templateChannels);
+        const normalizedWindow = execution.view(outputNormalized,
+          window.offset * templateChannels, window.count * templateChannels);
+        const updateWindow = execution.view(pairUpdate,
+          window.offset * pairChannels, window.count * pairChannels);
+        const windowNormParams = execution.upload(`multimer-template.output-norm-params-${window.offset}`,
+          createAttentionNormParameters(window.count, templateChannels, 0, templateChannels,
+            false, 1, window.count, 1e-5), GPUBufferUsage.UNIFORM);
+        const windowOutputParams = execution.upload(`multimer-template.output-params-${window.offset}`,
+          new Uint32Array([window.count, templateChannels, pairChannels]), GPUBufferUsage.UNIFORM);
+        grid = execution.linearGrid(window.count, 1);
+        execution.dispatch(encoder, normalize,
+          [templateWindow, outputNormWeights, windowNormParams, normalizedWindow],
+          grid[0], grid[1], 1, `multimer-template.output-normalize-${window.offset}`);
+        grid = execution.linearGrid(window.count * pairChannels);
+        execution.dispatch(encoder, outputPipeline,
+          [normalizedWindow, outputWeight, outputBias, windowOutputParams, updateWindow],
+          grid[0], grid[1], 1, `multimer-template.output-${window.offset}`);
+      }
       grid = execution.linearGrid(msaRows.elements);
       execution.dispatch(encoder, msaPipeline,
         [msaInputWeight, msaInputBias, msaOutputWeight, msaOutputBias, msaParams, msaRows], grid[0], grid[1]);

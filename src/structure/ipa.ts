@@ -1,4 +1,5 @@
 import { type ActivationStorage, storageArray, storageWords, storedElement } from "../runtime/storage.js";
+import { rowWindows } from "../runtime/sharded.js";
 import {
   createTransitionShaders, TRANSITION_TILE_COLUMNS, TRANSITION_TILE_ROWS, type TransitionInput,
 } from "../evoformer/transition.js";
@@ -585,40 +586,6 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
 const GRID_WIDTH = 32_768;
 
-/**
- * Windows of pair rows, each inside one binding and starting where a binding
- * offset may start.
- *
- * A binding covers a bounded slice of a buffer and must begin on a 256-byte
- * boundary, so a window holds a whole number of those boundaries of every
- * binding cut from it. Only the pair is windowed here: the row statistics are
- * two floats a residue pair, small enough to stay whole at any length.
- */
-export function pairRowWindows(
-  rows: number, bindingBytes: number, rowByteSizes: readonly number[],
-): readonly { readonly offset: number; readonly count: number }[] {
-  let alignment = 1;
-  for (const rowBytes of rowByteSizes) {
-    const rowsPerBoundary = 256 / greatestCommonDivisor(rowBytes, 256);
-    alignment = alignment * rowsPerBoundary / greatestCommonDivisor(alignment, rowsPerBoundary);
-  }
-  const widest = Math.max(...rowByteSizes);
-  const perBinding = Math.floor(bindingBytes / widest / alignment) * alignment;
-  if (perBinding <= 0) {
-    throw new RangeError("the structure module cannot fit an aligned pair window in one binding");
-  }
-  if (rows <= perBinding) return [{ offset: 0, count: rows }];
-  const windows: { offset: number; count: number }[] = [];
-  for (let offset = 0; offset < rows; offset += perBinding) {
-    windows.push({ offset, count: Math.min(perBinding, rows - offset) });
-  }
-  return windows;
-}
-
-function greatestCommonDivisor(a: number, b: number): number {
-  return b === 0 ? a : greatestCommonDivisor(b, a % b);
-}
-
 /** A run of queries whose pair rows one binding can cover. */
 export interface IpaQueryWindow {
   readonly offset: number;
@@ -776,7 +743,7 @@ export class InvariantPointAttentionGpu {
         ? keep(this.allocator.upload("ipa.pair", input.pair, GPUBufferUsage.STORAGE)) : undefined;
       // One window of queries at a time keeps the pair rows a feature pass
       // reads inside a single binding.
-      const queryWindows = pairRowWindows(input.length, bindingLimit,
+      const queryWindows = rowWindows(input.length, bindingLimit,
         [storageWords(input.length * input.pairChannels, pairStorage) * 4]).map((window) => ({
         offset: window.offset, count: window.count,
         bounds: upload(`ipa.query-window-${window.offset}`,
@@ -816,7 +783,7 @@ export class InvariantPointAttentionGpu {
         };
         // Both passes read the pair by row, and a whole pair is past what one
         // binding may cover, so they walk it a window of rows at a time.
-        for (const window of pairRowWindows(rows, bindingLimit,
+        for (const window of rowWindows(rows, bindingLimit,
           [storageWords(input.pairChannels, pairStorage) * 4])) {
           const bounds = upload(`ipa.pair-window-${window.offset}`,
             new Uint32Array([window.offset, window.count, 0, 0]), GPUBufferUsage.UNIFORM);
