@@ -128,6 +128,8 @@ export interface MonomerTrunkSubmissionCounts {
 }
 
 export interface MonomerGpuOptions {
+  /** Called as each Evoformer block finishes; see `MonomerProgressCallback`. */
+  readonly onProgress?: MonomerProgressCallback;
   /** Profile one extra-MSA and one main Evoformer block in a selected recycle. */
   readonly profile?: boolean;
   readonly profileRecycle?: number;
@@ -192,6 +194,26 @@ export interface MonomerRecycleGpuProfile {
   readonly mainEvoformer: MonomerBlockGpuProfile;
 }
 
+/** Where a prediction has got to inside a recycle. */
+export interface MonomerProgress {
+  readonly recycle: number;
+  /** The stack running now: `extra-msa`, `evoformer` or `structure`. */
+  readonly phase: "extra-msa" | "evoformer" | "structure";
+  /** Blocks of that stack whose work the device has finished. */
+  readonly completed: number;
+  readonly total: number;
+}
+
+/**
+ * Called as each block's work completes.
+ *
+ * A recycle at 1500 residues is minutes of GPU work, and a page that says
+ * nothing until it ends looks stalled. Encoding runs a bounded number of
+ * command buffers ahead of the device, so a callback placed after that wait
+ * follows the device rather than the encoder.
+ */
+export type MonomerProgressCallback = (progress: MonomerProgress) => void;
+
 export type MonomerRecycleCallback = (
   result: MonomerRecycleSummary, recycle: number,
 ) => void;
@@ -219,6 +241,7 @@ export class AlphaFoldMonomerGpu {
   readonly profileMainEvoformerBlock: number;
   readonly compactTransitions: boolean;
   readonly maxPooledBytes: number | undefined;
+  readonly onProgress: MonomerProgressCallback | undefined;
   readonly bindingBudgetBytes: number | undefined;
   /** Dispatch label to largest binding, for the labels above the budget. */
   oversizedBindings: ReadonlyMap<string, number> = new Map();
@@ -239,6 +262,7 @@ export class AlphaFoldMonomerGpu {
     this.maxPooledBytes = options.maxPooledBytes
       ?? (this.compactTransitions ? COMPACT_GPU_POOL_BYTES : undefined);
     this.bindingBudgetBytes = options.bindingBudgetBytes;
+    this.onProgress = options.onProgress;
     this.multimer = options.multimer ?? false;
     this.returnFinalPair = options.returnFinalPair ?? false;
     this.collapseQueryOnlyTemplate = options.collapseQueryOnlyTemplate ?? true;
@@ -557,6 +581,9 @@ export class AlphaFoldMonomerGpu {
             ? execution.finishTimestampProfile(holder.encoder) : undefined;
           if (profiling) await submit(holder.encoder, `extra-MSA recycle ${recycle} block ${block}`);
           else await submitAhead(holder.encoder, `extra-MSA recycle ${recycle} block ${block}`);
+          this.onProgress?.({
+            recycle, phase: "extra-msa", completed: block + 1, total: weights.extraStack.length,
+          });
           if (profiling) {
             const entries = pendingProfile === undefined
               ? (await this.device.queue.onSubmittedWorkDone(), [{
@@ -637,6 +664,9 @@ export class AlphaFoldMonomerGpu {
             ? execution.finishTimestampProfile(holder.encoder) : undefined;
           if (profiling) await submit(holder.encoder, `main Evoformer recycle ${recycle} block ${block}`);
           else await submitAhead(holder.encoder, `main Evoformer recycle ${recycle} block ${block}`);
+          this.onProgress?.({
+            recycle, phase: "evoformer", completed: block + 1, total: weights.mainStack.length,
+          });
           if (profiling) {
             const entries = pendingProfile === undefined
               ? (await this.device.queue.onSubmittedWorkDone(), [{

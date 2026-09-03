@@ -5,7 +5,9 @@
  * it when the browser exposes WebGPU there, so the document stays responsive
  * for the minutes a long chain takes.
  */
-import { AlphaFoldMonomerGpu, type MonomerPrediction, type MonomerRecycleSummary } from "../src/model/monomer.js";
+import {
+  AlphaFoldMonomerGpu, type MonomerPrediction, type MonomerProgress, type MonomerRecycleSummary,
+} from "../src/model/monomer.js";
 import {
   AlphaFoldMultimerGpu, type MultimerPrediction, type MultimerRecycleSummary,
 } from "../src/model/multimer.js";
@@ -284,7 +286,20 @@ export async function runInference(job: InferenceJob, reporter: InferenceReporte
     }
     reporter.recycle(result, recycle);
   };
+  // A recycle at 1500 residues is minutes of GPU work. Reporting each block as
+  // the device finishes it keeps the stage line moving, so a long prediction
+  // reads as slow rather than stalled.
+  let lastProgress = 0;
+  const onProgress = (progress: MonomerProgress): void => {
+    const now = performance.now();
+    if (progress.completed < progress.total && now - lastProgress < 500) return;
+    lastProgress = now;
+    const stack = progress.phase === "extra-msa" ? "Extra MSA" : "Evoformer";
+    reporter.stage("inference", "active", `Recycle ${progress.recycle}/${job.recycles} · `
+      + `${stack} block ${progress.completed}/${progress.total}`);
+  };
   const modelOptions = {
+    onProgress,
     compactTransitions: devicePlan.transitionMode === "chunked",
     profile: job.profile !== undefined,
     profileRecycle: job.profile?.recycle ?? 0,
