@@ -1,4 +1,6 @@
-import { planShards, shardBindings, shardLoader, type ShardLayout } from "../runtime/sharded.js";
+import {
+  shardBindings, shardLoader, shardStorer, shardWordLoader, type ShardLayout,
+} from "../runtime/sharded.js";
 import { GpuBufferAllocator, type AllocatedGpuBuffer, type AllocationSnapshot } from "../runtime/allocator.js";
 import { pipelineCacheForDevice, type ComputePipelineCache } from "../runtime/pipeline-cache.js";
 import { subgroupRange } from "../runtime/subgroups.js";
@@ -208,6 +210,43 @@ const WHOLE_SHARD: ShardLayout = { count: 1, shardElements: Number.MAX_SAFE_INTE
 export function createAttentionNormalizeShader(
   storage: ActivationStorage = "f32", shards: ShardLayout = WHOLE_SHARD,
 ): string {
+  return normalizeShader(storage, shards, false);
+}
+
+/**
+ * The same LayerNorm writing over its input. WebGPU rejects one buffer bound
+ * both read-only and read-write in a dispatch, so the in-place form has a
+ * single read-write binding. It is exact for `transpose == 0` with one batch
+ * (every row reads and writes the same offsets): all reads of a row complete
+ * before any invocation stores, and each invocation stores only elements it
+ * alone read in the final loop.
+ */
+export function createAttentionNormalizeInPlaceShader(
+  storage: ActivationStorage = "f32", shards: ShardLayout = WHOLE_SHARD,
+): string {
+  return normalizeShader(storage, shards, true);
+}
+
+function normalizeShader(storage: ActivationStorage, shards: ShardLayout, inPlace: boolean): string {
+  const normalized = (channel: string) =>
+    `(source_load(input_base + ${channel}) - row_mean[0]) * inverse_std
+      * weights[p.scale + ${channel}] + weights[p.offset + ${channel}]`;
+  // Packed in place, an invocation owns whole words rather than single
+  // channels: two invocations sharing a word would otherwise race to write it.
+  const store = !inPlace
+    ? `  for (var c = local.x; c < p.channels; c += 64u) {
+    output[output_base + c] = ${normalized("c")};
+  }`
+    : storage === "f32"
+      ? `  for (var c = local.x; c < p.channels; c += 64u) {
+    source_store(output_base + c, ${normalized("c")});
+  }`
+      : `  for (var word = local.x; word < p.channels / 2u; word += 64u) {
+    let c = word * 2u;
+    let low = ${normalized("c")};
+    let high = ${normalized("c + 1u")};
+    source_store((output_base + c) >> 1u, pack2x16float(vec2<f32>(low, high)));
+  }`;
   return `
 struct NormParameters {
   rows: u32, channels: u32, scale: u32, offset: u32,
@@ -215,11 +254,12 @@ struct NormParameters {
   batch_offset: u32, batch_total: u32, padding: vec2<u32>,
 };
 const GRID_WIDTH: u32 = 32768u;
-${shardBindings(shards, "source", storage, 0, false)}
+${shardBindings(shards, "source", storage, 0, inPlace)}
 @group(0) @binding(${shards.count}) var<storage, read> weights: array<f32>;
 @group(0) @binding(${shards.count + 1}) var<uniform> p: NormParameters;
-@group(0) @binding(${shards.count + 2}) var<storage, read_write> output: array<f32>;
+${inPlace ? "" : `@group(0) @binding(${shards.count + 2}) var<storage, read_write> output: array<f32>;`}
 ${shardLoader(shards, "source", storage)}
+${inPlace ? shardStorer(shards, "source", storage) : ""}
 var<workgroup> partial: array<f32, 64>;
 var<workgroup> row_mean: array<f32, 1>;
 
@@ -236,7 +276,7 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
   let row = group.x + group.y * GRID_WIDTH;
   if (row >= p.rows) { return; }
   let input_base = source_row(row) * p.channels;
-  let output_base = row * p.channels;
+  let output_base = ${inPlace ? "input_base" : "row * p.channels"};
   var sum = 0.0;
   for (var c = local.x; c < p.channels; c += 64u) { sum += source_load(input_base + c); }
   partial[local.x] = sum;
@@ -259,44 +299,12 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
     workgroupBarrier();
   }
   let inverse_std = inverseSqrt(partial[0] / f32(p.channels) + p.epsilon);
-  for (var c = local.x; c < p.channels; c += 64u) {
-    output[output_base + c] = (source_load(input_base + c) - row_mean[0]) * inverse_std
-      * weights[p.scale + c] + weights[p.offset + c];
-  }
+${store}
 }`;
 }
 
 /** Row LayerNorm over an f32 source. */
 export const ATTENTION_NORMALIZE_SHADER = createAttentionNormalizeShader("f32");
-
-/**
- * The same LayerNorm writing over its input. WebGPU rejects one buffer bound
- * both read-only and read-write in a dispatch, so the in-place form has a
- * single read-write binding. It is exact for `transpose == 0` with one batch
- * (every row reads and writes the same offsets): all reads of a row complete
- * before any invocation stores, and each invocation stores only elements it
- * alone read in the final loop.
- */
-export function createAttentionNormalizeInPlaceShader(storage: ActivationStorage = "f32"): string {
-  const shader = createAttentionNormalizeShader(storage)
-    .replace("var<storage, read> source", "var<storage, read_write> source")
-    .replace(`@group(0) @binding(3) var<storage, read_write> output: array<f32>;\n`, "")
-    .replace(/\boutput\[/g, "source[");
-  if (storage === "f32") return shader;
-  // Packed, an invocation owns whole words rather than single channels:
-  // two invocations sharing a word would otherwise race to write it.
-  return shader.replace(`  for (var c = local.x; c < p.channels; c += 64u) {
-    source[output_base + c] = (${storedElement(storage, "source", "input_base + c")} - row_mean[0]) * inverse_std
-      * weights[p.scale + c] + weights[p.offset + c];
-  }`, `  for (var word = local.x; word < p.channels / 2u; word += 64u) {
-    let c = word * 2u;
-    let low = (${storedElement(storage, "source", "input_base + c")} - row_mean[0]) * inverse_std
-      * weights[p.scale + c] + weights[p.offset + c];
-    let high = (${storedElement(storage, "source", "input_base + c + 1u")} - row_mean[0]) * inverse_std
-      * weights[p.scale + c + 1u] + weights[p.offset + c + 1u];
-    source[(output_base + c) >> 1u] = pack2x16float(vec2<f32>(low, high));
-  }`);
-}
 
 export const ATTENTION_NORMALIZE_IN_PLACE_SHADER = createAttentionNormalizeInPlaceShader("f32");
 
@@ -309,7 +317,9 @@ export const ATTENTION_NORMALIZE_IN_PLACE_SHADER = createAttentionNormalizeInPla
  * as the source. Statistics are stored at the row's index in the source, so
  * every consumer indexes them the way it indexes the source.
  */
-export function createAttentionStatisticsShader(storage: ActivationStorage = "f32"): string {
+export function createAttentionStatisticsShader(
+  storage: ActivationStorage = "f32", shards: ShardLayout = WHOLE_SHARD,
+): string {
   return `
 struct NormParameters {
   rows: u32, channels: u32, scale: u32, offset: u32,
@@ -317,9 +327,10 @@ struct NormParameters {
   batch_offset: u32, batch_total: u32, padding: vec2<u32>,
 };
 const GRID_WIDTH: u32 = 32768u;
-@group(0) @binding(0) var<storage, read> source: array<${storageArray(storage)}>;
-@group(0) @binding(1) var<uniform> p: NormParameters;
-@group(0) @binding(2) var<storage, read_write> statistics: array<f32>;
+${shardBindings(shards, "source", storage, 0, false)}
+@group(0) @binding(${shards.count}) var<uniform> p: NormParameters;
+@group(0) @binding(${shards.count + 1}) var<storage, read_write> statistics: array<f32>;
+${shardLoader(shards, "source", storage)}
 var<workgroup> partial: array<f32, 64>;
 var<workgroup> row_mean: array<f32, 1>;
 
@@ -982,7 +993,9 @@ export function selectAttentionFlashKernel(
   return { cacheKey: "attention:flash", shader: ATTENTION_FLASH_SHADER, queryTile: 1, variant };
 }
 
-export function createAttentionOutputShader(residual: boolean, storage: ActivationStorage = "f32"): string {
+export function createAttentionOutputShader(
+  residual: boolean, storage: ActivationStorage = "f32", shards: ShardLayout = WHOLE_SHARD,
+): string {
   // Rows are numbered within this batch window, and column attention consumes
   // a transposed view, so the result row is remapped both ways.
   const outputRow = `let b = p.batch_offset + row / p.queries;
@@ -993,15 +1006,18 @@ export function createAttentionOutputShader(residual: boolean, storage: Activati
 @group(0) @binding(0) var<storage, read> source: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> p: Parameters;
-@group(0) @binding(3) var<storage, read_write> output: array<${storageArray(storage)}>;`,
+${shardBindings(shards, "output", storage, 3, true)}
+${shardStorer(shards, "output", storage)}
+${storage === "f16" ? shardWordLoader(shards, "output") : (residual ? shardLoader(shards, "output", storage) : "")}`,
     rows: "p.batch * p.queries",
     inner: "p.heads * p.head_dim",
     columns: "p.channels",
     sourceElement: "source[row * p.heads * p.head_dim + k]",
     weightElement: "weights[p.output_weight + k * p.channels + column]",
     store: `${outputRow}
-          output[output_row * p.channels + column] ${residual ? "+=" : "="}
-            element + weights[p.output_bias + column];`,
+          let slot = output_row * p.channels + column;
+          let written = element + weights[p.output_bias + column];
+          output_store(slot, ${residual ? "output_load(slot) + written" : "written"});`,
     // Packed storage is written a word (two adjacent channels) at a time; the
     // four columns an invocation holds start at a multiple of four and the
     // channel count is even, so the words are its own.
@@ -1010,8 +1026,8 @@ export function createAttentionOutputShader(residual: boolean, storage: Activati
 ${[0, 2].map((pair) => `          if (column + ${pair + 1}u < p.channels) {
             var stored = vec2<f32>(values[${pair}] + weights[p.output_bias + column + ${pair}u],
               values[${pair + 1}] + weights[p.output_bias + column + ${pair + 1}u]);
-            ${residual ? `stored += unpack2x16float(output[(base + ${pair}u) >> 1u]);` : ""}
-            output[(base + ${pair}u) >> 1u] = pack2x16float(stored);
+            ${residual ? `stored += unpack2x16float(output_load_word((base + ${pair}u) >> 1u));` : ""}
+            output_store((base + ${pair}u) >> 1u, pack2x16float(stored));
           }`).join("\n")}` } : {}),
   });
 }

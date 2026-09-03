@@ -582,6 +582,8 @@ interface EncodeAttentionOptions {
   readonly pairStorage?: ActivationStorage | undefined;
   /** Splits the command buffer between windows; see `SubmissionFlush`. */
   readonly flush?: SubmissionFlush | undefined;
+  /** Bytes one binding may cover of `source`; defaults to the device's limit. */
+  readonly bindingBytes?: number | undefined;
 }
 
 async function encodeAttention(
@@ -601,14 +603,20 @@ async function encodeAttention(
     execution.device, options.channels / options.heads, options.queries,
   );
   const storage = options.storage ?? "f32";
+  // The source and the residual target are the same tensor, and at long chain
+  // lengths it outgrows one binding, so both are bound as windows of it.
+  const sourceShards = planShards(options.batch * options.queries * options.channels, options.channels,
+    options.bindingBytes ?? execution.device.limits.maxStorageBufferBindingSize, storage === "f16" ? 2 : 4);
+  const shardKey = `${storage}:${sourceShards.count}`;
   const [normalize, project, pairProject, flash, outputProject, pairNormalize] = await Promise.all([
-    execution.pipelines.get(`block:attention:normalize:${storage}`, createAttentionNormalizeShader(storage)),
+    execution.pipelines.get(`block:attention:normalize:${shardKey}`,
+      createAttentionNormalizeShader(storage, sourceShards)),
     execution.pipelines.get("block:attention:project", ATTENTION_PROJECT_SHADER),
     execution.pipelines.get("block:attention:pair-bias", ATTENTION_PAIR_BIAS_SHADER),
     execution.pipelines.get(`block:${flashKernel.cacheKey}`, flashKernel.shader),
     execution.pipelines.get(
-      `block:attention:output${options.residualTarget === undefined ? "" : "-residual"}:${storage}`,
-      createAttentionOutputShader(options.residualTarget !== undefined, storage),
+      `block:attention:output${options.residualTarget === undefined ? "" : "-residual"}:${shardKey}`,
+      createAttentionOutputShader(options.residualTarget !== undefined, storage, sourceShards),
     ),
     // The pair bias source has its own storage, which need not match the
     // attention source's: MSA row attention reads a pair, not an MSA.
@@ -641,11 +649,21 @@ async function encodeAttention(
         count, options.queries, 1e-5, offset, options.batch,
       )),
   }));
+  const shardsOf = (tensor: GpuTensor): readonly GpuTensor[] => {
+    if (sourceShards.count === 1) return [tensor];
+    const total = options.batch * options.queries * options.channels;
+    return Array.from({ length: sourceShards.count }, (_, index) => {
+      const offset = index * sourceShards.shardElements;
+      const count = Math.min(sourceShards.shardElements, total - offset);
+      return execution.view(tensor, storageWords(offset, storage), storageWords(count, storage));
+    });
+  };
+  const sourceViews = shardsOf(options.source);
   const normalizeWindow = (window: (typeof windowParameters)[number]): GpuTensor => {
     const rows = window.count * options.queries;
     const target = execution.view(normalized, 0, rows * options.channels);
     const grid = execution.linearGrid(rows, 1);
-    execution.dispatch(encoder, normalize, [options.source, weights, window.norm, target],
+    execution.dispatch(encoder, normalize, [...sourceViews, weights, window.norm, target],
       grid[0], grid[1], 1, `${options.label}.normalize-${window.offset}`);
     return target;
   };
@@ -701,6 +719,7 @@ async function encodeAttention(
     }
   }
 
+  const outputViews = output === options.source ? sourceViews : shardsOf(output);
   const query = execution.allocate(`${options.label}.query`, windowElements);
   const key = execution.allocate(`${options.label}.key`, windowElements);
   const value = execution.allocate(`${options.label}.value`, windowElements);
@@ -726,7 +745,7 @@ async function encodeAttention(
       Math.ceil(options.queries / flashKernel.queryTile), count, options.heads,
       `${options.label}.flash-${offset}`);
     const outputGrid = gemmGrid(rows, options.channels);
-    execution.dispatch(encoder, outputProject, [weighted, weights, params, output],
+    execution.dispatch(encoder, outputProject, [weighted, weights, params, ...outputViews],
       outputGrid[0], outputGrid[1], 1, `${options.label}.output-${offset}`);
   }
   releaseScratch([pairBias, normalized, query, key, value, gate, weighted], output);
