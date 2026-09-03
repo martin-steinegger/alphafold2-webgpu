@@ -79,10 +79,12 @@ describe.skipIf(!enabled)("InvariantPointAttention WebGPU", () => {
     };
     const result = await new InvariantPointAttentionGpu(device).run(descriptor);
     // The pair is read by row here, and a whole pair is past what one binding
-    // may cover at long chain lengths. A small limit forces
-    // the same windows this fixture would take there; the answer must not move.
+    // may cover at long chain lengths. A quarter of a mebibyte takes this
+    // fixture's pair seven windows and its queries eight, the same path a long
+    // chain takes on a device with a small limit; the answer must not move.
+    // It stays above the attention bias, which is one binding at any length.
     const windowed = await new InvariantPointAttentionGpu(device).run({
-      ...descriptor, bindingLimitBytes: 64 * 1024,
+      ...descriptor, bindingLimitBytes: 256 * 1024,
     });
     expect(errorMetrics(windowed.output, result.output).maxAbsoluteError).toBe(0);
     const expected = expectedStages.subarray(0, expectedShape[1]! * expectedShape[2]!);

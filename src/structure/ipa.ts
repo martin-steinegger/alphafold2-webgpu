@@ -735,6 +735,14 @@ export class InvariantPointAttentionGpu {
       // Two floats a pair row, and one bias a head and residue pair, in place
       // of a whole normalized pair.
       const statistics = allocate("ipa.pair-statistics", input.length * input.length * 2);
+      // One float a head and residue pair, read by every attention dispatch
+      // for arbitrary pairs, so unlike the pair itself it cannot be windowed.
+      const biasBytes = input.heads * input.length * input.length * 4;
+      if (biasBytes > bindingLimit) {
+        throw new RangeError(`The structure module's attention bias is `
+          + `${(biasBytes / 1024 ** 2).toFixed(0)} MiB at ${input.length} residues, past the `
+          + `${(bindingLimit / 1024 ** 2).toFixed(0)} MiB this device binds at once.`);
+      }
       const pairBias = allocate("ipa.pair-bias", input.heads * input.length * input.length);
       const linearParams = (label: string, columns: number, weight: number, bias: number): AllocatedGpuBuffer =>
         upload(label, new Uint32Array([input.length, input.channels, columns, weight, bias, 0, 0, 0]),

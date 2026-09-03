@@ -31,6 +31,12 @@ test("predicts a 1500-residue chain through the page", async ({ page }) => {
   await page.locator("#recycles").selectOption("0");
   await page.locator("#sequence").fill(sequence);
   await page.locator("#predict").click();
+  // A recycle at this length is minutes of GPU work, so the stage line has to
+  // move while it runs: blocks completed, and once both stacks have been timed
+  // the minutes left. Without it a working run is indistinguishable from a
+  // stalled one, which is what users report.
+  await expect(page.locator('[data-stage="inference"] small'))
+    .toHaveText(/Evoformer block \d+\/\d+/, { timeout: 20 * 60_000 });
   await expect(page.locator("#results-section")).toBeVisible({ timeout: 40 * 60_000 });
   await expect(page.locator("#result-length")).toHaveText(String(RESIDUES));
   const prediction = await page.evaluate(() => window.__AFWEBGPU_PREDICTION__);
