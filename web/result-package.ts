@@ -144,18 +144,21 @@ const round = (value: number, decimals: number): number => Number(value.toFixed(
 
 /** The alignment-error matrix in AlphaFold-DB's published shape, as ColabFold writes it. */
 export function predictedAlignedErrorJson(confidence: PackagedConfidence, length: number): string {
-  const rows: number[][] = [];
+  // Written a row at a time rather than through an array of arrays: at 1500
+  // residues that array would be two and a quarter million boxed numbers,
+  // which costs far more than the text it becomes.
+  const rows = new Array<string>(length);
+  const cells = new Array<string>(length);
   for (let row = 0; row < length; row += 1) {
-    const values = new Array<number>(length);
     for (let column = 0; column < length; column += 1) {
-      values[column] = round(confidence.predictedAlignedError[row * length + column]!, 2);
+      const value = round(confidence.predictedAlignedError[row * length + column]!, 2);
+      cells[column] = Number.isFinite(value) ? String(value) : "null";
     }
-    rows.push(values);
+    rows[row] = `[${cells.join(",")}]`;
   }
-  return JSON.stringify([{
-    predicted_aligned_error: rows,
-    max_predicted_aligned_error: round(confidence.maxPredictedAlignedError, 2),
-  }]);
+  const maximum = round(confidence.maxPredictedAlignedError, 2);
+  return `[{"predicted_aligned_error":[${rows.join(",")}],`
+    + `"max_predicted_aligned_error":${Number.isFinite(maximum) ? String(maximum) : "null"}}]`;
 }
 
 const ALPHAFOLD_CITATION = `@article{jumper2021highly,

@@ -96,6 +96,21 @@ describe("resultPackageEntries", () => {
     expect(parsed[0]!.max_predicted_aligned_error).toBe(31.75);
   });
 
+  it("writes the same text an array of arrays would, at a length worth streaming", () => {
+    const length = 64;
+    const pae = Float32Array.from({ length: length * length }, (_, index) => (index % 317) / 7);
+    const confidence = { predictedAlignedError: pae, maxPredictedAlignedError: 31.75 };
+    const streamed = predictedAlignedErrorJson(confidence, length);
+    const rows: number[][] = [];
+    for (let row = 0; row < length; row += 1) {
+      rows.push(Array.from({ length }, (_, column) =>
+        Math.round(pae[row * length + column]! * 100) / 100));
+    }
+    expect(streamed).toBe(JSON.stringify([{
+      predicted_aligned_error: rows, max_predicted_aligned_error: 31.75,
+    }]));
+  });
+
   it("cites only the methods a run actually used", () => {
     const monomerLocal = citations({ multimer: false, usedMmseqs2: false });
     expect(monomerLocal).toContain("jumper2021highly");
