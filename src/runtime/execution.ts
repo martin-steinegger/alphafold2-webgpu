@@ -53,6 +53,8 @@ interface TimestampCapture {
   readonly querySet: GPUQuerySet;
   readonly labels: string[];
   nextQuery: number;
+  /** Set once the set is full; later dispatches run untimed. */
+  truncated: boolean;
 }
 
 interface PendingTimestampReadback {
@@ -242,10 +244,13 @@ export class WebGpuExecution {
     const target = this.#encoderHolder?.encoder ?? encoder;
     const timestamp = this.#timestamps;
     let timestampWrites: GPUComputePassTimestampWrites | undefined;
-    if (timestamp !== undefined) {
-      if (timestamp.nextQuery + 2 > timestamp.querySet.count) {
-        throw new RangeError("GPU timestamp query capacity exceeded");
-      }
+    // A query set holds at most 2048 dispatches, and a block at a long chain
+    // length has more. The profile then covers the first of them rather than
+    // failing the prediction it was measuring.
+    if (timestamp !== undefined && timestamp.nextQuery + 2 > timestamp.querySet.count) {
+      timestamp.truncated = true;
+    }
+    if (timestamp !== undefined && !timestamp.truncated) {
       timestamp.labels.push(label ?? `dispatch-${timestamp.labels.length}`);
       timestampWrites = {
         querySet: timestamp.querySet,
@@ -358,6 +363,7 @@ export class WebGpuExecution {
       querySet: this.device.createQuerySet({ type: "timestamp", count: maxDispatches * 2 }),
       labels: [],
       nextQuery: 0,
+      truncated: false,
     };
   }
 

@@ -588,7 +588,7 @@ export class AlphaFoldMonomerGpu {
             { label: `monomer.extra-${recycle}-${block}` }) };
           const checkpoint = execution.checkpoint();
           const profiling = block === profileBlock;
-          if (profiling && timestampProfile) execution.beginTimestampProfile(512);
+          if (profiling && timestampProfile) execution.beginTimestampProfile(2048);
           const profileStart = profiling ? performance.now() : 0;
           this.device.pushErrorScope("validation");
           // A profiled block keeps one buffer so its timestamps span the block.
@@ -672,7 +672,7 @@ export class AlphaFoldMonomerGpu {
             { label: `monomer.main-${recycle}-${block}` }) };
           const checkpoint = execution.checkpoint();
           const profiling = block === profileBlock;
-          if (profiling && timestampProfile) execution.beginTimestampProfile(512);
+          if (profiling && timestampProfile) execution.beginTimestampProfile(2048);
           const profileStart = profiling ? performance.now() : 0;
           this.device.pushErrorScope("validation");
           await encodeSplit(holder, () => encodeEvoformerBlock(execution, holder.encoder, {
