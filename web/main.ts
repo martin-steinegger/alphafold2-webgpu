@@ -334,7 +334,6 @@ function applyViewerColoring(
     }
     viewer.zoomTo({ chain: selection });
   }
-  viewer.render();
 }
 
 async function showStructure(pdb: string, chainCount: number, mode: string): Promise<void> {
@@ -347,6 +346,9 @@ async function showStructure(pdb: string, chainCount: number, mode: string): Pro
     const viewer = api.createViewer(container, { backgroundColor: "#ffffff" });
     viewer.addModel(pdb, "pdb");
     applyViewerColoring(viewer, mode, chainCount);
+    // 3Dmol's cartoon renderer needs a fitted camera on its first frame.
+    // Rendering from applyViewerColoring before this zoom caused its current
+    // CDN build to fail for newly displayed multimer models.
     viewer.zoomTo(); viewer.render();
     currentViewer = viewer;
     viewerResizeObserver = new ResizeObserver(() => { viewer.resize(); viewer.render(); });
@@ -847,6 +849,7 @@ element<HTMLSelectElement>("viewer-color").addEventListener("change", (event) =>
   if (currentViewer !== undefined) {
     applyViewerColoring(currentViewer, (event.currentTarget as HTMLSelectElement).value, currentChainCount,
       currentInterface);
+    currentViewer.render();
   }
 });
 
@@ -893,6 +896,7 @@ function updateInterfaceSelection(): void {
   const focus = currentInterface === undefined ? undefined : [...new Set(currentInterface)];
   applyViewerColoring(currentViewer, mode, currentChainCount, focus);
   if (focus === undefined) currentViewer.zoomTo();
+  currentViewer.render();
 }
 
 /** Outlines the chosen block on the matrix that is already drawn. */
