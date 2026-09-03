@@ -21,6 +21,7 @@ import {
   planMonomerDevice, requestAlphaFoldDevice, suggestMonomerRows, type AlphaFoldDeviceRequirements,
 } from "../src/runtime/device.js";
 import { setGpuMemoryBudget } from "../src/runtime/allocator.js";
+import { remainingPhrase, remainingTrunkSeconds } from "./progress.js";
 
 export const inferenceStages = ["device", "msa", "model", "features", "inference", "results"] as const;
 export type InferenceStage = typeof inferenceStages[number];
@@ -308,22 +309,17 @@ export async function runInference(job: InferenceJob, reporter: InferenceReporte
     reporter.stage("inference", "active", `Recycle ${progress.recycle}/${job.recycles} · `
       + `${stack} block ${progress.completed}/${progress.total}${remaining(progress)}`);
   };
-  /** What is left of the trunk, once both stacks have been timed. */
   const remaining = (progress: MonomerProgress): string => {
-    const extra = blockSeconds.get("extra-msa");
-    const main = blockSeconds.get("evoformer");
-    if (extra === undefined || main === undefined || blockCounts === undefined) return "";
-    const perExtra = extra.total / extra.count;
-    const perMain = main.total / main.count;
-    const left = progress.phase === "extra-msa"
-      ? (blockCounts.extra - progress.completed) * perExtra + blockCounts.main * perMain
-      : (blockCounts.main - progress.completed) * perMain;
-    const recyclesLeft = job.recycles - progress.recycle;
-    const seconds = left + recyclesLeft * (blockCounts.extra * perExtra + blockCounts.main * perMain);
-    if (seconds < 30) return "";
-    const minutes = Math.round(seconds / 60);
-    return minutes < 1 ? " · under a minute left" : ` · about ${minutes} min left`;
+    if (blockCounts === undefined) return "";
+    return remainingPhrase(remainingTrunkSeconds(progress, {
+      extraBlocks: blockCounts.extra, mainBlocks: blockCounts.main, recycles: job.recycles,
+    }, {
+      extraSeconds: mean(blockSeconds.get("extra-msa")),
+      mainSeconds: mean(blockSeconds.get("evoformer")),
+    }));
   };
+  const mean = (measured: { total: number; count: number } | undefined): number | undefined =>
+    measured === undefined ? undefined : measured.total / measured.count;
   let blockCounts: { readonly extra: number; readonly main: number } | undefined;
   const modelOptions = {
     onProgress,
