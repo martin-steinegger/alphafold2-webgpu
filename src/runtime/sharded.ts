@@ -22,11 +22,19 @@ export interface ShardLayout {
   readonly totalElements: number;
 }
 
+/** WebGPU's guaranteed storage-binding offset alignment. */
+const BINDING_OFFSET_BYTES = 256;
+
+function greatestCommonDivisor(a: number, b: number): number {
+  return b === 0 ? a : greatestCommonDivisor(b, a % b);
+}
+
 /**
  * Splits `totalElements` so no shard exceeds the binding limit.
  *
  * Shards start on a multiple of `alignElements`, so a row never straddles two
- * of them and a consumer that reads whole rows stays inside one binding.
+ * of them and a consumer that reads whole rows stays inside one binding, and
+ * on a 256-byte boundary, which is the offset alignment a binding must have.
  */
 export function planShards(
   totalElements: number, alignElements: number, bindingBytes: number, bytesPerElement = 4,
@@ -34,8 +42,12 @@ export function planShards(
   if (![totalElements, alignElements, bindingBytes].every((value) => Number.isSafeInteger(value) && value > 0)) {
     throw new RangeError("shard planning needs positive sizes");
   }
-  const perBinding = Math.floor(bindingBytes / bytesPerElement / alignElements) * alignElements;
+  const offsetElements = BINDING_OFFSET_BYTES / bytesPerElement;
+  const alignment = alignElements * offsetElements
+    / greatestCommonDivisor(alignElements, offsetElements);
+  const perBinding = Math.floor(bindingBytes / bytesPerElement / alignment) * alignment;
   if (perBinding <= 0) throw new RangeError("a single aligned row exceeds the binding limit");
+  if (!Number.isSafeInteger(perBinding)) throw new RangeError("shard alignment is not a whole element count");
   if (totalElements <= perBinding) {
     return { count: 1, shardElements: totalElements, totalElements };
   }
