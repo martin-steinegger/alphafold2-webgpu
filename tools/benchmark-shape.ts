@@ -78,11 +78,16 @@ try {
   const profileMode = process.env.AFWEBGPU_PROFILE ?? "";
   const profile = profileMode !== "";
   const poolMib = Number(process.env.AFWEBGPU_POOL_MIB ?? "");
-  const prediction = await new AlphaFoldMonomerGpu(device, {
+  // AFWEBGPU_BINDING_MIB lists the kernels that bind more than that of one
+  // buffer, which is what a device with a small binding limit would refuse.
+  const bindingMib = Number(process.env.AFWEBGPU_BINDING_MIB ?? "");
+  const monomer = new AlphaFoldMonomerGpu(device, {
     ...(profile ? { profile: true } : {}),
     ...memoryOptions,
     ...(poolMib > 0 ? { maxPooledBytes: poolMib * 1024 ** 2 } : {}),
-  }).predict(features, {
+    ...(bindingMib > 0 ? { bindingBudgetBytes: bindingMib * 1024 ** 2 } : {}),
+  });
+  const prediction = await monomer.predict(features, {
     embedding, template, extraStack, mainStack, structure,
     lddt: confidence.lddt, pae: confidence.pae, geometry,
   }, await model.tensor("confidencePaeBreaks"));
@@ -98,6 +103,13 @@ try {
     submissionsPerRecycle: prediction.recycles[0]?.trunkSubmissions.total,
     meanPlddt: Number(prediction.final.confidence.meanPlddt.toFixed(3)),
   }));
+  if (monomer.oversizedBindings.size > 0) {
+    const over = [...monomer.oversizedBindings].sort((a, b) => b[1] - a[1]);
+    console.error(`\nBindings over ${bindingMib} MiB (${over.length} labels):`);
+    for (const [label, bytes] of over) {
+      console.error(`  ${(bytes / 1024 ** 2).toFixed(1).padStart(8)} MiB  ${label}`);
+    }
+  }
   // What was actually live when the trunk hit its peak, which is the list a
   // memory reduction has to work down.
   const composition = prediction.memory.peakComposition;

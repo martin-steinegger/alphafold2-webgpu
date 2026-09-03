@@ -1,6 +1,7 @@
 import { GpuBufferAllocator, type AllocatedGpuBuffer, type AllocationSnapshot } from "../runtime/allocator.js";
 import { pipelineCacheForDevice, type ComputePipelineCache } from "../runtime/pipeline-cache.js";
 import { type ActivationStorage, storageArray, storedElement } from "../runtime/storage.js";
+import { shardBindings, shardLoader, type ShardLayout } from "../runtime/sharded.js";
 import { createTiledGemmShader, gemmGrid } from "../runtime/gemm.js";
 
 export interface OuterProductMeanWeights {
@@ -262,24 +263,42 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
  * reads them contiguously. Only the store has to unfold (i, a) and (j, b) back
  * into the layout the output projection expects.
  */
-export const OUTER_PRODUCT_MEAN_CONTRACT_SHADER = createTiledGemmShader({
+/**
+ * The contraction over sequences of the two per-sequence projections.
+ *
+ * Both projections carry every sequence, so at a long length with a deep
+ * alignment they pass what one binding may cover and arrive as several
+ * windows each, read through a generated accessor.
+ */
+export function createOuterProductMeanContractShader(shards: ShardLayout = CONTRACT_UNSHARDED): string {
+  return createTiledGemmShader({
   preamble: `${OPM_TILE_COMMON}
-@group(0) @binding(0) var<storage, read> left: array<f32>;
-@group(0) @binding(1) var<storage, read> right: array<f32>;
-@group(0) @binding(2) var<uniform> p: Parameters;
-@group(0) @binding(3) var<uniform> tile: TileParameters;
-@group(0) @binding(4) var<storage, read_write> outer: array<f32>;`,
+${shardBindings(shards, "left", "f32", 0, false)}
+${shardBindings(shards, "right", "f32", shards.count, false)}
+@group(0) @binding(${2 * shards.count}) var<uniform> p: Parameters;
+@group(0) @binding(${2 * shards.count + 1}) var<uniform> tile: TileParameters;
+@group(0) @binding(${2 * shards.count + 2}) var<storage, read_write> outer: array<f32>;
+${shardLoader(shards, "left", "f32")}
+${shardLoader(shards, "right", "f32")}`,
   rows: "tile.count * p.c_outer",
   inner: "p.sequences",
   columns: "p.length * p.c_outer",
-  sourceElement: "left[k * p.length * p.c_outer + tile.offset * p.c_outer + row]",
-  weightElement: "right[k * p.length * p.c_outer + column]",
+  sourceElement: "left_load(k * p.length * p.c_outer + tile.offset * p.c_outer + row)",
+  weightElement: "right_load(k * p.length * p.c_outer + column)",
   store: `let block_i = row / p.c_outer;
           let outer_left = row % p.c_outer;
           let j = column / p.c_outer;
           let outer_right = column % p.c_outer;
           outer[((block_i * p.length + j) * p.c_outer + outer_left) * p.c_outer + outer_right] = element;`,
-});
+  });
+}
+
+/** One binding covering a whole projection, which is the common case. */
+const CONTRACT_UNSHARDED: ShardLayout = {
+  count: 1, shardElements: Number.MAX_SAFE_INTEGER, totalElements: 0,
+};
+
+export const OUTER_PRODUCT_MEAN_CONTRACT_SHADER = createOuterProductMeanContractShader();
 
 /**
  * Output projection of the contracted outer product.
@@ -298,6 +317,8 @@ export function createOuterProductMeanProjectOutputShader(
 @group(0) @binding(2) var<storage, read> weights: array<f32>;
 @group(0) @binding(3) var<uniform> p: Parameters;
 @group(0) @binding(4) var<uniform> tile: TileParameters;
+// The output covers this block's pair rows only: at long lengths the whole
+// pair is past what one binding may reach, and the block is a window of it.
 @group(0) @binding(5) var<storage, read_write> output: array<${storageArray(storage)}>;`,
     rows: "tile.count * p.length",
     inner: "p.c_outer * p.c_outer",
@@ -310,10 +331,11 @@ export function createOuterProductMeanProjectOutputShader(
     ...(storage === "f16" ? {
       storeVector: `let pair = tile.offset * p.length + row;
       let scale = 1.0 / (p.normalization_epsilon + pair_count[pair]);
+      let local = row;
       let biases = vec4<f32>(weights[p.output_bias + column], weights[p.output_bias + column + 1u],
         weights[p.output_bias + column + 2u], weights[p.output_bias + column + 3u]);
       var stored = (values + biases) * scale;
-      let word = (pair * p.c_z + column) >> 1u;
+      let word = (local * p.c_z + column) >> 1u;
       ${residual ? "stored += vec4<f32>(unpack2x16float(output[word]), unpack2x16float(output[word + 1u]));" : ""}
       output[word] = pack2x16float(stored.xy);
       output[word + 1u] = pack2x16float(stored.zw);`,
@@ -321,7 +343,7 @@ export function createOuterProductMeanProjectOutputShader(
     } : {
       store: `let pair = tile.offset * p.length + row;
           let projected = element + weights[p.output_bias + column];
-          output[pair * p.c_z + column] ${residual ? "+=" : "="}
+          output[row * p.c_z + column] ${residual ? "+=" : "="}
             projected / (p.normalization_epsilon + pair_count[pair]);`,
     }),
   });
@@ -431,12 +453,14 @@ export class OuterProductMeanGpu {
       ));
       const encoder = this.device.createCommandEncoder({ label: "outer-product-mean" });
       this.device.pushErrorScope("validation");
-      const pass = (pipeline: GPUComputePipeline, buffers: readonly GPUBuffer[], x: number, y = 1): void => {
+      const pass = (pipeline: GPUComputePipeline, buffers: readonly GPUBuffer[], x: number, y = 1,
+        window?: { binding: number; offset: number; size: number }): void => {
         const compute = encoder.beginComputePass();
         compute.setPipeline(pipeline);
         compute.setBindGroup(0, this.device.createBindGroup({
           layout: pipeline.getBindGroupLayout(0),
-          entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer } })),
+          entries: buffers.map((buffer, binding) => ({ binding, resource: binding === window?.binding
+            ? { buffer, offset: window.offset, size: window.size } : { buffer } })),
         }));
         compute.dispatchWorkgroups(x, y);
         compute.end();
@@ -461,7 +485,8 @@ export class OuterProductMeanGpu {
         const outputGrid = gemmGrid(count * input.length, input.cZ);
         pass(projectOutputPipeline,
           [outer.buffer, pairCount.buffer, weights.buffer, params.buffer, tile.buffer, output.buffer],
-          outputGrid[0], outputGrid[1]);
+          outputGrid[0], outputGrid[1], { binding: 5,
+            offset: offset * input.length * input.cZ * 4, size: count * input.length * input.cZ * 4 });
       }
       encoder.copyBufferToBuffer(output.buffer, 0, readback.buffer, 0, pairElements * 4);
       const start = performance.now();

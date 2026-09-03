@@ -3,6 +3,7 @@ import { create, globals } from "webgpu";
 import { EvoformerBlockGpu } from "../src/evoformer/block.js";
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
+import { planShards } from "../src/runtime/sharded.js";
 import { errorMetrics } from "../src/triangle/types.js";
 
 /**
@@ -47,9 +48,25 @@ describe.skipIf(!enabled)("pair binding shards", () => {
       triangleHidden: weights.triangleMultiplicationOutgoing.linearAPBias.length,
       weights,
     };
+    // The budget below has to actually split both tensors, or the sharded run
+    // would be the whole-binding run under another name.
+    // Small enough to split the pair, the MSA and the triangle's whole
+    // operand several ways, and large enough that the windows of the pair and
+    // of the operand still fit the stage's storage slots together.
+    const budget = 512 * 1024;
+    expect(planShards(descriptor.length * descriptor.length * descriptor.cZ, descriptor.cZ, budget).count)
+      .toBeGreaterThan(1);
+    const pairs = descriptor.length * descriptor.length;
+    expect(planShards((pairs + pairs % 2) * descriptor.triangleHidden, 2, budget).count).toBeGreaterThan(1);
+    // The MSA here is smaller than the pair, so it gets a budget of its own.
+    const msaBudget = 128 * 1024;
+    expect(planShards(descriptor.sequences * descriptor.length * descriptor.cM, descriptor.cM, msaBudget).count)
+      .toBeGreaterThan(1);
     const whole = await new EvoformerBlockGpu(device).run(descriptor);
-    // 59 residues hold a 1.8 MiB pair, so a quarter of a mebibyte is five shards.
-    const sharded = await new EvoformerBlockGpu(device).run({ ...descriptor, pairBindingBytes: 256 * 1024 });
+    // 59 residues hold a 1.8 MiB pair, which this budget splits four ways.
+    const sharded = await new EvoformerBlockGpu(device).run({
+      ...descriptor, pairBindingBytes: budget, msaBindingBytes: msaBudget,
+    });
     expect(errorMetrics(sharded.pair, whole.pair).maxAbsoluteError).toBe(0);
     expect(errorMetrics(sharded.msa, whole.msa).maxAbsoluteError).toBe(0);
   }, 600_000);

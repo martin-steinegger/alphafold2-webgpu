@@ -64,6 +64,14 @@ interface PendingTimestampReadback {
 export interface WebGpuExecutionOptions {
   readonly transitionBufferLimit?: number;
   readonly maxPooledBytes?: number;
+  /**
+   * Bytes one binding may cover, at most the device's own limit.
+   *
+   * Every kernel that walks a tensor larger than this splits it into windows
+   * or shards. Lowering it makes a short prediction take the path a long one
+   * takes on a device with a small limit, and reports what still exceeds it.
+   */
+  readonly bindingBudgetBytes?: number;
 }
 
 export class WebGpuExecution {
@@ -71,6 +79,8 @@ export class WebGpuExecution {
   readonly allocator: GpuBufferAllocator;
   readonly pipelines: ComputePipelineCache;
   readonly transitionBufferLimit: number;
+  /** Bytes one binding may cover: the device's limit unless a budget lowers it. */
+  readonly bindingLimitBytes: number;
   readonly #allocations: AllocatedGpuBuffer[] = [];
   #timestamps: TimestampCapture | undefined;
   #dispatchCount = 0;
@@ -84,11 +94,15 @@ export class WebGpuExecution {
     this.pipelines = pipelineCacheForDevice(device);
     this.transitionBufferLimit = Math.min(
       device.limits.maxStorageBufferBindingSize,
+      options.bindingBudgetBytes ?? device.limits.maxStorageBufferBindingSize,
       options.transitionBufferLimit ?? device.limits.maxStorageBufferBindingSize,
     );
     if (!Number.isSafeInteger(this.transitionBufferLimit) || this.transitionBufferLimit <= 0) {
       throw new RangeError("transitionBufferLimit must be a positive safe integer");
     }
+    this.#bindingBudgetBytes = options.bindingBudgetBytes;
+    this.bindingLimitBytes = Math.min(
+      device.limits.maxStorageBufferBindingSize, options.bindingBudgetBytes ?? Number.MAX_SAFE_INTEGER);
   }
 
   upload(label: string, data: ArrayBufferView, usage: GPUBufferUsageFlags = GPUBufferUsage.STORAGE): GpuTensor {
@@ -141,6 +155,41 @@ export class WebGpuExecution {
     this.#encoderHolder = holder;
   }
 
+  /**
+   * Reports bindings larger than a budget, without a device that enforces one.
+   *
+   * A binding may cover only `maxStorageBufferBindingSize` bytes of a buffer,
+   * and the adapters here allow gigabytes, so a kernel that binds a whole
+   * pair passes at every length that fits in memory and then fails on a
+   * device with the 128 MiB default. Setting a budget well under any real
+   * tensor lists the kernels that would fail there, by label.
+   */
+  setBindingBudget(bytes: number | undefined): void {
+    this.#bindingBudgetBytes = bytes;
+    this.#oversizedBindings.clear();
+  }
+
+  /** Labels of the dispatches that exceeded the budget, and their largest binding. */
+  get oversizedBindings(): ReadonlyMap<string, number> {
+    return this.#oversizedBindings;
+  }
+
+  #recordOversizedBindings(tensors: readonly GpuTensor[], label: string | undefined): void {
+    const budget = this.#bindingBudgetBytes;
+    if (budget === undefined) return;
+    for (const tensor of tensors) {
+      const bytes = tensor.elements * 4;
+      // Uploaded buffers hold weights and feature tables, which a kernel reads
+      // whole; only activations can be walked in windows.
+      if (bytes <= budget || tensor.allocation.uploaded) continue;
+      const key = label ?? "unlabelled";
+      this.#oversizedBindings.set(key, Math.max(this.#oversizedBindings.get(key) ?? 0, bytes));
+    }
+  }
+
+  #bindingBudgetBytes: number | undefined;
+  readonly #oversizedBindings = new Map<string, number>();
+
   dispatch(
     encoder: GPUCommandEncoder,
     pipeline: GPUComputePipeline,
@@ -182,6 +231,7 @@ export class WebGpuExecution {
         timestampWrites: timestampWrites!,
       });
     }
+    if (this.#bindingBudgetBytes !== undefined) this.#recordOversizedBindings(tensors, label);
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, this.device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),

@@ -1,4 +1,6 @@
-import { planShards } from "../runtime/sharded.js";
+import {
+  planShards, shardBindings, shardLoader, shardStorer, shardWordLoader, type ShardLayout,
+} from "../runtime/sharded.js";
 import {
   createAttentionNormalizeShader,
   createAttentionOutputShader,
@@ -21,8 +23,9 @@ import { releaseScratch } from "./execution-scratch.js";
 import {
   createOuterProductMeanNormalizeShader,
   createOuterProductMeanParameters,
-  OUTER_PRODUCT_MEAN_CONTRACT_SHADER,
+  createOuterProductMeanContractShader,
   OUTER_PRODUCT_MEAN_PAIR_COUNT_SHADER,
+  OUTER_PRODUCT_BLOCK_LIMIT_BYTES,
   OUTER_PRODUCT_NORMALIZE_WINDOW_BYTES,
   outerProductMeanNormalizeWindow,
   outerProductMeanRowBlock,
@@ -146,6 +149,8 @@ export interface EvoformerBlockInput {
    * which is the only way to exercise it here.
    */
   readonly pairBindingBytes?: number;
+  /** The same, for the MSA activations. */
+  readonly msaBindingBytes?: number;
   readonly weights: EvoformerBlockWeights;
 }
 
@@ -205,7 +210,7 @@ type EvoformerShape = Pick<
   EvoformerBlockInput,
   "sequences" | "length" | "cM" | "cZ" | "cOuter" | "triangleHidden" | "outerProductMeanFirst"
   | "scratchWindowBytes" | "triangleWholeStorage" | "msaStorage" | "pairStorage" | "flush"
-  | "pairBindingBytes"
+  | "pairBindingBytes" | "msaBindingBytes"
 >;
 
 const GLOBAL_ATTENTION_COMMON = `
@@ -227,23 +232,32 @@ const GRID_WIDTH: u32 = 32768u;
  * statistics, so the row's mean and inverse standard deviation stand in for a
  * whole normalized copy.
  */
-function globalAttentionLoader(storage: ActivationStorage, binding = "source"): string {
+function globalAttentionLoader(binding = "source"): string {
   return `
 fn normalized_element(source_row: u32, c: u32) -> f32 {
-  return (${storedElement(storage, binding, "source_row * p.channels + c")} - statistics[2u * source_row])
+  return (${binding}_load(source_row * p.channels + c) - statistics[2u * source_row])
     * statistics[2u * source_row + 1u] * weights[p.norm_scale + c] + weights[p.norm_offset + c];
 }`;
 }
 
-function createGlobalAttentionKvShader(storage: ActivationStorage): string {
+/** One binding covering the whole extra MSA, which is the common case. */
+const GLOBAL_UNSHARDED: ShardLayout = {
+  count: 1, shardElements: Number.MAX_SAFE_INTEGER, totalElements: 0,
+};
+
+function createGlobalAttentionKvShader(
+  storage: ActivationStorage, shards: ShardLayout = GLOBAL_UNSHARDED,
+): string {
+  const n = shards.count;
   return `${GLOBAL_ATTENTION_COMMON}
-@group(0) @binding(0) var<storage, read> source: array<${storageArray(storage)}>;
-@group(0) @binding(1) var<storage, read> weights: array<f32>;
-@group(0) @binding(2) var<uniform> p: Parameters;
-@group(0) @binding(3) var<storage, read_write> keys: array<f32>;
-@group(0) @binding(4) var<storage, read_write> values: array<f32>;
-@group(0) @binding(5) var<storage, read> statistics: array<f32>;
-${globalAttentionLoader(storage)}
+${shardBindings(shards, "source", storage, 0, false)}
+@group(0) @binding(${n}) var<storage, read> weights: array<f32>;
+@group(0) @binding(${n + 1}) var<uniform> p: Parameters;
+@group(0) @binding(${n + 2}) var<storage, read_write> keys: array<f32>;
+@group(0) @binding(${n + 3}) var<storage, read_write> values: array<f32>;
+@group(0) @binding(${n + 4}) var<storage, read> statistics: array<f32>;
+${shardLoader(shards, "source", storage)}
+${globalAttentionLoader()}
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let index = id.x + id.y * GRID_WIDTH * 64u;
@@ -269,15 +283,19 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
  * head channel, so it is computed once here rather than once per projected
  * channel inside the query projection.
  */
-function createGlobalAttentionColumnMeanShader(storage: ActivationStorage): string {
+function createGlobalAttentionColumnMeanShader(
+  storage: ActivationStorage, shards: ShardLayout = GLOBAL_UNSHARDED,
+): string {
+  const n = shards.count;
   return `${GLOBAL_ATTENTION_COMMON}
-@group(0) @binding(0) var<storage, read> source: array<${storageArray(storage)}>;
-@group(0) @binding(1) var<storage, read> mask: array<f32>;
-@group(0) @binding(2) var<uniform> p: Parameters;
-@group(0) @binding(3) var<storage, read_write> means: array<f32>;
-@group(0) @binding(4) var<storage, read> statistics: array<f32>;
-@group(0) @binding(5) var<storage, read> weights: array<f32>;
-${globalAttentionLoader(storage)}
+${shardBindings(shards, "source", storage, 0, false)}
+@group(0) @binding(${n}) var<storage, read> mask: array<f32>;
+@group(0) @binding(${n + 1}) var<uniform> p: Parameters;
+@group(0) @binding(${n + 2}) var<storage, read_write> means: array<f32>;
+@group(0) @binding(${n + 3}) var<storage, read> statistics: array<f32>;
+@group(0) @binding(${n + 4}) var<storage, read> weights: array<f32>;
+${shardLoader(shards, "source", storage)}
+${globalAttentionLoader()}
 var<workgroup> column_denominator: array<f32, 1>;
 
 @compute @workgroup_size(64)
@@ -417,24 +435,28 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
  * every gate read from every store.
  */
 function createGlobalAttentionOutputShader(
-  residual: boolean, storage: ActivationStorage = "f32",
+  residual: boolean, storage: ActivationStorage = "f32", shards: ShardLayout = GLOBAL_UNSHARDED,
 ): string {
   const sourceBinding = residual ? "output" : "source";
   // Bindings are numbered from zero in the order the dispatch passes them, so
-  // the residual form's list is one shorter rather than one hole longer.
+  // the residual form's list is one set shorter rather than one hole longer.
   let binding = 0;
   const next = (): number => binding++;
-  const sourceDeclaration = residual
-    ? "" : `@group(0) @binding(${next()}) var<storage, read> source: array<${storageArray(storage)}>;`;
+  const take = (count: number): number => { const first = binding; binding += count; return first; };
+  const sourceDeclaration = residual ? "" : shardBindings(shards, "source", storage, take(shards.count), false);
   return createTiledGemmShader({
     preamble: `${GLOBAL_ATTENTION_COMMON}
 ${sourceDeclaration}
 @group(0) @binding(${next()}) var<storage, read> attended: array<f32>;
 @group(0) @binding(${next()}) var<storage, read> weights: array<f32>;
 @group(0) @binding(${next()}) var<uniform> p: Parameters;
-@group(0) @binding(${next()}) var<storage, read_write> output: array<${storageArray(storage)}>;
+${shardBindings(shards, "output", storage, take(shards.count), true)}
 @group(0) @binding(${next()}) var<storage, read> statistics: array<f32>;
-${globalAttentionLoader(storage, sourceBinding)}
+${residual ? "" : shardLoader(shards, "source", storage)}
+${shardStorer(shards, "output", storage)}
+${storage === "f16" || residual ? shardLoader(shards, "output", storage) : ""}
+${storage === "f16" ? shardWordLoader(shards, "output") : ""}
+${globalAttentionLoader(sourceBinding)}
 
 // Rows and the MSA are both sequence-major here.
 fn gated_attention(row: u32, projected_channel: u32) -> f32 {
@@ -451,15 +473,16 @@ fn gated_attention(row: u32, projected_channel: u32) -> f32 {
     columns: "p.channels",
     sourceElement: "gated_attention(row, k)",
     weightElement: "weights[p.output_weight + k * p.channels + column]",
-    store: `output[row * p.channels + column] ${residual ? "+=" : "="}
-          element + weights[p.output_bias + column];`,
+    store: `let index = row * p.channels + column;
+          let written = element + weights[p.output_bias + column];
+          output_store(index, ${residual ? "output_load(index) + written" : "written"});`,
     // Packed storage is written a word (two adjacent channels) at a time.
     ...(storage === "f16" ? { storeVector: `let base = row * p.channels + column;
 ${[0, 2].map((pair) => `          if (column + ${pair + 1}u < p.channels) {
             var stored = vec2<f32>(values[${pair}] + weights[p.output_bias + column + ${pair}u],
               values[${pair + 1}] + weights[p.output_bias + column + ${pair + 1}u]);
-            ${residual ? `stored += unpack2x16float(output[(base + ${pair}u) >> 1u]);` : ""}
-            output[(base + ${pair}u) >> 1u] = pack2x16float(stored);
+            ${residual ? `stored += unpack2x16float(output_load_word((base + ${pair}u) >> 1u));` : ""}
+            output_store((base + ${pair}u) >> 1u, pack2x16float(stored));
           }`).join("\n")}` } : {}),
   });
 }
@@ -606,7 +629,14 @@ async function encodeAttention(
   // The source and the residual target are the same tensor, and at long chain
   // lengths it outgrows one binding, so both are bound as windows of it.
   const sourceShards = planShards(options.batch * options.queries * options.channels, options.channels,
-    options.bindingBytes ?? execution.device.limits.maxStorageBufferBindingSize, storage === "f16" ? 2 : 4);
+    options.bindingBytes ?? execution.bindingLimitBytes, storage === "f16" ? 2 : 4);
+  // The output projection binds the windows beside the weighted values, the
+  // weights and the parameters; the normalize binds them beside three more.
+  const attentionSlots = sourceShards.count + 3;
+  if (attentionSlots > execution.device.limits.maxStorageBuffersPerShaderStage) {
+    throw new RangeError(`${options.label} needs ${attentionSlots} storage bindings, past this device's limit `
+      + `of ${execution.device.limits.maxStorageBuffersPerShaderStage}`);
+  }
   const shardKey = `${storage}:${sourceShards.count}`;
   const [normalize, project, pairProject, flash, outputProject, pairNormalize] = await Promise.all([
     execution.pipelines.get(`block:attention:normalize:${shardKey}`,
@@ -631,7 +661,7 @@ async function encodeAttention(
   // Attention is independent across batch entries, so the per-row tensors only
   // ever have to hold one window of them.
   const windowBatch = attentionBatchWindow(options.batch, options.queries, options.channels,
-    options.windowBytes ?? ATTENTION_WINDOW_TARGET_BYTES);
+    Math.min(options.windowBytes ?? ATTENTION_WINDOW_TARGET_BYTES, execution.bindingLimitBytes));
   const windowElements = windowBatch * options.queries * options.channels;
 
   const normalized = execution.allocate(`${options.label}.normalized`, windowElements);
@@ -680,7 +710,8 @@ async function encodeAttention(
       const channels = options.pairBias.channels;
       const rowElements = options.queries * channels;
       const pairWindowRows = Math.max(1, Math.min(options.queries, Math.floor(
-        (options.windowBytes ?? ATTENTION_WINDOW_TARGET_BYTES) / (rowElements * Float32Array.BYTES_PER_ELEMENT),
+        Math.min(options.windowBytes ?? ATTENTION_WINDOW_TARGET_BYTES, execution.bindingLimitBytes)
+          / (rowElements * Float32Array.BYTES_PER_ELEMENT),
       )));
       normalizedPair = execution.allocate(`${options.label}.pair-normalized`, pairWindowRows * rowElements);
       for (let offset = 0; offset < options.queries; offset += pairWindowRows) {
@@ -778,21 +809,39 @@ async function encodeGlobalAttention(
     offsets[0]!, offsets[1]!, 0, 0,
   ]);
   const storage = shape.msaStorage ?? "f32";
+  // Every kernel here reads the extra MSA down its columns, so none of them
+  // can take a window of rows; past the binding limit it arrives as several.
+  const shards = planShards(shape.sequences * shape.length * shape.cM, shape.cM,
+    shape.msaBindingBytes ?? execution.bindingLimitBytes, storage === "f16" ? 2 : 4);
+  const key = `${storage}:${shards.count}`;
+  const slots = shards.count * (residualTarget === undefined ? 2 : 1) + 3;
+  if (slots > execution.device.limits.maxStorageBuffersPerShaderStage) {
+    throw new RangeError(`${label} needs ${slots} storage bindings, past this device's limit of `
+      + `${execution.device.limits.maxStorageBuffersPerShaderStage}`);
+  }
   const [statisticsPipeline, kvPipeline, columnMeanPipeline, queryPipeline, flashPipeline, outputPipeline]
     = await Promise.all([
-    execution.pipelines.get(`block:attention:statistics:${storage}`, createAttentionStatisticsShader(storage)),
-    execution.pipelines.get(`block:global-attention:kv:${storage}`, createGlobalAttentionKvShader(storage)),
-    execution.pipelines.get(`block:global-attention:column-mean:${storage}`,
-      createGlobalAttentionColumnMeanShader(storage)),
+    execution.pipelines.get(`block:attention:statistics:${key}`,
+      createAttentionStatisticsShader(storage, shards)),
+    execution.pipelines.get(`block:global-attention:kv:${key}`, createGlobalAttentionKvShader(storage, shards)),
+    execution.pipelines.get(`block:global-attention:column-mean:${key}`,
+      createGlobalAttentionColumnMeanShader(storage, shards)),
     execution.pipelines.get("block:global-attention:query", GLOBAL_ATTENTION_QUERY_SHADER),
     execution.pipelines.get("block:global-attention:flash", GLOBAL_ATTENTION_FLASH_SHADER),
     execution.pipelines.get(
-      `block:global-attention:output${residualTarget === undefined ? "" : "-residual"}:${storage}`,
-      storage === "f32"
-        ? (residualTarget === undefined ? GLOBAL_ATTENTION_OUTPUT_SHADER : GLOBAL_ATTENTION_OUTPUT_RESIDUAL_SHADER)
-        : createGlobalAttentionOutputShader(residualTarget !== undefined, storage),
+      `block:global-attention:output${residualTarget === undefined ? "" : "-residual"}:${key}`,
+      createGlobalAttentionOutputShader(residualTarget !== undefined, storage, shards),
     ),
   ]);
+  const shardsOf = (tensor: GpuTensor): readonly GpuTensor[] => {
+    if (shards.count === 1) return [tensor];
+    return Array.from({ length: shards.count }, (_, index) => {
+      const offset = index * shards.shardElements;
+      const count = Math.min(shards.shardElements, shards.totalElements - offset);
+      return execution.view(tensor, storageWords(offset, storage), storageWords(count, storage));
+    });
+  };
+  const sourceViews = shardsOf(source);
   const weights = execution.upload(`${label}.weights`, packed);
   const parameters = uniform(execution, `${label}.parameters`, params);
   const normParameters = uniform(execution, `${label}.norm-parameters`, createAttentionNormParameters(
@@ -806,14 +855,15 @@ async function encodeGlobalAttention(
   const attended = execution.allocate(`${label}.attended`, shape.length * w.heads * headDim);
   const output = residualTarget ?? execution.allocate(`${label}.output`, shape.sequences * shape.length * shape.cM);
   let grid = execution.linearGrid(shape.length * shape.sequences, 1);
-  execution.dispatch(encoder, statisticsPipeline, [source, normParameters, statistics],
+  execution.dispatch(encoder, statisticsPipeline, [...sourceViews, normParameters, statistics],
     grid[0], grid[1], 1, `${label}.statistics`);
   grid = execution.linearGrid(shape.length * shape.sequences * headDim);
-  execution.dispatch(encoder, kvPipeline, [source, weights, parameters, keys, values, statistics],
+  execution.dispatch(encoder, kvPipeline, [...sourceViews, weights, parameters, keys, values, statistics],
     grid[0], grid[1], 1, `${label}.kv`);
   const means = execution.allocate(`${label}.column-means`, shape.length * shape.cM);
   grid = execution.linearGrid(shape.length, 1);
-  execution.dispatch(encoder, columnMeanPipeline, [source, mask, parameters, means, statistics, weights],
+  execution.dispatch(encoder, columnMeanPipeline,
+    [...sourceViews, mask, parameters, means, statistics, weights],
     grid[0], grid[1], 1, `${label}.column-mean`);
   const queryGrid = gemmGrid(shape.length, w.heads * headDim);
   execution.dispatch(encoder, queryPipeline, [means, weights, parameters, query],
@@ -822,10 +872,11 @@ async function encodeGlobalAttention(
     shape.length, w.heads, 1, `${label}.flash`);
   const outputGrid = gemmGrid(shape.sequences * shape.length, shape.cM);
   // The residual form reads the output binding, so the source is not bound twice.
+  const outputViews = output === source ? sourceViews : shardsOf(output);
   execution.dispatch(encoder, outputPipeline,
     residualTarget === undefined
-      ? [source, attended, weights, parameters, output, statistics]
-      : [attended, weights, parameters, output, statistics],
+      ? [...sourceViews, attended, weights, parameters, ...outputViews, statistics]
+      : [attended, weights, parameters, ...outputViews, statistics],
     outputGrid[0], outputGrid[1], 1, `${label}.output`);
   releaseScratch([statistics, means, keys, values, query, attended], output);
   return output;
@@ -847,25 +898,38 @@ async function encodeOuterProductMean(
   };
   const packed = packOuterProductMeanWeights(descriptor);
   const storage = input.msaStorage ?? "f32";
+  const rows = input.sequences * input.length;
+  // Both projections carry every sequence, so a deep alignment at a long
+  // length puts them past one binding; the contraction reads them as windows.
+  const projectionShards = planShards(rows * input.cOuter, input.cOuter, execution.bindingLimitBytes);
   const [normalize, project, contractPipeline, pairCountPipeline, projectOutputPipeline] = await Promise.all([
     execution.pipelines.get(`block:opm:normalize:${storage}`, createOuterProductMeanNormalizeShader(storage)),
     execution.pipelines.get("block:opm:project", OUTER_PRODUCT_MEAN_PROJECT_SHADER),
-    execution.pipelines.get("block:opm:contract", OUTER_PRODUCT_MEAN_CONTRACT_SHADER),
+    execution.pipelines.get(`block:opm:contract:${projectionShards.count}`,
+      createOuterProductMeanContractShader(projectionShards)),
     execution.pipelines.get("block:opm:pair-count", OUTER_PRODUCT_MEAN_PAIR_COUNT_SHADER),
     execution.pipelines.get(
       `block:opm:project-output${residualTarget === undefined ? "" : "-residual"}:${input.pairStorage ?? "f32"}`,
       createOuterProductMeanProjectOutputShader(residualTarget !== undefined, input.pairStorage ?? "f32"),
     ),
   ]);
-  const rows = input.sequences * input.length;
   const weights = execution.upload("opm.weights", packed.data);
   const params = uniform(execution, "opm.parameters", createOuterProductMeanParameters(descriptor, packed.offsets));
   const normalizeRows = outerProductMeanNormalizeWindow(rows, input.cM,
-    input.scratchWindowBytes ?? OUTER_PRODUCT_NORMALIZE_WINDOW_BYTES);
+    Math.min(input.scratchWindowBytes ?? OUTER_PRODUCT_NORMALIZE_WINDOW_BYTES, execution.bindingLimitBytes));
   const normalized = execution.allocate("opm.normalized", normalizeRows * input.cM);
+  const projectionViews = (tensor: GpuTensor): readonly GpuTensor[] => {
+    if (projectionShards.count === 1) return [tensor];
+    return Array.from({ length: projectionShards.count }, (_, index) => {
+      const offset = index * projectionShards.shardElements;
+      return execution.view(tensor, offset,
+        Math.min(projectionShards.shardElements, projectionShards.totalElements - offset));
+    });
+  };
   const left = execution.allocate("opm.left", rows * input.cOuter);
   const right = execution.allocate("opm.right", rows * input.cOuter);
-  const rowBlock = outerProductMeanRowBlock(input.length, input.cOuter);
+  const rowBlock = outerProductMeanRowBlock(input.length, input.cOuter,
+    Math.min(OUTER_PRODUCT_BLOCK_LIMIT_BYTES, execution.bindingLimitBytes));
   const outer = execution.allocate("opm.outer", rowBlock * input.length * input.cOuter * input.cOuter);
   const pairCount = execution.allocate("opm.pair-count", input.length * input.length);
   const output = residualTarget ?? execution.allocate("opm.output",
@@ -903,11 +967,17 @@ async function encodeOuterProductMean(
     const count = Math.min(rowBlock, input.length - offset);
     const tile = uniform(execution, `opm.block-${offset}`, new Uint32Array([offset, count, 0, 0]));
     const contractGrid = gemmGrid(count * input.cOuter, input.length * input.cOuter);
-    execution.dispatch(encoder, contractPipeline, [left, right, params, tile, outer],
+    execution.dispatch(encoder, contractPipeline,
+      [...projectionViews(left), ...projectionViews(right), params, tile, outer],
       contractGrid[0], contractGrid[1], 1, "opm.contract");
     const projectOutputGrid = gemmGrid(count * input.length, input.cZ);
-    execution.dispatch(encoder, projectOutputPipeline, [outer, pairCount, weights, params, tile, output],
-      projectOutputGrid[0], projectOutputGrid[1], 1, "opm.project-output");
+    // The block writes its own pair rows, so it binds only those.
+    const pairStorage = input.pairStorage ?? "f32";
+    const outputWindow = execution.view(output,
+      storageWords(offset * input.length * input.cZ, pairStorage),
+      storageWords(count * input.length * input.cZ, pairStorage));
+    execution.dispatch(encoder, projectOutputPipeline, [outer, pairCount, weights, params, tile, outputWindow],
+      projectOutputGrid[0], projectOutputGrid[1], 1, `opm.project-output-${offset}`);
   }
   releaseScratch([normalized, left, right, outer, pairCount], output);
   return output;
@@ -953,18 +1023,33 @@ async function encodeTriangleMultiplication(
   const shape = { length: input.length, cZ: input.cZ, cHidden: input.triangleHidden };
   const packed = packTriangleWeights(weightsValue, "f32");
   const blockRows = triangleBlockRows(input.length, input.cZ, input.triangleHidden,
-    input.scratchWindowBytes ?? TRIANGLE_BLOCK_TARGET_BYTES);
+    Math.min(input.scratchWindowBytes ?? TRIANGLE_BLOCK_TARGET_BYTES, execution.bindingLimitBytes));
   const wholeStorage = input.triangleWholeStorage ?? "f32";
   const pairStorage = input.pairStorage ?? "f32";
   // A pair past the device's binding limit is bound as several windows of the
   // same buffer, which the shaders read through a generated accessor.
   const pairShards = planShards(input.length * input.length * input.cZ, input.cZ,
-    input.pairBindingBytes ?? execution.device.limits.maxStorageBufferBindingSize,
+    input.pairBindingBytes ?? execution.bindingLimitBytes,
     pairStorage === "f16" ? 2 : 4);
+  // The whole operand is the pair's size in hidden channels, so it passes the
+  // binding limit before the pair does and is windowed the same way.
+  const wholeStride = input.length * input.length + (input.length * input.length) % 2;
+  const wholeShards = planShards(wholeStride * input.triangleHidden, 2,
+    input.pairBindingBytes ?? execution.bindingLimitBytes,
+    wholeStorage === "f16" ? 2 : 4);
+  // The projection reads the pair and writes the whole operand in one
+  // dispatch, so their windows share the stage's storage slots with three
+  // more for the mask, the weights and the statistics.
+  const slots = pairShards.count + wholeShards.count + 3;
+  if (slots > execution.device.limits.maxStorageBuffersPerShaderStage) {
+    throw new RangeError(`a ${input.length}-residue pair needs ${slots} storage bindings in the triangle `
+      + `multiplication, past this device's limit of ${execution.device.limits.maxStorageBuffersPerShaderStage}`);
+  }
   const shaders = createTriangleShaders(shape, "f32", packed.offsets, 1e-5, direction, blockRows, wholeStorage,
-    pairStorage, residualTarget !== undefined, pairShards);
+    pairStorage, residualTarget !== undefined, pairShards, wholeShards);
   const pipelineKey = `block:triangle:${direction}:${input.length}:${input.cZ}`
-    + `:${input.triangleHidden}:${blockRows}:${wholeStorage}:${pairStorage}:${pairShards.count}`;
+    + `:${input.triangleHidden}:${blockRows}:${wholeStorage}:${pairStorage}:${pairShards.count}`
+    + `:${wholeShards.count}`;
   const [inputStatistics, projectGate, projectBlockOperand, projectWholeOperand, contract, hiddenStatistics, projectOutput]
     = await Promise.all([
     execution.pipelines.get(`${pipelineKey}:input-statistics`, shaders.inputStatistics),
@@ -979,15 +1064,15 @@ async function encodeTriangleMultiplication(
     ),
   ]);
   const pairs = input.length * input.length;
-  const shardViews = (tensor: GpuTensor): readonly GpuTensor[] => {
-    if (pairShards.count === 1) return [tensor];
-    const total = pairs * input.cZ;
-    return Array.from({ length: pairShards.count }, (_, index) => {
-      const offset = index * pairShards.shardElements;
-      const count = Math.min(pairShards.shardElements, total - offset);
-      return execution.view(tensor, storageWords(offset, pairStorage), storageWords(count, pairStorage));
+  const views = (tensor: GpuTensor, layout: ShardLayout, storage: ActivationStorage): readonly GpuTensor[] => {
+    if (layout.count === 1) return [tensor];
+    return Array.from({ length: layout.count }, (_, index) => {
+      const offset = index * layout.shardElements;
+      const count = Math.min(layout.shardElements, layout.totalElements - offset);
+      return execution.view(tensor, storageWords(offset, storage), storageWords(count, storage));
     });
   };
+  const shardViews = (tensor: GpuTensor): readonly GpuTensor[] => views(tensor, pairShards, pairStorage);
   const blockPairs = blockRows * input.length;
   const weights = execution.upload(`triangle.${direction}.weights`, packed.data);
   const output = residualTarget
@@ -1009,10 +1094,10 @@ async function encodeTriangleMultiplication(
   execution.dispatch(encoder, inputStatistics, [...pairViews, statistics],
     statisticsGrid[0], statisticsGrid[1], 1, `triangle.${direction}.input-statistics`);
   const gate = execution.allocate(`triangle.${direction}.gate`, blockPairs * input.cZ);
-  const project = (pipeline: GPUComputePipeline, target: GpuTensor, block: (typeof blocks)[number],
-    label: string): void => {
+  const project = (pipeline: GPUComputePipeline, target: readonly GpuTensor[],
+    block: (typeof blocks)[number], label: string): void => {
     const grid = gemmGrid(block.count * input.length, 2 * input.triangleHidden);
-    execution.dispatch(encoder, pipeline, [...pairViews, pairMask, weights, statistics, target, block.uniform],
+    execution.dispatch(encoder, pipeline, [...pairViews, pairMask, weights, statistics, ...target, block.uniform],
       grid[0], grid[1], 1, `triangle.${direction}.${label}-${block.offset}`);
   };
 
@@ -1020,10 +1105,10 @@ async function encodeTriangleMultiplication(
   // first residue is projected per block; the other has to be complete before
   // any block contracts and is filled block by block, in half precision when
   // requested.
-  const wholeStride = pairs + (pairs % 2);
   const wholeProjection = execution.allocate(`triangle.${direction}.whole`,
-    wholeStorage === "f16" ? wholeStride * input.triangleHidden / 2 : wholeStride * input.triangleHidden);
-  for (const block of blocks) project(projectWholeOperand, wholeProjection, block, "project-whole");
+    storageWords(wholeStride * input.triangleHidden, wholeStorage === "f16" ? "f16" : "f32"));
+  const wholeViews = views(wholeProjection, wholeShards, wholeStorage === "f16" ? "f16" : "f32");
+  for (const block of blocks) project(projectWholeOperand, wholeViews, block, "project-whole");
   const blockedProjection = execution.allocate(`triangle.${direction}.blocked`, blockPairs * input.triangleHidden);
   const contracted = execution.allocate(`triangle.${direction}.contracted`, blockPairs * input.triangleHidden);
   const hiddenStats = execution.allocate(`triangle.${direction}.hidden-statistics`, blockPairs * 2);
@@ -1033,9 +1118,9 @@ async function encodeTriangleMultiplication(
     [encoder, dispatchedAtSplit] = await splitWhenLong(execution, encoder, dispatchedAtSplit, input.flush,
       `triangle.${direction}.flush-${block.offset}`);
     const rows = block.count * input.length;
-    project(projectBlockOperand, blockedProjection, block, "project-block");
+    project(projectBlockOperand, [blockedProjection], block, "project-block");
     const contractGrid = gemmGrid(block.count, input.length);
-    execution.dispatch(encoder, contract, [blockedProjection, wholeProjection, contracted, block.uniform],
+    execution.dispatch(encoder, contract, [blockedProjection, ...wholeViews, contracted, block.uniform],
       contractGrid[0], contractGrid[1], input.triangleHidden, `triangle.${direction}.contract-${block.offset}`);
     const stats = execution.view(hiddenStats, 0, rows * 2);
     execution.dispatch(encoder, hiddenStatistics, [contracted, stats, block.uniform],
@@ -1082,7 +1167,7 @@ export async function encodeEvoformerBlock(
     },
     label: "msa-row-attention",
     windowBytes: shapeWindowBytes, residualTarget: msa, storage: input.msaStorage,
-    pairStorage: input.pairStorage, flush: input.flush,
+    pairStorage: input.pairStorage, flush: input.flush, bindingBytes: input.msaBindingBytes,
   });
 
   const column = input.weights.msaColumnAttention;
@@ -1091,6 +1176,7 @@ export async function encodeEvoformerBlock(
     channels: input.cM, heads: column.heads, transpose: true, weights: column.attention,
     label: "msa-column-attention",
     windowBytes: shapeWindowBytes, residualTarget: msa, storage: input.msaStorage, flush: input.flush,
+    bindingBytes: input.msaBindingBytes,
   });
 
   await encodeTransition(
@@ -1114,6 +1200,7 @@ export async function encodeEvoformerBlock(
     pairBias: { source: "normalized-input", projectionWeight: starting.pairProjectionWeight },
     label: "triangle-attention-starting",
     windowBytes: shapeWindowBytes, residualTarget: pair, storage: input.pairStorage, flush: input.flush,
+    bindingBytes: input.pairBindingBytes,
   });
 
   const ending = input.weights.triangleAttentionEnding;
@@ -1123,6 +1210,7 @@ export async function encodeEvoformerBlock(
     pairBias: { source: "normalized-input", projectionWeight: ending.pairProjectionWeight },
     label: "triangle-attention-ending",
     windowBytes: shapeWindowBytes, residualTarget: pair, storage: input.pairStorage, flush: input.flush,
+    bindingBytes: input.pairBindingBytes,
   });
 
   await encodeTransition(

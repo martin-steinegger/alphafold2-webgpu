@@ -117,6 +117,12 @@ export class AllocatedGpuBuffer {
   readonly byteLength: number;
   /** Usage the tensor asked for; the physical buffer may carry more. */
   readonly usage: GPUBufferUsageFlags;
+  /**
+   * Whether host data was written into it, which makes it weights, feature
+   * tables or masks rather than an activation. Their size follows the model,
+   * not the sequence length, so they are not candidates for windowing.
+   */
+  uploaded = false;
   readonly #allocationByteLength: number;
   readonly #allocationUsage: GPUBufferUsageFlags;
   /**
@@ -247,6 +253,7 @@ export class GpuBufferAllocator {
   upload(label: string, data: ArrayBufferView, usage: GPUBufferUsageFlags): AllocatedGpuBuffer {
     const allocation = this.allocate(label, data.byteLength, usage | GPUBufferUsage.COPY_DST,
       { requireSubmitted: true });
+    allocation.uploaded = true;
     if (data.byteLength % 4 === 0) {
       this.device.queue.writeBuffer(allocation.buffer, 0, data.buffer, data.byteOffset, data.byteLength);
     } else {

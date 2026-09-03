@@ -139,10 +139,15 @@ function triangleSources(): [string, string][] {
             const layout = planShards(pairElements, shape.cZ,
               shards === 1 ? Number.MAX_SAFE_INTEGER : Math.ceil(pairElements / shards) * 4,
               pairStorage === "f16" ? 2 : 4);
+            const pairs = shape.length * shape.length;
+            const wholeElements = (pairs + pairs % 2) * shape.cHidden;
+            const wholeLayout = planShards(wholeElements, 2,
+              shards === 1 ? Number.MAX_SAFE_INTEGER : Math.ceil(wholeElements / shards) * 4,
+              wholeStorage === "f16" ? 2 : 4);
             const label = `triangle(${direction},whole=${wholeStorage},pair=${pairStorage},`
-              + `residual=${residual},shards=${layout.count})`;
+              + `residual=${residual},shards=${layout.count}/${wholeLayout.count})`;
             const shaders = createTriangleShaders(shape, "f32", offsets, 1e-5, direction, 4,
-              wholeStorage, pairStorage, residual, layout);
+              wholeStorage, pairStorage, residual, layout, wholeLayout);
             for (const [name, code] of Object.entries(shaders)) {
               if (typeof code === "string" && code.includes("@compute")) sources.push([`${label}.${name}`, code]);
             }

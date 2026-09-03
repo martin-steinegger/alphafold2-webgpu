@@ -12,7 +12,7 @@ function adapterWithLimits(maxStorageBufferBindingSize: number, maxBufferSize: n
   const requestDevice = vi.fn(async () => ({}) as GPUDevice);
   const adapter = {
     features: new Set<GPUFeatureName>(["subgroups" as GPUFeatureName, "timestamp-query"]),
-    limits: { maxStorageBufferBindingSize, maxBufferSize },
+    limits: { maxStorageBufferBindingSize, maxBufferSize, maxStorageBuffersPerShaderStage: 16 },
     requestDevice,
   } as unknown as GPUAdapter;
   return { adapter, requestDevice };
@@ -27,6 +27,7 @@ describe("requestAlphaFoldDevice", () => {
       requiredLimits: {
         maxBufferSize: 256 * 1024 ** 2,
         maxStorageBufferBindingSize: 128 * 1024 ** 2,
+        maxStorageBuffersPerShaderStage: 16,
       },
     });
   });
@@ -117,14 +118,29 @@ describe("requestAlphaFoldDevice", () => {
       requiredLimits: {
         maxBufferSize: 256 * 1024 ** 2,
         maxStorageBufferBindingSize: 128 * 1024 ** 2,
+        maxStorageBuffersPerShaderStage: 16,
       },
     }));
   });
 
-  it("rejects a shape that exceeds the adapter instead of silently lowering its requirements", async () => {
+  it("takes the adapter's binding limit when the shape wants more, and windows the rest", async () => {
+    // A tensor past the binding limit is bound as several windows of the same
+    // buffer, so a small limit costs dispatch slots rather than the run.
     const { adapter, requestDevice } = adapterWithLimits(64 * 1024 ** 2, 256 * 1024 ** 2);
-    const requirements = monomerDeviceRequirements(291, 508, 1024);
-    await expect(requestAlphaFoldDevice(adapter, requirements)).rejects.toThrow(/requires a 128 MiB storage binding/);
+    await requestAlphaFoldDevice(adapter, monomerDeviceRequirements(291, 508, 1024));
+    expect(requestDevice).toHaveBeenCalledWith(expect.objectContaining({
+      requiredLimits: {
+        maxBufferSize: 256 * 1024 ** 2,
+        maxStorageBufferBindingSize: 64 * 1024 ** 2,
+        maxStorageBuffersPerShaderStage: 16,
+      },
+    }));
+  });
+
+  it("rejects a shape whose largest tensor exceeds the adapter's buffer size", async () => {
+    const { adapter, requestDevice } = adapterWithLimits(64 * 1024 ** 2, 64 * 1024 ** 2);
+    await expect(requestAlphaFoldDevice(adapter, monomerDeviceRequirements(291, 508, 1024)))
+      .rejects.toThrow(/requires a 256 MiB buffer/);
     expect(requestDevice).not.toHaveBeenCalled();
   });
 });

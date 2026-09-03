@@ -132,10 +132,14 @@ const MSA_SHADER = `${COMMON}
 @group(0) @binding(3) var<storage, read> weights: array<f32>;
 @group(0) @binding(4) var<uniform> p: Parameters;
 @group(0) @binding(5) var<storage, read_write> output: array<f32>;
+// x is the first element this dispatch writes and y how many it spans; the
+// whole tensor may be past what one binding reaches.
+@group(0) @binding(6) var<uniform> w: vec4<u32>;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x + id.y * GRID_WIDTH * 64u;
-  if (index >= p.msa_sequences * p.length * p.msa_channels) { return; }
+  let local = id.x + id.y * GRID_WIDTH * 64u;
+  if (local >= w.y) { return; }
+  let index = w.x + local;
   let channel = index % p.msa_channels;
   let row = index / p.msa_channels;
   let residue = row % p.length;
@@ -162,7 +166,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   result += msa_features[feature_base + 26u]
     * weights[p.preprocess_msa_weight + 48u * p.msa_channels + channel];
   if (sequence == 0u) { result += previous_msa[residue * p.msa_channels + channel]; }
-  output[index] = result;
+  output[local] = result;
 }`;
 
 function createMsaEmbedShader(storage: ActivationStorage): string {
@@ -175,11 +179,13 @@ function createMsaEmbedShader(storage: ActivationStorage): string {
 @group(0) @binding(3) var<storage, read> weights: array<f32>;
 @group(0) @binding(4) var<uniform> p: Parameters;
 @group(0) @binding(5) var<storage, read_write> output: array<u32>;
+@group(0) @binding(6) var<uniform> w: vec4<u32>;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let pair = id.x + id.y * GRID_WIDTH * 64u;
+  let local_word = id.x + id.y * GRID_WIDTH * 64u;
+  if (local_word >= w.y / 2u) { return; }
+  let pair = w.x / 2u + local_word;
   let pairs_per_row = p.msa_channels / 2u;
-  if (pair >= p.msa_sequences * p.length * pairs_per_row) { return; }
   let channel = (pair % pairs_per_row) * 2u;
   let row = pair / pairs_per_row;
   let residue = row % p.length;
@@ -210,7 +216,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let base = residue * p.msa_channels + channel;
     result += vec2<f32>(previous_msa[base], previous_msa[base + 1u]);
   }
-  output[pair] = pack2x16float(result);
+  output[local_word] = pack2x16float(result);
 }`;
 }
 
@@ -222,10 +228,12 @@ const EXTRA_SHADER = `${COMMON}
 @group(0) @binding(3) var<storage, read> weights: array<f32>;
 @group(0) @binding(4) var<uniform> p: Parameters;
 @group(0) @binding(5) var<storage, read_write> output: array<f32>;
+@group(0) @binding(6) var<uniform> w: vec4<u32>;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x + id.y * GRID_WIDTH * 64u;
-  if (index >= p.extra_sequences * p.length * p.extra_channels) { return; }
+  let local = id.x + id.y * GRID_WIDTH * 64u;
+  if (local >= w.y) { return; }
+  let index = w.x + local;
   let channel = index % p.extra_channels;
   let row = index / p.extra_channels;
   let code = u32(extra_msa[row]);
@@ -233,7 +241,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   result += weights[p.extra_weight + code * p.extra_channels + channel];
   result += has_deletion[row] * weights[p.extra_weight + 23u * p.extra_channels + channel];
   result += deletion_value[row] * weights[p.extra_weight + 24u * p.extra_channels + channel];
-  output[index] = result;
+  output[local] = result;
 }`;
 
 function createExtraEmbedShader(storage: ActivationStorage): string {
@@ -245,11 +253,13 @@ function createExtraEmbedShader(storage: ActivationStorage): string {
 @group(0) @binding(3) var<storage, read> weights: array<f32>;
 @group(0) @binding(4) var<uniform> p: Parameters;
 @group(0) @binding(5) var<storage, read_write> output: array<u32>;
+@group(0) @binding(6) var<uniform> w: vec4<u32>;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let pair = id.x + id.y * GRID_WIDTH * 64u;
+  let local_word = id.x + id.y * GRID_WIDTH * 64u;
+  if (local_word >= w.y / 2u) { return; }
+  let pair = w.x / 2u + local_word;
   let pairs_per_row = p.extra_channels / 2u;
-  if (pair >= p.extra_sequences * p.length * pairs_per_row) { return; }
   let channel = (pair % pairs_per_row) * 2u;
   let row = pair / pairs_per_row;
   let code = u32(extra_msa[row]);
@@ -260,16 +270,16 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   result += has_deletion[row] * vec2<f32>(weights[deletion], weights[deletion + 1u]);
   let value = p.extra_weight + 24u * p.extra_channels + channel;
   result += deletion_value[row] * vec2<f32>(weights[value], weights[value + 1u]);
-  output[pair] = pack2x16float(result);
+  output[local_word] = pack2x16float(result);
 }`;
 }
 
 
-function createPairShader(storage: ActivationStorage): string {
-  const previous = storedElement(storage, "previous_pair", "index");
+export function createPairShader(storage: ActivationStorage): string {
+  const previous = storedElement(storage, "previous_pair", "local");
   const body = PAIR_SHADER
     .replace("var<storage, read> previous_pair: array<f32>", `var<storage, read> previous_pair: array<${storageArray(storage)}>`)
-    .replace("result += previous_pair[index];", `result += ${previous};`);
+    .replace("result += previous_pair[local];", `result += ${previous};`);
   if (storage === "f32") return body;
   // One invocation per word: two adjacent channels of one pair, which is what
   // a packed store owns. The pair channel count is even, so a word never
@@ -278,17 +288,20 @@ function createPairShader(storage: ActivationStorage): string {
     .replace("var<storage, read_write> output: array<f32>", "var<storage, read_write> output: array<u32>")
     .replace(`@compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x + id.y * GRID_WIDTH * 64u;
-  if (index >= p.length * p.length * p.pair_channels) { return; }
-  output[index] = pair_element(index / p.pair_channels, index % p.pair_channels);
+  let local = id.x + id.y * GRID_WIDTH * 64u;
+  if (local >= w.y) { return; }
+  let index = w.x + local;
+  output[local] = pair_element(index / p.pair_channels, index % p.pair_channels, local);
 }`, `@compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let word = id.x + id.y * GRID_WIDTH * 64u;
-  if (word >= p.length * p.length * p.pair_channels / 2u) { return; }
+  let local_word = id.x + id.y * GRID_WIDTH * 64u;
+  if (local_word >= w.y / 2u) { return; }
+  let word = w.x / 2u + local_word;
   let channels = p.pair_channels / 2u;
   let pair = word / channels;
   let channel = (word % channels) * 2u;
-  output[word] = pack2x16float(vec2<f32>(pair_element(pair, channel), pair_element(pair, channel + 1u)));
+  output[local_word] = pack2x16float(vec2<f32>(pair_element(pair, channel, local_word * 2u),
+    pair_element(pair, channel + 1u, local_word * 2u + 1u)));
 }`);
 }
 
@@ -302,14 +315,17 @@ const PAIR_SHADER = `${COMMON}
 @group(0) @binding(6) var<storage, read> weights: array<f32>;
 @group(0) @binding(7) var<uniform> p: Parameters;
 @group(0) @binding(8) var<storage, read_write> output: array<f32>;
+// x is the first pair element this dispatch covers and y how many it spans:
+// the whole pair passes what one binding may reach, so it is written in
+// windows, and every binding of it covers one window.
+@group(0) @binding(9) var<uniform> w: vec4<u32>;
 
 fn pseudo_beta_coordinate(residue: u32, coordinate: u32) -> f32 {
   let atom = select(3u, 1u, u32(aatype[residue]) == 7u);
   return previous_positions[(residue * 37u + atom) * 3u + coordinate];
 }
 
-fn pair_element(pair: u32, channel: u32) -> f32 {
-  let index = pair * p.pair_channels + channel;
+fn pair_element(pair: u32, channel: u32, local: u32) -> f32 {
   let i = pair / p.length;
   let j = pair % p.length;
   var result = weights[p.left_bias + channel] + weights[p.right_bias + channel];
@@ -331,7 +347,7 @@ fn pair_element(pair: u32, channel: u32) -> f32 {
       result += weights[p.previous_position_weight + bin * p.pair_channels + channel];
     }
   }
-  result += previous_pair[index];
+  result += previous_pair[local];
   result += weights[p.relative_bias + channel];
   let raw_offset = i32(residue_index[i]) - i32(residue_index[j]) + i32(p.max_relative);
   var relative = u32(clamp(raw_offset, 0, i32(2u * p.max_relative)));
@@ -355,9 +371,10 @@ fn pair_element(pair: u32, channel: u32) -> f32 {
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x + id.y * GRID_WIDTH * 64u;
-  if (index >= p.length * p.length * p.pair_channels) { return; }
-  output[index] = pair_element(index / p.pair_channels, index % p.pair_channels);
+  let local = id.x + id.y * GRID_WIDTH * 64u;
+  if (local >= w.y) { return; }
+  let index = w.x + local;
+  output[local] = pair_element(index / p.pair_channels, index % p.pair_channels, local);
 }`;
 
 /**
@@ -365,10 +382,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
  * reads `previous_pair` only at the element it stores, so a single read-write
  * binding is exact and one pair-shaped tensor serves as input and output.
  */
-function createPairInPlaceShader(storage: ActivationStorage): string {
+export function createPairInPlaceShader(storage: ActivationStorage): string {
   return createPairShader(storage)
     .replace("var<storage, read> previous_pair", "var<storage, read_write> previous_pair")
     .replace(`@group(0) @binding(8) var<storage, read_write> output: array<${storageArray(storage)}>;\n`, "")
+    .replace("@group(0) @binding(9) var<uniform> w: vec4<u32>;", "@group(0) @binding(8) var<uniform> w: vec4<u32>;")
     .replace(/\boutput\[/g, "previous_pair[");
 }
 
@@ -492,16 +510,55 @@ export async function encodeInputEmbedder(
   // the embedder instead of three.
   const pair = previousPair;
   const extra = execution.allocate("embed.extra", storageWords(extraElements, storage));
+  // Both passes over the pair are per pair row, and the whole pair outgrows
+  // what one binding may cover, so both walk it in windows of whole rows.
+  // Windows hold whole rows of a tensor and fit one binding.
+  const windowElementsFor = (channels: number, tensorStorage: ActivationStorage): number =>
+    Math.max(channels, Math.floor(execution.bindingLimitBytes
+      / (channels * (tensorStorage === "f16" ? 2 : 4))) * channels);
+  // One row is one pair's channels; there are length squared of them.
+  const rowElements = input.pairChannels;
+  const bindingRows = Math.max(1, Math.floor(
+    execution.bindingLimitBytes
+    / (rowElements * (pairStorage === "f16" ? 2 : 4))));
   let grid = execution.linearGrid(input.length * input.length, 1);
-  execution.dispatch(encoder, normalizePair, [previousPair, weights, previousPairNormParams], grid[0], grid[1]);
+  for (let row = 0; row < input.length * input.length; row += bindingRows) {
+    const rows = Math.min(bindingRows, input.length * input.length - row);
+    const windowParams = rows === input.length * input.length ? previousPairNormParams
+      : temporaryUpload(`embed.previous-pair-norm-params-${row}`, createAttentionNormParameters(
+        rows, input.pairChannels, packed.offsets[12]!, packed.offsets[13]!, false, 1, rows, 1e-5,
+      ), GPUBufferUsage.UNIFORM);
+    const window = execution.view(previousPair, storageWords(row * rowElements, pairStorage),
+      storageWords(rows * rowElements, pairStorage));
+    grid = execution.linearGrid(rows, 1);
+    execution.dispatch(encoder, normalizePair, [window, weights, windowParams], grid[0], grid[1],
+      1, `embed.pair-normalize-${row}`);
+  }
   // A packed pair is written a word at a time, two channels per invocation.
-  grid = execution.linearGrid(storageWords(pairElements, pairStorage));
-  execution.dispatch(encoder, pairPipeline,
-    [target, previousPair, previousPositions, aatype, residueIndex, chainIds, weights, params],
-    grid[0], grid[1]);
-  grid = execution.linearGrid(storageWords(extraElements, storage));
-  execution.dispatch(encoder, extraPipeline, [extraMsaInput, hasDeletion, deletionValue, weights, params, extra],
-    grid[0], grid[1]);
+  const windowElements = bindingRows * rowElements;
+  for (let offset = 0; offset < pairElements; offset += windowElements) {
+    const count = Math.min(windowElements, pairElements - offset);
+    const window = temporaryUpload(`embed.pair-window-${offset}`,
+      new Uint32Array([offset, count, 0, 0]), GPUBufferUsage.UNIFORM);
+    const pairWindow = execution.view(previousPair, storageWords(offset, pairStorage),
+      storageWords(count, pairStorage));
+    grid = execution.linearGrid(storageWords(count, pairStorage));
+    execution.dispatch(encoder, pairPipeline,
+      [target, pairWindow, previousPositions, aatype, residueIndex, chainIds, weights, params, window],
+      grid[0], grid[1], 1, `embed.pair-${offset}`);
+  }
+  // Written in windows for the same reason as the pair.
+  const extraWindow = windowElementsFor(input.extraMsaChannels, storage);
+  for (let offset = 0; offset < extraElements; offset += extraWindow) {
+    const count = Math.min(extraWindow, extraElements - offset);
+    const bounds = temporaryUpload(`embed.extra-window-${offset}`,
+      new Uint32Array([offset, count, 0, 0]), GPUBufferUsage.UNIFORM);
+    const target = execution.view(extra, storageWords(offset, storage), storageWords(count, storage));
+    grid = execution.linearGrid(storageWords(count, storage));
+    execution.dispatch(encoder, extraPipeline,
+      [extraMsaInput, hasDeletion, deletionValue, weights, params, target, bounds],
+      grid[0], grid[1], 1, `embed.extra-${offset}`);
+  }
   const msaTemporaries = [target, weights, params, previousMsaNormParams];
   const pairTemporaries = temporaries.filter((tensor) => !msaTemporaries.includes(tensor));
   const encodeMsa = (msaEncoder: GPUCommandEncoder): GpuTensor => {
@@ -513,10 +570,20 @@ export async function encodeInputEmbedder(
     const msa = execution.allocate("embed.msa", storageWords(msaElements, storage),
       GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
     let msaGrid = execution.linearGrid(input.length, 1);
-    execution.dispatch(msaEncoder, normalizeMsa, [previousMsa, weights, previousMsaNormParams], msaGrid[0], msaGrid[1]);
-    msaGrid = execution.linearGrid(storageWords(msaElements, storage));
-    execution.dispatch(msaEncoder, msaPipeline, [target, msaFeatures, previousMsa, weights, params, msa],
-      msaGrid[0], msaGrid[1]);
+    execution.dispatch(msaEncoder, normalizeMsa, [previousMsa, weights, previousMsaNormParams],
+      msaGrid[0], msaGrid[1], 1, "embed.msa-normalize");
+    const msaWindow = windowElementsFor(input.msaChannels, storage);
+    for (let offset = 0; offset < msaElements; offset += msaWindow) {
+      const count = Math.min(msaWindow, msaElements - offset);
+      const bounds = execution.upload(`embed.msa-window-${offset}`,
+        new Uint32Array([offset, count, 0, 0]), GPUBufferUsage.UNIFORM);
+      msaTemporaries.push(bounds);
+      const window = execution.view(msa, storageWords(offset, storage), storageWords(count, storage));
+      msaGrid = execution.linearGrid(storageWords(count, storage));
+      execution.dispatch(msaEncoder, msaPipeline,
+        [target, msaFeatures, previousMsa, weights, params, window, bounds],
+        msaGrid[0], msaGrid[1], 1, `embed.msa-${offset}`);
+    }
     return msa;
   };
   return { pairWithoutTemplates: pair, extraMsa: extra, temporaries: pairTemporaries, msaTemporaries, encodeMsa };
@@ -608,12 +675,20 @@ export class InputEmbedderGpu {
       pass(normalize, [previousPair, weights, previousPairNormParams, previousPairNormalized],
         dispatch[0], dispatch[1]);
       dispatch = grid(msaElements);
-      pass(msaPipeline, [target, msaFeatures, previousMsaNormalized, weights, params, msa], dispatch[0], dispatch[1]);
+      const msaWindow = upload("embed.msa-window", new Uint32Array([0, msaElements, 0, 0]),
+        GPUBufferUsage.UNIFORM);
+      pass(msaPipeline, [target, msaFeatures, previousMsaNormalized, weights, params, msa, msaWindow],
+        dispatch[0], dispatch[1]);
       dispatch = grid(pairElements);
+      const pairWindow = upload("embed.pair-window", new Uint32Array([0, pairElements, 0, 0]),
+        GPUBufferUsage.UNIFORM);
       pass(pairPipeline, [target, previousPairNormalized, previousPositions, aatype, residueIndex,
-        chainIds, weights, params, pair], dispatch[0], dispatch[1]);
+        chainIds, weights, params, pair, pairWindow], dispatch[0], dispatch[1]);
       dispatch = grid(extraElements);
-      pass(extraPipeline, [extraMsaInput, hasDeletion, deletionValue, weights, params, extra], dispatch[0], dispatch[1]);
+      const extraWindow = upload("embed.extra-window", new Uint32Array([0, extraElements, 0, 0]),
+        GPUBufferUsage.UNIFORM);
+      pass(extraPipeline, [extraMsaInput, hasDeletion, deletionValue, weights, params, extra, extraWindow],
+        dispatch[0], dispatch[1]);
       encoder.copyBufferToBuffer(msa.buffer, 0, msaReadback.buffer, 0, msaElements * 4);
       encoder.copyBufferToBuffer(pair.buffer, 0, pairReadback.buffer, 0, pairElements * 4);
       encoder.copyBufferToBuffer(extra.buffer, 0, extraReadback.buffer, 0, extraElements * 4);

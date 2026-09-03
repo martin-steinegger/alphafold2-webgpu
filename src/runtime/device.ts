@@ -317,12 +317,12 @@ export async function requestAlphaFoldDevice(
   if (requiredStorageBufferBindingSize > requiredBufferSize) {
     throw new RangeError("storage binding requirement cannot exceed the buffer-size requirement");
   }
-  if (requiredBufferSize > adapter.limits.maxBufferSize
-    || requiredStorageBufferBindingSize > adapter.limits.maxStorageBufferBindingSize) {
+  // A tensor past the adapter's binding limit is bound as several windows of
+  // the same buffer, so only the buffer size is a hard requirement.
+  if (requiredBufferSize > adapter.limits.maxBufferSize) {
     const mib = (value: number): string => `${(value / 1024 ** 2).toFixed(0)} MiB`;
-    throw new RangeError(`This input requires a ${mib(requiredStorageBufferBindingSize)} storage binding and `
-      + `${mib(requiredBufferSize)} buffer, but this adapter exposes `
-      + `${mib(adapter.limits.maxStorageBufferBindingSize)} and ${mib(adapter.limits.maxBufferSize)}.`);
+    throw new RangeError(`This input requires a ${mib(requiredBufferSize)} buffer, but this adapter exposes `
+      + `${mib(adapter.limits.maxBufferSize)}.`);
   }
   const maxStorageBufferBindingSize = Math.min(
     adapter.limits.maxStorageBufferBindingSize,
@@ -332,9 +332,13 @@ export async function requestAlphaFoldDevice(
     adapter.limits.maxBufferSize,
     nextLimitTier(Math.max(requiredBufferSize, maxStorageBufferBindingSize), WEBGPU_BASE_MAX_BUFFER_SIZE),
   );
+  // Windows of one tensor occupy consecutive slots, so a device that binds
+  // more of them per stage reaches longer sequences. The adapter's own figure
+  // costs nothing to ask for.
+  const maxStorageBuffersPerShaderStage = adapter.limits.maxStorageBuffersPerShaderStage;
   const device = await adapter.requestDevice({
     requiredFeatures,
-    requiredLimits: { maxBufferSize, maxStorageBufferBindingSize },
+    requiredLimits: { maxBufferSize, maxStorageBufferBindingSize, maxStorageBuffersPerShaderStage },
   });
   recordSubgroupRange(device, adapter);
   return device;

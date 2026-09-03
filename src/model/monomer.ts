@@ -148,6 +148,15 @@ export interface MonomerGpuOptions {
   readonly pairStorage?: ActivationStorage;
   /** Caps reusable scratch retained between blocks; compact mode uses the bounded shared default. */
   readonly maxPooledBytes?: number;
+  /**
+   * Records every binding above this many bytes, in `oversizedBindings`.
+   *
+   * A diagnostic for the binding-size limit: adapters here allow far more
+   * than the 128 MiB a device gets by default, so a kernel binding a whole
+   * pair only fails elsewhere. A budget under any real activation lists the
+   * kernels that would fail there, at a length small enough to run quickly.
+   */
+  readonly bindingBudgetBytes?: number;
   /** Internal model architecture selector used by AlphaFoldMultimerGpu. */
   readonly multimer?: boolean;
   /** Multimer CA-distance RMS threshold; negative disables early stopping. */
@@ -210,6 +219,9 @@ export class AlphaFoldMonomerGpu {
   readonly profileMainEvoformerBlock: number;
   readonly compactTransitions: boolean;
   readonly maxPooledBytes: number | undefined;
+  readonly bindingBudgetBytes: number | undefined;
+  /** Dispatch label to largest binding, for the labels above the budget. */
+  oversizedBindings: ReadonlyMap<string, number> = new Map();
   readonly triangleWholeStorage: TriangleWholeStorage;
   readonly msaStorage: ActivationStorage;
   readonly pairStorage: ActivationStorage;
@@ -226,6 +238,7 @@ export class AlphaFoldMonomerGpu {
     this.compactTransitions = options.compactTransitions ?? false;
     this.maxPooledBytes = options.maxPooledBytes
       ?? (this.compactTransitions ? COMPACT_GPU_POOL_BYTES : undefined);
+    this.bindingBudgetBytes = options.bindingBudgetBytes;
     this.multimer = options.multimer ?? false;
     this.returnFinalPair = options.returnFinalPair ?? false;
     this.collapseQueryOnlyTemplate = options.collapseQueryOnlyTemplate ?? true;
@@ -331,7 +344,9 @@ export class AlphaFoldMonomerGpu {
     const execution = new WebGpuExecution(this.device, {
       ...(this.compactTransitions ? { transitionBufferLimit: TRANSITION_CHUNK_TARGET_BYTES } : {}),
       ...(this.maxPooledBytes === undefined ? {} : { maxPooledBytes: this.maxPooledBytes }),
+      ...(this.bindingBudgetBytes === undefined ? {} : { bindingBudgetBytes: this.bindingBudgetBytes }),
     });
+    this.oversizedBindings = execution.oversizedBindings;
     const results: MonomerRecycleSummary[] = [];
     let finalDetails: MonomerFinalDetails | undefined;
     let structureCorePeakResidentBytes = 0;

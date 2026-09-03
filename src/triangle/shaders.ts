@@ -6,6 +6,11 @@ import {
   planShards, shardBindings, shardLoader, shardStorer, shardWordLoader, type ShardLayout,
 } from "../runtime/sharded.js";
 
+/** The whole operand in a single binding, which is the common case. */
+const WHOLE_OPERAND_UNSHARDED: ShardLayout = {
+  count: 1, shardElements: Number.MAX_SAFE_INTEGER, totalElements: 0,
+};
+
 export interface TriangleShaders {
   /** Mean and inverse standard deviation of every pair row, computed once. */
   readonly inputStatistics: string;
@@ -87,6 +92,10 @@ export function createTriangleShaders(
   residualOutput = false,
   /** How the pair is spread over bindings; one shard is the whole tensor. */
   pairShards: ShardLayout = planShards(shape.length * shape.length * shape.cZ, shape.cZ,
+    Number.MAX_SAFE_INTEGER, 4),
+  /** How the whole operand is spread over bindings; it outgrows one first. */
+  wholeShards: ShardLayout = planShards(
+    (shape.length * shape.length + (shape.length * shape.length) % 2) * shape.cHidden, 2,
     Number.MAX_SAFE_INTEGER, 4),
 ): TriangleShaders {
   if (pairStorage === "f16" && precision !== "f32") {
@@ -196,8 +205,10 @@ fn normalized_input(pair_row: u32, k: u32) -> f32 {
    */
   const project = (
     operand: "a" | "b", stride: string, pairRow: string, storeRow: string, packed: boolean,
+    shards: ShardLayout = WHOLE_OPERAND_UNSHARDED,
   ): string => {
     const upper = operand.toUpperCase();
+    const wholeStorage: ActivationStorage = packed ? "f16" : "f32";
     const weight = (kind: "P" | "G"): string =>
       read(precision, `weights[W_LINEAR${upper}${kind}WEIGHT + (column >> 1u) * CZ + k]`);
     const bias = (kind: "P" | "G", channel: string): string =>
@@ -208,11 +219,12 @@ ${pairBindings("z", 0, false)}
 @group(0) @binding(${pairSlots}) var<storage, read> mask: array<f32>;
 @group(0) @binding(${pairSlots + 1}) var<storage, read> weights: array<${t}>;
 @group(0) @binding(${pairSlots + 2}) var<storage, read> statistics: array<f32>;
-@group(0) @binding(${pairSlots + 3}) var<storage, read_write> ${operand}: array<${packed ? "u32" : "f32"}>;
+${shardBindings(shards, operand, wholeStorage, pairSlots + 3, true)}
 // x is the first pair row of this block, y the number of pair rows it spans,
 // w the residues it covers.
-@group(0) @binding(${pairSlots + 4}) var<uniform> block: vec4<u32>;
+@group(0) @binding(${pairSlots + 3 + shards.count}) var<uniform> block: vec4<u32>;
 ${pairAccessors("z")}
+${shardStorer(shards, operand, wholeStorage)}
 
 fn pair_row_of(row: u32) -> u32 { return ${pairRow}; }
 
@@ -260,7 +272,7 @@ ${packed ? `    // Two consecutive pair rows share a word. Blocks start on even 
       let h = column_origin / 2u + half * 32u + h_local;
       if (row < gemm_rows && h < CH) {
         let second = select(0.0, gemm_stage[element + 1u], row + 1u < gemm_rows);
-        ${operand}[(h * ${stride} + ${storeRow}) >> 1u] = pack2x16float(vec2<f32>(gemm_stage[element], second));
+        ${operand}_store((h * ${stride} + ${storeRow}) >> 1u, pack2x16float(vec2<f32>(gemm_stage[element], second)));
       }
     }` : `    for (var item = 0u; item < 8u; item += 1u) {
       let element = thread + item * 256u;
@@ -268,7 +280,7 @@ ${packed ? `    // Two consecutive pair rows share a word. Blocks start on even 
       let r_local = element % 64u;
       let row = tile_row_origin + r_local;
       let h = column_origin / 2u + half * 32u + h_local;
-      if (row < gemm_rows && h < CH) { ${operand}[h * ${stride} + ${storeRow}] = gemm_stage[element]; }
+      if (row < gemm_rows && h < CH) { ${operand}_store(h * ${stride} + ${storeRow}, gemm_stage[element]); }
     }`}
     workgroupBarrier();
   }`,
@@ -280,15 +292,16 @@ ${packed ? `    // Two consecutive pair rows share a word. Blocks start on even 
   // out[i][j] = sum_k b[k][i] a[k][j] over a block of columns j, with the
   // GEMM rows being the block's columns and its columns every i.
   const packedWhole = wholeStorage === "f16";
-  const wholeElement = (index: string): string => packedWhole
-    ? `unpack2x16float(whole[(${index}) >> 1u])[(${index}) & 1u]` : `whole[${index}]`;
+  const wholeElement = (index: string): string => `whole_load(${index})`;
+  const wholeSlots = wholeShards.count;
   const contract = createTiledGemmShader({
     preamble: `${common}
 @group(0) @binding(0) var<storage, read> blocked: array<f32>;
-@group(0) @binding(1) var<storage, read> whole: array<${packedWhole ? "u32" : "f32"}>;
-@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+${shardBindings(wholeShards, "whole", packedWhole ? "f16" : "f32", 1, false)}
+@group(0) @binding(${1 + wholeSlots}) var<storage, read_write> output: array<f32>;
 // x is the first pair row of the block, w the residue count it spans.
-@group(0) @binding(3) var<uniform> block: vec4<u32>;`,
+@group(0) @binding(${2 + wholeSlots}) var<uniform> block: vec4<u32>;
+${shardLoader(wholeShards, "whole", packedWhole ? "f16" : "f32")}`,
     rows: "block.w",
     inner: "L",
     columns: "L",
@@ -382,7 +395,8 @@ fn normalized_hidden(row: u32, h: u32) -> f32 {
   // Outgoing contracts a's rows i against b's rows j; incoming contracts a's
   // columns j against b's columns i. In both, a is the block operand.
   const projectBlockOperand = project("a", "BLOCK_PAIRS", blockPairRow, "row", false);
-  const projectWholeOperand = project("b", "WHOLE_STRIDE", "block.x + row", "block.x + row", packedWhole);
+  const projectWholeOperand = project("b", "WHOLE_STRIDE", "block.x + row", "block.x + row", packedWhole,
+    wholeShards);
   return {
     inputStatistics, projectGate, projectBlockOperand, projectWholeOperand, contract, hiddenStatistics, projectOutput,
   };
