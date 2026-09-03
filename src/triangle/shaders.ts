@@ -2,6 +2,9 @@ import type { Precision, TriangleShape } from "./types.js";
 import type { WeightOffsets } from "./weights.js";
 import { createTiledGemmShader } from "../runtime/gemm.js";
 import { type ActivationStorage, storageArray, storedElement } from "../runtime/storage.js";
+import {
+  planShards, shardBindings, shardLoader, shardStorer, shardWordLoader, type ShardLayout,
+} from "../runtime/sharded.js";
 
 export interface TriangleShaders {
   /** Mean and inverse standard deviation of every pair row, computed once. */
@@ -82,16 +85,23 @@ export function createTriangleShaders(
   wholeStorage: TriangleWholeStorage = "f32",
   pairStorage: ActivationStorage = "f32",
   residualOutput = false,
+  /** How the pair is spread over bindings; one shard is the whole tensor. */
+  pairShards: ShardLayout = planShards(shape.length * shape.length * shape.cZ, shape.cZ,
+    Number.MAX_SAFE_INTEGER, 4),
 ): TriangleShaders {
   if (pairStorage === "f16" && precision !== "f32") {
     throw new RangeError("a packed pair needs f32 weight precision: both would claim the same halves of a word");
   }
   const common = prelude(shape, precision, offsets, epsilon, blockRows);
   const t = scalar(precision);
-  // The pair may be stored packed, whatever precision the weights are in.
-  const pairArray = pairStorage === "f16" ? "u32" : t;
-  const pairElement = (index: string): string => pairStorage === "f16"
-    ? storedElement("f16", "z", index) : read(precision, `z[${index}]`);
+  // The pair may be stored packed, whatever precision the weights are in, and
+  // it may be too large for one binding, in which case it arrives as several.
+  const pairBindings = (name: string, first: number, writable: boolean): string =>
+    shardBindings(pairShards, name, pairStorage === "f16" ? "f16" : "f32", first, writable);
+  const pairAccessors = (name: string): string =>
+    shardLoader(pairShards, name, pairStorage === "f16" ? "f16" : "f32");
+  const pairSlots = pairShards.count;
+  const pairElement = (index: string): string => `z_load(${index})`;
   const outgoing = direction === "outgoing";
   // Outgoing contracts over the second residue index and blocks the output by
   // rows i: its block operand a holds pair rows (i, k) of the block. Incoming
@@ -108,8 +118,9 @@ export function createTriangleShaders(
   // across lanes. The statistics let every later consumer normalize the raw
   // pair on the fly instead of materializing a normalized copy.
   const inputStatistics = `${common}
-@group(0) @binding(0) var<storage, read> source: array<${pairStorage === "f16" ? "u32" : t}>;
-@group(0) @binding(1) var<storage, read_write> statistics: array<f32>;
+${pairBindings("source", 0, false)}
+@group(0) @binding(${pairSlots}) var<storage, read_write> statistics: array<f32>;
+${shardLoader(pairShards, "source", pairStorage === "f16" ? "f16" : "f32")}
 var<workgroup> partial: array<f32, 64>;
 
 @compute @workgroup_size(64)
@@ -118,8 +129,7 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
   let base = row * CZ;
   var sum = 0.0;
   if (row < PAIRS) {
-    for (var c = local.x; c < CZ; c += 64u) { sum += ${pairStorage === "f16"
-      ? storedElement("f16", "source", "base + c") : read(precision, "source[base + c]")}; }
+    for (var c = local.x; c < CZ; c += 64u) { sum += source_load(base + c); }
   }
   partial[local.x] = sum;
   workgroupBarrier();
@@ -132,8 +142,7 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
   var squared = 0.0;
   if (row < PAIRS) {
     for (var c = local.x; c < CZ; c += 64u) {
-      let centered = ${pairStorage === "f16"
-        ? storedElement("f16", "source", "base + c") : read(precision, "source[base + c]")} - mean;
+      let centered = source_load(base + c) - mean;
       squared += centered * centered;
     }
   }
@@ -153,13 +162,14 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
   // contraction inputs it normalizes the raw pair while loading it.
   const projectGate = createTiledGemmShader({
     preamble: `${common}
-@group(0) @binding(0) var<storage, read> z: array<${pairArray}>;
-@group(0) @binding(1) var<storage, read> weights: array<${t}>;
-@group(0) @binding(2) var<storage, read> statistics: array<f32>;
-@group(0) @binding(3) var<storage, read_write> gate: array<f32>;
+${pairBindings("z", 0, false)}
+@group(0) @binding(${pairSlots}) var<storage, read> weights: array<${t}>;
+@group(0) @binding(${pairSlots + 1}) var<storage, read> statistics: array<f32>;
+@group(0) @binding(${pairSlots + 2}) var<storage, read_write> gate: array<f32>;
 // x is the first row of this block within the whole pair tensor, y the
 // number of rows it spans.
-@group(0) @binding(4) var<uniform> block: vec4<u32>;
+@group(0) @binding(${pairSlots + 3}) var<uniform> block: vec4<u32>;
+${pairAccessors("z")}
 
 fn pair_row_of(row: u32) -> u32 { return ${blockPairRow}; }
 
@@ -194,14 +204,15 @@ fn normalized_input(pair_row: u32, k: u32) -> f32 {
       read(precision, `weights[W_LINEAR${upper}${kind}BIAS + ${channel}]`);
     return createTiledGemmShader({
       preamble: `${common}
-@group(0) @binding(0) var<storage, read> z: array<${pairArray}>;
-@group(0) @binding(1) var<storage, read> mask: array<f32>;
-@group(0) @binding(2) var<storage, read> weights: array<${t}>;
-@group(0) @binding(3) var<storage, read> statistics: array<f32>;
-@group(0) @binding(4) var<storage, read_write> ${operand}: array<${packed ? "u32" : "f32"}>;
+${pairBindings("z", 0, false)}
+@group(0) @binding(${pairSlots}) var<storage, read> mask: array<f32>;
+@group(0) @binding(${pairSlots + 1}) var<storage, read> weights: array<${t}>;
+@group(0) @binding(${pairSlots + 2}) var<storage, read> statistics: array<f32>;
+@group(0) @binding(${pairSlots + 3}) var<storage, read_write> ${operand}: array<${packed ? "u32" : "f32"}>;
 // x is the first pair row of this block, y the number of pair rows it spans,
 // w the residues it covers.
-@group(0) @binding(5) var<uniform> block: vec4<u32>;
+@group(0) @binding(${pairSlots + 4}) var<uniform> block: vec4<u32>;
+${pairAccessors("z")}
 
 fn pair_row_of(row: u32) -> u32 { return ${pairRow}; }
 
@@ -326,8 +337,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 @group(0) @binding(1) var<storage, read> contracted: array<f32>;
 @group(0) @binding(2) var<storage, read> weights: array<${t}>;
 @group(0) @binding(3) var<storage, read> statistics: array<f32>;
-@group(0) @binding(4) var<storage, read_write> output: array<${storageArray(pairStorage)}>;
-@group(0) @binding(5) var<uniform> block: vec4<u32>;
+${shardBindings(pairShards, "output", pairStorage, 4, true)}
+@group(0) @binding(${4 + pairSlots}) var<uniform> block: vec4<u32>;
+${shardStorer(pairShards, "output", pairStorage)}
+${pairStorage === "f16" ? shardWordLoader(pairShards, "output")
+  : (residualOutput ? shardLoader(pairShards, "output", pairStorage) : "")}
 
 fn pair_row_of(row: u32) -> u32 { return ${blockPairRow}; }
 
@@ -351,13 +365,16 @@ fn normalized_hidden(row: u32, h: u32) -> f32 {
         weights[W_LINEARZBIAS + column + 2u], weights[W_LINEARZBIAS + column + 3u]);
       var stored = (values + biases) * gates;
       let word = index >> 1u;
-      ${residualOutput ? `stored += vec4<f32>(unpack2x16float(output[word]), unpack2x16float(output[word + 1u]));` : ""}
-      output[word] = pack2x16float(stored.xy);
-      output[word + 1u] = pack2x16float(stored.zw);`,
+      ${residualOutput
+        ? `stored += vec4<f32>(unpack2x16float(output_load_word(word)), unpack2x16float(output_load_word(word + 1u)));`
+        : ""}
+      output_store(word, pack2x16float(stored.xy));
+      output_store(word + 1u, pack2x16float(stored.zw));`,
       store: "",
     } : {
       store: `let index = pair_row_of(row) * CZ + column;
-          output[index] ${residualOutput ? "+=" : "="} (element + ${read(precision, "weights[W_LINEARZBIAS + column]")}) * gate[row * CZ + column];`,
+          let written = (element + ${read(precision, "weights[W_LINEARZBIAS + column]")}) * gate[row * CZ + column];
+          output_store(index, ${residualOutput ? "output_load(index) + written" : "written"});`,
     }),
   });
 

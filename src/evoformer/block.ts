@@ -1,3 +1,4 @@
+import { planShards } from "../runtime/sharded.js";
 import {
   createAttentionNormalizeShader,
   createAttentionOutputShader,
@@ -138,6 +139,13 @@ export interface EvoformerBlockInput {
    * submission covers more than a bounded number of dispatches.
    */
   readonly flush?: SubmissionFlush;
+  /**
+   * Bytes one binding may cover of the pair, defaulting to the device's limit.
+   *
+   * Lowering it forces the sharded path on a device whose limit is generous,
+   * which is the only way to exercise it here.
+   */
+  readonly pairBindingBytes?: number;
   readonly weights: EvoformerBlockWeights;
 }
 
@@ -197,6 +205,7 @@ type EvoformerShape = Pick<
   EvoformerBlockInput,
   "sequences" | "length" | "cM" | "cZ" | "cOuter" | "triangleHidden" | "outerProductMeanFirst"
   | "scratchWindowBytes" | "triangleWholeStorage" | "msaStorage" | "pairStorage" | "flush"
+  | "pairBindingBytes"
 >;
 
 const GLOBAL_ATTENTION_COMMON = `
@@ -928,10 +937,15 @@ async function encodeTriangleMultiplication(
     input.scratchWindowBytes ?? TRIANGLE_BLOCK_TARGET_BYTES);
   const wholeStorage = input.triangleWholeStorage ?? "f32";
   const pairStorage = input.pairStorage ?? "f32";
+  // A pair past the device's binding limit is bound as several windows of the
+  // same buffer, which the shaders read through a generated accessor.
+  const pairShards = planShards(input.length * input.length * input.cZ, input.cZ,
+    input.pairBindingBytes ?? execution.device.limits.maxStorageBufferBindingSize,
+    pairStorage === "f16" ? 2 : 4);
   const shaders = createTriangleShaders(shape, "f32", packed.offsets, 1e-5, direction, blockRows, wholeStorage,
-    pairStorage, residualTarget !== undefined);
+    pairStorage, residualTarget !== undefined, pairShards);
   const pipelineKey = `block:triangle:${direction}:${input.length}:${input.cZ}`
-    + `:${input.triangleHidden}:${blockRows}:${wholeStorage}:${pairStorage}`;
+    + `:${input.triangleHidden}:${blockRows}:${wholeStorage}:${pairStorage}:${pairShards.count}`;
   const [inputStatistics, projectGate, projectBlockOperand, projectWholeOperand, contract, hiddenStatistics, projectOutput]
     = await Promise.all([
     execution.pipelines.get(`${pipelineKey}:input-statistics`, shaders.inputStatistics),
@@ -946,6 +960,15 @@ async function encodeTriangleMultiplication(
     ),
   ]);
   const pairs = input.length * input.length;
+  const shardViews = (tensor: GpuTensor): readonly GpuTensor[] => {
+    if (pairShards.count === 1) return [tensor];
+    const total = pairs * input.cZ;
+    return Array.from({ length: pairShards.count }, (_, index) => {
+      const offset = index * pairShards.shardElements;
+      const count = Math.min(pairShards.shardElements, total - offset);
+      return execution.view(tensor, storageWords(offset, pairStorage), storageWords(count, pairStorage));
+    });
+  };
   const blockPairs = blockRows * input.length;
   const weights = execution.upload(`triangle.${direction}.weights`, packed.data);
   const output = residualTarget
@@ -963,13 +986,14 @@ async function encodeTriangleMultiplication(
   const statistics = execution.allocate(`triangle.${direction}.statistics`, pairs * 2);
   const statisticsGrid = execution.linearGrid(pairs, 1);
   let encoder = encoderValue;
-  execution.dispatch(encoder, inputStatistics, [pair, statistics], statisticsGrid[0], statisticsGrid[1], 1,
-    `triangle.${direction}.input-statistics`);
+  const pairViews = shardViews(pair);
+  execution.dispatch(encoder, inputStatistics, [...pairViews, statistics],
+    statisticsGrid[0], statisticsGrid[1], 1, `triangle.${direction}.input-statistics`);
   const gate = execution.allocate(`triangle.${direction}.gate`, blockPairs * input.cZ);
   const project = (pipeline: GPUComputePipeline, target: GpuTensor, block: (typeof blocks)[number],
     label: string): void => {
     const grid = gemmGrid(block.count * input.length, 2 * input.triangleHidden);
-    execution.dispatch(encoder, pipeline, [pair, pairMask, weights, statistics, target, block.uniform],
+    execution.dispatch(encoder, pipeline, [...pairViews, pairMask, weights, statistics, target, block.uniform],
       grid[0], grid[1], 1, `triangle.${direction}.${label}-${block.offset}`);
   };
 
@@ -984,6 +1008,7 @@ async function encodeTriangleMultiplication(
   const blockedProjection = execution.allocate(`triangle.${direction}.blocked`, blockPairs * input.triangleHidden);
   const contracted = execution.allocate(`triangle.${direction}.contracted`, blockPairs * input.triangleHidden);
   const hiddenStats = execution.allocate(`triangle.${direction}.hidden-statistics`, blockPairs * 2);
+  const outputViews = output === pair ? pairViews : shardViews(output);
   let dispatchedAtSplit = execution.dispatchCount;
   for (const block of blocks) {
     [encoder, dispatchedAtSplit] = await splitWhenLong(execution, encoder, dispatchedAtSplit, input.flush,
@@ -1000,9 +1025,10 @@ async function encodeTriangleMultiplication(
     // projection is the first thing to write it.
     const gateGrid = gemmGrid(rows, input.cZ);
     const gateBlock = execution.view(gate, 0, rows * input.cZ);
-    execution.dispatch(encoder, projectGate, [pair, weights, statistics, gateBlock, block.uniform],
+    execution.dispatch(encoder, projectGate, [...pairViews, weights, statistics, gateBlock, block.uniform],
       gateGrid[0], gateGrid[1], 1, `triangle.${direction}.project-gate-${block.offset}`);
-    execution.dispatch(encoder, projectOutput, [gateBlock, contracted, weights, stats, output, block.uniform],
+    execution.dispatch(encoder, projectOutput,
+      [gateBlock, contracted, weights, stats, ...outputViews, block.uniform],
       gateGrid[0], gateGrid[1], 1, `triangle.${direction}.project-output-${block.offset}`);
   }
   releaseScratch([statistics, gate, blockedProjection, wholeProjection, contracted, hiddenStats], output);

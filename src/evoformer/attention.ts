@@ -1,3 +1,4 @@
+import { planShards, shardBindings, shardLoader, type ShardLayout } from "../runtime/sharded.js";
 import { GpuBufferAllocator, type AllocatedGpuBuffer, type AllocationSnapshot } from "../runtime/allocator.js";
 import { pipelineCacheForDevice, type ComputePipelineCache } from "../runtime/pipeline-cache.js";
 import { subgroupRange } from "../runtime/subgroups.js";
@@ -201,7 +202,12 @@ export function createAttentionNormParameters(
   return new Uint8Array(buffer);
 }
 
-export function createAttentionNormalizeShader(storage: ActivationStorage = "f32"): string {
+/** One binding covering everything, which is what a tensor under the limit gets. */
+const WHOLE_SHARD: ShardLayout = { count: 1, shardElements: Number.MAX_SAFE_INTEGER, totalElements: 0 };
+
+export function createAttentionNormalizeShader(
+  storage: ActivationStorage = "f32", shards: ShardLayout = WHOLE_SHARD,
+): string {
   return `
 struct NormParameters {
   rows: u32, channels: u32, scale: u32, offset: u32,
@@ -209,10 +215,11 @@ struct NormParameters {
   batch_offset: u32, batch_total: u32, padding: vec2<u32>,
 };
 const GRID_WIDTH: u32 = 32768u;
-@group(0) @binding(0) var<storage, read> source: array<${storageArray(storage)}>;
-@group(0) @binding(1) var<storage, read> weights: array<f32>;
-@group(0) @binding(2) var<uniform> p: NormParameters;
-@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+${shardBindings(shards, "source", storage, 0, false)}
+@group(0) @binding(${shards.count}) var<storage, read> weights: array<f32>;
+@group(0) @binding(${shards.count + 1}) var<uniform> p: NormParameters;
+@group(0) @binding(${shards.count + 2}) var<storage, read_write> output: array<f32>;
+${shardLoader(shards, "source", storage)}
 var<workgroup> partial: array<f32, 64>;
 var<workgroup> row_mean: array<f32, 1>;
 
@@ -231,7 +238,7 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
   let input_base = source_row(row) * p.channels;
   let output_base = row * p.channels;
   var sum = 0.0;
-  for (var c = local.x; c < p.channels; c += 64u) { sum += ${storedElement(storage, "source", "input_base + c")}; }
+  for (var c = local.x; c < p.channels; c += 64u) { sum += source_load(input_base + c); }
   partial[local.x] = sum;
   workgroupBarrier();
   for (var stride = 32u; stride > 0u; stride /= 2u) {
@@ -242,7 +249,7 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
   workgroupBarrier();
   var squared = 0.0;
   for (var c = local.x; c < p.channels; c += 64u) {
-    let centered = ${storedElement(storage, "source", "input_base + c")} - row_mean[0];
+    let centered = source_load(input_base + c) - row_mean[0];
     squared += centered * centered;
   }
   partial[local.x] = squared;
@@ -253,7 +260,7 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
   }
   let inverse_std = inverseSqrt(partial[0] / f32(p.channels) + p.epsilon);
   for (var c = local.x; c < p.channels; c += 64u) {
-    output[output_base + c] = (${storedElement(storage, "source", "input_base + c")} - row_mean[0]) * inverse_std
+    output[output_base + c] = (source_load(input_base + c) - row_mean[0]) * inverse_std
       * weights[p.scale + c] + weights[p.offset + c];
   }
 }`;
@@ -330,7 +337,7 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
   let input_row = source_row(row);
   let input_base = input_row * p.channels;
   var sum = 0.0;
-  for (var c = local.x; c < p.channels; c += 64u) { sum += ${storedElement(storage, "source", "input_base + c")}; }
+  for (var c = local.x; c < p.channels; c += 64u) { sum += source_load(input_base + c); }
   partial[local.x] = sum;
   workgroupBarrier();
   for (var stride = 32u; stride > 0u; stride /= 2u) {
@@ -341,7 +348,7 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
   workgroupBarrier();
   var squared = 0.0;
   for (var c = local.x; c < p.channels; c += 64u) {
-    let centered = ${storedElement(storage, "source", "input_base + c")} - row_mean[0];
+    let centered = source_load(input_base + c) - row_mean[0];
     squared += centered * centered;
   }
   partial[local.x] = squared;
