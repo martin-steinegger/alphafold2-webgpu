@@ -46,8 +46,12 @@ export function planShards(
   const alignment = alignElements * offsetElements
     / greatestCommonDivisor(alignElements, offsetElements);
   const perBinding = Math.floor(bindingBytes / bytesPerElement / alignment) * alignment;
-  if (perBinding <= 0) throw new RangeError("a single aligned row exceeds the binding limit");
-  if (!Number.isSafeInteger(perBinding)) throw new RangeError("shard alignment is not a whole element count");
+  if (perBinding <= 0) {
+    // A window has to hold whole rows and whole 256-byte boundaries of them,
+    // so the smallest one is their least common multiple.
+    throw new RangeError(`the smallest aligned window is ${alignment * bytesPerElement} bytes, `
+      + `past the ${bindingBytes} bytes one binding may cover`);
+  }
   if (totalElements <= perBinding) {
     return { count: 1, shardElements: totalElements, totalElements };
   }

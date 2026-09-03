@@ -53,7 +53,8 @@ describe("binding shards", () => {
     }
   });
 
-  it("refuses a row that cannot fit a binding at all", () => {
-    expect(() => planShards(1000, 512, 256, 4)).toThrow(/exceeds the binding limit/);
+  it("says what the smallest window would be when even that will not fit", () => {
+    expect(() => planShards(1000, 512, 256, 4))
+      .toThrow(/smallest aligned window is 2048 bytes, past the 256 bytes/);
   });
 });
