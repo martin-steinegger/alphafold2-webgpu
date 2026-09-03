@@ -77,6 +77,17 @@ export interface EvoformerBlockWeights {
   readonly pairTransition: TransitionWeights;
 }
 
+/**
+ * Ends the command buffer under construction and returns its successor.
+ *
+ * Everything already encoded is submitted, so the queue keeps the ordering the
+ * caller wrote, and the caller continues on the returned encoder.
+ */
+export type SubmissionFlush = (label: string) => Promise<GPUCommandEncoder>;
+
+/** Dispatches one command buffer may hold before the loops that grow with the shape split it. */
+export const SUBMISSION_DISPATCH_LIMIT = 192;
+
 export interface EvoformerBlockInput {
   readonly msa: Float32Array;
   readonly pair: Float32Array;
@@ -102,6 +113,15 @@ export interface EvoformerBlockInput {
    * beside the MSA and the triangle multiplication's whole projection.
    */
   readonly pairStorage?: ActivationStorage;
+  /**
+   * Closes the command buffer being built and opens the next one.
+   *
+   * A long chain puts thousands of dispatches in one submission, and a driver
+   * that waits seconds for a command buffer to finish is a driver that decides
+   * the GPU has hung. The loops that grow with the shape call this so no
+   * submission covers more than a bounded number of dispatches.
+   */
+  readonly flush?: SubmissionFlush;
   readonly weights: EvoformerBlockWeights;
 }
 
@@ -160,7 +180,7 @@ export type TemplatePairBlockWeights = Omit<EvoformerPairBlockWeights, "outerPro
 type EvoformerShape = Pick<
   EvoformerBlockInput,
   "sequences" | "length" | "cM" | "cZ" | "cOuter" | "triangleHidden" | "outerProductMeanFirst"
-  | "scratchWindowBytes" | "triangleWholeStorage" | "msaStorage" | "pairStorage"
+  | "scratchWindowBytes" | "triangleWholeStorage" | "msaStorage" | "pairStorage" | "flush"
 >;
 
 const GLOBAL_ATTENTION_COMMON = `
@@ -530,13 +550,16 @@ interface EncodeAttentionOptions {
   readonly storage?: ActivationStorage | undefined;
   /** Storage of `pairSource`, which the bias projection normalizes window by window. */
   readonly pairStorage?: ActivationStorage | undefined;
+  /** Splits the command buffer between windows; see `SubmissionFlush`. */
+  readonly flush?: SubmissionFlush | undefined;
 }
 
 async function encodeAttention(
   execution: WebGpuExecution,
-  encoder: GPUCommandEncoder,
+  encoderValue: GPUCommandEncoder,
   options: EncodeAttentionOptions,
 ): Promise<GpuTensor> {
+  let encoder = encoderValue;
   const descriptor = {
     activations: new Float32Array(0), mask: new Float32Array(0), batch: options.batch,
     queryLength: options.queries, channels: options.channels, heads: options.heads,
@@ -658,7 +681,13 @@ async function encodeAttention(
   // it only after this window's output projection has read it.
   const weighted = normalized;
 
+  let dispatchedAtFlush = execution.dispatchCount;
   for (const window of windowParameters) {
+    if (options.flush !== undefined
+      && execution.dispatchCount - dispatchedAtFlush >= SUBMISSION_DISPATCH_LIMIT) {
+      encoder = await options.flush(`${options.label}.flush-${window.offset}`);
+      dispatchedAtFlush = execution.dispatchCount;
+    }
     const { offset, count } = window;
     const rows = count * options.queries;
     const params = window.attention;
@@ -861,7 +890,7 @@ export function triangleBlockRows(
 
 async function encodeTriangleMultiplication(
   execution: WebGpuExecution,
-  encoder: GPUCommandEncoder,
+  encoderValue: GPUCommandEncoder,
   pair: GpuTensor,
   pairMask: GpuTensor,
   input: EvoformerShape,
@@ -909,6 +938,7 @@ async function encodeTriangleMultiplication(
   // loading it, from per-row statistics computed once.
   const statistics = execution.allocate(`triangle.${direction}.statistics`, pairs * 2);
   const statisticsGrid = execution.linearGrid(pairs, 1);
+  let encoder = encoderValue;
   execution.dispatch(encoder, inputStatistics, [pair, statistics], statisticsGrid[0], statisticsGrid[1], 1,
     `triangle.${direction}.input-statistics`);
   const gate = execution.allocate(`triangle.${direction}.gate`, blockPairs * input.cZ);
@@ -930,7 +960,15 @@ async function encodeTriangleMultiplication(
   const blockedProjection = execution.allocate(`triangle.${direction}.blocked`, blockPairs * input.triangleHidden);
   const contracted = execution.allocate(`triangle.${direction}.contracted`, blockPairs * input.triangleHidden);
   const hiddenStats = execution.allocate(`triangle.${direction}.hidden-statistics`, blockPairs * 2);
+  let dispatchedAtFlush = execution.dispatchCount;
+  const flushIfLong = async (label: string): Promise<void> => {
+    if (input.flush === undefined) return;
+    if (execution.dispatchCount - dispatchedAtFlush < SUBMISSION_DISPATCH_LIMIT) return;
+    encoder = await input.flush(label);
+    dispatchedAtFlush = execution.dispatchCount;
+  };
   for (const block of blocks) {
+    await flushIfLong(`triangle.${direction}.flush-${block.offset}`);
     const rows = block.count * input.length;
     project(projectBlockOperand, blockedProjection, block, "project-block");
     const contractGrid = gemmGrid(block.count, input.length);
@@ -980,7 +1018,7 @@ export async function encodeEvoformerBlock(
     },
     label: "msa-row-attention",
     windowBytes: shapeWindowBytes, residualTarget: msa, storage: input.msaStorage,
-    pairStorage: input.pairStorage,
+    pairStorage: input.pairStorage, flush: input.flush,
   });
 
   const column = input.weights.msaColumnAttention;
@@ -988,7 +1026,7 @@ export async function encodeEvoformerBlock(
     source: msa, mask: msaMask, batch: input.length, queries: input.sequences,
     channels: input.cM, heads: column.heads, transpose: true, weights: column.attention,
     label: "msa-column-attention",
-    windowBytes: shapeWindowBytes, residualTarget: msa, storage: input.msaStorage,
+    windowBytes: shapeWindowBytes, residualTarget: msa, storage: input.msaStorage, flush: input.flush,
   });
 
   await encodeTransition(
@@ -1011,7 +1049,7 @@ export async function encodeEvoformerBlock(
     channels: input.cZ, heads: starting.heads, transpose: false, weights: starting.attention,
     pairBias: { source: "normalized-input", projectionWeight: starting.pairProjectionWeight },
     label: "triangle-attention-starting",
-    windowBytes: shapeWindowBytes, residualTarget: pair, storage: input.pairStorage,
+    windowBytes: shapeWindowBytes, residualTarget: pair, storage: input.pairStorage, flush: input.flush,
   });
 
   const ending = input.weights.triangleAttentionEnding;
@@ -1020,7 +1058,7 @@ export async function encodeEvoformerBlock(
     channels: input.cZ, heads: ending.heads, transpose: true, weights: ending.attention,
     pairBias: { source: "normalized-input", projectionWeight: ending.pairProjectionWeight },
     label: "triangle-attention-ending",
-    windowBytes: shapeWindowBytes, residualTarget: pair, storage: input.pairStorage,
+    windowBytes: shapeWindowBytes, residualTarget: pair, storage: input.pairStorage, flush: input.flush,
   });
 
   await encodeTransition(
@@ -1061,7 +1099,7 @@ export async function encodeEvoformerPairBlock(
       source: "normalized-input", projectionWeight: weights.triangleAttentionStarting.pairProjectionWeight,
     },
     label: "extra.triangle-attention-starting",
-    windowBytes: shapeWindowBytes, residualTarget: pair, storage: shape.pairStorage,
+    windowBytes: shapeWindowBytes, residualTarget: pair, storage: shape.pairStorage, flush: shape.flush,
   });
   await encodeAttention(execution, encoder, {
     source: pair, mask: pairMask, batch: shape.length, queries: shape.length,
@@ -1071,7 +1109,7 @@ export async function encodeEvoformerPairBlock(
       source: "normalized-input", projectionWeight: weights.triangleAttentionEnding.pairProjectionWeight,
     },
     label: "extra.triangle-attention-ending",
-    windowBytes: shapeWindowBytes, residualTarget: pair, storage: shape.pairStorage,
+    windowBytes: shapeWindowBytes, residualTarget: pair, storage: shape.pairStorage, flush: shape.flush,
   });
   await encodeTransition(
     execution, encoder, pair, shape.length * shape.length, shape.cZ,
@@ -1107,7 +1145,7 @@ export async function encodeExtraMsaBlock(
     },
     label: "extra.msa-row-attention",
     windowBytes: shapeWindowBytes, residualTarget: msa, storage: shape.msaStorage,
-    pairStorage: shape.pairStorage,
+    pairStorage: shape.pairStorage, flush: shape.flush,
   });
   await encodeGlobalAttention(
     execution, encoder, msa, msaMask, shape, weights.msaColumnGlobalAttention,

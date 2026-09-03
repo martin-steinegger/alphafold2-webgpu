@@ -73,6 +73,8 @@ export class WebGpuExecution {
   readonly transitionBufferLimit: number;
   readonly #allocations: AllocatedGpuBuffer[] = [];
   #timestamps: TimestampCapture | undefined;
+  #dispatchCount = 0;
+  #encoderHolder: { encoder: GPUCommandEncoder } | undefined;
   #activeEncoder: GPUCommandEncoder | undefined;
   #activePass: GPUComputePassEncoder | undefined;
 
@@ -118,6 +120,27 @@ export class WebGpuExecution {
     return [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
   }
 
+  /**
+   * Dispatches encoded so far.
+   *
+   * The loops that grow with the sequence length watch this to decide when a
+   * command buffer has taken on enough work, since a submission a driver waits
+   * seconds for is a submission it may decide has hung.
+   */
+  get dispatchCount(): number { return this.#dispatchCount; }
+
+  /**
+   * Directs every dispatch at the holder's current command buffer.
+   *
+   * A long block is split across several buffers, and the functions encoding
+   * it hold whichever encoder they were called with. Rather than thread a
+   * replacement back through each of them, dispatches follow the holder, which
+   * the split updates. Cleared with `undefined` once the block is submitted.
+   */
+  setEncoderHolder(holder: { encoder: GPUCommandEncoder } | undefined): void {
+    this.#encoderHolder = holder;
+  }
+
   dispatch(
     encoder: GPUCommandEncoder,
     pipeline: GPUComputePipeline,
@@ -127,6 +150,8 @@ export class WebGpuExecution {
     z = 1,
     label?: string,
   ): void {
+    this.#dispatchCount += 1;
+    const target = this.#encoderHolder?.encoder ?? encoder;
     const timestamp = this.#timestamps;
     let timestampWrites: GPUComputePassTimestampWrites | undefined;
     if (timestamp !== undefined) {
@@ -144,15 +169,15 @@ export class WebGpuExecution {
     let pass: GPUComputePassEncoder;
     const reusable = timestampWrites === undefined;
     if (reusable) {
-      if (this.#activeEncoder !== encoder || this.#activePass === undefined) {
+      if (this.#activeEncoder !== target || this.#activePass === undefined) {
         this.endComputePass();
-        this.#activeEncoder = encoder;
-        this.#activePass = encoder.beginComputePass({ label: "afwebgpu.compute" });
+        this.#activeEncoder = target;
+        this.#activePass = target.beginComputePass({ label: "afwebgpu.compute" });
       }
       pass = this.#activePass;
       if (label !== undefined) pass.pushDebugGroup(label);
     } else {
-      pass = encoder.beginComputePass({
+      pass = target.beginComputePass({
         ...(label === undefined ? {} : { label }),
         timestampWrites: timestampWrites!,
       });

@@ -373,6 +373,30 @@ export class AlphaFoldMonomerGpu {
       if (inFlight.length > BLOCKS_IN_FLIGHT) await inFlight.shift();
       if (pendingErrors.length > BLOCKS_IN_FLIGHT) await settleErrors();
     };
+    /**
+     * Splits a block's encoding across command buffers.
+     *
+     * One buffer for a whole block is thousands of dispatches at long chain
+     * lengths, and a driver that waits seconds for one to finish may decide
+     * the GPU has hung: on Apple that shows as a stalled or crashed browser
+     * rather than an error. Each piece carries its own validation scope, which
+     * settles at the same rolling pace as the rest.
+     */
+    let splitSubmissions = 0;
+    const flushEncoder = (holder: { encoder: GPUCommandEncoder }) =>
+      async (label: string): Promise<GPUCommandEncoder> => {
+        splitSubmissions += 1;
+        await submitAhead(holder.encoder, label);
+        holder.encoder = this.device.createCommandEncoder({ label });
+        this.device.pushErrorScope("validation");
+        return holder.encoder;
+      };
+    /** Encodes a block whose command buffers the block itself may split. */
+    const encodeSplit = async (holder: { encoder: GPUCommandEncoder },
+      encode: () => Promise<void>): Promise<void> => {
+      execution.setEncoderHolder(holder);
+      try { await encode(); } finally { execution.setEncoderHolder(undefined); }
+    };
     const releaseTensor = (tensor: GpuTensor): void => {
       tensor.allocation.release();
       execution.allocator.trimPooled();
@@ -502,18 +526,22 @@ export class AlphaFoldMonomerGpu {
         let extraSubmissions = 0;
         for (let block = 0; block < weights.extraStack.length; block += 1) {
           const profileBlock = shouldProfileRecycle ? this.profileExtraMsaBlock : -1;
-          const encoder = this.device.createCommandEncoder({ label: `monomer.extra-${recycle}-${block}` });
+          const holder = { encoder: this.device.createCommandEncoder(
+            { label: `monomer.extra-${recycle}-${block}` }) };
           const checkpoint = execution.checkpoint();
           const profiling = block === profileBlock;
           if (profiling && timestampProfile) execution.beginTimestampProfile(512);
           const profileStart = profiling ? performance.now() : 0;
           this.device.pushErrorScope("validation");
-          await encodeExtraMsaBlock(execution, encoder, extraShape, weights.extraStack[block]!,
-            embedding.extraMsa, embedding.pairWithoutTemplates, extraMsaMask, pairMaskTensor);
+          // A profiled block keeps one buffer so its timestamps span the block.
+          await encodeSplit(holder, () => encodeExtraMsaBlock(execution, holder.encoder,
+            { ...extraShape, ...(profiling ? {} : { flush: flushEncoder(holder) }) },
+            weights.extraStack[block]!,
+            embedding.extraMsa, embedding.pairWithoutTemplates, extraMsaMask, pairMaskTensor));
           const pendingProfile = profiling && timestampProfile
-            ? execution.finishTimestampProfile(encoder) : undefined;
-          if (profiling) await submit(encoder, `extra-MSA recycle ${recycle} block ${block}`);
-          else await submitAhead(encoder, `extra-MSA recycle ${recycle} block ${block}`);
+            ? execution.finishTimestampProfile(holder.encoder) : undefined;
+          if (profiling) await submit(holder.encoder, `extra-MSA recycle ${recycle} block ${block}`);
+          else await submitAhead(holder.encoder, `extra-MSA recycle ${recycle} block ${block}`);
           if (profiling) {
             const entries = pendingProfile === undefined
               ? (await this.device.queue.onSubmittedWorkDone(), [{
@@ -579,19 +607,21 @@ export class AlphaFoldMonomerGpu {
         let mainSubmissions = 0;
         for (let block = 0; block < weights.mainStack.length; block += 1) {
           const profileBlock = shouldProfileRecycle ? this.profileMainEvoformerBlock : -1;
-          const encoder = this.device.createCommandEncoder({ label: `monomer.main-${recycle}-${block}` });
+          const holder = { encoder: this.device.createCommandEncoder(
+            { label: `monomer.main-${recycle}-${block}` }) };
           const checkpoint = execution.checkpoint();
           const profiling = block === profileBlock;
           if (profiling && timestampProfile) execution.beginTimestampProfile(512);
           const profileStart = profiling ? performance.now() : 0;
           this.device.pushErrorScope("validation");
-          await encodeEvoformerBlock(execution, encoder, {
+          await encodeSplit(holder, () => encodeEvoformerBlock(execution, holder.encoder, {
             ...mainDescriptor, weights: weights.mainStack[block]!,
-          }, mainMsa, embedding.pairWithoutTemplates, mainMsaMask, pairMaskTensor);
+            ...(profiling ? {} : { flush: flushEncoder(holder) }),
+          }, mainMsa, embedding.pairWithoutTemplates, mainMsaMask, pairMaskTensor));
           const pendingProfile = profiling && timestampProfile
-            ? execution.finishTimestampProfile(encoder) : undefined;
-          if (profiling) await submit(encoder, `main Evoformer recycle ${recycle} block ${block}`);
-          else await submitAhead(encoder, `main Evoformer recycle ${recycle} block ${block}`);
+            ? execution.finishTimestampProfile(holder.encoder) : undefined;
+          if (profiling) await submit(holder.encoder, `main Evoformer recycle ${recycle} block ${block}`);
+          else await submitAhead(holder.encoder, `main Evoformer recycle ${recycle} block ${block}`);
           if (profiling) {
             const entries = pendingProfile === undefined
               ? (await this.device.queue.onSubmittedWorkDone(), [{
@@ -678,7 +708,7 @@ export class AlphaFoldMonomerGpu {
         const trunkSubmissions = {
           embedding: 1, template: templateSubmissions,
           extraMsa: extraSubmissions, mainEvoformer: mainSubmissions, readback: 1,
-          total: 2 + templateSubmissions + extraSubmissions + mainSubmissions,
+          total: 2 + templateSubmissions + extraSubmissions + mainSubmissions + splitSubmissions,
         };
         const gpuProfile = extraProfile === undefined || mainProfile === undefined
           ? undefined : { extraMsa: extraProfile, mainEvoformer: mainProfile };
