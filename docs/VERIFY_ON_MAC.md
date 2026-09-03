@@ -339,6 +339,11 @@ Report the granted `storageBinding` and `buffer` from the run log, the wall
 time, and the Chrome GPU process peak from Activity Monitor.
 `AFWEBGPU_LONG_CHAIN_LENGTH` sets a different length.
 
+While it runs, the inference step counts Evoformer blocks and, once it has
+timed a block of each stack, says roughly how many minutes are left. If that
+line stops moving, the run is genuinely stuck and the block it stopped on is
+worth reporting; if it keeps moving, the prediction is only slow.
+
 A binding smaller than the shape no longer refuses the run: a tensor past the
 limit is bound as several windows of the same buffer, and the kernels read it
 through a generated accessor. If Chrome gives Metal a small binding, the run
