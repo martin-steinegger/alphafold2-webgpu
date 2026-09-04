@@ -1,3 +1,6 @@
+import { createLinearShader } from "../src/evoformer/transition.js";
+import { GEMM_TILE_COLUMNS, GEMM_TILE_ROWS } from "../src/runtime/gemm.js";
+
 /**
  * The dense-projection kernels, and the shapes the model runs them at.
  *
@@ -26,6 +29,7 @@ export interface Candidate {
   /** What the kernel's bindings expect, which is not always plain f32. */
   readonly sourceFormat?: "f32" | "f16";
   readonly weightFormat?: "f32" | "f16";
+  readonly outputFormat?: "f32" | "f16";
 }
 
 const PARAMETERS = `
@@ -138,16 +142,20 @@ function tiledGemm(
   if (!Number.isInteger(rowThreads) || !Number.isInteger(registerRows)) {
     throw new Error(`bad tiling ${tileRows}x${tileColumns}`);
   }
-  const sourceVectors = (tileRows * tileInner) / 4;
   const weightVectors = (tileInner * tileColumns) / 4;
   const declare = (name: string, count: number): string => Array.from({ length: count },
     (_, index) => `  var ${name}${index} = ${vec}(0.0);`).join("\n");
   const accumulate = Array.from({ length: registerRows }, (_, r) =>
-    `      let a${r} = tile_source[(k * ${tileRows}u + row_base + ${r}u) / 4u][(row_base + ${r}u) % 4u];`
+    `      let a${r} = tile_source[k * ${tileRows}u + row_base + ${r}u];`
     + `\n      acc${r} += a${r} * w;`).join("\n");
   return `${half ? "enable f16;\n" : ""}${PARAMETERS}
-// A is staged transposed (k-major) so one k step reads consecutive rows.
-var<workgroup> tile_source: array<${vec}, ${sourceVectors}>;
+// A is staged transposed (k-major) so one k step reads consecutive rows, and
+// as scalars rather than vectors: adjacent elements are written by different
+// invocations, and assigning separate lanes of one workgroup vec4
+// concurrently is a data race that Metal lowers to a clobbering
+// read-modify-write of the whole vector. The shared GEMM fixed this once
+// already; these candidates were extracted from the code before that.
+var<workgroup> tile_source: array<${scalar}, ${tileRows * tileInner}>;
 var<workgroup> tile_weight: array<${vec}, ${weightVectors}>;
 
 @compute @workgroup_size(${threads}, 1, 1)
@@ -172,8 +180,7 @@ ${declare("acc", registerRows)}
       if (source_row < parameters.rows && source_k < parameters.inner) {
         value = source[source_row * parameters.inner + source_k];
       }
-      let slot = load_k * ${tileRows}u + load_row;
-      tile_source[slot / 4u][slot % 4u] = ${cast("value")};
+      tile_source[load_k * ${tileRows}u + load_row] = ${cast("value")};
     }
     for (var item = thread; item < ${weightVectors}u; item += ${threads}u) {
       let load_k = item / ${tileColumns / 4}u;
@@ -258,10 +265,12 @@ fn source_at(index: u32) -> f32 {
  * bounds are left out, so it measures throughput and nothing else.
  */
 function subgroupMatrixGemm(componentType: "f32" | "f16", size: number): string {
+  const out = componentType === "f16" ? "f16" : "f32";
   const enables = `${componentType === "f16" ? "enable f16;\n" : ""}enable chromium_experimental_subgroup_matrix;\n`;
   const buffer = componentType === "f16" ? "f16" : "f32";
   return `${enables}${PARAMETERS.replace("array<f32>;\n@group(0) @binding(1) var<storage, read> weights: array<f32>;",
-    `array<${buffer}>;\n@group(0) @binding(1) var<storage, read> weights: array<${buffer}>;`)}
+    `array<${buffer}>;\n@group(0) @binding(1) var<storage, read> weights: array<${buffer}>;`)
+    .replace("var<storage, read_write> output: array<f32>;", `var<storage, read_write> output: array<${out}>;`)}
 @compute @workgroup_size(32, 1, 1)
 fn main(@builtin(workgroup_id) group: vec3<u32>) {
   let row_origin = group.y * ${size}u;
@@ -280,6 +289,10 @@ fn main(@builtin(workgroup_id) group: vec3<u32>) {
 }
 
 export const CANDIDATES: readonly Candidate[] = [
+  // The kernel the model actually runs, so the baseline is not a
+  // reimplementation of it that may have drifted.
+  { name: "production", shader: createLinearShader(false), tileRows: GEMM_TILE_ROWS,
+    tileColumns: GEMM_TILE_COLUMNS },
   { name: "current-64x128k8", shader: tiledGemm(64, 128, 8), tileRows: 64, tileColumns: 128 },
   { name: "tiled-64x64k16", shader: tiledGemm(64, 64, 16), tileRows: 64, tileColumns: 64 },
   { name: "tiled-128x128k8", shader: tiledGemm(128, 128, 8), tileRows: 128, tileColumns: 128 },
@@ -295,9 +308,11 @@ export const CANDIDATES: readonly Candidate[] = [
     requiresF16: true },
   { name: "matrix-f32-8x8x8", shader: subgroupMatrixGemm("f32", 8), tileRows: 8, tileColumns: 8,
     requiresSubgroupMatrix: { componentType: "f32", size: 8 }, alignment: 8, throughputOnly: true },
+  // An f16 matrix produces an f16 result, which only an f16 buffer can hold.
   { name: "matrix-f16-8x8x8", shader: subgroupMatrixGemm("f16", 8), tileRows: 8, tileColumns: 8,
     requiresF16: true, requiresSubgroupMatrix: { componentType: "f16", size: 8 },
-    alignment: 8, throughputOnly: true, sourceFormat: "f16", weightFormat: "f16" },
+    alignment: 8, throughputOnly: true, sourceFormat: "f16", weightFormat: "f16",
+    outputFormat: "f16" },
 ];
 
 export interface Shape { readonly name: string; readonly rows: number; readonly inner: number; readonly columns: number; }

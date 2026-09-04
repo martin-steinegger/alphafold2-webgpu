@@ -47,6 +47,15 @@ test("measures every projection kernel", async ({ page }) => {
       return configs.some((config) => String(config.componentType) === wants.componentType
         && Number(config.M) === wants.size && Number(config.N) === wants.size && Number(config.K) === wants.size);
     };
+    /** Raw f16 bytes back to f32, for a kernel whose result is half precision. */
+    const fromHalves = (values: Uint16Array): Float32Array => Float32Array.from(values, (bits) => {
+      const sign = (bits & 0x8000) !== 0 ? -1 : 1;
+      const exponent = (bits >> 10) & 0x1f;
+      const mantissa = bits & 0x3ff;
+      if (exponent === 0) return sign * mantissa * 2 ** -24;
+      if (exponent === 31) return mantissa === 0 ? sign * Infinity : Number.NaN;
+      return sign * (1 + mantissa / 1024) * 2 ** (exponent - 15);
+    });
     /** f32 values as raw f16 bytes, for the matrix kernels that read them. */
     const halves = (values: Float32Array): Uint16Array => {
       const out = new Uint16Array(values.length);
@@ -85,6 +94,9 @@ test("measures every projection kernel", async ({ page }) => {
         reference[row * check.columns + column] = total;
       }
     }
+    // A kernel that computes the wrong thing must not be able to win on
+    // speed, so what fails here is marked and excluded from the ranking.
+    const wrong = new Set<string>();
     lines.push(`== accuracy, M=${check.rows} K=${check.inner} N=${check.columns} (no bias) ==`);
     for (const candidate of candidates) {
       if (candidate.requiresF16 === true && !device.features.has("shader-f16" as GPUFeatureName)) continue;
@@ -100,8 +112,9 @@ test("measures every projection kernel", async ({ page }) => {
       const params = device.createBuffer({ size: 32, usage: 64 | 8 });
       device.queue.writeBuffer(params, 0, new Uint32Array([
         check.rows, check.inner, check.columns, 0, check.inner * check.columns, 0, 0, 0]));
-      const output = device.createBuffer({ size: check.rows * check.columns * 4, usage: 128 | 4 });
-      const readback = device.createBuffer({ size: check.rows * check.columns * 4, usage: 1 | 8 });
+      const outputBytes = check.rows * check.columns * (candidate.outputFormat === "f16" ? 2 : 4);
+      const output = device.createBuffer({ size: outputBytes, usage: 128 | 4 });
+      const readback = device.createBuffer({ size: outputBytes, usage: 1 | 8 });
       device.pushErrorScope("validation");
       const pipeline = device.createComputePipeline({
         label: candidate.name, layout: "auto",
@@ -109,6 +122,7 @@ test("measures every projection kernel", async ({ page }) => {
       });
       const failure = await device.popErrorScope();
       if (failure !== null) {
+        wrong.add(candidate.name);
         lines.push(`  ${candidate.name} rejected: ${failure.message.split("\n")[0]}`);
       } else {
         const group = device.createBindGroup({
@@ -121,10 +135,11 @@ test("measures every projection kernel", async ({ page }) => {
         pass.dispatchWorkgroups(Math.ceil(check.columns / candidate.tileColumns),
           Math.ceil(check.rows / candidate.tileRows), 1);
         pass.end();
-        encoder.copyBufferToBuffer(output, 0, readback, 0, check.rows * check.columns * 4);
+        encoder.copyBufferToBuffer(output, 0, readback, 0, outputBytes);
         device.queue.submit([encoder.finish()]);
         await readback.mapAsync(1);
-        const values = new Float32Array(readback.getMappedRange().slice(0));
+        const raw = readback.getMappedRange().slice(0);
+        const values = candidate.outputFormat === "f16" ? fromHalves(new Uint16Array(raw)) : new Float32Array(raw);
         readback.unmap();
         let worst = 0;
         let scale = 0;
@@ -132,8 +147,10 @@ test("measures every projection kernel", async ({ page }) => {
           worst = Math.max(worst, Math.abs(values[index]! - reference[index]!));
           scale = Math.max(scale, Math.abs(reference[index]!));
         }
+        const relative = 100 * worst / scale;
+        if (relative > 1) wrong.add(candidate.name);
         lines.push(`  ${candidate.name.padEnd(22)} worst error ${worst.toExponential(2)} `
-          + `(${(100 * worst / scale).toFixed(3)}% of the largest value)`);
+          + `(${relative.toFixed(3)}% of the largest value)${relative > 1 ? "   WRONG" : ""}`);
       }
       for (const buffer of [source, weights, params, output, readback]) buffer.destroy();
     }
@@ -161,6 +178,7 @@ test("measures every projection kernel", async ({ page }) => {
         shape.rows, shape.inner, shape.columns, 0, shape.inner * shape.columns, 1, 0, 0,
       ]));
       const output = device.createBuffer({ size: shape.rows * shape.columns * 4, usage: 128 });
+      const outputHalf = device.createBuffer({ size: shape.rows * shape.columns * 2, usage: 128 });
       const flops = 2 * shape.rows * shape.inner * shape.columns;
       let best = { name: "", milliseconds: Number.POSITIVE_INFINITY };
       let baseline = 0;
@@ -181,7 +199,8 @@ test("measures every projection kernel", async ({ page }) => {
         const group = device.createBindGroup({
           layout: pipeline.getBindGroupLayout(0),
           entries: [candidate.sourceFormat === "f16" ? sourceHalf : source,
-            candidate.weightFormat === "f16" ? weightsHalf : weights, params, output]
+            candidate.weightFormat === "f16" ? weightsHalf : weights, params,
+            candidate.outputFormat === "f16" ? outputHalf : output]
             .map((buffer, binding) => ({ binding, resource: { buffer } })),
         });
         const x = Math.ceil(shape.columns / candidate.tileColumns);
@@ -205,14 +224,19 @@ test("measures every projection kernel", async ({ page }) => {
         const iterations = Math.max(4, Math.min(2000, Math.ceil(60 / Math.max(rough, 0.01))));
         let milliseconds = Number.POSITIVE_INFINITY;
         for (let repeat = 0; repeat < 3; repeat += 1) milliseconds = Math.min(milliseconds, await batch(iterations));
-        if (candidate.name.startsWith("current")) baseline = milliseconds;
-        if (milliseconds < best.milliseconds) best = { name: candidate.name, milliseconds };
+        const failed = wrong.has(candidate.name);
+        if (candidate.name === "production") baseline = milliseconds;
+        if (!failed && milliseconds < best.milliseconds) best = { name: candidate.name, milliseconds };
         lines.push(`  ${candidate.name.padEnd(22)} ${milliseconds.toFixed(3)} ms  `
-          + `${(flops / milliseconds / 1e9).toFixed(2)} TFLOP/s`);
+          + `${(flops / milliseconds / 1e9).toFixed(2)} TFLOP/s`
+          + (failed ? "   (failed accuracy, not ranked)" : ""));
       }
-      lines.push(`  -> fastest ${best.name}`
-        + (baseline > 0 ? ` (${(baseline / best.milliseconds).toFixed(2)}x over current)` : ""));
-      for (const buffer of [source, weights, sourceHalf, weightsHalf, params, output]) buffer.destroy();
+      lines.push(`  -> fastest correct: ${best.name || "none"}`
+        + (baseline > 0 && best.milliseconds < Number.POSITIVE_INFINITY
+          ? ` (${(baseline / best.milliseconds).toFixed(2)}x over production)` : ""));
+      for (const buffer of [source, weights, sourceHalf, weightsHalf, params, output, outputHalf]) {
+        buffer.destroy();
+      }
     }
     device.destroy();
     return lines;

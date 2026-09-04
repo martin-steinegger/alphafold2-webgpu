@@ -55,6 +55,9 @@ for (const shape of SHAPES) {
   // pipeline creation. Numerical agreement is gated by the GPU differential tests.
   for (const candidate of CANDIDATES) {
     if (candidate.requiresF16 === true && !device.features.has("shader-f16")) continue;
+    // The matrix candidates need an extension dawn-node does not offer here;
+    // they are measured in the browser calibration instead.
+    if (candidate.requiresSubgroupMatrix !== undefined) continue;
     device.pushErrorScope("validation");
     const pipeline = device.createComputePipeline({
       label: candidate.name, layout: "auto",
