@@ -168,22 +168,39 @@ describe("estimateMonomerMemory", () => {
   // The estimate gates whether a browser prediction is allowed to start, so it
   // must cover physical pooled GPUBuffer residency rather than only the
   // allocator's logically live bytes.
-  const measured: ReadonlyArray<readonly [number, number, number, number]> = [
-    [59, 508, 1024, 102], [128, 256, 512, 97], [256, 256, 512, 130],
-    [384, 256, 512, 231], [512, 256, 512, 312],
+  interface MeasuredShape {
+    readonly length: number; readonly msa: number; readonly extra: number;
+    readonly residentMib: number; readonly multimer?: boolean;
+  }
+  const measured: readonly MeasuredShape[] = [
+    { length: 59, msa: 508, extra: 1024, residentMib: 102 },
+    { length: 128, msa: 256, extra: 512, residentMib: 97 },
+    { length: 256, msa: 256, extra: 512, residentMib: 130 },
+    { length: 384, msa: 256, extra: 512, residentMib: 231 },
+    { length: 512, msa: 256, extra: 512, residentMib: 312 },
+    // The long and Multimer shapes, where a headroom calibrated on the ones
+    // above used to tower over the truth: a quarter of the live peak is a
+    // sound allowance at 512 residues and 500 MiB of nonsense at 1400.
+    { length: 1500, msa: 508, extra: 1024, residentMib: 1911 },
+    { length: 354, msa: 8, extra: 8, residentMib: 179, multimer: true },
+    { length: 1416, msa: 8, extra: 8, residentMib: 2077, multimer: true },
   ];
+  const estimateFor = (shape: MeasuredShape): number =>
+    estimateMonomerMemory(shape.length, shape.msa, shape.extra, "full",
+      shape.multimer === true ? { multimer: true, templateRows: 4 } : {}).estimatedPeakBytes / 1024 ** 2;
 
   it("stays an upper bound on measured combined residency", () => {
-    for (const [length, msa, extra, residentMib] of measured) {
-      const estimate = estimateMonomerMemory(length, msa, extra, "full").estimatedPeakBytes / 1024 ** 2;
-      expect(estimate, `${length} residues`).toBeGreaterThan(residentMib);
+    for (const shape of measured) {
+      expect(estimateFor(shape), `${shape.length} residues`).toBeGreaterThan(shape.residentMib);
     }
   });
 
   it("does not drift far above what actually runs", () => {
-    for (const [length, msa, extra, residentMib] of measured) {
-      const estimate = estimateMonomerMemory(length, msa, extra, "full").estimatedPeakBytes / 1024 ** 2;
-      expect(estimate / residentMib, `${length} residues`).toBeLessThan(1.4);
+    // On Apple the estimate is compared against a safety budget, so an
+    // estimate well above the truth refuses predictions that would fit: a
+    // 1400-residue complex was turned away by four mebibytes.
+    for (const shape of measured) {
+      expect(estimateFor(shape) / shape.residentMib, `${shape.length} residues`).toBeLessThan(1.4);
     }
   });
 

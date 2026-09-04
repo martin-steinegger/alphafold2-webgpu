@@ -170,10 +170,21 @@ export function estimateMonomerMemory(
   // activations shrink logical tensors faster than they shrink that pool, so
   // their measured resident/live gap is wider and gets its own calibration.
   // The fixed allowance keeps small shapes conservative as well.
+  // Whole-MiB allocation rounding and the reusable scratch pool measured above
+  // the live model from 59 through 1000 residues, and a quarter of the live
+  // peak plus a fixed allowance covers that range. It does not extend: the
+  // gap is mostly the pool holding one or two scratch shapes, so it grows far
+  // more slowly than the pair. At 1400 residues a quarter came to 587 MiB
+  // where the pool measured 86, which pushed the estimate past the Apple
+  // safety budget and refused a complex that fits. The second term bounds the
+  // tail without touching the calibrated range.
   const packedStorageCount = Number(options.msaStorage !== "f32")
     + Number(options.triangleWholeStorage !== "f32") + Number(options.pairStorage !== "f32");
   const residentScale = packedStorageCount === 2 ? 0.40 : packedStorageCount === 1 ? 0.30 : 0.25;
-  const residentHeadroomBytes = Math.ceil(livePeakBytes * residentScale) + 16 * 1024 ** 2;
+  const residentHeadroomBytes = Math.ceil(Math.min(
+    livePeakBytes * residentScale + 16 * 1024 ** 2,
+    192 * 1024 ** 2 + livePeakBytes * 0.12,
+  ));
   const estimatedPeakBytes = livePeakBytes + residentHeadroomBytes;
   if (![persistentBytes, scratchBytes, residentHeadroomBytes, estimatedPeakBytes].every(Number.isSafeInteger)) {
     throw new RangeError("monomer aggregate memory estimate exceeds JavaScript precision");
