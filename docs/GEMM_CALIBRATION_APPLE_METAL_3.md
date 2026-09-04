@@ -5,7 +5,12 @@ Measured on an M4 Pro MacBook, Chromium, Apple Metal 3, on branch
 
 ## Conclusion
 
-**Ship `f16-chunked`, with the k depth measured per device.** It runs the
+**Ship `f16-chunked`, with the k depth measured per device.** But read the
+subgroup-matrix section first: a matrix kernel measured 1.7x here, in f32 and
+exactly, which is a better answer than half precision on any device that has
+the units. It needs a caller change and so is reported rather than shipped.
+
+It runs the
 projection shapes 1.11x to 1.25x faster than the f32 kernel and moves the
 59-residue acceptance prediction by 0.008 pLDDT, against a gate of 0.05.
 Across a whole prediction it is worth 1.046x on that 59-residue input and
@@ -309,12 +314,23 @@ that made pure f16 unusable in the projections. If it is tried, it should be
 tried against a deep MSA, recycle by recycle, and the `f16-chunked`
 arrangement is the one to reach for.
 
-## Subgroup matrix units
+## Subgroup matrix units, which turn out to matter
 
-`matrix-f32-8x8x8` and `matrix-f16-8x8x8` remain slower than production, at
-about 0.72x. The prototype gives one subgroup one 8x8 output tile and walks all
-of K from storage with no reuse, so it is memory-bound by construction and says
-nothing about the hardware. Untouched by this work.
+The 8x8x8 prototype is still 0.60x to 0.72x, and the brief's reading of it was
+right: it gives one subgroup one output tile and walks K with no reuse, so it
+was a poor kernel rather than evidence about the hardware.
+
+Given a 32x32 region per subgroup it reaches **1.55x to 2.15x, in f32, with
+production's own error to the digit** — faster than pure f16 was, and exact.
+On this device that is a better answer than any half-precision arrangement,
+and it is why the conclusion above is scoped to devices with `shader-f16`
+rather than stated as the best available kernel.
+
+It cannot be integrated without a change to the call sites, because
+`subgroupMatrixLoad` needs a typed array and a stride where
+`createTiledGemmShader` takes a WGSL expression.
+`docs/SUBGROUP_MATRIX_APPLE_METAL_3.md` has the measurements, the two
+non-obvious constraints, and what it would need.
 
 ## Commands
 

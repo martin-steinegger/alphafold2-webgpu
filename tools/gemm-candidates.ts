@@ -415,6 +415,91 @@ fn main(@builtin(workgroup_id) group: vec3<u32>) {
 }`;
 }
 
+/**
+ * The matrix units with enough reuse to be worth using, on any shape.
+ *
+ * The prototype elsewhere in this file gives one subgroup one 8x8 output tile
+ * and walks all of K, which is one multiply-accumulate per two tile loads:
+ * memory-bound by construction, and it measures 0.72x. This gives one subgroup
+ * a 32x32 region, so four left tiles and four right tiles feed sixteen
+ * multiply-accumulates — 2.0 per load rather than 0.5, a four-fold improvement
+ * in arithmetic intensity from register reuse alone.
+ *
+ * One subgroup per workgroup, which is not an accident: `subgroupMatrixStore`
+ * requires its offset to be uniform, and WGSL's uniformity analysis works at
+ * workgroup scope, so an offset derived from which subgroup you are in cannot
+ * be proven uniform even though it is. Deriving everything from the workgroup
+ * id sidesteps that, and costs nothing here because the reuse is in registers
+ * rather than in workgroup storage.
+ *
+ * The model's row counts are arbitrary — 29,972, say — so the edges matter. A
+ * scalar fallback for a ragged region was tried and is pathological: its inner
+ * loop reads the weights with a stride of a whole row, uncoalesced, and it
+ * took `opm-out2` to 0.09x. Instead the matrix path runs everywhere and the
+ * *store* is what checks bounds. Loads past the end of a tensor are clamped by
+ * WGSL's robustness rules, so a partial region computes garbage in the rows
+ * and columns that do not exist, and those are precisely the ones never
+ * written.
+ *
+ * The result is staged through workgroup memory so a per-invocation epilogue
+ * can apply the bias and the activation, which is what makes this kernel
+ * verifiable rather than a throughput measurement.
+ */
+function subgroupMatrixTiledGemm(
+  componentType: "f32" | "f16", size: number, bounded: boolean,
+): string {
+  const tiles = 4;
+  const region = tiles * size;
+  const enables = `${componentType === "f16" ? "enable f16;\n" : ""}`
+    + "enable chromium_experimental_subgroup_matrix;\n";
+  const buffer = componentType === "f16" ? "f16" : "f32";
+  const each = (count: number, body: (index: number) => string): string =>
+    Array.from({ length: count }, (_, index) => body(index)).join("\n");
+  const guard = bounded
+    ? "      if (row >= parameters.rows || column >= parameters.columns) { continue; }\n"
+    : "";
+  return `${enables}${PARAMETERS
+    .replace("array<f32>;\n@group(0) @binding(1) var<storage, read> weights: array<f32>;",
+      `array<${buffer}>;\n@group(0) @binding(1) var<storage, read> weights: array<f32>;`)
+    .replace("var<storage, read_write> output: array<f32>;",
+      `var<storage, read_write> output: array<${buffer}>;`)}
+var<workgroup> scratch: array<${componentType}, ${region * region}>;
+
+@compute @workgroup_size(32, 1, 1)
+fn main(
+  @builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>,
+) {
+  let lane = local.x;
+  let row_origin = group.y * ${region}u;
+  let column_origin = group.x * ${region}u;
+${each(tiles, (r) => each(tiles, (c) =>
+    `  var acc_${r}_${c} = subgroup_matrix_result<${componentType}, ${size}, ${size}>();`))}
+
+  for (var k0 = 0u; k0 < parameters.inner; k0 += ${size}u) {
+${each(tiles, (r) => `    let left_${r} = subgroupMatrixLoad<subgroup_matrix_left<${componentType}, ${size}, ${size}>>(
+      &source, (row_origin + ${r * size}u) * parameters.inner + k0, false, parameters.inner);`)}
+${each(tiles, (c) => `    let right_${c} = subgroupMatrixLoad<subgroup_matrix_right<${componentType}, ${size}, ${size}>>(
+      &weights, parameters.weight_offset + k0 * parameters.columns + column_origin + ${c * size}u,
+      false, parameters.columns);`)}
+${each(tiles, (r) => each(tiles, (c) =>
+    `    acc_${r}_${c} = subgroupMatrixMultiplyAccumulate(left_${r}, right_${c}, acc_${r}_${c});`))}
+  }
+
+${each(tiles, (r) => each(tiles, (c) =>
+    `  subgroupMatrixStore(&scratch, ${r * size}u * ${region}u + ${c * size}u,
+    acc_${r}_${c}, false, ${region}u);`))}
+  workgroupBarrier();
+  for (var item = lane; item < ${region * region}u; item += 32u) {
+    let row = row_origin + item / ${region}u;
+    let column = column_origin + item % ${region}u;
+${guard}    var value = f32(scratch[item]) + weights[parameters.bias_offset + column];
+    if (parameters.activation == 1u) { value = max(value, 0.0); }
+    output[row * parameters.columns + column] = ${buffer === "f16" ? "f16(value)" : "value"};
+  }
+}`;
+}
+
 export const CANDIDATES: readonly Candidate[] = [
   // The kernel the model actually runs, so the baseline is not a
   // reimplementation of it that may have drifted.
@@ -457,6 +542,17 @@ export const CANDIDATES: readonly Candidate[] = [
     tileRows: 128, tileColumns: 128, requiresF16: true },
   { name: "f16-chunked-wide-128x256k8r8", shader: tiledGemmWide(128, 256, 8, 2, "f16-chunked"),
     tileRows: 128, tileColumns: 256, requiresF16: true },
+  // The matrix units with register reuse: one subgroup, a 32x32 region.
+  { name: "matrix-tiled-f32", shader: subgroupMatrixTiledGemm("f32", 8, false),
+    tileRows: 32, tileColumns: 32,
+    requiresSubgroupMatrix: { componentType: "f32", size: 8 }, alignment: 32 },
+
+  // The same kernel with the store checking bounds, so it serves the row
+  // counts the model actually has.
+  { name: "matrix-bounded-f32", shader: subgroupMatrixTiledGemm("f32", 8, true),
+    tileRows: 32, tileColumns: 32,
+    requiresSubgroupMatrix: { componentType: "f32", size: 8 } },
+
   { name: "matrix-f32-8x8x8", shader: subgroupMatrixGemm("f32", 8), tileRows: 8, tileColumns: 8,
     requiresSubgroupMatrix: { componentType: "f32", size: 8 }, alignment: 8, throughputOnly: true },
   // An f16 matrix produces an f16 result, which only an f16 buffer can hold.
@@ -480,5 +576,14 @@ export const SHAPES: readonly Shape[] = [
   { name: "trans1    M=29972 K=256 N=1024", rows: 29972, inner: 256, columns: 1024 },
   { name: "trans2    M=29972 K=1024 N=256", rows: 29972, inner: 1024, columns: 256 },
   { name: "extra1    M=60416 K=64 N=256", rows: 60416, inner: 64, columns: 256 },
+  // The same work at row counts divisible by 32, so the subgroup-matrix
+  // kernels can be measured on the shapes that dominate a recycle. The real
+  // row counts are products of a sequence count and a residue count and are
+  // arbitrary, so a matrix kernel would need tail handling to serve them;
+  // these say what it would be worth if it had it.
+  { name: "project32  M=29984 K=256 N=1024", rows: 29984, inner: 256, columns: 1024 },
+  { name: "output32   M=29984 K=256 N=256", rows: 29984, inner: 256, columns: 256 },
+  { name: "trans2-32  M=29984 K=1024 N=256", rows: 29984, inner: 1024, columns: 256 },
+  { name: "opmcon32   M=128 K=512 N=32000", rows: 128, inner: 512, columns: 32000 },
 ];
 
