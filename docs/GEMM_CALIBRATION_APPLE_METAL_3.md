@@ -197,6 +197,22 @@ its own, before the deep MSA takes it to `NaN`.
 Chunked, for comparison, on the same recycles: 56.7134, 59.9037, 61.3638,
 63.2275, and 96.8032 against 96.8022 on the deep MSA.
 
+## The project's own gate, on the shipped kernel
+
+`monomer-q8-metal-regression.spec.ts` is not part of this work; it is the
+project's existing acceptance check, and unlike everything above it asserts
+absolute values rather than a difference. Run with the selection left to decide
+for itself, so with `f16-chunked-64x128k16`:
+
+```text
+exact:  meanPlddt 96.80231527554787   ptm 0.7545686515711122
+packed: meanPlddt 96.80400163036282   ptm 0.7546169833611633
+```
+
+against thresholds of pLDDT above 90, pTM above 0.65, and packed within 0.25
+pLDDT and 0.005 pTM of exact. The f32 kernel returns 96.8022 on the same
+input, so half precision moves the deep-MSA acceptance number by 0.0001.
+
 ## Whole-prediction timing
 
 Four interleaved rounds, order reversed on alternate rounds, each variant
