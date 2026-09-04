@@ -296,16 +296,66 @@ function drawPae(values: Float32Array, length: number, maximum: number, chainLen
   context.fillText("Aligned residue", left + size / 2, height - 8);
 }
 
-function loadViewer(): Promise<ThreeDmolApi> {
-  if (window.$3Dmol !== undefined) return Promise.resolve(window.$3Dmol);
-  viewerLoader ??= new Promise((resolve, reject) => {
+/**
+ * Where the structure viewer comes from.
+ *
+ * The first is a version that cannot change under the page; the second is the
+ * project's rolling build, kept only for networks that cannot reach the CDN.
+ * An unpinned viewer has already cost us twice: a build that renders today can
+ * throw tomorrow, and a stack trace against it stops matching the file within
+ * hours, which makes a user's report impossible to follow up. The run log says
+ * which one answered.
+ */
+const VIEWER_SOURCES = [
+  "https://cdn.jsdelivr.net/npm/3dmol@2.5.5/build/3Dmol-min.js",
+  "https://3dmol.org/build/3Dmol.js",
+] as const;
+
+function loadScript(src: string): Promise<ThreeDmolApi> {
+  return new Promise((resolve, reject) => {
     const script = document.createElement("script");
-    script.src = "https://3dmol.org/build/3Dmol.js"; script.async = true;
-    script.onload = () => window.$3Dmol === undefined ? reject(new Error("3Dmol did not initialize")) : resolve(window.$3Dmol);
-    script.onerror = () => reject(new Error("Could not load the optional 3D structure viewer"));
+    script.src = src; script.async = true;
+    script.onload = () => window.$3Dmol === undefined
+      ? reject(new Error(`${src} did not define the viewer`)) : resolve(window.$3Dmol);
+    script.onerror = () => reject(new Error(`could not load ${src}`));
     document.head.append(script);
   });
+}
+
+function loadViewer(): Promise<ThreeDmolApi> {
+  if (window.$3Dmol !== undefined) return Promise.resolve(window.$3Dmol);
+  viewerLoader ??= (async () => {
+    const failures: string[] = [];
+    for (const source of VIEWER_SOURCES) {
+      try {
+        const api = await loadScript(source);
+        log(`3D viewer: loaded from ${source}.`);
+        return api;
+      } catch (error) {
+        failures.push(error instanceof Error ? error.message : String(error));
+      }
+    }
+    throw new Error(`Could not load the optional 3D structure viewer: ${failures.join("; ")}`);
+  })();
   return viewerLoader;
+}
+
+/**
+ * Reports a lost WebGL context, which a renderer cannot survive.
+ *
+ * A browser drops the context when it has too many live or the driver resets,
+ * and every later draw then fails somewhere inside the renderer with no sign
+ * of the cause. Naming it turns that into one line in the log.
+ */
+function watchViewerContext(container: HTMLElement): void {
+  const canvas = container.querySelector("canvas");
+  if (canvas === null) return;
+  canvas.addEventListener("webglcontextlost", (event) => {
+    event.preventDefault();
+    log("3D viewer: the browser took back the WebGL context, so the structure stopped drawing. "
+      + "Every other view and the downloads are unaffected; reloading the page restores it.");
+  });
+  canvas.addEventListener("webglcontextrestored", () => log("3D viewer: the WebGL context came back."));
 }
 
 /** Paints the viewer by confidence, by chain or along the sequence. */
@@ -375,6 +425,7 @@ async function showStructure(pdb: string, chainCount: number, mode: string): Pro
     // CDN build to fail for newly displayed multimer models.
     viewer.zoomTo(); viewer.render();
     currentViewer = viewer;
+    watchViewerContext(container);
     viewerResizeObserver = new ResizeObserver(() => withViewer("resizing", () => {
       viewer.resize(); viewer.render();
     }));
