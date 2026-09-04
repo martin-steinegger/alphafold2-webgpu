@@ -15,9 +15,13 @@ import { expect, test } from "@playwright/test";
 const enabled = process.env.AFWEBGPU_CAPACITY === "1";
 const CHAIN = "PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK";
 const copies = Number(process.env.AFWEBGPU_COMPLEX_CHAINS ?? "24");
+// Recycling retains the previous pass's positions and pair representation, so
+// it costs memory as well as time; at this length that is the difference
+// between a prediction and a dead renderer, and it is worth measuring apart.
+const recycles = Number(process.env.AFWEBGPU_COMPLEX_RECYCLES ?? "0");
 
 test.skip(!enabled, "set AFWEBGPU_CAPACITY=1 and point AFWEBGPU_QUALIFICATION_ASSET_ROOT at a multimer model");
-test(`predicts a ${copies}-chain complex`, async ({ page }) => {
+test(`predicts a ${copies}-chain complex with ${recycles} extra recycles`, async ({ page }) => {
   test.setTimeout(6 * 60 * 60_000);
   page.on("console", (message) => console.log(`browser: ${message.text()}`));
   page.on("pageerror", (error) => console.log(`page error: ${error.message}`));
@@ -25,7 +29,7 @@ test(`predicts a ${copies}-chain complex`, async ({ page }) => {
   const root = process.cwd();
   await page.goto("/?worker=0");
 
-  const outcome = await page.evaluate(async ({ root, chain, copies }) => {
+  const outcome = await page.evaluate(async ({ root, chain, copies, recycles }) => {
     const expression = await import(/* @vite-ignore */
       `/@fs${root}/src/input/sequence-expression.ts`) as {
         parseSequenceExpression(value: string): {
@@ -60,7 +64,7 @@ test(`predicts a ${copies}-chain complex`, async ({ page }) => {
           a3m: `>query\n${parsed.sequence}\n`, sequence: parsed.sequence,
           depth: 1, multimer: parsed.multimer, chains: parsed.chains,
         },
-        maxMsaSequences: 1, maxExtraSequences: 1, recycles: 0,
+        maxMsaSequences: 1, maxExtraSequences: 1, recycles,
         randomSeed: 0, compactPolicy: false,
       }, reporter);
       const final = result.prediction.final as { confidence?: Record<string, number> };
@@ -78,9 +82,10 @@ test(`predicts a ${copies}-chain complex`, async ({ page }) => {
         meanPlddt: Number.NaN, ptm: Number.NaN, iptm: Number.NaN, failure: String(error),
       };
     }
-  }, { root, chain: CHAIN, copies });
+  }, { root, chain: CHAIN, copies, recycles });
 
   console.log(`\nCAPACITY\n${copies} chains, ${outcome.residues} residues, `
+    + `${recycles} extra recycles, `
     + `${outcome.seconds.toFixed(0)} s\n`
     + (outcome.failure === undefined
       ? `pLDDT ${outcome.meanPlddt.toFixed(4)}  pTM ${outcome.ptm.toFixed(5)}  `
