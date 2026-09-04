@@ -426,9 +426,13 @@ async function showStructure(pdb: string, chainCount: number, mode: string): Pro
     viewer.zoomTo(); viewer.render();
     currentViewer = viewer;
     watchViewerContext(container);
-    viewerResizeObserver = new ResizeObserver(() => withViewer("resizing", () => {
-      viewer.resize(); viewer.render();
-    }));
+    viewerResizeObserver = new ResizeObserver(() => {
+      // Starting another prediction hides the results, which resizes the
+      // container to nothing: drawing into a zero-sized canvas fails in the
+      // renderer and says so, for a frame nobody can see.
+      if (container.clientWidth === 0 || container.clientHeight === 0) return;
+      withViewer("resizing", () => { viewer.resize(); viewer.render(); });
+    });
     viewerResizeObserver.observe(container);
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);

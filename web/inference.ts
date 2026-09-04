@@ -79,8 +79,13 @@ function isAppleUnifiedMemory(adapter: GPUAdapter): boolean {
 
 function unifiedMemoryBudget(appleUnifiedMemory: boolean): number | undefined {
   if (!appleUnifiedMemory) return undefined;
-  const deviceMemory = (navigator as Navigator & { readonly deviceMemory?: number }).deviceMemory;
-  if (deviceMemory === undefined || !Number.isFinite(deviceMemory) || deviceMemory <= 0) return undefined;
+  const reported = (navigator as Navigator & { readonly deviceMemory?: number }).deviceMemory;
+  // navigator.deviceMemory is Chromium-only, so on Firefox this budget used to
+  // vanish and nothing stopped a prediction whose own estimate was several
+  // gigabytes: it ran until WebGPU refused a buffer mid-way. Chromium caps the
+  // figure at 8 anyway, so assuming it gives Firefox the budget every Chromium
+  // user on Apple already gets rather than none.
+  const deviceMemory = reported === undefined || !Number.isFinite(reported) || reported <= 0 ? 8 : reported;
   // Apple GPUs share system RAM, and Metal accepts allocations well past the
   // point where macOS starts paging, which freezes the machine rather than
   // failing the prediction. navigator.deviceMemory is privacy-rounded and capped
