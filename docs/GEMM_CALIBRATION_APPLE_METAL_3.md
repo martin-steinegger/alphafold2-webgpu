@@ -86,16 +86,18 @@ the arrangement.
 
 ## Kernel speed, against the production f32 kernel
 
-| shape | `f16` k8 | `f16` k16 | `chunked` k8 | `chunked` k16 | `mixed` k8 | f32 k16 |
-|---|---|---|---|---|---|---|
-| opm-contract | 1.40x | 1.45x | 1.17x | 1.26x | 1.14x | 1.07x |
-| opm-out | 1.54x | 1.54x | 1.16x | 1.16x | 1.13x | 1.03x |
-| opm-out2 | 1.28x | 1.29x | 1.15x | 1.21x | 1.11x | 1.01x |
-| project | 1.36x | 1.35x | 1.13x | 1.15x | 1.11x | 1.02x |
-| output | 1.37x | 1.36x | 1.12x | 1.15x | 1.12x | 1.02x |
-| trans1 | 1.37x | 1.36x | 1.14x | 1.16x | 1.12x | 1.03x |
-| trans2 | 1.39x | 1.39x | 1.14x | 1.19x | 1.12x | 1.04x |
-| extra1 | 1.50x | 1.42x | 1.12x | 1.13x | 1.16x | 1.02x |
+Median of three runs. One run is excluded and discussed under stability below.
+
+| shape | `f16` (rejected) | `chunked` k8 | `chunked` k16 | `mixed` k8 | f32 k16 |
+|---|---|---|---|---|---|
+| opm-contract | 1.37x | 1.16x | 1.25x | 1.13x | 1.06x |
+| opm-out | 1.51x | 1.13x | 1.14x | 1.10x | 1.02x |
+| opm-out2 | 1.27x | 1.14x | 1.20x | 1.10x | 1.01x |
+| project | 1.37x | 1.13x | 1.15x | 1.11x | 1.02x |
+| output | 1.37x | 1.13x | 1.16x | 1.12x | 1.02x |
+| trans1 | 1.37x | 1.13x | 1.15x | 1.12x | 1.02x |
+| trans2 | 1.38x | 1.14x | 1.18x | 1.12x | 1.03x |
+| extra1 | 1.48x | 1.12x | 1.11x | 1.14x | 1.00x |
 
 Chunked beats mixed at every shape, so mixed is kept only as a candidate the
 per-device probe may still prefer elsewhere. The brief's threshold for chunked
@@ -103,8 +105,59 @@ was 1.3x; it reaches 1.26x at best and 1.15x typically, so the hoped-for
 outcome — chunked being nearly as fast as pure f16 — did not happen. It is
 still the fastest arrangement that is safe.
 
-The f32 k16 tile is a consistent 1.01x to 1.07x for free on devices without
+The f32 k16 tile is a consistent 1.00x to 1.06x for free on devices without
 `shader-f16`, and is now measured rather than fixed.
+
+### Stability, and one run that lied
+
+`production` is stable to about 2% across four runs. The half-precision
+kernels are not: in one run they all came back 25% slower while `production`
+did not move at all, which was enough to put `f16-chunked` under 1.0x and
+would have reversed the conclusion had it been the only run.
+
+That run was launched immediately after 22 minutes of sustained full-model
+work. Two later runs returned to the numbers above. So the half-precision
+advantage is not perfectly stable under sustained load in a way the f32 kernel
+is not, which is why the table is a median of three runs rather than one
+measurement.
+
+The mechanism is not established from one observation and is not asserted
+here. Against it: the 1,416-residue complex sustained 11 minutes of continuous
+GPU work and still finished 1.117x faster. Anyone re-measuring this should run
+the calibration more than once and should not trust a single pass — which is
+the same lesson the whole-prediction timing and the device probe each taught
+separately.
+
+### A wider register block does not help
+
+The projection is compute-bound, not bandwidth-bound: `f16-source`, which
+reads the source at half width with the arithmetic in f32, measures 1.0x. And
+2.85 TFLOP/s is well under this GPU's f32 peak, so there should be headroom.
+The shipped tiling gives each invocation eight rows by four columns, 32
+multiply-adds against twelve staged reads per k step. Widening to eight
+columns makes that 64 against sixteen, a ratio of 4.0 rather than 2.67.
+
+It is slower, in every arrangement and at every shape:
+
+| shape | f32 128x128 r8 | f32 64x128 r8 | chunked 128x128 r8 | f32 128x256 r8 |
+|---|---|---|---|---|
+| opm-contract | 0.86x | 0.87x | 0.84x | 0.24x |
+| opm-out | 1.04x | 0.99x | 1.12x | 0.20x |
+| opm-out2 | 0.70x | 0.96x | 0.76x | 0.13x |
+| project | 0.94x | 0.94x | 0.85x | 0.28x |
+| output | 0.91x | 0.95x | 0.84x | 0.27x |
+| trans1 | 0.95x | 0.95x | 0.87x | 0.29x |
+| trans2 | 0.96x | 0.96x | 0.89x | 0.25x |
+| extra1 | 0.87x | 0.97x | 0.84x | 0.31x |
+
+The occupancy lost to the extra accumulator registers costs more than the
+loads saved. The 128x256 tile, which asks one invocation to hold 32
+accumulator vectors, collapses to a quarter of production and is almost
+certainly spilling. All of them compute the right answer, so this is a
+performance result and not a correctness one.
+
+The candidates stay in `tools/gemm-candidates.ts`, measured and rejected, so
+the next person does not have to guess that this was tried.
 
 ## What half precision costs a prediction
 
