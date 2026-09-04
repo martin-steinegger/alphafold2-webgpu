@@ -274,7 +274,12 @@ test("the per-device probe picks what the sweep picks", async ({ page }) => {
         gemmVariantName(variant: { precision: string; inner: number }): string;
       };
     const adapter = await navigator.gpu?.requestAdapter({ powerPreference: "high-performance" });
-    if (adapter === null || adapter === undefined) return { lines: ["no adapter"], winner: "none" };
+    if (adapter === null || adapter === undefined) {
+      return {
+        lines: ["no adapter"], winner: "none", probeMilliseconds: 0,
+        fastest: Number.NaN, chosenMilliseconds: Number.NaN,
+      };
+    }
     const features = (["shader-f16", "subgroups"] as GPUFeatureName[])
       .filter((feature) => adapter.features.has(feature));
     const device = await adapter.requestDevice({ requiredFeatures: features });
