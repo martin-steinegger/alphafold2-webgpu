@@ -12,12 +12,21 @@ Across a whole prediction it is worth 1.044x, because the projections are only
 part of a recycle.
 
 **Pure f16 is rejected, and this is the main result.** It is much the fastest
-candidate, at 1.28x to 1.54x, and it is unusable: accumulating a whole
-contraction in half precision overflows on a deep MSA. The 508-row acceptance
-alignment went from 96.80 pLDDT to 69.94 and its pTM to `NaN`. The
-microbenchmark did not predict this at all — it reported 0.948% worst error,
-which reads like a tolerable rounding cost. Only the end-to-end differential
-on the deep input found it, and only because the brief demanded a second input.
+candidate, at 1.28x to 1.54x, and it is unusable: the 508-row acceptance
+alignment went from 96.80 pLDDT to 69.94 and its pTM to `NaN`. A `NaN` pTM
+means the running sum reached infinity.
+
+The cause is isolated, not inferred. All three arrangements stage their
+operands in f16 identically; they differ only in where the sum is kept. The
+two that reduce in f32 came back within 0.015 pLDDT of the f32 kernel on that
+same input, so the staged half-precision operands are fine and it is
+accumulating the whole of K in half precision that fails.
+
+The microbenchmark did not predict this at all. It reported 0.948% worst
+error, which reads like a tolerable rounding cost, because random operands of
+uniform magnitude never build a partial sum large enough to overflow. Only the
+end-to-end differential on the deep input found it, and only because the brief
+demanded a second input.
 
 Half precision therefore has to be bought in the arrangement that keeps the
 reduction in f32, not in the one the microbenchmark ranked first.
