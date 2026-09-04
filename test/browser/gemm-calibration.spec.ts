@@ -41,6 +41,26 @@ test("measures every projection kernel", async ({ page }) => {
         .map((key) => `${key}=${String(config[key])}`).join(" ")}`);
     }
 
+    const matrixOffered = (candidate: typeof candidates[number]): boolean => {
+      const wants = candidate.requiresSubgroupMatrix;
+      if (wants === undefined) return true;
+      return configs.some((config) => String(config.componentType) === wants.componentType
+        && Number(config.M) === wants.size && Number(config.N) === wants.size && Number(config.K) === wants.size);
+    };
+    /** f32 values as raw f16 bytes, for the matrix kernels that read them. */
+    const halves = (values: Float32Array): Uint16Array => {
+      const out = new Uint16Array(values.length);
+      const view = new DataView(new ArrayBuffer(4));
+      for (let index = 0; index < values.length; index += 1) {
+        view.setFloat32(0, values[index]!);
+        const bits = view.getUint32(0);
+        const sign = (bits >>> 16) & 0x8000;
+        const exponent = ((bits >>> 23) & 0xff) - 127 + 15;
+        const mantissa = (bits >>> 13) & 0x3ff;
+        out[index] = exponent <= 0 ? sign : exponent >= 31 ? sign | 0x7c00 : sign | (exponent << 10) | mantissa;
+      }
+      return out;
+    };
     const random = (count: number): Float32Array => {
       let state = 0x1234567;
       return Float32Array.from({ length: count }, () => {
@@ -48,16 +68,97 @@ test("measures every projection kernel", async ({ page }) => {
         return state / 0x100000000 - 0.5;
       });
     };
-    for (const shape of shapes) {
-      lines.push(`== ${shape.name} ==`);
-      const source = device.createBuffer({ size: shape.rows * shape.inner * 4, usage: 128 | 8 });
-      device.queue.writeBuffer(source, 0, random(shape.rows * shape.inner));
-      const weightCount = shape.inner * shape.columns + shape.columns;
-      const weights = device.createBuffer({ size: weightCount * 4, usage: 128 | 8 });
-      device.queue.writeBuffer(weights, 0, random(weightCount));
+    // Accuracy before speed: half precision accumulates a K-long reduction in
+    // f16, and a kernel that is fast and wrong is worth nothing. One small
+    // aligned shape is checked against a reference computed here.
+    const check = { rows: 64, inner: 256, columns: 64 };
+    const checkSource = random(check.rows * check.inner);
+    const checkWeights = random(check.inner * check.columns + check.columns);
+    checkWeights.fill(0, check.inner * check.columns);
+    const reference = new Float32Array(check.rows * check.columns);
+    for (let row = 0; row < check.rows; row += 1) {
+      for (let column = 0; column < check.columns; column += 1) {
+        let total = 0;
+        for (let k = 0; k < check.inner; k += 1) {
+          total += checkSource[row * check.inner + k]! * checkWeights[k * check.columns + column]!;
+        }
+        reference[row * check.columns + column] = total;
+      }
+    }
+    lines.push(`== accuracy, M=${check.rows} K=${check.inner} N=${check.columns} (no bias) ==`);
+    for (const candidate of candidates) {
+      if (candidate.requiresF16 === true && !device.features.has("shader-f16" as GPUFeatureName)) continue;
+      if (candidate.requiresSubgroupMatrix !== undefined && !matrixOffered(candidate)) continue;
+      const halfSource = candidate.sourceFormat === "f16";
+      const halfWeights = candidate.weightFormat === "f16";
+      const source = device.createBuffer({
+        size: check.rows * check.inner * (halfSource ? 2 : 4), usage: 128 | 8 });
+      const weights = device.createBuffer({
+        size: (check.inner * check.columns + check.columns) * (halfWeights ? 2 : 4), usage: 128 | 8 });
+      device.queue.writeBuffer(source, 0, halfSource ? halves(checkSource) : checkSource);
+      device.queue.writeBuffer(weights, 0, halfWeights ? halves(checkWeights) : checkWeights);
       const params = device.createBuffer({ size: 32, usage: 64 | 8 });
       device.queue.writeBuffer(params, 0, new Uint32Array([
-        shape.rows, shape.inner, shape.columns, shape.inner * shape.columns, 0, 0, 0, 0,
+        check.rows, check.inner, check.columns, 0, check.inner * check.columns, 0, 0, 0]));
+      const output = device.createBuffer({ size: check.rows * check.columns * 4, usage: 128 | 4 });
+      const readback = device.createBuffer({ size: check.rows * check.columns * 4, usage: 1 | 8 });
+      device.pushErrorScope("validation");
+      const pipeline = device.createComputePipeline({
+        label: candidate.name, layout: "auto",
+        compute: { module: device.createShaderModule({ code: candidate.shader }), entryPoint: "main" },
+      });
+      const failure = await device.popErrorScope();
+      if (failure !== null) {
+        lines.push(`  ${candidate.name} rejected: ${failure.message.split("\n")[0]}`);
+      } else {
+        const group = device.createBindGroup({
+          layout: pipeline.getBindGroupLayout(0),
+          entries: [source, weights, params, output].map((buffer, binding) => ({ binding, resource: { buffer } })),
+        });
+        const encoder = device.createCommandEncoder();
+        const pass = encoder.beginComputePass();
+        pass.setPipeline(pipeline); pass.setBindGroup(0, group);
+        pass.dispatchWorkgroups(Math.ceil(check.columns / candidate.tileColumns),
+          Math.ceil(check.rows / candidate.tileRows), 1);
+        pass.end();
+        encoder.copyBufferToBuffer(output, 0, readback, 0, check.rows * check.columns * 4);
+        device.queue.submit([encoder.finish()]);
+        await readback.mapAsync(1);
+        const values = new Float32Array(readback.getMappedRange().slice(0));
+        readback.unmap();
+        let worst = 0;
+        let scale = 0;
+        for (let index = 0; index < values.length; index += 1) {
+          worst = Math.max(worst, Math.abs(values[index]! - reference[index]!));
+          scale = Math.max(scale, Math.abs(reference[index]!));
+        }
+        lines.push(`  ${candidate.name.padEnd(22)} worst error ${worst.toExponential(2)} `
+          + `(${(100 * worst / scale).toFixed(3)}% of the largest value)`);
+      }
+      for (const buffer of [source, weights, params, output, readback]) buffer.destroy();
+    }
+
+    for (const shape of shapes) {
+      lines.push(`== ${shape.name} ==`);
+      const aligned = (candidate: typeof candidates[number]): boolean => candidate.alignment === undefined
+        || (shape.rows % candidate.alignment === 0 && shape.inner % candidate.alignment === 0
+          && shape.columns % candidate.alignment === 0);
+      const sourceValues = random(shape.rows * shape.inner);
+      const weightCount = shape.inner * shape.columns + shape.columns;
+      const weightValues = random(weightCount);
+      const source = device.createBuffer({ size: shape.rows * shape.inner * 4, usage: 128 | 8 });
+      device.queue.writeBuffer(source, 0, sourceValues);
+      const weights = device.createBuffer({ size: weightCount * 4, usage: 128 | 8 });
+      device.queue.writeBuffer(weights, 0, weightValues);
+      // A kernel that declares half-precision bindings gets half-precision
+      // data: feeding it f32 bytes measures a kernel reading nonsense.
+      const sourceHalf = device.createBuffer({ size: shape.rows * shape.inner * 2, usage: 128 | 8 });
+      device.queue.writeBuffer(sourceHalf, 0, halves(sourceValues));
+      const weightsHalf = device.createBuffer({ size: weightCount * 2, usage: 128 | 8 });
+      device.queue.writeBuffer(weightsHalf, 0, halves(weightValues));
+      const params = device.createBuffer({ size: 32, usage: 64 | 8 });
+      device.queue.writeBuffer(params, 0, new Uint32Array([
+        shape.rows, shape.inner, shape.columns, 0, shape.inner * shape.columns, 1, 0, 0,
       ]));
       const output = device.createBuffer({ size: shape.rows * shape.columns * 4, usage: 128 });
       const flops = 2 * shape.rows * shape.inner * shape.columns;
@@ -65,6 +166,11 @@ test("measures every projection kernel", async ({ page }) => {
       let baseline = 0;
       for (const candidate of candidates) {
         if (candidate.requiresF16 === true && !device.features.has("shader-f16" as GPUFeatureName)) continue;
+        if (candidate.requiresSubgroupMatrix !== undefined && !matrixOffered(candidate)) continue;
+        if (!aligned(candidate)) {
+          lines.push(`  ${candidate.name} skipped: needs M, N and K divisible by ${candidate.alignment}`);
+          continue;
+        }
         device.pushErrorScope("validation");
         const pipeline = device.createComputePipeline({
           label: candidate.name, layout: "auto",
@@ -74,7 +180,9 @@ test("measures every projection kernel", async ({ page }) => {
         if (failure !== null) { lines.push(`  ${candidate.name} rejected: ${failure.message.split("\n")[0]}`); continue; }
         const group = device.createBindGroup({
           layout: pipeline.getBindGroupLayout(0),
-          entries: [source, weights, params, output].map((buffer, binding) => ({ binding, resource: { buffer } })),
+          entries: [candidate.sourceFormat === "f16" ? sourceHalf : source,
+            candidate.weightFormat === "f16" ? weightsHalf : weights, params, output]
+            .map((buffer, binding) => ({ binding, resource: { buffer } })),
         });
         const x = Math.ceil(shape.columns / candidate.tileColumns);
         const y = Math.ceil(shape.rows / candidate.tileRows);
@@ -104,7 +212,7 @@ test("measures every projection kernel", async ({ page }) => {
       }
       lines.push(`  -> fastest ${best.name}`
         + (baseline > 0 ? ` (${(baseline / best.milliseconds).toFixed(2)}x over current)` : ""));
-      for (const buffer of [source, weights, params, output]) buffer.destroy();
+      for (const buffer of [source, weights, sourceHalf, weightsHalf, params, output]) buffer.destroy();
     }
     device.destroy();
     return lines;

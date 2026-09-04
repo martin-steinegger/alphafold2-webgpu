@@ -15,6 +15,17 @@ export interface Candidate {
   readonly tileColumns: number;
   /** Skipped unless the device has the shader-f16 feature. */
   readonly requiresF16?: boolean;
+  /**
+   * Skipped unless the adapter offers a matrix unit of this component type and
+   * shape, and unless the shape's M, N and K are all multiples of `alignment`.
+   */
+  readonly requiresSubgroupMatrix?: { readonly componentType: string; readonly size: number };
+  readonly alignment?: number;
+  /** Measures arithmetic only: no bias, no activation, so it is not verified. */
+  readonly throughputOnly?: boolean;
+  /** What the kernel's bindings expect, which is not always plain f32. */
+  readonly sourceFormat?: "f32" | "f16";
+  readonly weightFormat?: "f32" | "f16";
 }
 
 const PARAMETERS = `
@@ -237,6 +248,37 @@ fn source_at(index: u32) -> f32 {
       "value = source_at(source_row * parameters.inner + source_k);");
 }
 
+/**
+ * The hardware matrix units, through Chromium's experimental subgroup matrix.
+ *
+ * Apple Metal 3 offers 8x8x8 tiles in f32 and f16; this machine's NVIDIA
+ * adapter offers only integer ones, so nothing here can be compiled or
+ * checked locally. One subgroup owns one output tile and walks K, which is
+ * the simplest arrangement that uses the units at all: bias, activation and
+ * bounds are left out, so it measures throughput and nothing else.
+ */
+function subgroupMatrixGemm(componentType: "f32" | "f16", size: number): string {
+  const enables = `${componentType === "f16" ? "enable f16;\n" : ""}enable chromium_experimental_subgroup_matrix;\n`;
+  const buffer = componentType === "f16" ? "f16" : "f32";
+  return `${enables}${PARAMETERS.replace("array<f32>;\n@group(0) @binding(1) var<storage, read> weights: array<f32>;",
+    `array<${buffer}>;\n@group(0) @binding(1) var<storage, read> weights: array<${buffer}>;`)}
+@compute @workgroup_size(32, 1, 1)
+fn main(@builtin(workgroup_id) group: vec3<u32>) {
+  let row_origin = group.y * ${size}u;
+  let column_origin = group.x * ${size}u;
+  var acc = subgroup_matrix_result<${componentType}, ${size}, ${size}>();
+  for (var k0 = 0u; k0 < parameters.inner; k0 += ${size}u) {
+    let left = subgroupMatrixLoad<subgroup_matrix_left<${componentType}, ${size}, ${size}>>(
+      &source, row_origin * parameters.inner + k0, false, parameters.inner);
+    let right = subgroupMatrixLoad<subgroup_matrix_right<${componentType}, ${size}, ${size}>>(
+      &weights, parameters.weight_offset + k0 * parameters.columns + column_origin, false, parameters.columns);
+    acc = subgroupMatrixMultiplyAccumulate(left, right, acc);
+  }
+  subgroupMatrixStore(&output, row_origin * parameters.columns + column_origin, acc,
+    false, parameters.columns);
+}`;
+}
+
 export const CANDIDATES: readonly Candidate[] = [
   { name: "current-64x128k8", shader: tiledGemm(64, 128, 8), tileRows: 64, tileColumns: 128 },
   { name: "tiled-64x64k16", shader: tiledGemm(64, 64, 16), tileRows: 64, tileColumns: 64 },
@@ -244,11 +286,18 @@ export const CANDIDATES: readonly Candidate[] = [
   // 16 KiB of workgroup storage exactly, with no headroom against the WebGPU
   // minimum, so it is measured but not shipped.
   { name: "tiled-128x128k16", shader: tiledGemm(128, 128, 16), tileRows: 128, tileColumns: 128 },
-  { name: "f16-source-64x128k8", shader: tiledGemmPackedSource(64, 128, 8), tileRows: 64, tileColumns: 128 },
+  // Reads the source as packed half words, the way the model stores it.
+  { name: "f16-source-64x128k8", shader: tiledGemmPackedSource(64, 128, 8), tileRows: 64, tileColumns: 128,
+    sourceFormat: "f16" },
   { name: "f16-math-64x128k8", shader: tiledGemm(64, 128, 8, "f16"), tileRows: 64, tileColumns: 128,
     requiresF16: true },
   { name: "f16-math-64x64k16", shader: tiledGemm(64, 64, 16, "f16"), tileRows: 64, tileColumns: 64,
     requiresF16: true },
+  { name: "matrix-f32-8x8x8", shader: subgroupMatrixGemm("f32", 8), tileRows: 8, tileColumns: 8,
+    requiresSubgroupMatrix: { componentType: "f32", size: 8 }, alignment: 8, throughputOnly: true },
+  { name: "matrix-f16-8x8x8", shader: subgroupMatrixGemm("f16", 8), tileRows: 8, tileColumns: 8,
+    requiresF16: true, requiresSubgroupMatrix: { componentType: "f16", size: 8 },
+    alignment: 8, throughputOnly: true, sourceFormat: "f16", weightFormat: "f16" },
 ];
 
 export interface Shape { readonly name: string; readonly rows: number; readonly inner: number; readonly columns: number; }
