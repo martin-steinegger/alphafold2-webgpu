@@ -26,6 +26,19 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     + vec2<f32>(update[element], update[element + 1u]));
 }`;
 
+/** The same, for an update already packed: a producer that writes the pair's
+ * storage saves a tensor the size of the pair over one that writes f32. */
+const ADD_IN_PLACE_BOTH_PACKED_SHADER = `
+const GRID_WIDTH: u32 = 32768u;
+@group(0) @binding(0) var<storage, read_write> base: array<u32>;
+@group(0) @binding(1) var<storage, read> update: array<u32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let word = id.x + id.y * GRID_WIDTH * 64u;
+  if (word >= arrayLength(&base)) { return; }
+  base[word] = pack2x16float(unpack2x16float(base[word]) + unpack2x16float(update[word]));
+}`;
+
 const PACK_HALVES_SHADER = `
 const GRID_WIDTH: u32 = 32768u;
 @group(0) @binding(0) var<storage, read> source: array<f32>;
@@ -324,16 +337,19 @@ export class WebGpuExecution {
    * elements sharing a word and no two invocations touch the same word.
    */
   async addInPlace(encoder: GPUCommandEncoder, base: GpuTensor, update: GpuTensor, label: string,
-    storage: ActivationStorage = "f32"): Promise<void> {
-    if (base.elements !== storageWords(update.elements, storage)) {
+    storage: ActivationStorage = "f32", updateStorage: ActivationStorage = "f32"): Promise<void> {
+    const packedUpdate = storage === "f16" && updateStorage === "f16";
+    if (base.elements !== (packedUpdate ? update.elements : storageWords(update.elements, storage))) {
       throw new RangeError("residual tensors must have equal sizes");
     }
-    if (storage === "f16" && update.elements % 2 !== 0) {
+    if (storage === "f16" && !packedUpdate && update.elements % 2 !== 0) {
       throw new RangeError("a packed residual needs an even element count");
     }
     const pipeline = storage === "f32"
       ? await this.pipelines.get("runtime:add-in-place", ADD_IN_PLACE_SHADER)
-      : await this.pipelines.get("runtime:add-in-place-packed", ADD_IN_PLACE_PACKED_SHADER);
+      : packedUpdate
+        ? await this.pipelines.get("runtime:add-in-place-both-packed", ADD_IN_PLACE_BOTH_PACKED_SHADER)
+        : await this.pipelines.get("runtime:add-in-place-packed", ADD_IN_PLACE_PACKED_SHADER);
     const grid = this.linearGrid(base.elements);
     this.dispatch(encoder, pipeline, [base, update], grid[0], grid[1], 1, label);
   }

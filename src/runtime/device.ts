@@ -113,10 +113,13 @@ export function estimateMonomerMemory(
   // 64-channel template pair, normalizes it and projects a pair-sized update,
   // and its blocks keep one whole 64-channel projection plus blocks.
   const templateBlock = triangleBlockRows(length, 64, 64) * length * 64 * bytes;
-  // That module is f32 throughout, whatever the pair it adds into is stored as.
-  const exactPair = checkedBytes("template pair", length, length, 128, bytes);
+  // Its three pair-shaped tensors: the 64-channel template pair, its
+  // normalized copy, and the update, which is written in the storage of the
+  // pair it is added into rather than always in f32.
+  const templatePair = checkedBytes("template pair", length, length, 64, bytes);
+  const templateUpdate = checkedBytes("template update", length, length, 128, pairBytes);
   const templateModuleBytes = options.multimer === true
-    ? pair + extra + masks + 2 * positions + 3 * exactPair + 3 * templateBlock : 0;
+    ? pair + extra + masks + 2 * positions + 2 * templatePair + templateUpdate + 3 * templateBlock : 0;
 
   // Every operation bounds its own scratch against an explicit budget, so the
   // peak is the largest single operation's working set, not a sum over the
@@ -246,6 +249,12 @@ export function monomerDeviceRequirements(
     length * length * 128 * pairBytes,
     // The triangle multiplication's whole projection matches the pair in size.
     length * length * 128 * (options.triangleWholeStorage === "f32" ? bytes : 2),
+    // Multimer's template module holds three pair-shaped tensors of its own,
+    // the widest being its 64-channel pair in f32 and its update in the pair's
+    // storage. Leaving them out asked for a buffer smaller than the run needs,
+    // which failed inside WebGPU with a size and no name.
+    options.multimer === true ? length * length * 64 * bytes : 0,
+    options.multimer === true ? length * length * 128 * pairBytes : 0,
     OUTER_PRODUCT_BLOCK_LIMIT_BYTES,
   );
   if (!Number.isSafeInteger(largestTensor)) throw new RangeError("monomer tensor size exceeds JavaScript precision");

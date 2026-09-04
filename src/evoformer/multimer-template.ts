@@ -79,26 +79,50 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }`;
 }
 
-const OUTPUT_SHADER = `
+/**
+ * The template's pair update, in the storage of the pair it is added into.
+ *
+ * At 1400 residues an f32 update is a 980 MiB buffer, past what browsers on
+ * Apple hand out, and the pair it joins is packed anyway.
+ */
+function createOutputShader(storage: ActivationStorage): string {
+  const projected = (channel: string): string => `{
+    var value = bias[${channel}];
+    for (var c = 0u; c < p.input_channels; c += 1u) {
+      value += max(source[row * p.input_channels + c], 0.0) * weight[c * p.output_channels + ${channel}];
+    }
+    projection = value;
+  }`;
+  const body = storage === "f16"
+    ? `  let word = id.x + id.y * GRID_WIDTH * 64u;
+  if (word >= p.rows * p.output_channels / 2u) { return; }
+  let out = (word * 2u) % p.output_channels;
+  let row = (word * 2u) / p.output_channels;
+  var projection = 0.0;
+  ${projected("out")}
+  let low = projection;
+  ${projected("out + 1u")}
+  output[word] = pack2x16float(vec2<f32>(low, projection));`
+    : `  let index = id.x + id.y * GRID_WIDTH * 64u;
+  if (index >= p.rows * p.output_channels) { return; }
+  let row = index / p.output_channels;
+  let out = index % p.output_channels;
+  var projection = 0.0;
+  ${projected("out")}
+  output[index] = projection;`;
+  return `
 struct P { rows: u32, input_channels: u32, output_channels: u32 };
 const GRID_WIDTH: u32 = 32768u;
 @group(0) @binding(0) var<storage, read> source: array<f32>;
 @group(0) @binding(1) var<storage, read> weight: array<f32>;
 @group(0) @binding(2) var<storage, read> bias: array<f32>;
 @group(0) @binding(3) var<uniform> p: P;
-@group(0) @binding(4) var<storage, read_write> output: array<f32>;
+@group(0) @binding(4) var<storage, read_write> output: array<${storageArray(storage)}>;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x + id.y * GRID_WIDTH * 64u;
-  if (index >= p.rows * p.output_channels) { return; }
-  let row = index / p.output_channels;
-  let out = index % p.output_channels;
-  var value = bias[out];
-  for (var c = 0u; c < p.input_channels; c += 1u) {
-    value += max(source[row * p.input_channels + c], 0.0) * weight[c * p.output_channels + out];
-  }
-  output[index] = value;
+${body}
 }`;
+}
 
 const MSA_SHADER = `
 struct P { length: u32, rows: u32, channels: u32 };
@@ -262,8 +286,8 @@ export class MultimerMockTemplateGpu {
       const outputBias = execution.upload("multimer-template.output-bias", weightsValue.outputBias);
       const outputParams = execution.upload("multimer-template.output-params",
         new Uint32Array([pairs, templateChannels, pairChannels]), GPUBufferUsage.UNIFORM);
-      const pairUpdate = execution.allocate("multimer-template.pair-update", pairs * pairChannels,
-        GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+      const pairUpdate = execution.allocate("multimer-template.pair-update",
+        storageWords(pairs * pairChannels, pairStorage), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
       const msaInputWeight = execution.upload("multimer-template.msa-input-weight", weightsValue.msaInputWeight);
       const msaInputBias = execution.upload("multimer-template.msa-input-bias", weightsValue.msaInputBias);
       const msaOutputWeight = execution.upload("multimer-template.msa-output-weight", weightsValue.msaOutputWeight);
@@ -274,7 +298,7 @@ export class MultimerMockTemplateGpu {
         GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
       const [normalize, outputPipeline, msaPipeline] = await Promise.all([
         execution.pipelines.get("multimer-template:normalize", ATTENTION_NORMALIZE_SHADER),
-        execution.pipelines.get("multimer-template:output", OUTPUT_SHADER),
+        execution.pipelines.get(`multimer-template:output:${pairStorage}`, createOutputShader(pairStorage)),
         execution.pipelines.get("multimer-template:msa", MSA_SHADER),
       ]);
       encoder = this.device.createCommandEncoder({ label: "multimer-template.output" });
@@ -282,13 +306,14 @@ export class MultimerMockTemplateGpu {
       // The same for the output projection, whose update is the widest row of
       // the three at 128 channels.
       for (const window of rowWindows(pairs, execution.bindingLimitBytes,
-        [templateChannels * 4, pairChannels * 4])) {
+        [templateChannels * 4, storageWords(pairChannels, pairStorage) * 4])) {
         const templateWindow = execution.view(templatePair,
           window.offset * templateChannels, window.count * templateChannels);
         const normalizedWindow = execution.view(outputNormalized,
           window.offset * templateChannels, window.count * templateChannels);
         const updateWindow = execution.view(pairUpdate,
-          window.offset * pairChannels, window.count * pairChannels);
+          storageWords(window.offset * pairChannels, pairStorage),
+          storageWords(window.count * pairChannels, pairStorage));
         const windowNormParams = execution.upload(`multimer-template.output-norm-params-${window.offset}`,
           createAttentionNormParameters(window.count, templateChannels, 0, templateChannels,
             false, 1, window.count, 1e-5), GPUBufferUsage.UNIFORM);
@@ -298,7 +323,7 @@ export class MultimerMockTemplateGpu {
         execution.dispatch(encoder, normalize,
           [templateWindow, outputNormWeights, windowNormParams, normalizedWindow],
           grid[0], grid[1], 1, `multimer-template.output-normalize-${window.offset}`);
-        grid = execution.linearGrid(window.count * pairChannels);
+        grid = execution.linearGrid(storageWords(window.count * pairChannels, pairStorage));
         execution.dispatch(encoder, outputPipeline,
           [normalizedWindow, outputWeight, outputBias, windowOutputParams, updateWindow],
           grid[0], grid[1], 1, `multimer-template.output-${window.offset}`);

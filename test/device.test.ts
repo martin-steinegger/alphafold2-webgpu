@@ -146,17 +146,22 @@ describe("requestAlphaFoldDevice", () => {
 });
 
 describe("estimateMonomerMemory", () => {
-  it("charges Multimer-v3 for its template rows and template module", () => {
-    const monomer = estimateMonomerMemory(590, 508, 2048, "full");
-    const multimer = estimateMonomerMemory(590, 508, 2048, "full", { multimer: true, templateRows: 4 });
-    expect(multimer.estimatedPeakBytes).toBeGreaterThan(monomer.estimatedPeakBytes);
-    // The template module holds several pair-sized tensors beside the pair and
-    // the extra alignment, so at this size it sets the peak: about three pair
-    // representations (170 MiB each at 590 residues) above the trunk terms.
-    const pair = 590 * 590 * 128 * 2;
-    expect(multimer.estimatedPeakBytes - monomer.estimatedPeakBytes).toBeGreaterThan(pair);
-    // A ten-copy 59-mer at the page's multimer defaults is over a gigabyte live.
-    expect(multimer.estimatedPeakBytes).toBeGreaterThan(1000 * 1024 ** 2);
+  it("charges Multimer-v3 for the pair-shaped tensors its template module holds", () => {
+    // Three of them: the 64-channel template pair, its normalized copy, and
+    // the update, which is written in the storage of the pair it joins. With a
+    // shallow alignment that module is the peak, so the difference from the
+    // monomer is what it holds beyond the trunk.
+    const monomer = estimateMonomerMemory(590, 128, 256, "full");
+    const multimer = estimateMonomerMemory(590, 128, 256, "full", { multimer: true, templateRows: 4 });
+    const templatePair = 590 * 590 * 64 * 4;
+    const difference = multimer.estimatedPeakBytes - monomer.estimatedPeakBytes;
+    expect(difference).toBeGreaterThan(templatePair);
+    expect(difference).toBeLessThan(3 * templatePair);
+    // A deep alignment puts the trunk above that module, and the estimate then
+    // charges Multimer only for the template rows it adds to the alignment.
+    const deepMonomer = estimateMonomerMemory(590, 508, 2048, "full");
+    const deepMultimer = estimateMonomerMemory(590, 508, 2048, "full", { multimer: true, templateRows: 4 });
+    expect(deepMultimer.estimatedPeakBytes).toBeGreaterThanOrEqual(deepMonomer.estimatedPeakBytes);
   });
 
   // Combined resident peaks measured on GB10 with the model's packed storage.

@@ -38,6 +38,13 @@ const plan = planMonomerDevice(adapter, length, 1, 1, undefined, false,
 console.error(`chains ${chains.map((chain) => chain.length).join("+")} = ${length} residues; estimated peak `
   + `${(plan.memory.estimatedPeakBytes / 1024 ** 2).toFixed(0)} MiB`);
 const device = await requestAlphaFoldDevice(adapter, plan.requirements);
+// The largest single buffer is what a device's maxBufferSize refuses first.
+let largestBufferBytes = 0;
+const createBuffer = device.createBuffer.bind(device);
+(device as { createBuffer: GPUDevice["createBuffer"] }).createBuffer = (descriptor: GPUBufferDescriptor) => {
+  largestBufferBytes = Math.max(largestBufferBytes, descriptor.size);
+  return createBuffer(descriptor);
+};
 try {
   // AFWEBGPU_COMPLEX_MSA=1 searches the public ColabFold server for paired and
   // unpaired alignments, which is the only way to judge a complex's confidence.
@@ -75,6 +82,7 @@ const prediction = await new AlphaFoldMultimerGpu(device, storage).predict(featu
     meanPlddt: Number(prediction.final.confidence.meanPlddt.toFixed(2)),
     ptm: Number(prediction.final.confidence.ptm.toFixed(3)),
     iptm: (prediction.final.confidence as { iptm?: number }).iptm,
+    largestBufferMiB: Math.round(largestBufferBytes / 1024 ** 2),
   }));
 } finally {
   device.destroy();

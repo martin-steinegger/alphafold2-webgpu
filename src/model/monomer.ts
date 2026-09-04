@@ -554,8 +554,9 @@ export class AlphaFoldMonomerGpu {
           const templateMsa = template.msaRowsTensor!;
           const templateEncoder = this.device.createCommandEncoder({ label: `multimer.template-merge-${recycle}` });
           this.device.pushErrorScope("validation");
+          // The template now writes its update in the pair's own storage.
           await execution.addInPlace(templateEncoder, embedding.pairWithoutTemplates, templatePair,
-            `multimer.template-pair-residual-${recycle}`, this.pairStorage);
+            `multimer.template-pair-residual-${recycle}`, this.pairStorage, this.pairStorage);
           if (this.msaStorage === "f32") {
             execution.endComputePass(templateEncoder);
             templateEncoder.copyBufferToBuffer(templateMsa.allocation.buffer, 0,
