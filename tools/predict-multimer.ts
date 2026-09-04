@@ -58,6 +58,15 @@ const prediction = await new AlphaFoldMultimerGpu(device, storage).predict(featu
     console.error(`recycle=${recycle} pLDDT=${summary.confidence.meanPlddt.toFixed(1)} pTM=${summary.confidence.ptm.toFixed(3)}`
       + ` ipTM=${(summary.confidence as { iptm?: number }).iptm?.toFixed(3) ?? "-"} time=${(summary.elapsedMilliseconds / 1000).toFixed(2)} s`);
   });
+  // AFWEBGPU_PDB_OUT writes the structure, for reproducing viewer problems.
+  const pdbOut = process.env.AFWEBGPU_PDB_OUT;
+  if (pdbOut !== undefined) {
+    const { predictionToPdb } = await import("../web/prediction-results.js");
+    const { writeFile } = await import("node:fs/promises");
+    await writeFile(pdbOut, predictionToPdb(chains.join(""), prediction.final.structure,
+      prediction.final.confidence.plddt, chains.map((chain) => chain.length)));
+    console.error(`wrote ${pdbOut}`);
+  }
   console.log(JSON.stringify({
     length, chains: chains.map((chain) => chain.length), recycles,
     millisecondsPerRecycle: Math.round(prediction.elapsedMilliseconds / recycles),

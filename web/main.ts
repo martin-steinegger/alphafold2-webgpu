@@ -309,6 +309,25 @@ function loadViewer(): Promise<ThreeDmolApi> {
 }
 
 /** Paints the viewer by confidence, by chain or along the sequence. */
+/**
+ * Runs one interaction on the 3D viewer, and survives it failing.
+ *
+ * 3Dmol renders through WebGL from a CDN build, and a browser that refuses a
+ * draw takes the whole handler down with it: on Firefox for macOS a camera fit
+ * threw inside its renderer and left the results page dead to further clicks.
+ * The structure is one of eight views of a prediction, so a viewer that will
+ * not draw costs the model, not the run: the failure goes to the log and every
+ * other view, and the downloads, keep working.
+ */
+function withViewer(what: string, action: (viewer: Viewer3D) => void): boolean {
+  if (currentViewer === undefined) return false;
+  try { action(currentViewer); return true; } catch (error) {
+    log(`3D viewer: ${what} failed (${error instanceof Error ? error.message : String(error)}). `
+      + "The other views and the downloads are unaffected.");
+    return false;
+  }
+}
+
 function applyViewerColoring(
   viewer: Viewer3D, mode: string, chainCount: number, focus?: readonly number[],
 ): void {
@@ -332,7 +351,12 @@ function applyViewerColoring(
       if (focus.includes(index)) { selection.push(letter); continue; }
       viewer.setStyle({ chain: letter }, { cartoon: { color: "#d8dee3", opacity: .35 } });
     }
-    viewer.zoomTo({ chain: selection });
+    // The fit is the part that fails on some builds; the styles above are
+    // what the click was for, so they stand even when it does.
+    try { viewer.zoomTo({ chain: selection }); } catch (error) {
+      log(`3D viewer: could not fit the camera to the interface `
+        + `(${error instanceof Error ? error.message : String(error)}).`);
+    }
   }
 }
 
@@ -351,12 +375,17 @@ async function showStructure(pdb: string, chainCount: number, mode: string): Pro
     // CDN build to fail for newly displayed multimer models.
     viewer.zoomTo(); viewer.render();
     currentViewer = viewer;
-    viewerResizeObserver = new ResizeObserver(() => { viewer.resize(); viewer.render(); });
+    viewerResizeObserver = new ResizeObserver(() => withViewer("resizing", () => {
+      viewer.resize(); viewer.render();
+    }));
     viewerResizeObserver.observe(container);
   } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
     const message = document.createElement("p");
-    message.textContent = `${error instanceof Error ? error.message : String(error)}. The PDB download is still available.`;
+    message.textContent = `${detail}. The PDB download is still available.`;
     container.append(message);
+    // Also in the run log, which is what gets copied into a bug report.
+    log(`3D viewer: the structure would not draw (${detail}). Every other view and the downloads are unaffected.`);
   }
 }
 
@@ -846,11 +875,11 @@ async function runPrediction(): Promise<void> {
   } finally { button.disabled = false; clearCacheButton.disabled = false; stopButton.hidden = true; }
 }
 element<HTMLSelectElement>("viewer-color").addEventListener("change", (event) => {
-  if (currentViewer !== undefined) {
-    applyViewerColoring(currentViewer, (event.currentTarget as HTMLSelectElement).value, currentChainCount,
-      currentInterface);
-    currentViewer.render();
-  }
+  const mode = (event.currentTarget as HTMLSelectElement).value;
+  withViewer("recolouring", (viewer) => {
+    applyViewerColoring(viewer, mode, currentChainCount, currentInterface);
+    viewer.render();
+  });
 });
 
 /**
@@ -891,12 +920,13 @@ function updateInterfaceSelection(): void {
           + " Click the block again to show every chain.";
     drawPaeHighlight();
   }
-  if (currentViewer === undefined) return;
   const mode = element<HTMLSelectElement>("viewer-color").value;
   const focus = currentInterface === undefined ? undefined : [...new Set(currentInterface)];
-  applyViewerColoring(currentViewer, mode, currentChainCount, focus);
-  if (focus === undefined) currentViewer.zoomTo();
-  currentViewer.render();
+  withViewer("isolating the interface", (viewer) => {
+    applyViewerColoring(viewer, mode, currentChainCount, focus);
+    if (focus === undefined) viewer.zoomTo();
+    viewer.render();
+  });
 }
 
 /** Outlines the chosen block on the matrix that is already drawn. */
