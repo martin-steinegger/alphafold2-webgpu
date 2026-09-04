@@ -15,10 +15,25 @@ kernel, so each branch uses whatever it would select for itself.
 | branch | kernel | recycles | elapsed | mean pLDDT | pTM | ipTM |
 |---|---|---|---|---|---|---|
 | `main` | f32 64x128k8 | 0 | 746 s | 32.3469 | 0.19455 | 0.17473 |
+| `f16-projection` | f16-chunked 64x128k16 | 0 | 668 s | 32.3388 | 0.19457 | 0.17472 |
+
+**The input still runs, and it runs 1.117x faster.** That is a much larger
+gain than the 1.044x the 59-residue monomer showed, which is what you would
+expect: the dense projections are a bigger share of the work at 1,416
+residues, so the same kernel is worth more of it. This is the longest input
+either branch can predict and it is also where half precision pays best.
 
 The confidence is low because this is a 24-copy homomer with no alignment at
 all, one sequence deep. That is expected and is not what the run measures: the
 question is whether 1,416 residues completes and comes back finite.
+
+Mean pLDDT moves by 0.008 and pTM and ipTM by 0.00002, far inside the gate.
+An earlier run of this input recorded confidence identical to `main` in every
+printed digit, which looked like the kernel toggle having failed; it was the
+probe having selected f32 that time, before its timing batch was fixed. Note
+also that a mean over 1,416 residues damps per-residue perturbation by about
+a factor of 38, so this input is a weak accuracy test however it comes out —
+the 59-residue differential is the sensitive one.
 
 Estimated peak allocation was 2,440 MiB — 502 MiB persistent, 605 MiB scratch,
 433 MiB resident allowance — against the 5,734 MiB Apple unified-memory safety
