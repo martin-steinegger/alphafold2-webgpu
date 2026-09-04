@@ -31,8 +31,21 @@ import {
 const PROBE_ROWS = 1024;
 const PROBE_INNER = 512;
 const PROBE_COLUMNS = 512;
-const PROBE_DISPATCHES = 4;
 const PROBE_REPEATS = 3;
+
+/**
+ * How long one timed batch should take, and the resolution that forces.
+ *
+ * A browser clamps `performance.now` to about 0.1 ms, so a batch of four
+ * dispatches of a 0.4 ms kernel can only be measured to about 6% — coarser
+ * than the 10% to 15% that separates these variants, which makes the ranking
+ * noise. Measured that way the probe picked the slowest half-precision
+ * arrangement over the fastest. So a rough pass sizes the real batch to reach
+ * this many milliseconds, the way `gemm-calibration.spec.ts` already does.
+ */
+const PROBE_BATCH_MILLISECONDS = 20;
+const PROBE_ROUGH_DISPATCHES = 4;
+const PROBE_MAX_DISPATCHES = 2000;
 
 /**
  * Shape the correctness check runs at, and how wrong a candidate may be.
@@ -268,22 +281,27 @@ async function measureTime(device: GPUDevice, variant: GemmVariant, probe: Probe
   const [x, y] = gemmGrid(probe.rows, probe.columns);
   // A submission costs a millisecond or two to come back and the clock is
   // coarse, both of which swamp one dispatch of a few hundred microseconds, so
-  // a batch is what gets timed.
-  const batch = async (): Promise<number> => {
+  // a batch of dispatches is what gets timed.
+  const batch = async (dispatches: number): Promise<number> => {
     const encoder = device.createCommandEncoder({ label: `gemm-selection.time.${variant.precision}` });
     const pass = encoder.beginComputePass();
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, group);
-    for (let dispatch = 0; dispatch < PROBE_DISPATCHES; dispatch += 1) pass.dispatchWorkgroups(x, y, 1);
+    for (let dispatch = 0; dispatch < dispatches; dispatch += 1) pass.dispatchWorkgroups(x, y, 1);
     pass.end();
     const started = performance.now();
     device.queue.submit([encoder.finish()]);
     await device.queue.onSubmittedWorkDone();
-    return (performance.now() - started) / PROBE_DISPATCHES;
+    return (performance.now() - started) / dispatches;
   };
-  await batch();
+  // The rough pass also warms the pipeline, so its own time is discarded.
+  const rough = await batch(PROBE_ROUGH_DISPATCHES);
+  const dispatches = Math.max(PROBE_ROUGH_DISPATCHES, Math.min(PROBE_MAX_DISPATCHES,
+    Math.ceil(PROBE_BATCH_MILLISECONDS / Math.max(rough, 0.01))));
   let best = Number.POSITIVE_INFINITY;
-  for (let repeat = 0; repeat < PROBE_REPEATS; repeat += 1) best = Math.min(best, await batch());
+  for (let repeat = 0; repeat < PROBE_REPEATS; repeat += 1) {
+    best = Math.min(best, await batch(dispatches));
+  }
   return best;
 }
 

@@ -279,9 +279,11 @@ test("the per-device probe picks what the sweep picks", async ({ page }) => {
       .filter((feature) => adapter.features.has(feature));
     const device = await adapter.requestDevice({ requiredFeatures: features });
     const started = performance.now();
-    const measurements = await selection.measureGemmVariants(device);
-    const probeMilliseconds = performance.now() - started;
     const winner = await selection.calibrateGemmVariant(device);
+    const probeMilliseconds = performance.now() - started;
+    // A second, independent pass. If the two disagree about the ranking, the
+    // probe is not resolving these variants apart and its choice is noise.
+    const measurements = await selection.measureGemmVariants(device);
     const lines = [`probe cost: ${probeMilliseconds.toFixed(0)} ms`];
     for (const measurement of [...measurements].sort((a, b) => a.milliseconds - b.milliseconds)) {
       lines.push(`  ${selection.gemmVariantName(measurement.variant).padEnd(24)} `
@@ -289,11 +291,25 @@ test("the per-device probe picks what the sweep picks", async ({ page }) => {
         + `error ${(measurement.relativeError * 100).toFixed(3)}%`);
     }
     device.destroy();
-    return { lines, winner: selection.gemmVariantName(winner), probeMilliseconds };
+    const ranked = [...measurements].sort((a, b) => a.milliseconds - b.milliseconds);
+    const chosen = measurements.find(
+      (measurement) => selection.gemmVariantName(measurement.variant) === selection.gemmVariantName(winner),
+    );
+    return {
+      lines, winner: selection.gemmVariantName(winner), probeMilliseconds,
+      fastest: ranked[0]?.milliseconds ?? Number.NaN,
+      chosenMilliseconds: chosen?.milliseconds ?? Number.NaN,
+    };
   }, { root });
   console.log(`\nGEMM PROBE\n${outcome.lines.join("\n")}\nchose: ${outcome.winner}\n`);
   // Whatever it chooses has to be one the prediction gate cleared.
   expect(["f32", "f16-chunked", "f16-mixed"].some((precision) => outcome.winner.startsWith(precision)))
     .toBe(true);
-  expect(outcome.winner).not.toContain("f16-64x");
+  expect(outcome.winner).not.toMatch(/^f16-64x/u);
+  // And it has to be one of the fast ones. A probe whose batch is too short to
+  // resolve these variants apart picks by noise, and picked the slowest
+  // half-precision arrangement over the fastest until the batch was sized to
+  // the clock. Being within a tenth of the best is the loosest check that
+  // still fails that.
+  expect(outcome.chosenMilliseconds).toBeLessThan(outcome.fastest * 1.1);
 });
