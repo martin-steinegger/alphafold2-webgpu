@@ -8,7 +8,7 @@
  * that will run the model. This measures every candidate at the shapes the
  * model actually runs and prints a table to paste back.
  */
-import { test } from "@playwright/test";
+import { expect, test } from "@playwright/test";
 import { CANDIDATES, SHAPES } from "../../tools/gemm-candidates.js";
 
 test.skip(process.env.AFWEBGPU_GEMM_CALIBRATION !== "1", "set AFWEBGPU_GEMM_CALIBRATION=1");
@@ -246,4 +246,54 @@ test("measures every projection kernel", async ({ page }) => {
     return lines;
   }, { candidates: CANDIDATES.map((c) => ({ ...c })), shapes: SHAPES.map((s) => ({ ...s })) });
   console.log(`\nGEMM CALIBRATION\n${report.join("\n")}\n`);
+});
+
+
+/**
+ * Whether the per-device probe agrees with the full sweep.
+ *
+ * `gemm-selection.ts` measures one shape at device creation and has to choose
+ * what an eight-shape sweep would have chosen. If it does not, the probe shape
+ * is unrepresentative, and the whole mechanism quietly ships the wrong kernel
+ * on every device: a selector that measures the wrong thing is worse than a
+ * constant, because it looks as though it was measured.
+ */
+test("the per-device probe picks what the sweep picks", async ({ page }) => {
+  test.setTimeout(10 * 60_000);
+  page.on("console", (message) => console.log(`browser: ${message.text()}`));
+  const root = process.cwd();
+  await page.goto("/");
+  const outcome = await page.evaluate(async ({ root }) => {
+    const selection = await import(/* @vite-ignore */
+      `/@fs${root}/src/runtime/gemm-selection.ts`) as {
+        measureGemmVariants(device: GPUDevice): Promise<readonly {
+          variant: { precision: string; inner: number };
+          milliseconds: number; relativeError: number;
+        }[]>;
+        calibrateGemmVariant(device: GPUDevice): Promise<{ precision: string; inner: number }>;
+        gemmVariantName(variant: { precision: string; inner: number }): string;
+      };
+    const adapter = await navigator.gpu?.requestAdapter({ powerPreference: "high-performance" });
+    if (adapter === null || adapter === undefined) return { lines: ["no adapter"], winner: "none" };
+    const features = (["shader-f16", "subgroups"] as GPUFeatureName[])
+      .filter((feature) => adapter.features.has(feature));
+    const device = await adapter.requestDevice({ requiredFeatures: features });
+    const started = performance.now();
+    const measurements = await selection.measureGemmVariants(device);
+    const probeMilliseconds = performance.now() - started;
+    const winner = await selection.calibrateGemmVariant(device);
+    const lines = [`probe cost: ${probeMilliseconds.toFixed(0)} ms`];
+    for (const measurement of [...measurements].sort((a, b) => a.milliseconds - b.milliseconds)) {
+      lines.push(`  ${selection.gemmVariantName(measurement.variant).padEnd(24)} `
+        + `${measurement.milliseconds.toFixed(3)} ms   `
+        + `error ${(measurement.relativeError * 100).toFixed(3)}%`);
+    }
+    device.destroy();
+    return { lines, winner: selection.gemmVariantName(winner), probeMilliseconds };
+  }, { root });
+  console.log(`\nGEMM PROBE\n${outcome.lines.join("\n")}\nchose: ${outcome.winner}\n`);
+  // Whatever it chooses has to be one the prediction gate cleared.
+  expect(["f32", "f16-chunked", "f16-mixed"].some((precision) => outcome.winner.startsWith(precision)))
+    .toBe(true);
+  expect(outcome.winner).not.toContain("f16-64x");
 });

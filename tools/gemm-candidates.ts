@@ -256,6 +256,113 @@ ${Array.from({ length: registerRows }, (_, index) =>
 
 
 /**
+ * The same arrangement with a wider register block.
+ *
+ * `f16-source` measured at 1.0x, so the projection is not bandwidth-bound; it
+ * is compute-bound at about 2.85 TFLOP/s, well under this GPU's f32 peak. The
+ * shipped tiling gives each invocation eight rows by four columns, which is 32
+ * multiply-adds against twelve staged reads per k step. Widening the block to
+ * eight columns doubles the arithmetic per thread to 64 against sixteen reads,
+ * a ratio of 4.0 rather than 2.67, at the cost of twice the accumulator
+ * registers. Whether that pays depends on whether the occupancy it loses is
+ * worth more than the loads it saves, which is a question for the device.
+ */
+function tiledGemmWide(
+  tileRows: number, tileColumns: number, tileInner: number,
+  columnVectors: number, precision: "f32" | "f16" | "f16-chunked" = "f32",
+): string {
+  const half = precision !== "f32";
+  const scalar = half ? "f16" : "f32";
+  const chunked = precision === "f16-chunked";
+  const threads = 256;
+  const registerColumns = 4 * columnVectors;
+  const columnThreads = tileColumns / registerColumns;
+  const rowThreads = threads / columnThreads;
+  const registerRows = tileRows / rowThreads;
+  if (![columnThreads, rowThreads, registerRows].every(Number.isInteger)) {
+    throw new Error(`bad wide tiling ${tileRows}x${tileColumns} r${registerColumns}`);
+  }
+  const weightVectors = (tileInner * tileColumns) / 4;
+  const each = (count: number, body: (index: number) => string): string =>
+    Array.from({ length: count }, (_, index) => body(index)).join("\n");
+  const pairs = (body: (row: number, vector: number) => string): string =>
+    Array.from({ length: registerRows }, (_, row) =>
+      Array.from({ length: columnVectors }, (_, vector) => body(row, vector)).join("\n")).join("\n");
+  return `${half ? "enable f16;\n" : ""}${PARAMETERS}
+var<workgroup> tile_source: array<${scalar}, ${tileRows * tileInner}>;
+var<workgroup> tile_weight: array<vec4<${scalar}>, ${weightVectors}>;
+
+@compute @workgroup_size(${threads}, 1, 1)
+fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) group: vec3<u32>) {
+  let thread = local.x;
+  let column_thread = thread % ${columnThreads}u;
+  let row_thread = thread / ${columnThreads}u;
+  let row_base = row_thread * ${registerRows}u;
+  let row_origin = group.y * ${tileRows}u;
+  let column_origin = group.x * ${tileColumns}u;
+  // One invocation owns ${columnVectors} adjacent vectors, so its columns are
+  // strided by the whole thread block rather than contiguous: that keeps every
+  // lane of a shared vector read by one invocation.
+  let column = column_origin + column_thread * 4u;
+${pairs((row, vector) => `  var acc${row}_${vector} = vec4<f32>(0.0);`)}
+
+  for (var k0 = 0u; k0 < parameters.inner; k0 += ${tileInner}u) {
+    for (var item = thread; item < ${tileRows * tileInner}u; item += ${threads}u) {
+      let load_row = item / ${tileInner}u;
+      let load_k = item % ${tileInner}u;
+      let source_row = row_origin + load_row;
+      let source_k = k0 + load_k;
+      var value = 0.0;
+      if (source_row < parameters.rows && source_k < parameters.inner) {
+        value = source[source_row * parameters.inner + source_k];
+      }
+      tile_source[load_k * ${tileRows}u + load_row] = ${half ? "f16(value)" : "value"};
+    }
+    for (var item = thread; item < ${weightVectors}u; item += ${threads}u) {
+      let load_k = item / ${tileColumns / 4}u;
+      let load_column = (item % ${tileColumns / 4}u) * 4u;
+      let weight_k = k0 + load_k;
+      var value = vec4<f32>(0.0);
+      if (weight_k < parameters.inner) {
+        for (var lane = 0u; lane < 4u; lane += 1u) {
+          let output_column = column_origin + load_column + lane;
+          if (output_column < parameters.columns) {
+            value[lane] = weights[parameters.weight_offset + weight_k * parameters.columns + output_column];
+          }
+        }
+      }
+      tile_weight[item] = ${half ? `vec4<${scalar}>(value)` : "value"};
+    }
+    workgroupBarrier();
+${chunked ? `${pairs((row, vector) => `    var chunk${row}_${vector} = vec4<f16>(0.0);`)}\n` : ""}    for (var k = 0u; k < ${tileInner}u; k += 1u) {
+${each(columnVectors, (vector) =>
+    `      let w${vector} = tile_weight[k * ${tileColumns / 4}u + column_thread + ${vector * columnThreads}u];`)}
+${each(registerRows, (row) => `      let a${row} = tile_source[k * ${tileRows}u + row_base + ${row}u];`)}
+${pairs((row, vector) => chunked
+    ? `      chunk${row}_${vector} += a${row} * w${vector};`
+    : `      acc${row}_${vector} += ${half ? `vec4<f32>(a${row} * w${vector})` : `a${row} * w${vector}`};`)}
+    }${chunked ? `\n${pairs((row, vector) => `    acc${row}_${vector} += vec4<f32>(chunk${row}_${vector});`)}` : ""}
+    workgroupBarrier();
+  }
+
+${pairs((row, vector) => `  {
+    let out_row = row_origin + row_base + ${row}u;
+    let out_column = column + ${vector * columnThreads}u * 4u;
+    if (out_row < parameters.rows) {
+      var value = acc${row}_${vector};
+      for (var lane = 0u; lane < 4u; lane += 1u) {
+        if (out_column + lane < parameters.columns) {
+          var stored = value[lane] + weights[parameters.bias_offset + out_column + lane];
+          if (parameters.activation == 1u) { stored = max(stored, 0.0); }
+          output[out_row * parameters.columns + out_column + lane] = stored;
+        }
+      }
+    }
+  }`)}
+}`;
+}
+
+/**
  * The same tiling, reading A as packed f16 pairs.
  *
  * shader-f16 is unavailable on this adapter, but unpack2x16float is core WGSL,
@@ -342,6 +449,14 @@ export const CANDIDATES: readonly Candidate[] = [
     tileColumns: 128, requiresF16: true },
   { name: "f16-chunked-64x64k16", shader: tiledGemm(64, 64, 16, "f16-chunked"), tileRows: 64,
     tileColumns: 64, requiresF16: true },
+  // Eight columns per invocation instead of four.
+  { name: "wide-128x128k8r8", shader: tiledGemmWide(128, 128, 8, 2), tileRows: 128, tileColumns: 128 },
+  { name: "wide-64x128k8r8", shader: tiledGemmWide(64, 128, 8, 2), tileRows: 64, tileColumns: 128 },
+  { name: "wide-128x256k8r8", shader: tiledGemmWide(128, 256, 8, 2), tileRows: 128, tileColumns: 256 },
+  { name: "f16-chunked-wide-128x128k8r8", shader: tiledGemmWide(128, 128, 8, 2, "f16-chunked"),
+    tileRows: 128, tileColumns: 128, requiresF16: true },
+  { name: "f16-chunked-wide-128x256k8r8", shader: tiledGemmWide(128, 256, 8, 2, "f16-chunked"),
+    tileRows: 128, tileColumns: 256, requiresF16: true },
   { name: "matrix-f32-8x8x8", shader: subgroupMatrixGemm("f32", 8), tileRows: 8, tileColumns: 8,
     requiresSubgroupMatrix: { componentType: "f32", size: 8 }, alignment: 8, throughputOnly: true },
   // An f16 matrix produces an f16 result, which only an f16 buffer can hold.

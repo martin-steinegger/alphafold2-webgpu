@@ -335,7 +335,10 @@ export function calibrateGemmVariant(device: GPUDevice): Promise<GemmVariant> {
       const half = [fastest("f16-chunked"), fastest("f16-mixed")]
         .filter((measurement) => measurement !== undefined)
         .sort((left, right) => left.milliseconds - right.milliseconds)[0];
-      const winner = exact === undefined ? half?.variant ?? GEMM_VARIANT_F32
+      // If the f32 kernel itself did not reproduce the reference, the probe is
+      // what is broken, not the arithmetic: there is nothing to compare
+      // against, so nothing is changed.
+      const winner = exact === undefined ? GEMM_VARIANT_F32
         : half !== undefined && half.milliseconds * HALF_PRECISION_MARGIN < exact.milliseconds
           ? half.variant : exact.variant;
       setGemmVariant(winner);
