@@ -199,6 +199,42 @@ Half precision must also beat f32 by a margin of 1.1x before it is chosen, so
 an adapter that merely emulates f16 stays exact rather than trading accuracy
 for measurement noise.
 
+### The probe has to out-resolve the clock
+
+The first version of the probe timed four dispatches. A browser clamps
+`performance.now` to about 0.1 ms, so four dispatches of a 0.4 ms kernel
+resolve to about 6% — coarser than the 10% to 15% that separates these
+variants. Every measurement came back quantised to 0.025 ms, and the probe
+duly installed `f16-mixed`, the slowest half-precision arrangement, over
+`f16-chunked`, the fastest. It was ranking noise, and it would have shipped
+that way on every device.
+
+A rough pass now sizes the batch to reach 20 ms, which is what
+`gemm-calibration.spec.ts` already did. With that resolution the probe agrees
+with the eight-shape sweep:
+
+| variant | probe | error |
+|---|---|---|
+| `f16-chunked-64x128k16` | 0.202 ms | 0.060% |
+| `f16-chunked-64x128k8` | 0.216 ms | 0.044% |
+| `f16-mixed-64x128k16` | 0.225 ms | 0.021% |
+| `f16-mixed-64x128k8` | 0.228 ms | 0.021% |
+| `f32-64x128k16` | 0.240 ms | 0.000% |
+| `f32-64x128k8` | 0.248 ms | 0.000% |
+
+It chooses `f16-chunked-64x128k16` and costs about 280 ms once per device. The
+absolute times halved when the batch grew, which says the short batch was
+measuring submission overhead as much as the kernel.
+
+`gemm-calibration.spec.ts` asserts the installed variant is within a tenth of
+the fastest measured, and measures twice: two passes that disagree about the
+ranking mean the probe cannot tell these kernels apart. That is the check that
+would have caught the original.
+
+This is also why the prediction gate covers every variant in the shippable set
+rather than only the one that wins here. Which one wins is a measurement, and
+measurements move.
+
 ## A side effect worth someone's attention
 
 `src/triangle/webgpu.ts` already accepts a `precision: "f16"` option, guards it
