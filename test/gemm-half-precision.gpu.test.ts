@@ -18,10 +18,27 @@ import { gemmVariantName } from "../src/runtime/gemm-selection.js";
 
 const enabled = process.env.AFWEBGPU_GPU_TESTS === "1";
 
-const VARIANTS: readonly GemmVariant[] = [
-  { precision: "f32", inner: 8 }, { precision: "f32", inner: 16 },
-  { precision: "f16", inner: 8 }, { precision: "f16", inner: 16 },
-];
+/**
+ * Every arrangement the generator can emit, including pure `f16`, which the
+ * model does not ship. The kernel still has to compute the right answer at
+ * these depths; what disqualified it was a contraction over a deep MSA, which
+ * is a property of the model's magnitudes rather than of the kernel.
+ */
+const VARIANTS: readonly GemmVariant[] = ([8, 16] as const).flatMap((inner) =>
+  (["f32", "f16", "f16-mixed", "f16-chunked"] as const).map((precision) => ({ precision, inner })));
+
+/**
+ * What each arrangement may be wrong by, from the measured worst case at that
+ * depth. These bound the kernel, not the model: what half precision costs a
+ * prediction is settled by `test/browser/gemm-differential.spec.ts`.
+ */
+function tolerance(variant: GemmVariant, inner: number): number {
+  if (variant.precision === "f32") return 1e-4;
+  // Pure f16 reduces the whole of K in half precision, so its error grows
+  // with the square root of K; the other two reduce in f32 and do not.
+  if (variant.precision === "f16") return inner > 512 ? 1.5e-2 : 5e-3;
+  return 2e-3;
+}
 
 /** Values with a spread the model's activations have, and reproducible. */
 function values(count: number, seed: number): Float32Array {
@@ -196,7 +213,7 @@ describe.skipIf(!enabled)("half-precision projection", () => {
       it(`computes A x W + bias with ${name} at K=${inner}`, async (context) => {
         // Skipped rather than silently passed: a vacuous green here would be
         // indistinguishable from a verified half-precision kernel.
-        if (variant.precision === "f16" && !half) context.skip();
+        if (variant.precision !== "f32" && !half) context.skip();
         const source = values(rows * inner, 0x1234567);
         const weights = values(inner * columns, 0x89abcdef);
         const bias = values(columns, 0x2468ace);
@@ -207,20 +224,18 @@ describe.skipIf(!enabled)("half-precision projection", () => {
         // and 1% at K=1024 is what the measured worst case leaves room for.
         // These bound the kernel, not the model: what half precision costs a
         // prediction was settled end to end.
-        const tolerance = variant.precision === "f32" ? 1e-4 : inner > 512 ? 1.5e-2 : 5e-3;
-        expect(worstRelativeError(actual, expected)).toBeLessThan(tolerance);
+        expect(worstRelativeError(actual, expected)).toBeLessThan(tolerance(variant, inner));
       });
 
       it(`reaches an epilogue as vec4<f32> with ${name} at K=${inner}`, async (context) => {
-        if (variant.precision === "f16" && !half) context.skip();
+        if (variant.precision !== "f32" && !half) context.skip();
         const source = values(rows * inner, 0x13579bd);
         const weights = values(inner * columns, 0x2468ace);
         const bias = values(columns, 0x1234567);
         const expected = reference(source, weights, bias, rows, inner, columns);
         const actual = await run(epilogueShader(variant), `epilogue.${name}.k${inner}`,
           rows, inner, columns, source, weights, bias);
-        const tolerance = variant.precision === "f32" ? 1e-4 : inner > 512 ? 1.5e-2 : 5e-3;
-        expect(worstRelativeError(actual, expected)).toBeLessThan(tolerance);
+        expect(worstRelativeError(actual, expected)).toBeLessThan(tolerance(variant, inner));
       });
     }
 

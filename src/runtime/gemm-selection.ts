@@ -9,12 +9,15 @@ import { pipelineCacheForDevice } from "./pipeline-cache.js";
  *
  * One hand-tiled GEMM serves every projection in the model, and two of its
  * choices cannot be derived from anything WebGPU reports. Apple's shader cores
- * issue half-precision multiply-accumulate at twice the f32 rate, which made
- * pure f16 1.36x to 1.55x faster than f32 at every shape the model runs on an
- * M4 Pro; the same kernel is no faster on adapters whose f16 is emulated, and
- * the depth of the staged k tile swings a few percent either way by driver.
- * So both are measured once per device and the winner is cached, the way
+ * issue half-precision multiply-accumulate at twice the f32 rate, worth 1.15x
+ * to 1.26x on the projection shapes once the reduction is kept safe; the same
+ * kernel is no faster on adapters whose f16 is emulated, and the depth of the
+ * staged k tile swings a few percent either way by driver. So both are
+ * measured once per device and the winner is cached, the way
  * `src/evoformer/attention-calibration.ts` already picks the flash kernel.
+ *
+ * Which arrangements may be measured at all is not a runtime question, and
+ * `SHIPPABLE_GEMM_PRECISIONS` below says why.
  *
  * The selection is installed before `requestAlphaFoldDevice` hands the device
  * out, which is what keeps it invisible to every call site. No consumer can
@@ -54,11 +57,28 @@ const CHECK_TOLERANCE = 0.02;
  * sum, which the end-to-end differential showed the model tolerates but which
  * buys nothing on an adapter that merely emulates f16. Requiring a clear
  * margin keeps such a device exact instead of trading accuracy for measurement
- * noise. Apple clears it by a wide margin, at 1.36x to 1.55x.
+ * noise. Apple clears it comfortably.
  */
 const HALF_PRECISION_MARGIN = 1.1;
 
 const selections = new WeakMap<GPUDevice, Promise<GemmVariant>>();
+
+/**
+ * A variant pinned ahead of any device, for differential testing.
+ *
+ * Whether half precision costs the model anything can only be answered by
+ * predicting one input both ways and comparing, which needs the choice held
+ * still across two runs that would otherwise measure it. This is that hold,
+ * the counterpart of `presetAttentionFlashKernel`. It is not a setting: no URL,
+ * environment variable or stored preference reaches it, and production never
+ * calls it, so a device still measures its own arithmetic.
+ */
+let pinnedVariant: GemmVariant | undefined;
+
+export function forceGemmVariant(variant: GemmVariant | undefined): void {
+  pinnedVariant = variant;
+  setGemmVariant(variant ?? GEMM_VARIANT_F32);
+}
 
 /**
  * Whether a device without `shader-f16` has ever been calibrated.
@@ -81,12 +101,29 @@ function hasHalfPrecision(device: GPUDevice): boolean {
   return features?.has("shader-f16" as GPUFeatureName) === true;
 }
 
+/**
+ * Arrangements a device is allowed to be measured into, and why not more.
+ *
+ * Pure `f16` is deliberately absent. It is the fastest of them, at 1.36x to
+ * 1.55x, and it is not safe: accumulating a whole contraction in half
+ * precision overflows on a deep MSA, which took the 508-row acceptance
+ * prediction from 96.80 pLDDT to 69.94 and its pTM to NaN. No runtime probe
+ * can rediscover that, because it only shows up at a depth and a magnitude a
+ * cheap probe does not reach, so the exclusion is recorded here instead of
+ * being left to a measurement. `test/browser/gemm-differential.spec.ts` holds
+ * every variant in this list to the prediction gate.
+ */
+export const SHIPPABLE_GEMM_PRECISIONS: readonly GemmVariant["precision"][] = [
+  "f32", "f16-chunked", "f16-mixed",
+];
+
 /** Variants worth measuring against each other on this device. */
 export function gemmVariantCandidates(device: GPUDevice): readonly GemmVariant[] {
   const depths = [8, 16] as const;
-  const precisions: GemmVariant["precision"][] = ["f32"];
-  if (hasHalfPrecision(device) && !sawDeviceWithoutHalfPrecision) precisions.push("f16");
-  return precisions.flatMap((precision) => depths.map((inner) => ({ precision, inner })));
+  const usable = hasHalfPrecision(device) && !sawDeviceWithoutHalfPrecision
+    ? SHIPPABLE_GEMM_PRECISIONS
+    : SHIPPABLE_GEMM_PRECISIONS.filter((precision) => precision === "f32");
+  return usable.flatMap((precision) => depths.map((inner) => ({ precision, inner })));
 }
 
 export function gemmVariantName(variant: GemmVariant): string {
@@ -274,6 +311,10 @@ export async function measureGemmVariants(
  * Anything that throws leaves the f32 kernel in place.
  */
 export function calibrateGemmVariant(device: GPUDevice): Promise<GemmVariant> {
+  if (pinnedVariant !== undefined) {
+    setGemmVariant(pinnedVariant);
+    return Promise.resolve(pinnedVariant);
+  }
   const cached = selections.get(device);
   if (cached !== undefined) return cached;
   const selection = (async (): Promise<GemmVariant> => {
@@ -284,12 +325,16 @@ export function calibrateGemmVariant(device: GPUDevice): Promise<GemmVariant> {
         (measurement) => measurement.relativeError <= CHECK_TOLERANCE,
       );
       // A shallower tile keeps a tie, having less workgroup storage to lose.
-      const fastest = (precision: GemmVariant["precision"]): GemmVariantMeasurement | undefined =>
+      const fastest = (
+        precision: GemmVariant["precision"],
+      ): GemmVariantMeasurement | undefined =>
         usable.filter((measurement) => measurement.variant.precision === precision)
           .sort((left, right) => left.milliseconds - right.milliseconds
             || left.variant.inner - right.variant.inner)[0];
       const exact = fastest("f32");
-      const half = fastest("f16");
+      const half = [fastest("f16-chunked"), fastest("f16-mixed")]
+        .filter((measurement) => measurement !== undefined)
+        .sort((left, right) => left.milliseconds - right.milliseconds)[0];
       const winner = exact === undefined ? half?.variant ?? GEMM_VARIANT_F32
         : half !== undefined && half.milliseconds * HALF_PRECISION_MARGIN < exact.milliseconds
           ? half.variant : exact.variant;

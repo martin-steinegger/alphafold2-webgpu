@@ -36,7 +36,24 @@ const GEMM_WORKGROUP_BYTES = 16384;
  * without touching a single call site.
  */
 export interface GemmVariant {
-  readonly precision: "f32" | "f16";
+  /**
+   * Where half precision is used, which is not one choice but three.
+   *
+   * `f16` stages, multiplies and accumulates in half precision. It is the
+   * fastest and it is not shippable: a contraction over a deep MSA overflows
+   * the accumulator, which took a 508-row prediction from 96.8 pLDDT to 69.9
+   * and its pTM to NaN.
+   *
+   * `f16-mixed` multiplies in half precision and accumulates in single. The
+   * multiply is where Apple's rate doubles and the long reduction is where the
+   * error grows, so the two can be bought separately.
+   *
+   * `f16-chunked` accumulates in half precision for the depth of one staged
+   * tile and folds that into an f32 running sum once per tile, so the error
+   * grows with the square root of 8 or 16 terms rather than of K while all but
+   * one add per tile stays in half precision.
+   */
+  readonly precision: "f32" | "f16" | "f16-mixed" | "f16-chunked";
   readonly inner: 8 | 16;
 }
 
@@ -119,8 +136,12 @@ export function createTiledGemmShader(
   shader: TiledGemmShader, variant: GemmVariant = gemmVariant(),
 ): string {
   const tileColumns = shader.tileColumns ?? GEMM_TILE_COLUMNS;
-  const half = variant.precision === "f16";
+  const half = variant.precision !== "f32";
   const scalar = half ? "f16" : "f32";
+  // Only the pure arrangement keeps the running sum in half precision; the
+  // other two reduce in f32 and differ in what they do inside one tile.
+  const halfAccumulator = variant.precision === "f16";
+  const chunked = variant.precision === "f16-chunked";
   const stageBytes = shader.epilogue === undefined ? 0 : (shader.stageElements ?? 2048) * 4;
   const operandBytes = (inner: number): number =>
     GEMM_TILE_ROWS * inner * (half ? 2 : 4) + inner * tileColumns * (half ? 2 : 4);
@@ -146,7 +167,8 @@ export function createTiledGemmShader(
   // Half precision accumulates under a private name and rebinds `acc{n}` to
   // the converted value once the k loop is done, so every epilogue and store
   // fragment a caller wrote against `vec4<f32>` keeps compiling unchanged.
-  const register = half ? "gemm_acc" : "acc";
+  const register = halfAccumulator ? "gemm_acc" : "acc";
+  const accumulatorScalar = halfAccumulator ? "f16" : "f32";
   // `enable` must precede every declaration, and a preamble may already carry
   // its own copy for an activation stored as f16.
   const enable = half && !shader.preamble.includes("enable f16;") ? "enable f16;\n" : "";
@@ -175,7 +197,7 @@ fn main(
   let row_origin = tile_row_origin + row_thread * ${rowsPerThread}u;
   let column_origin = group.x * ${tileColumns}u;
   let tile_column = column_origin + column_thread * 4u;
-${lines(rowsPerThread, (row) => `  var ${register}${row} = vec4<${scalar}>(0.0);`)}
+${lines(rowsPerThread, (row) => `  var ${register}${row} = vec4<${accumulatorScalar}>(0.0);`)}
 
   for (var k0 = 0u; k0 < gemm_inner; k0 += ${tileInner}u) {
     for (var item = thread; item < ${GEMM_TILE_ROWS * tileInner}u; item += ${GEMM_THREADS}u) {
@@ -200,15 +222,20 @@ ${lines(4, (lane) => `        {
       gemm_weight[item] = ${half ? "vec4<f16>(loaded)" : "loaded"};
     }
     workgroupBarrier();
-    for (var step = 0u; step < ${tileInner}u; step += 1u) {
+${chunked ? `${lines(rowsPerThread, (row) => `    var chunk${row} = vec4<f16>(0.0);`)}\n` : ""}    for (var step = 0u; step < ${tileInner}u; step += 1u) {
       let w = gemm_weight[step * ${columnThreads}u + column_thread];
       let a_base = step * ${GEMM_TILE_ROWS}u + row_thread * ${rowsPerThread}u;
 ${lines(vectorsPerThread, (vector) => `      let a${vector} = vec4<${scalar}>(${items(4,
     (lane) => `gemm_source[a_base + ${vector * 4 + lane}u]`)});`)}
-${lines(rowsPerThread, (row) => `      ${register}${row} += a${Math.floor(row / 4)}[${row % 4}u] * w;`)}
-    }
+${lines(rowsPerThread, (row) => {
+    const product = `a${Math.floor(row / 4)}[${row % 4}u] * w`;
+    if (chunked) return `      chunk${row} += ${product};`;
+    if (variant.precision === "f16-mixed") return `      acc${row} += vec4<f32>(${product});`;
+    return `      ${register}${row} += ${product};`;
+  })}
+    }${chunked ? `\n${lines(rowsPerThread, (row) => `    acc${row} += vec4<f32>(chunk${row});`)}` : ""}
     workgroupBarrier();
-  }${half ? `\n${lines(rowsPerThread, (row) => `  let acc${row} = vec4<f32>(gemm_acc${row});`)}` : ""}
+  }${halfAccumulator ? `\n${lines(rowsPerThread, (row) => `  let acc${row} = vec4<f32>(gemm_acc${row});`)}` : ""}
 
 ${shader.epilogue !== undefined ? shader.epilogue : lines(rowsPerThread, (index) => `
   {
