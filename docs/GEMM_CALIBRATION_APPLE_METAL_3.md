@@ -1,7 +1,7 @@
 # Half-precision projections on Apple Metal 3
 
 Measured on an M4 Pro MacBook, Chromium, Apple Metal 3, on branch
-`f16-projection`. Harness revision `f16-projection`, 20 commits from `main`.
+`f16-projection`. Harness revision `f16-projection`, 19 commits from `main`.
 
 ## Conclusion
 
