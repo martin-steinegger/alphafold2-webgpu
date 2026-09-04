@@ -320,8 +320,8 @@ The 8x8x8 prototype is still 0.60x to 0.72x, and the brief's reading of it was
 right: it gives one subgroup one output tile and walks K with no reuse, so it
 was a poor kernel rather than evidence about the hardware.
 
-Given a 32x32 region per subgroup it reaches **1.55x to 2.15x, in f32, with
-production's own error to the digit** — faster than pure f16 was, and exact.
+Given a 32x32 region per subgroup it reaches **1.46x to 2.15x, median of three
+runs, in f32, with production's own error to the digit** — faster than pure f16 was, and exact.
 On this device that is a better answer than any half-precision arrangement,
 and it is why the conclusion above is scoped to devices with `shader-f16`
 rather than stated as the best available kernel.

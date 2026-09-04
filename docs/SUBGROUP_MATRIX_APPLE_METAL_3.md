@@ -8,21 +8,27 @@ gemm-calibration`.
 
 The half-precision work in `GEMM_CALIBRATION_APPLE_METAL_3.md` ships
 `f16-chunked` at 1.11x to 1.25x, having rejected pure f16 as unsafe. A
-subgroup-matrix kernel with proper reuse beats all of it, and it is not
-approximate:
+subgroup-matrix kernel with proper reuse beats all of it at every shape, and it
+is not approximate:
 
-| shape | production | **matrix f32** | f16-chunked (shipped) | pure f16 (rejected) |
+Median of three runs, with the spread across them, because a single pass is
+not trustworthy on this machine — see the stability section of
+`GEMM_CALIBRATION_APPLE_METAL_3.md`.
+
+| shape | production | **matrix f32** | spread | f16-chunked (shipped) |
 |---|---:|---:|---:|---:|
-| opm-contract | 2.79 TFLOP/s | **1.69x** | 1.26x | 1.39x |
-| opm-out | 2.04 | **2.15x** | 1.13x | 1.50x |
-| opm-out2 | 2.23 | **1.74x** | 1.21x | 1.27x |
-| project | 2.85 | **1.67x** | 1.15x | 1.36x |
-| output | 2.77 | **1.69x** | 1.15x | 1.37x |
-| trans1 | 2.83 | **1.68x** | 1.16x | 1.37x |
-| trans2 | 2.95 | **1.72x** | 1.19x | 1.38x |
-| extra1 | 2.32 | **1.55x** | 1.14x | 1.49x |
+| opm-contract | 2.79 TFLOP/s | **1.69x** | 1.64-1.69x | 1.26x |
+| opm-out | 2.04 | **2.15x** | 2.02-2.15x | 1.13x |
+| opm-out2 | 2.23 | **1.76x** | 1.74-1.76x | 1.21x |
+| project | 2.85 | **1.67x** | 1.56-1.68x | 1.16x |
+| output | 2.77 | **1.69x** | 1.61-1.70x | 1.15x |
+| trans1 | 2.83 | **1.67x** | 1.56-1.68x | 1.15x |
+| trans2 | 2.95 | **1.71x** | 1.58-1.73x | 1.18x |
+| extra1 | 2.32 | **1.46x** | 1.43-1.55x | 1.12x |
 
-It reaches 4.7 to 5.1 TFLOP/s against production's 2.8, and its worst error is
+So 1.46x to 2.15x, against 1.12x to 1.26x for the kernel this branch ships and
+1.27x to 1.50x for the pure f16 kernel it rejected. It reaches 4.7 to 5.1
+TFLOP/s against production's 2.8, and its worst error is
 2.62e-6 at K=256 and 1.00e-5 at K=1024 — the same as production, to the digit,
 because it accumulates in f32. There is no accuracy gate to pass: it computes
 what the f32 kernel computes.
@@ -75,7 +81,7 @@ correct and free. Loads past the end of a tensor are clamped by WGSL's
 robustness rules, so a partial region computes garbage exactly in the rows and
 columns that do not exist, and those are the ones never written. The bounded
 kernel measures within noise of the unbounded one on aligned shapes and keeps
-1.55x to 2.15x on the real ones.
+1.46x to 2.15x on the real ones.
 
 ## What it needs from the callers, and why it stopped here
 
