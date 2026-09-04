@@ -20,13 +20,26 @@ test("measures every projection kernel", async ({ page }) => {
     const lines: string[] = [];
     const adapter = await navigator.gpu?.requestAdapter({ powerPreference: "high-performance" });
     if (adapter === null || adapter === undefined) return ["no WebGPU adapter"];
-    const wanted = ["shader-f16", "subgroups", "subgroup-size-control"];
+    const wanted = ["shader-f16", "subgroups", "subgroup-size-control",
+      "chromium-experimental-subgroup-matrix"];
     const features = wanted.filter((name) => adapter.features.has(name as GPUFeatureName));
     const device = await adapter.requestDevice({ requiredFeatures: features as GPUFeatureName[] });
     lines.push(`features: ${[...adapter.features].sort().join(", ")}`);
     lines.push(`granted: ${features.join(", ") || "none"}`);
     const info = adapter.info as GPUAdapterInfo | undefined;
     lines.push(`adapter: ${info?.vendor ?? "?"} ${info?.architecture ?? ""} ${info?.description ?? ""}`.trim());
+    // The shapes and component types the hardware's matrix units accept. A
+    // tensor-core kernel has to be written against these, and they differ by
+    // vendor: this Linux NVIDIA adapter offers integer ones only, so a float
+    // kernel for Apple cannot be designed, let alone compiled, without them.
+    const configs = (adapter.info as unknown as {
+      subgroupMatrixConfigs?: readonly Record<string, unknown>[];
+    }).subgroupMatrixConfigs ?? [];
+    lines.push(`subgroup matrix configs: ${configs.length === 0 ? "none" : ""}`);
+    for (const config of configs) {
+      lines.push(`  ${["componentType", "resultComponentType", "M", "N", "K"]
+        .map((key) => `${key}=${String(config[key])}`).join(" ")}`);
+    }
 
     const random = (count: number): Float32Array => {
       let state = 0x1234567;

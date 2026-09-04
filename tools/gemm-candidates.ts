@@ -108,7 +108,17 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
  * holding an RR x RC register block. A and W tiles are staged in workgroup
  * memory as vec4 so both the global and the shared reads stay vectorized.
  */
-function tiledGemm(tileRows: number, tileColumns: number, tileInner: number): string {
+function tiledGemm(
+  tileRows: number, tileColumns: number, tileInner: number, scalar: "f32" | "f16" = "f32",
+): string {
+  // Half precision is generated, not patched in: the staged tiles, the
+  // products and the accumulators are all f16, and only the loads from and
+  // stores to the f32 buffers convert. Apple issues f16 multiply-accumulate
+  // at twice the f32 rate and stages half the bytes.
+  const half = scalar === "f16";
+  const vec = `vec4<${scalar}>`;
+  const cast = (value: string): string => half ? `${scalar}(${value})` : value;
+  const castVec = (value: string): string => half ? `${vec}(${value})` : value;
   const threads = 256;
   const registerColumns = 4;
   const columnThreads = tileColumns / registerColumns;
@@ -120,14 +130,14 @@ function tiledGemm(tileRows: number, tileColumns: number, tileInner: number): st
   const sourceVectors = (tileRows * tileInner) / 4;
   const weightVectors = (tileInner * tileColumns) / 4;
   const declare = (name: string, count: number): string => Array.from({ length: count },
-    (_, index) => `  var ${name}${index} = vec4<f32>(0.0);`).join("\n");
+    (_, index) => `  var ${name}${index} = ${vec}(0.0);`).join("\n");
   const accumulate = Array.from({ length: registerRows }, (_, r) =>
     `      let a${r} = tile_source[(k * ${tileRows}u + row_base + ${r}u) / 4u][(row_base + ${r}u) % 4u];`
     + `\n      acc${r} += a${r} * w;`).join("\n");
-  return `${PARAMETERS}
+  return `${half ? "enable f16;\n" : ""}${PARAMETERS}
 // A is staged transposed (k-major) so one k step reads consecutive rows.
-var<workgroup> tile_source: array<vec4<f32>, ${sourceVectors}>;
-var<workgroup> tile_weight: array<vec4<f32>, ${weightVectors}>;
+var<workgroup> tile_source: array<${vec}, ${sourceVectors}>;
+var<workgroup> tile_weight: array<${vec}, ${weightVectors}>;
 
 @compute @workgroup_size(${threads}, 1, 1)
 fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) group: vec3<u32>) {
@@ -152,7 +162,7 @@ ${declare("acc", registerRows)}
         value = source[source_row * parameters.inner + source_k];
       }
       let slot = load_k * ${tileRows}u + load_row;
-      tile_source[slot / 4u][slot % 4u] = value;
+      tile_source[slot / 4u][slot % 4u] = ${cast("value")};
     }
     for (var item = thread; item < ${weightVectors}u; item += ${threads}u) {
       let load_k = item / ${tileColumns / 4}u;
@@ -170,7 +180,7 @@ ${declare("acc", registerRows)}
           }
         }
       }
-      tile_weight[item] = value;
+      tile_weight[item] = ${castVec("value")};
     }
     workgroupBarrier();
     for (var k = 0u; k < ${tileInner}u; k += 1u) {
@@ -188,7 +198,8 @@ ${accumulate}
     let row = row_origin + row_base + r;
     if (row < parameters.rows) {
       var value = vec4<f32>(0.0);
-${Array.from({ length: registerRows }, (_, index) => `      if (r == ${index}u) { value = acc${index}; }`).join("\n")}
+${Array.from({ length: registerRows }, (_, index) =>
+  `      if (r == ${index}u) { value = ${half ? `vec4<f32>(acc${index})` : `acc${index}`}; }`).join("\n")}
       value += bias;
       if (parameters.activation == 1u) { value = max(value, vec4<f32>(0.0)); }
       let base = row * parameters.columns + column;
@@ -226,27 +237,6 @@ fn source_at(index: u32) -> f32 {
       "value = source_at(source_row * parameters.inner + source_k);");
 }
 
-export /**
- * The same tiling with half-precision arithmetic.
- *
- * Apple GPUs issue f16 multiply-accumulate at twice the f32 rate and stage
- * half the bytes in workgroup memory, which is the closest a laptop gets to a
- * tensor core through WebGPU today. The staged tiles and the accumulators are
- * f16; the operands arrive and the result leaves in f32, so this measures the
- * arithmetic, not a change of storage. It needs the shader-f16 feature.
- */
-function tiledGemmHalf(tileRows: number, tileColumns: number, tileInner: number): string {
-  return `enable f16;\n${tiledGemm(tileRows, tileColumns, tileInner)}`
-    .replace(/var<workgroup> gemm_source: array<vec4<f32>, (\d+)>;/, "var<workgroup> gemm_source: array<vec4<f16>, $1>;")
-    .replace(/var<workgroup> gemm_weight: array<vec4<f32>, (\d+)>;/, "var<workgroup> gemm_weight: array<vec4<f16>, $1>;")
-    .replace(/var<workgroup> gemm_source: array<f32, (\d+)>;/, "var<workgroup> gemm_source: array<f16, $1>;")
-    .replace(/gemm_source\[([^\]]+)\] = value;/, "gemm_source[$1] = f16(value);")
-    .replace(/gemm_weight\[([^\]]+)\] = vec4<f32>\(([^;]+)\);/, "gemm_weight[$1] = vec4<f16>($2);")
-    .replace(/var acc(\d) = vec4<f32>\(0.0\);/g, "var acc$1 = vec4<f16>(0.0);")
-    .replace(/let w = gemm_weight\[([^\]]+)\];/, "let w = gemm_weight[$1];")
-    .replace(/acc(\d) \+= ([^;]+);/g, "acc$1 += $2;");
-}
-
 export const CANDIDATES: readonly Candidate[] = [
   { name: "current-64x128k8", shader: tiledGemm(64, 128, 8), tileRows: 64, tileColumns: 128 },
   { name: "tiled-64x64k16", shader: tiledGemm(64, 64, 16), tileRows: 64, tileColumns: 64 },
@@ -255,9 +245,9 @@ export const CANDIDATES: readonly Candidate[] = [
   // minimum, so it is measured but not shipped.
   { name: "tiled-128x128k16", shader: tiledGemm(128, 128, 16), tileRows: 128, tileColumns: 128 },
   { name: "f16-source-64x128k8", shader: tiledGemmPackedSource(64, 128, 8), tileRows: 64, tileColumns: 128 },
-  { name: "f16-math-64x128k8", shader: tiledGemmHalf(64, 128, 8), tileRows: 64, tileColumns: 128,
+  { name: "f16-math-64x128k8", shader: tiledGemm(64, 128, 8, "f16"), tileRows: 64, tileColumns: 128,
     requiresF16: true },
-  { name: "f16-math-128x128k16", shader: tiledGemmHalf(128, 128, 16), tileRows: 128, tileColumns: 128,
+  { name: "f16-math-64x64k16", shader: tiledGemm(64, 64, 16, "f16"), tileRows: 64, tileColumns: 64,
     requiresF16: true },
 ];
 
