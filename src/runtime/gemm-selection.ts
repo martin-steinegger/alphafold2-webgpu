@@ -2,7 +2,6 @@ import {
   createTiledGemmShader, gemmGrid, GEMM_VARIANT_F32, setGemmVariant,
   type GemmVariant,
 } from "./gemm.js";
-import { pipelineCacheForDevice } from "./pipeline-cache.js";
 
 /**
  * Which arithmetic and which k depth the dense projections use on this device.
@@ -189,9 +188,21 @@ function destroyProbe(probe: Probe): void {
   }
 }
 
+/**
+ * The probe builds its pipelines directly rather than through the shared
+ * cache: they are used once, at device creation, and would otherwise sit in a
+ * cache meant for the kernels the model actually runs for the device's whole
+ * lifetime.
+ */
 async function pipelineFor(device: GPUDevice, variant: GemmVariant): Promise<GPUComputePipeline> {
-  return pipelineCacheForDevice(device)
-    .get(`gemm-selection.${gemmVariantName(variant)}`, probeShader(variant));
+  const label = `gemm-selection.${gemmVariantName(variant)}`;
+  return device.createComputePipelineAsync({
+    label, layout: "auto",
+    compute: {
+      module: device.createShaderModule({ label: `${label}.wgsl`, code: probeShader(variant) }),
+      entryPoint: "main",
+    },
+  });
 }
 
 function bindProbe(
