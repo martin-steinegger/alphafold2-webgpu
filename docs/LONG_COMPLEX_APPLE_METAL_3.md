@@ -16,6 +16,7 @@ kernel, so each branch uses whatever it would select for itself.
 |---|---|---|---|---|---|---|
 | `main` | f32 64x128k8 | 0 | 746 s | 32.3469 | 0.19455 | 0.17473 |
 | `f16-projection` | f16-chunked 64x128k16 | 0 | 668 s | 32.3388 | 0.19457 | 0.17472 |
+| `f16-projection` | f16-chunked 64x128k16 | 1 | 1,334 s | 33.7754 | 0.19168 | 0.17200 |
 
 **The input still runs, and it runs 1.117x faster.** That is a much larger
 gain than the 1.044x the 59-residue monomer showed, which is what you would
@@ -27,13 +28,13 @@ The confidence is low because this is a 24-copy homomer with no alignment at
 all, one sequence deep. That is expected and is not what the run measures: the
 question is whether 1,416 residues completes and comes back finite.
 
-The kernel named in the second row is identified rather than read off: that
-run predates a fix to the capacity probe, which asked which variant was
+The kernel in the second row was identified rather than read off, because
+that run predates a fix to the capacity probe: it asked which variant was
 installed before the prediction rather than after, and so reported the f32
-default. It is `f16-chunked-64x128k16` because that is what the per-device
-probe chooses on this adapter, and because the run differs from `main` in
-confidence and in time, neither of which the f32 kernel could do — it is
-emitted byte for byte as `main` emits it.
+default. The third row read it correctly and confirms it, on the same adapter
+and the same selector, as `f16-chunked-64x128k16`. Its recycle 0 also
+reproduces the second row exactly — 32.3388, 0.19457, 0.17472 — so the kernel
+is deterministic run to run and the two rows ran the same one.
 
 Mean pLDDT moves by 0.008 and pTM and ipTM by 0.00002, far inside the gate.
 An earlier run of this input recorded confidence identical to `main` in every
@@ -53,13 +54,21 @@ and 48 main blocks.
 ## Recycling
 
 An earlier attempt at this input with one extra recycle killed the renderer
-after 4.4 minutes, mid-way through the first pass, and it was running the f32
-kernel at the time. Recycling retains the previous pass's positions and pair
-representation, so at this length it costs memory as well as time, which makes
-it a separate question from the one above rather than more of the same.
+after 4.4 minutes, mid-way through the first pass, while running the f32
+kernel. Recycling retains the previous pass's positions and pair
+representation, so at this length it costs memory as well as time, and that
+looked like the explanation.
 
-`AFWEBGPU_COMPLEX_RECYCLES` selects it, and it is measured on both branches
-for the same reason the single pass is.
+**It is not, and the crash does not reproduce.** The same input with one extra
+recycle now completes in 1,334 seconds, both passes, on `f16-chunked-64x128k16`
+— the row above. So the failure was neither a recycling ceiling nor anything
+this branch introduced, and the honest description is a transient: the machine
+was concurrently fetching 292 MiB of model weights when it happened. It is
+recorded here rather than explained away, because a renderer that dies once at
+this length is worth knowing about even when it cannot be reproduced.
+
+Two passes cost 1,334 s against 668 s for one, which is very nearly linear, so
+recycling at this length is a time cost far more than a memory one.
 
 ## Command
 
