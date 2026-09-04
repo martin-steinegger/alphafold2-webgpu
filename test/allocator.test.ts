@@ -6,7 +6,7 @@ describe("GPU buffer pooling", () => {
     const buffers: { destroy: ReturnType<typeof vi.fn> }[] = [];
     const device = { createBuffer: vi.fn(() => {
       const buffer = { destroy: vi.fn() }; buffers.push(buffer); return buffer;
-    }) } as unknown as GPUDevice;
+    }), limits: { maxBufferSize: 4 * 1024 ** 3 } } as unknown as GPUDevice;
     const allocator = new GpuBufferAllocator(device, true, 12);
     const first = allocator.allocate("first", 8, 1);
     const second = allocator.allocate("second", 8, 1);
@@ -32,7 +32,9 @@ describe("GPU buffer pooling", () => {
 
   it("does not retain a single buffer larger than the pool cap", () => {
     const buffer = { destroy: vi.fn() };
-    const device = { createBuffer: vi.fn(() => buffer) } as unknown as GPUDevice;
+    const device = {
+      createBuffer: vi.fn(() => buffer), limits: { maxBufferSize: 4 * 1024 ** 3 },
+    } as unknown as GPUDevice;
     const allocator = new GpuBufferAllocator(device, true, 4);
     allocator.allocate("large", 8, 1).release();
     expect(buffer.destroy).not.toHaveBeenCalled();
@@ -45,7 +47,7 @@ describe("GPU buffer pooling", () => {
     const buffers: { destroy: ReturnType<typeof vi.fn> }[] = [];
     const device = { createBuffer: vi.fn(() => {
       const buffer = { destroy: vi.fn() }; buffers.push(buffer); return buffer;
-    }) } as unknown as GPUDevice;
+    }), limits: { maxBufferSize: 4 * 1024 ** 3 } } as unknown as GPUDevice;
     const allocator = new GpuBufferAllocator(device, true, 128);
     const large = allocator.allocate("large", 32, 1);
     const best = allocator.allocate("best", 24, 1);
@@ -67,7 +69,7 @@ describe("GPU buffer pooling", () => {
     const buffers: { destroy: ReturnType<typeof vi.fn> }[] = [];
     const device = { createBuffer: vi.fn(() => {
       const buffer = { destroy: vi.fn() }; buffers.push(buffer); return buffer;
-    }) } as unknown as GPUDevice;
+    }), limits: { maxBufferSize: 4 * 1024 ** 3 } } as unknown as GPUDevice;
     const allocator = new GpuBufferAllocator(device, true);
     // An uploaded tensor (storage | copy-dst) retires, then plain storage
     // scratch of the same size takes the buffer over instead of creating one.
@@ -87,7 +89,7 @@ describe("GPU buffer pooling", () => {
     const buffers: { destroy: ReturnType<typeof vi.fn> }[] = [];
     const device = { createBuffer: vi.fn(() => {
       const buffer = { destroy: vi.fn() }; buffers.push(buffer); return buffer;
-    }) } as unknown as GPUDevice;
+    }), limits: { maxBufferSize: 4 * 1024 ** 3 } } as unknown as GPUDevice;
     const allocator = new GpuBufferAllocator(device, true);
     allocator.allocate("scratch", 32, 1 | 8).release();
     // Commands encoded before this point may still read the retired buffer,
@@ -106,7 +108,7 @@ describe("GPU buffer pooling", () => {
     const buffers: { destroy: ReturnType<typeof vi.fn> }[] = [];
     const device = { createBuffer: vi.fn(() => {
       const buffer = { destroy: vi.fn() }; buffers.push(buffer); return buffer;
-    }) } as unknown as GPUDevice;
+    }), limits: { maxBufferSize: 4 * 1024 ** 3 } } as unknown as GPUDevice;
     setGpuMemoryBudget(device, 64);
     // Two allocators on one device share the budget, as the trunk and the
     // structure module do.
@@ -128,7 +130,7 @@ describe("GPU buffer pooling", () => {
     const buffers: { destroy: ReturnType<typeof vi.fn> }[] = [];
     const device = { createBuffer: vi.fn(() => {
       const buffer = { destroy: vi.fn() }; buffers.push(buffer); return buffer;
-    }) } as unknown as GPUDevice;
+    }), limits: { maxBufferSize: 4 * 1024 ** 3 } } as unknown as GPUDevice;
     for (const allocator of [new GpuBufferAllocator(device, true, 128), new GpuBufferAllocator(device, true)]) {
       const before = (device.createBuffer as ReturnType<typeof vi.fn>).mock.calls.length;
       allocator.allocate("storage", 32, 1).release();
@@ -142,7 +144,7 @@ describe("GPU buffer pooling", () => {
     const buffers: { destroy: ReturnType<typeof vi.fn> }[] = [];
     const device = { createBuffer: vi.fn(() => {
       const buffer = { destroy: vi.fn() }; buffers.push(buffer); return buffer;
-    }) } as unknown as GPUDevice;
+    }), limits: { maxBufferSize: 4 * 1024 ** 3 } } as unknown as GPUDevice;
     const allocator = new GpuBufferAllocator(device, true);
     const large = allocator.allocate("large", 64, 1);
     const medium = allocator.allocate("medium", 32, 1);

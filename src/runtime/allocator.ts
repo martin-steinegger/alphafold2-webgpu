@@ -191,6 +191,14 @@ export class GpuBufferAllocator {
       throw new RangeError(`invalid allocation size ${requestedBytes} for ${label}`);
     }
     const byteLength = Math.ceil(requestedBytes / 4) * 4;
+    // A buffer past the device's limit fails inside WebGPU with a size and no
+    // name, which says nothing about which tensor asked or what to change.
+    const maximum = this.device.limits.maxBufferSize;
+    if (byteLength > maximum) {
+      const mib = (value: number): string => `${(value / 1024 ** 2).toFixed(0)} MiB`;
+      throw new RangeError(`${label} needs a ${mib(byteLength)} buffer, past the ${mib(maximum)} `
+        + "this device allows. A shorter sequence, fewer chains or fewer alignment rows will fit.");
+    }
     // Readback buffers keep their exact size: callers map them whole.
     const physicalBytes = byteLength >= POOL_GRANULARITY_BYTES && (usage & GPUBufferUsage.MAP_READ) === 0
       ? Math.ceil(byteLength / POOL_GRANULARITY_BYTES) * POOL_GRANULARITY_BYTES : byteLength;
