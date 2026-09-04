@@ -6,7 +6,7 @@ const HOMOTRIMER = new Array(3).fill(HOMOMER_CHAIN).join(":");
 
 test("auto-detects monomers and multimers and switches to custom A3M", async ({ page }) => {
   await page.goto("/");
-  await expect(page.getByRole("heading", { name: "Fold a protein in your browser." })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Prediction input" })).toBeVisible();
   await expect(page.locator("#sequence-length")).toHaveText("59 residues");
   await expect(page.locator("#input-mode")).toHaveValue("mmseqs2");
   await expect(page.locator("#msa-api-url")).toHaveValue("https://api.colabfold.com");

@@ -101,18 +101,24 @@ input:disabled, select:disabled { color: #888; background: #eee; }
 #msa-plot-summary { color: #777; font: .68rem "Roboto Mono", monospace; text-align: right; }
 .table-wrap { overflow: auto; margin-top: 1rem; } table { width: 100%; border-collapse: collapse; font: .7rem "Roboto Mono", monospace; }
 th, td { padding: .65rem; border-bottom: 1px solid #ddd; text-align: right; } th:first-child, td:first-child { text-align: left; } th { color: #777; font-weight: 400; }
+/* The archive is what a finished prediction is for, so it closes the results
+   rather than hiding in their heading. */
+.download-bar { padding: 4px 16px 22px; }
+.download-all { display: grid; gap: .3rem; width: 100%; padding: 1.15rem 1.25rem; border: 0; border-radius: 2px;
+  color: #fff; background: var(--primary); text-align: left; cursor: pointer; box-shadow: 0 2px 3px #0003; }
+.download-all span { font-size: 1.05rem; font-weight: 500; letter-spacing: .06em; text-transform: uppercase; }
+.download-all small { color: #ffffffc4; font-size: .78rem; letter-spacing: normal; text-transform: none; }
+.download-all:hover { background: var(--primary-dark); }
+.download-all:disabled { color: #999; background: #ddd; cursor: wait; box-shadow: none; }
+.download-all:disabled small { color: #888; }
 .reference { margin-top: 8px; padding: 1.15rem 1rem; }
 .reference h2 { margin-bottom: .55rem; font-size: 1.45rem; } .reference p { margin: .35rem 0; color: #444; font-size: .8rem; line-height: 1.5; }
-.about { display: grid; grid-template-columns: 1fr 1fr; gap: 3rem; margin-top: 8px; padding: 64px 18px; border-top: 1px solid #ddd; background: #fff; }
-.eyebrow { color: var(--primary); font: .72rem "Roboto Mono", monospace; letter-spacing: .12em; text-transform: uppercase; }
-.about h2 { max-width: 430px; margin-top: .6rem; font-size: clamp(2rem, 4vw, 3.5rem); line-height: 1; }
-.about p { margin: 0; color: #666; line-height: 1.75; } .about-copy { display: grid; gap: 1.1rem; align-content: start; }
 .capability { display: flex; align-items: start; gap: .6rem; line-height: 1.5; color: #777; font: .76rem "Roboto Mono", monospace; }
 .capability-dot { flex: 0 0 auto; margin-top: .35rem; width: 8px; height: 8px; border-radius: 50%; background: #d49a20; box-shadow: 0 0 0 4px #d49a201d; }
 .capability[data-state="ready"] { color: var(--success); } .capability[data-state="ready"] .capability-dot { background: var(--success); box-shadow: 0 0 0 4px #26834a1d; }
 .capability[data-state="failed"] { color: var(--danger); } .capability[data-state="failed"] .capability-dot { background: var(--danger); }
 .capability[data-state="warning"] { color: var(--warning); } .capability[data-state="warning"] .capability-dot { background: var(--warning); box-shadow: 0 0 0 4px #b26a001d; }
-.capability-block { display: grid; gap: .55rem; max-width: 46rem; }
+.capability-block { display: grid; gap: .55rem; max-width: 46rem; padding: 0 16px 14px; }
 .capability-details { color: #666; font-size: .78rem; line-height: 1.6; }
 .capability-details summary { color: var(--primary); font: .74rem "Roboto Mono", monospace; cursor: pointer; }
 .capability-details p { margin: .55rem 0 0; color: #555; font-size: .78rem; }
@@ -120,7 +126,7 @@ th, td { padding: .65rem; border-bottom: 1px solid #ddd; text-align: right; } th
 .capability-details li { color: #555; font-size: .78rem; }
 footer { display: flex; justify-content: space-between; padding: 1.5rem 1rem 2.5rem; color: #888; font-size: .7rem; }
 
-@media (max-width: 900px) { .workspace { grid-template-columns: 1fr; } .result-grid { grid-template-columns: 1fr; grid-template-areas: "structure" "plddt" "msa" "pae" "recycle"; } .about { grid-template-columns: 1fr; } }
+@media (max-width: 900px) { .workspace { grid-template-columns: 1fr; } .result-grid { grid-template-columns: 1fr; grid-template-areas: "structure" "plddt" "msa" "pae" "recycle"; } }
 @media (max-width: 680px) { body { padding-left: 0; } .side-rail { display: none; } .site-header { padding-inline: 12px; } .header-links a:not(:first-child) { display: none; } .header-links { gap: .8rem; } main, footer { width: calc(100% - 12px); } .two-columns, .advanced-grid { grid-template-columns: 1fr; } .advanced-grid .wide { grid-column: auto; } .score-grid { grid-template-columns: 1fr 1fr; } .primary { width: 100%; } textarea { min-height: 76px; } }
 @media (max-width: 430px) { .brand { font-size: 1rem; } .score-grid { grid-template-columns: 1fr; } footer { display: grid; gap: .5rem; } #structure-viewer { height: 390px; } }
 

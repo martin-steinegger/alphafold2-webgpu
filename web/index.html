@@ -24,7 +24,6 @@
       <a href="#prediction-heading" title="Prediction input" aria-label="Prediction input">⌁</a>
       <a href="#run-heading" title="Run status" aria-label="Run status">▶</a>
       <a href="#results-heading" title="Prediction results" aria-label="Prediction results">▦</a>
-      <a href="#about-heading" title="About" aria-label="About">?</a>
     </nav>
 
     <main>
@@ -82,6 +81,16 @@
 
         <aside class="panel run-panel" aria-live="polite">
           <div class="panel-heading"><div><span class="step">02</span><h2 id="run-heading">Run</h2></div></div>
+          <div class="capability-block">
+            <div id="gpu-summary" class="capability" data-state="checking">
+              <span class="capability-dot"></span><span id="gpu-summary-text">Checking WebGPU compatibility…</span>
+            </div>
+            <details id="gpu-details" class="capability-details" hidden>
+              <summary>Compatibility details</summary>
+              <p id="gpu-detail-text"></p>
+              <ul id="gpu-remedies"></ul>
+            </details>
+          </div>
           <ol id="run-stages" class="stages">
             <li data-stage="device"><span>1</span><div><strong>WebGPU device</strong><small>Waiting</small></div></li>
             <li data-stage="msa"><span>2</span><div><strong>Sequence alignment</strong><small>Waiting</small></div></li>
@@ -102,7 +111,7 @@
       </section>
 
       <section id="results-section" class="results" hidden aria-labelledby="results-heading">
-        <div class="section-heading"><div><span class="step">03</span><h2 id="results-heading">Prediction results</h2></div><div><span id="total-time"></span><button id="download-results" class="quiet inverse" type="button" hidden>Download results ZIP</button></div></div>
+        <div class="section-heading"><div><span class="step">03</span><h2 id="results-heading">Prediction results</h2></div><div><span id="total-time"></span></div></div>
         <div class="score-grid">
           <article><span>Mean pLDDT</span><strong id="mean-plddt">—</strong><small id="plddt-label">Confidence</small></article>
           <article><span>pTM</span><strong id="ptm">—</strong><small>Predicted TM-score</small></article>
@@ -133,6 +142,12 @@
           </article>
           <article class="result-card recycle-card"><h3>Recycle summary</h3><div class="table-wrap"><table><thead><tr><th>Pass</th><th>pLDDT</th><th>pTM</th><th>Time</th></tr></thead><tbody id="recycle-results"></tbody></table></div></article>
         </div>
+        <div class="download-bar">
+          <button id="download-results" class="download-all" type="button" hidden>
+            <span>Download results</span>
+            <small>Structure, scores, alignment error, plots, alignment and citations, as one ZIP</small>
+          </button>
+        </div>
       </section>
 
       <section class="reference" aria-labelledby="reference-heading">
@@ -141,26 +156,6 @@
         <p>MMseqs2 MSA generation is provided by the public <a href="https://github.com/sokrypton/ColabFold">ColabFold</a> service. Mirdita M, Schütze K, Moriwaki Y, et al. <a href="https://doi.org/10.1038/s41592-022-01488-1">ColabFold: making protein folding accessible to all.</a> Nature Methods, 2022.</p>
       </section>
 
-      <section class="about" aria-labelledby="about-heading">
-        <div>
-          <p class="eyebrow">Experimental · runs locally</p>
-          <h2 id="about-heading">Fold a protein in your browser.</h2>
-        </div>
-        <div class="about-copy">
-          <p>AlphaFold2 model-1 PTM and AlphaFold-Multimer-v3 model 1 inference run on WebGPU. Inference and predictions stay on this device. In MMseqs2 mode, the query is sent to the selected MSA API; single-sequence and custom-A3M modes remain local.</p>
-          <p>The TypeScript runtime preprocesses inputs and orchestrates inference. All learned AlphaFold operations execute as WGSL compute shaders on your local GPU. ColabFold-style paired/unpaired complex MSAs and serialized complex A3Ms are supported; templates, relaxation, and model ensembling are not.</p>
-          <div class="capability-block">
-            <div id="gpu-summary" class="capability" data-state="checking">
-              <span class="capability-dot"></span><span id="gpu-summary-text">Checking WebGPU compatibility…</span>
-            </div>
-            <details id="gpu-details" class="capability-details" hidden>
-              <summary>Compatibility details</summary>
-              <p id="gpu-detail-text"></p>
-              <ul id="gpu-remedies"></ul>
-            </details>
-          </div>
-        </div>
-      </section>
     </main>
     <footer><span>AlphaFold2 WebGPU · experimental research software</span><span>AlphaFold parameters: CC BY 4.0</span></footer>
     <script type="module" src="./main.ts"></script>

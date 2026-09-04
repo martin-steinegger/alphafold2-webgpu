@@ -566,8 +566,11 @@ async function downloadResultPackage(
   prediction: MonomerPrediction | MultimerPrediction, context: ResultContext,
 ): Promise<void> {
   const button = element<HTMLButtonElement>("download-results");
-  const label = button.textContent ?? "Download results";
-  button.disabled = true; button.textContent = "Packaging…";
+  // The button carries a title and a subtitle, so only the title changes.
+  const title = button.querySelector("span");
+  const label = title?.textContent ?? "Download results";
+  button.disabled = true;
+  if (title !== null) title.textContent = "Packaging…";
   try {
     const plots = [["plddt", "plddt-plot"], ["pae", "pae-plot"], ["coverage", "msa-plot"]] as const;
     const images = await Promise.all(plots.map(async ([suffix, id]) => (
@@ -592,7 +595,7 @@ async function downloadResultPackage(
     log(`Packaged the results as ${context.jobName}.result.zip (${formatMib(blob.size)}).`);
   } catch (error) {
     log(`Could not package the results: ${error instanceof Error ? error.message : String(error)}.`);
-  } finally { button.disabled = false; button.textContent = label; }
+  } finally { button.disabled = false; if (title !== null) title.textContent = label; }
 }
 
 function showResults(prediction: MonomerPrediction | MultimerPrediction, context: ResultContext): void {
