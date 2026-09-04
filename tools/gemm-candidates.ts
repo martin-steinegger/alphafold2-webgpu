@@ -124,16 +124,21 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
  * memory as vec4 so both the global and the shared reads stay vectorized.
  */
 function tiledGemm(
-  tileRows: number, tileColumns: number, tileInner: number, scalar: "f32" | "f16" = "f32",
+  tileRows: number, tileColumns: number, tileInner: number,
+  precision: "f32" | "f16" | "f16-mixed" = "f32",
 ): string {
   // Half precision is generated, not patched in: the staged tiles, the
   // products and the accumulators are all f16, and only the loads from and
   // stores to the f32 buffers convert. Apple issues f16 multiply-accumulate
   // at twice the f32 rate and stages half the bytes.
-  const half = scalar === "f16";
-  const vec = `vec4<${scalar}>`;
+  // "f16-mixed" multiplies in half precision and accumulates in single: the
+  // multiply is where the rate doubles, while a K-long reduction in f16 is
+  // where the error grows, so the two can be bought separately.
+  const half = precision !== "f32";
+  const scalar = half ? "f16" : "f32";
+  const accumulator = precision === "f16" ? "f16" : "f32";
+  const vec = `vec4<${accumulator}>`;
   const cast = (value: string): string => half ? `${scalar}(${value})` : value;
-  const castVec = (value: string): string => half ? `${vec}(${value})` : value;
   const threads = 256;
   const registerColumns = 4;
   const columnThreads = tileColumns / registerColumns;
@@ -147,7 +152,7 @@ function tiledGemm(
     (_, index) => `  var ${name}${index} = ${vec}(0.0);`).join("\n");
   const accumulate = Array.from({ length: registerRows }, (_, r) =>
     `      let a${r} = tile_source[k * ${tileRows}u + row_base + ${r}u];`
-    + `\n      acc${r} += a${r} * w;`).join("\n");
+    + `\n      acc${r} += ${precision === "f16-mixed" ? `vec4<f32>(a${r} * w)` : `a${r} * w`};`).join("\n");
   return `${half ? "enable f16;\n" : ""}${PARAMETERS}
 // A is staged transposed (k-major) so one k step reads consecutive rows, and
 // as scalars rather than vectors: adjacent elements are written by different
@@ -156,7 +161,7 @@ function tiledGemm(
 // read-modify-write of the whole vector. The shared GEMM fixed this once
 // already; these candidates were extracted from the code before that.
 var<workgroup> tile_source: array<${scalar}, ${tileRows * tileInner}>;
-var<workgroup> tile_weight: array<${vec}, ${weightVectors}>;
+var<workgroup> tile_weight: array<vec4<${scalar}>, ${weightVectors}>;
 
 @compute @workgroup_size(${threads}, 1, 1)
 fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) group: vec3<u32>) {
@@ -198,7 +203,7 @@ ${declare("acc", registerRows)}
           }
         }
       }
-      tile_weight[item] = ${castVec("value")};
+      tile_weight[item] = ${half ? `vec4<${scalar}>(value)` : "value"};
     }
     workgroupBarrier();
     for (var k = 0u; k < ${tileInner}u; k += 1u) {
@@ -217,7 +222,7 @@ ${accumulate}
     if (row < parameters.rows) {
       var value = vec4<f32>(0.0);
 ${Array.from({ length: registerRows }, (_, index) =>
-  `      if (r == ${index}u) { value = ${half ? `vec4<f32>(acc${index})` : `acc${index}`}; }`).join("\n")}
+  `      if (r == ${index}u) { value = ${accumulator === "f16" ? `vec4<f32>(acc${index})` : `acc${index}`}; }`).join("\n")}
       value += bias;
       if (parameters.activation == 1u) { value = max(value, vec4<f32>(0.0)); }
       let base = row * parameters.columns + column;
@@ -305,6 +310,9 @@ export const CANDIDATES: readonly Candidate[] = [
   { name: "f16-math-64x128k8", shader: tiledGemm(64, 128, 8, "f16"), tileRows: 64, tileColumns: 128,
     requiresF16: true },
   { name: "f16-math-64x64k16", shader: tiledGemm(64, 64, 16, "f16"), tileRows: 64, tileColumns: 64,
+    requiresF16: true },
+  // Half-precision products, single-precision accumulation.
+  { name: "f16-mixed-64x128k8", shader: tiledGemm(64, 128, 8, "f16-mixed"), tileRows: 64, tileColumns: 128,
     requiresF16: true },
   { name: "matrix-f32-8x8x8", shader: subgroupMatrixGemm("f32", 8), tileRows: 8, tileColumns: 8,
     requiresSubgroupMatrix: { componentType: "f32", size: 8 }, alignment: 8, throughputOnly: true },

@@ -80,79 +80,83 @@ test("measures every projection kernel", async ({ page }) => {
     // Accuracy before speed: half precision accumulates a K-long reduction in
     // f16, and a kernel that is fast and wrong is worth nothing. One small
     // aligned shape is checked against a reference computed here.
-    const check = { rows: 64, inner: 256, columns: 64 };
-    const checkSource = random(check.rows * check.inner);
-    const checkWeights = random(check.inner * check.columns + check.columns);
-    checkWeights.fill(0, check.inner * check.columns);
-    const reference = new Float32Array(check.rows * check.columns);
-    for (let row = 0; row < check.rows; row += 1) {
-      for (let column = 0; column < check.columns; column += 1) {
-        let total = 0;
-        for (let k = 0; k < check.inner; k += 1) {
-          total += checkSource[row * check.inner + k]! * checkWeights[k * check.columns + column]!;
-        }
-        reference[row * check.columns + column] = total;
-      }
-    }
     // A kernel that computes the wrong thing must not be able to win on
-    // speed, so what fails here is marked and excluded from the ranking.
+    // speed, so what fails at either depth is excluded from the ranking.
     const wrong = new Set<string>();
-    lines.push(`== accuracy, M=${check.rows} K=${check.inner} N=${check.columns} (no bias) ==`);
-    for (const candidate of candidates) {
-      if (candidate.requiresF16 === true && !device.features.has("shader-f16" as GPUFeatureName)) continue;
-      if (candidate.requiresSubgroupMatrix !== undefined && !matrixOffered(candidate)) continue;
-      const halfSource = candidate.sourceFormat === "f16";
-      const halfWeights = candidate.weightFormat === "f16";
-      const source = device.createBuffer({
-        size: check.rows * check.inner * (halfSource ? 2 : 4), usage: 128 | 8 });
-      const weights = device.createBuffer({
-        size: (check.inner * check.columns + check.columns) * (halfWeights ? 2 : 4), usage: 128 | 8 });
-      device.queue.writeBuffer(source, 0, halfSource ? halves(checkSource) : checkSource);
-      device.queue.writeBuffer(weights, 0, halfWeights ? halves(checkWeights) : checkWeights);
-      const params = device.createBuffer({ size: 32, usage: 64 | 8 });
-      device.queue.writeBuffer(params, 0, new Uint32Array([
-        check.rows, check.inner, check.columns, 0, check.inner * check.columns, 0, 0, 0]));
-      const outputBytes = check.rows * check.columns * (candidate.outputFormat === "f16" ? 2 : 4);
-      const output = device.createBuffer({ size: outputBytes, usage: 128 | 4 });
-      const readback = device.createBuffer({ size: outputBytes, usage: 1 | 8 });
-      device.pushErrorScope("validation");
-      const pipeline = device.createComputePipeline({
-        label: candidate.name, layout: "auto",
-        compute: { module: device.createShaderModule({ code: candidate.shader }), entryPoint: "main" },
-      });
-      const failure = await device.popErrorScope();
-      if (failure !== null) {
-        wrong.add(candidate.name);
-        lines.push(`  ${candidate.name} rejected: ${failure.message.split("\n")[0]}`);
-      } else {
-        const group = device.createBindGroup({
-          layout: pipeline.getBindGroupLayout(0),
-          entries: [source, weights, params, output].map((buffer, binding) => ({ binding, resource: { buffer } })),
-        });
-        const encoder = device.createCommandEncoder();
-        const pass = encoder.beginComputePass();
-        pass.setPipeline(pipeline); pass.setBindGroup(0, group);
-        pass.dispatchWorkgroups(Math.ceil(check.columns / candidate.tileColumns),
-          Math.ceil(check.rows / candidate.tileRows), 1);
-        pass.end();
-        encoder.copyBufferToBuffer(output, 0, readback, 0, outputBytes);
-        device.queue.submit([encoder.finish()]);
-        await readback.mapAsync(1);
-        const raw = readback.getMappedRange().slice(0);
-        const values = candidate.outputFormat === "f16" ? fromHalves(new Uint16Array(raw)) : new Float32Array(raw);
-        readback.unmap();
-        let worst = 0;
-        let scale = 0;
-        for (let index = 0; index < values.length; index += 1) {
-          worst = Math.max(worst, Math.abs(values[index]! - reference[index]!));
-          scale = Math.max(scale, Math.abs(reference[index]!));
+    // Two depths: the model reduces over as many as 1024 terms, and a half
+    // precision accumulator's error grows with the square root of that count,
+    // so a check at 256 says nothing about the transitions.
+    for (const check of [{ rows: 64, inner: 256, columns: 64 }, { rows: 64, inner: 1024, columns: 64 }]) {
+      const checkSource = random(check.rows * check.inner);
+      const checkWeights = random(check.inner * check.columns + check.columns);
+      checkWeights.fill(0, check.inner * check.columns);
+      const reference = new Float32Array(check.rows * check.columns);
+      for (let row = 0; row < check.rows; row += 1) {
+        for (let column = 0; column < check.columns; column += 1) {
+          let total = 0;
+          for (let k = 0; k < check.inner; k += 1) {
+            total += checkSource[row * check.inner + k]! * checkWeights[k * check.columns + column]!;
+          }
+          reference[row * check.columns + column] = total;
         }
-        const relative = 100 * worst / scale;
-        if (relative > 1) wrong.add(candidate.name);
-        lines.push(`  ${candidate.name.padEnd(22)} worst error ${worst.toExponential(2)} `
-          + `(${relative.toFixed(3)}% of the largest value)${relative > 1 ? "   WRONG" : ""}`);
       }
-      for (const buffer of [source, weights, params, output, readback]) buffer.destroy();
+      lines.push(`== accuracy, M=${check.rows} K=${check.inner} N=${check.columns} (no bias) ==`);
+      for (const candidate of candidates) {
+        if (candidate.requiresF16 === true && !device.features.has("shader-f16" as GPUFeatureName)) continue;
+        if (candidate.requiresSubgroupMatrix !== undefined && !matrixOffered(candidate)) continue;
+        const halfSource = candidate.sourceFormat === "f16";
+        const halfWeights = candidate.weightFormat === "f16";
+        const source = device.createBuffer({
+          size: check.rows * check.inner * (halfSource ? 2 : 4), usage: 128 | 8 });
+        const weights = device.createBuffer({
+          size: (check.inner * check.columns + check.columns) * (halfWeights ? 2 : 4), usage: 128 | 8 });
+        device.queue.writeBuffer(source, 0, halfSource ? halves(checkSource) : checkSource);
+        device.queue.writeBuffer(weights, 0, halfWeights ? halves(checkWeights) : checkWeights);
+        const params = device.createBuffer({ size: 32, usage: 64 | 8 });
+        device.queue.writeBuffer(params, 0, new Uint32Array([
+          check.rows, check.inner, check.columns, 0, check.inner * check.columns, 0, 0, 0]));
+        const outputBytes = check.rows * check.columns * (candidate.outputFormat === "f16" ? 2 : 4);
+        const output = device.createBuffer({ size: outputBytes, usage: 128 | 4 });
+        const readback = device.createBuffer({ size: outputBytes, usage: 1 | 8 });
+        device.pushErrorScope("validation");
+        const pipeline = device.createComputePipeline({
+          label: candidate.name, layout: "auto",
+          compute: { module: device.createShaderModule({ code: candidate.shader }), entryPoint: "main" },
+        });
+        const failure = await device.popErrorScope();
+        if (failure !== null) {
+          wrong.add(candidate.name);
+          lines.push(`  ${candidate.name} rejected: ${failure.message.split("\n")[0]}`);
+        } else {
+          const group = device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [source, weights, params, output].map((buffer, binding) => ({ binding, resource: { buffer } })),
+          });
+          const encoder = device.createCommandEncoder();
+          const pass = encoder.beginComputePass();
+          pass.setPipeline(pipeline); pass.setBindGroup(0, group);
+          pass.dispatchWorkgroups(Math.ceil(check.columns / candidate.tileColumns),
+            Math.ceil(check.rows / candidate.tileRows), 1);
+          pass.end();
+          encoder.copyBufferToBuffer(output, 0, readback, 0, outputBytes);
+          device.queue.submit([encoder.finish()]);
+          await readback.mapAsync(1);
+          const raw = readback.getMappedRange().slice(0);
+          const values = candidate.outputFormat === "f16" ? fromHalves(new Uint16Array(raw)) : new Float32Array(raw);
+          readback.unmap();
+          let worst = 0;
+          let scale = 0;
+          for (let index = 0; index < values.length; index += 1) {
+            worst = Math.max(worst, Math.abs(values[index]! - reference[index]!));
+            scale = Math.max(scale, Math.abs(reference[index]!));
+          }
+          const relative = 100 * worst / scale;
+          if (relative > 1) wrong.add(candidate.name);
+          lines.push(`  ${candidate.name.padEnd(22)} worst error ${worst.toExponential(2)} `
+            + `(${relative.toFixed(3)}% of the largest value)${relative > 1 ? "   WRONG" : ""}`);
+        }
+        for (const buffer of [source, weights, params, output, readback]) buffer.destroy();
+      }
     }
 
     for (const shape of shapes) {
