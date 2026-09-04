@@ -18,6 +18,49 @@ export const GEMM_TILE_ROWS = 64;
 export const GEMM_TILE_COLUMNS = 128;
 const GEMM_TILE_INNER = 8;
 const GEMM_THREADS = 256;
+/**
+ * Workgroup storage every WebGPU implementation guarantees. A deeper k tile
+ * stages more of both operands, and an epilogue reserves `gemm_stage` on top,
+ * so the depth is only taken when the three together still fit.
+ */
+const GEMM_WORKGROUP_BYTES = 16384;
+
+/**
+ * How the k loop computes, chosen per device rather than written down.
+ *
+ * `precision` is the arithmetic of the staged tiles, the products and the
+ * accumulator; `inner` is the depth of one staged k tile. Neither is visible
+ * to a caller: the accumulator still reaches the epilogue as `vec4<f32>`, and
+ * the k depth does not enter the dispatch grid, which `gemmGrid` derives from
+ * the output tile alone. That is what makes them safe to measure and switch
+ * without touching a single call site.
+ */
+export interface GemmVariant {
+  readonly precision: "f32" | "f16";
+  readonly inner: 8 | 16;
+}
+
+export const GEMM_VARIANT_F32: GemmVariant = { precision: "f32", inner: GEMM_TILE_INNER };
+
+let selectedVariant: GemmVariant = GEMM_VARIANT_F32;
+
+/** The variant every `createTiledGemmShader` uses unless told otherwise. */
+export function gemmVariant(): GemmVariant {
+  return selectedVariant;
+}
+
+/**
+ * Installs the measured winner.
+ *
+ * `src/runtime/gemm-selection.ts` calls this once per device, from inside
+ * `requestAlphaFoldDevice`, before any consumer can hold the device and so
+ * before any projection shader exists. Setting it later would let one cache
+ * key describe two different shaders, which `ComputePipelineCache` reports as
+ * a collision rather than running.
+ */
+export function setGemmVariant(variant: GemmVariant): void {
+  selectedVariant = variant;
+}
 
 export interface TiledGemmShader {
   /** WGSL emitted before the entry point: bindings, structs, and helpers. */
@@ -72,8 +115,24 @@ export function gemmGrid(
   return [Math.ceil(columns / tileColumns), Math.ceil(rows / GEMM_TILE_ROWS)];
 }
 
-export function createTiledGemmShader(shader: TiledGemmShader): string {
+export function createTiledGemmShader(
+  shader: TiledGemmShader, variant: GemmVariant = gemmVariant(),
+): string {
   const tileColumns = shader.tileColumns ?? GEMM_TILE_COLUMNS;
+  const half = variant.precision === "f16";
+  const scalar = half ? "f16" : "f32";
+  const stageBytes = shader.epilogue === undefined ? 0 : (shader.stageElements ?? 2048) * 4;
+  const operandBytes = (inner: number): number =>
+    GEMM_TILE_ROWS * inner * (half ? 2 : 4) + inner * tileColumns * (half ? 2 : 4);
+  // A depth that does not fit is stepped back rather than rejected: the
+  // caller asked for a projection, not for a particular k tile, and the
+  // shallower tile computes the same thing.
+  const tileInner = operandBytes(variant.inner) + stageBytes <= GEMM_WORKGROUP_BYTES
+    ? variant.inner : GEMM_TILE_INNER;
+  if (operandBytes(tileInner) + stageBytes > GEMM_WORKGROUP_BYTES) {
+    throw new RangeError(`GEMM tile ${GEMM_TILE_ROWS}x${tileColumns}k${tileInner} with `
+      + `${stageBytes} staging bytes exceeds ${GEMM_WORKGROUP_BYTES} bytes of workgroup storage`);
+  }
   const columnThreads = tileColumns / 4;
   const rowsPerThread = GEMM_TILE_ROWS / (GEMM_THREADS / columnThreads);
   const vectorsPerThread = rowsPerThread / 4;
@@ -84,14 +143,21 @@ export function createTiledGemmShader(shader: TiledGemmShader): string {
     Array.from({ length: count }, (_, index) => body(index)).join("\n");
   const items = (count: number, body: (index: number) => string): string =>
     Array.from({ length: count }, (_, index) => body(index)).join(", ");
-  return `${shader.preamble}
+  // Half precision accumulates under a private name and rebinds `acc{n}` to
+  // the converted value once the k loop is done, so every epilogue and store
+  // fragment a caller wrote against `vec4<f32>` keeps compiling unchanged.
+  const register = half ? "gemm_acc" : "acc";
+  // `enable` must precede every declaration, and a preamble may already carry
+  // its own copy for an activation stored as f16.
+  const enable = half && !shader.preamble.includes("enable f16;") ? "enable f16;\n" : "";
+  return `${enable}${shader.preamble}
 
 // Adjacent source elements are populated by different invocations. Keep them
 // as scalar workgroup objects: assigning separate lanes of one vec4 concurrently
 // is a data race and Metal may lower each lane assignment to a clobbering
 // read-modify-write of the whole vector.
-var<workgroup> gemm_source: array<f32, ${GEMM_TILE_ROWS * GEMM_TILE_INNER}>;
-var<workgroup> gemm_weight: array<vec4<f32>, ${(GEMM_TILE_INNER * tileColumns) / 4}>;
+var<workgroup> gemm_source: array<${scalar}, ${GEMM_TILE_ROWS * tileInner}>;
+var<workgroup> gemm_weight: array<vec4<${scalar}>, ${(tileInner * tileColumns) / 4}>;
 ${shader.epilogue === undefined ? "" : `var<workgroup> gemm_stage: array<f32, ${shader.stageElements ?? 2048}>;`}
 
 @compute @workgroup_size(${GEMM_THREADS}, 1, 1)
@@ -109,19 +175,19 @@ fn main(
   let row_origin = tile_row_origin + row_thread * ${rowsPerThread}u;
   let column_origin = group.x * ${tileColumns}u;
   let tile_column = column_origin + column_thread * 4u;
-${lines(rowsPerThread, (row) => `  var acc${row} = vec4<f32>(0.0);`)}
+${lines(rowsPerThread, (row) => `  var ${register}${row} = vec4<${scalar}>(0.0);`)}
 
-  for (var k0 = 0u; k0 < gemm_inner; k0 += ${GEMM_TILE_INNER}u) {
-    for (var item = thread; item < ${GEMM_TILE_ROWS * GEMM_TILE_INNER}u; item += ${GEMM_THREADS}u) {
-      let load_row = item / ${GEMM_TILE_INNER}u;
-      let k = k0 + (item % ${GEMM_TILE_INNER}u);
+  for (var k0 = 0u; k0 < gemm_inner; k0 += ${tileInner}u) {
+    for (var item = thread; item < ${GEMM_TILE_ROWS * tileInner}u; item += ${GEMM_THREADS}u) {
+      let load_row = item / ${tileInner}u;
+      let k = k0 + (item % ${tileInner}u);
       let row = group.y * ${GEMM_TILE_ROWS}u + load_row;
       var element = 0.0;
       if (row < gemm_rows && k < gemm_inner) { element = ${shader.sourceElement}; }
-      let slot = (item % ${GEMM_TILE_INNER}u) * ${GEMM_TILE_ROWS}u + load_row;
-      gemm_source[slot] = element;
+      let slot = (item % ${tileInner}u) * ${GEMM_TILE_ROWS}u + load_row;
+      gemm_source[slot] = ${half ? "f16(element)" : "element"};
     }
-    for (var item = thread; item < ${(GEMM_TILE_INNER * tileColumns) / 4}u; item += ${GEMM_THREADS}u) {
+    for (var item = thread; item < ${(tileInner * tileColumns) / 4}u; item += ${GEMM_THREADS}u) {
       let k = k0 + item / ${columnThreads}u;
       let load_column = column_origin + (item % ${columnThreads}u) * 4u;
       var loaded = vec4<f32>(0.0);
@@ -131,18 +197,18 @@ ${lines(4, (lane) => `        {
           if (column < gemm_columns) { loaded[${lane}u] = ${shader.weightElement}; }
         }`)}
       }
-      gemm_weight[item] = loaded;
+      gemm_weight[item] = ${half ? "vec4<f16>(loaded)" : "loaded"};
     }
     workgroupBarrier();
-    for (var step = 0u; step < ${GEMM_TILE_INNER}u; step += 1u) {
+    for (var step = 0u; step < ${tileInner}u; step += 1u) {
       let w = gemm_weight[step * ${columnThreads}u + column_thread];
       let a_base = step * ${GEMM_TILE_ROWS}u + row_thread * ${rowsPerThread}u;
-${lines(vectorsPerThread, (vector) => `      let a${vector} = vec4<f32>(${items(4,
+${lines(vectorsPerThread, (vector) => `      let a${vector} = vec4<${scalar}>(${items(4,
     (lane) => `gemm_source[a_base + ${vector * 4 + lane}u]`)});`)}
-${lines(rowsPerThread, (row) => `      acc${row} += a${Math.floor(row / 4)}[${row % 4}u] * w;`)}
+${lines(rowsPerThread, (row) => `      ${register}${row} += a${Math.floor(row / 4)}[${row % 4}u] * w;`)}
     }
     workgroupBarrier();
-  }
+  }${half ? `\n${lines(rowsPerThread, (row) => `  let acc${row} = vec4<f32>(gemm_acc${row});`)}` : ""}
 
 ${shader.epilogue !== undefined ? shader.epilogue : lines(rowsPerThread, (index) => `
   {

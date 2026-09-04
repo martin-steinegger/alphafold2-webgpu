@@ -125,7 +125,7 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
  */
 function tiledGemm(
   tileRows: number, tileColumns: number, tileInner: number,
-  precision: "f32" | "f16" | "f16-mixed" = "f32",
+  precision: "f32" | "f16" | "f16-mixed" | "f16-chunked" = "f32",
 ): string {
   // Half precision is generated, not patched in: the staged tiles, the
   // products and the accumulators are all f16, and only the loads from and
@@ -134,6 +134,10 @@ function tiledGemm(
   // "f16-mixed" multiplies in half precision and accumulates in single: the
   // multiply is where the rate doubles, while a K-long reduction in f16 is
   // where the error grows, so the two can be bought separately.
+  // "f16-chunked" buys both: the reduction stays in f16 for the depth of one
+  // staged tile and folds into an f32 running sum once per tile, so the error
+  // grows with the square root of the tile depth rather than of K while every
+  // multiply and all but one add per tile stay in half precision.
   const half = precision !== "f32";
   const scalar = half ? "f16" : "f32";
   const accumulator = precision === "f16" ? "f16" : "f32";
@@ -150,9 +154,20 @@ function tiledGemm(
   const weightVectors = (tileInner * tileColumns) / 4;
   const declare = (name: string, count: number): string => Array.from({ length: count },
     (_, index) => `  var ${name}${index} = ${vec}(0.0);`).join("\n");
+  const chunked = precision === "f16-chunked";
+  const product = (r: number): string => precision === "f16-mixed"
+    ? `vec4<f32>(a${r} * w)` : `a${r} * w`;
   const accumulate = Array.from({ length: registerRows }, (_, r) =>
     `      let a${r} = tile_source[k * ${tileRows}u + row_base + ${r}u];`
-    + `\n      acc${r} += ${precision === "f16-mixed" ? `vec4<f32>(a${r} * w)` : `a${r} * w`};`).join("\n");
+    + `\n      ${chunked ? `chunk${r} += a${r} * w` : `acc${r} += ${product(r)}`};`).join("\n");
+  const declareChunks = chunked
+    ? Array.from({ length: registerRows },
+      (_, index) => `    var chunk${index} = vec4<f16>(0.0);`).join("\n") + "\n"
+    : "";
+  const foldChunks = chunked
+    ? "\n" + Array.from({ length: registerRows },
+      (_, index) => `    acc${index} += vec4<f32>(chunk${index});`).join("\n")
+    : "";
   return `${half ? "enable f16;\n" : ""}${PARAMETERS}
 // A is staged transposed (k-major) so one k step reads consecutive rows, and
 // as scalars rather than vectors: adjacent elements are written by different
@@ -206,10 +221,10 @@ ${declare("acc", registerRows)}
       tile_weight[item] = ${half ? `vec4<${scalar}>(value)` : "value"};
     }
     workgroupBarrier();
-    for (var k = 0u; k < ${tileInner}u; k += 1u) {
+${declareChunks}    for (var k = 0u; k < ${tileInner}u; k += 1u) {
       let w = tile_weight[k * ${tileColumns / 4}u + column_thread];
 ${accumulate}
-    }
+    }${foldChunks}
     workgroupBarrier();
   }
 
@@ -300,6 +315,7 @@ export const CANDIDATES: readonly Candidate[] = [
     tileColumns: GEMM_TILE_COLUMNS },
   { name: "current-64x128k8", shader: tiledGemm(64, 128, 8), tileRows: 64, tileColumns: 128 },
   { name: "tiled-64x64k16", shader: tiledGemm(64, 64, 16), tileRows: 64, tileColumns: 64 },
+  { name: "tiled-64x128k16", shader: tiledGemm(64, 128, 16), tileRows: 64, tileColumns: 128 },
   { name: "tiled-128x128k8", shader: tiledGemm(128, 128, 8), tileRows: 128, tileColumns: 128 },
   // 16 KiB of workgroup storage exactly, with no headroom against the WebGPU
   // minimum, so it is measured but not shipped.
@@ -309,11 +325,23 @@ export const CANDIDATES: readonly Candidate[] = [
     sourceFormat: "f16" },
   { name: "f16-math-64x128k8", shader: tiledGemm(64, 128, 8, "f16"), tileRows: 64, tileColumns: 128,
     requiresF16: true },
+  { name: "f16-math-64x128k16", shader: tiledGemm(64, 128, 16, "f16"), tileRows: 64, tileColumns: 128,
+    requiresF16: true },
   { name: "f16-math-64x64k16", shader: tiledGemm(64, 64, 16, "f16"), tileRows: 64, tileColumns: 64,
     requiresF16: true },
   // Half-precision products, single-precision accumulation.
   { name: "f16-mixed-64x128k8", shader: tiledGemm(64, 128, 8, "f16-mixed"), tileRows: 64, tileColumns: 128,
     requiresF16: true },
+  { name: "f16-mixed-64x64k16", shader: tiledGemm(64, 64, 16, "f16-mixed"), tileRows: 64, tileColumns: 64,
+    requiresF16: true },
+  // Half-precision products and accumulation within a staged tile, folded
+  // into a single-precision running sum once per tile.
+  { name: "f16-chunked-64x128k8", shader: tiledGemm(64, 128, 8, "f16-chunked"), tileRows: 64,
+    tileColumns: 128, requiresF16: true },
+  { name: "f16-chunked-64x128k16", shader: tiledGemm(64, 128, 16, "f16-chunked"), tileRows: 64,
+    tileColumns: 128, requiresF16: true },
+  { name: "f16-chunked-64x64k16", shader: tiledGemm(64, 64, 16, "f16-chunked"), tileRows: 64,
+    tileColumns: 64, requiresF16: true },
   { name: "matrix-f32-8x8x8", shader: subgroupMatrixGemm("f32", 8), tileRows: 8, tileColumns: 8,
     requiresSubgroupMatrix: { componentType: "f32", size: 8 }, alignment: 8, throughputOnly: true },
   // An f16 matrix produces an f16 result, which only an f16 buffer can hold.

@@ -8,6 +8,7 @@ import { triangleBlockRows } from "../evoformer/block.js";
 import type { TriangleWholeStorage } from "../triangle/shaders.js";
 import type { ActivationStorage } from "./storage.js";
 import { TRANSITION_CHUNK_TARGET_BYTES, transitionChunkRows } from "../evoformer/transition.js";
+import { calibrateGemmVariant } from "./gemm-selection.js";
 import { recordSubgroupRange } from "./subgroups.js";
 
 const WEBGPU_BASE_MAX_BUFFER_SIZE = 256 * 1024 * 1024;
@@ -324,7 +325,9 @@ export async function requestAlphaFoldDevice(
   },
 ): Promise<GPUDevice> {
   // subgroup-size-control is shipping ahead of the current @webgpu/types union.
-  const optional = ["subgroups", "subgroup-size-control", "timestamp-query"] as const;
+  // shader-f16 is requested wherever it exists but never assumed to be worth
+  // using: gemm-selection measures it below and keeps f32 unless it wins.
+  const optional = ["subgroups", "subgroup-size-control", "timestamp-query", "shader-f16"] as const;
   const requiredFeatures = optional.filter(
     (feature) => adapter.features.has(feature as GPUFeatureName),
   ) as GPUFeatureName[];
@@ -361,5 +364,8 @@ export async function requestAlphaFoldDevice(
     requiredLimits: { maxBufferSize, maxStorageBufferBindingSize, maxStorageBuffersPerShaderStage },
   });
   recordSubgroupRange(device, adapter);
+  // Before the caller can hold the device, and so before any projection
+  // shader exists, settle which arithmetic and k depth the shared GEMM uses.
+  await calibrateGemmVariant(device);
   return device;
 }
