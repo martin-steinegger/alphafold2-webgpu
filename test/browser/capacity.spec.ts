@@ -63,12 +63,13 @@ test(`predicts a ${copies}-chain complex`, async ({ page }) => {
         maxMsaSequences: 1, maxExtraSequences: 1, recycles: 0,
         randomSeed: 0, compactPolicy: false,
       }, reporter);
-      const final = result.prediction.final as Record<string, Record<string, number>>;
+      const final = result.prediction.final as { confidence?: Record<string, number> };
+      const confidence = final.confidence ?? {};
       return {
         seconds: (performance.now() - started) / 1000,
         residues: parsed.sequence.replace(/:/gu, "").length,
-        meanPlddt: final.confidence.meanPlddt, ptm: final.confidence.ptm,
-        iptm: final.confidence.iptm, failure: undefined as string | undefined,
+        meanPlddt: confidence.meanPlddt ?? Number.NaN, ptm: confidence.ptm ?? Number.NaN,
+        iptm: confidence.iptm ?? Number.NaN, failure: undefined as string | undefined,
       };
     } catch (error) {
       return {
