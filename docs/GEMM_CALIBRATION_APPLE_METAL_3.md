@@ -1,15 +1,16 @@
 # Half-precision projections on Apple Metal 3
 
 Measured on an M4 Pro MacBook, Chromium, Apple Metal 3, on branch
-`f16-projection`. Harness revision `HEAD_PLACEHOLDER`.
+`f16-projection`. Harness revision `f16-projection`, 20 commits from `main`.
 
 ## Conclusion
 
 **Ship `f16-chunked`, with the k depth measured per device.** It runs the
-projection shapes 1.12x to 1.26x faster than the f32 kernel and moves the
+projection shapes 1.11x to 1.25x faster than the f32 kernel and moves the
 59-residue acceptance prediction by 0.008 pLDDT, against a gate of 0.05.
-Across a whole prediction it is worth 1.044x, because the projections are only
-part of a recycle.
+Across a whole prediction it is worth 1.046x on that 59-residue input and
+1.117x on the 1,416-residue complex, because the projections are only part of
+a recycle and how large a part depends on the input.
 
 **Pure f16 is rejected, and this is the main result.** It is much the fastest
 candidate, at 1.28x to 1.54x, and it is unusable: the 508-row acceptance
@@ -199,17 +200,22 @@ blocks and the later ones are several percent slower whatever kernel they use,
 which is enough to invert a ranking this close. A single pass in a fixed order
 measured `f32-k16` at 0.92x, which is an artefact.
 
-| variant | best | vs f32 |
-|---|---|---|
-| `f32-k8` | 4.44 s | 1.000x |
-| `f32-k16` | 4.42 s | 1.005x |
-| `f16-mixed-k8` | 4.36 s | 1.018x |
-| `f16-chunked-k8` | 4.33 s | 1.026x |
-| `f16-chunked-k16` | 4.26 s | 1.044x |
+| variant | best | vs f32 | repeated |
+|---|---|---|---|
+| `f32-k8` | 4.44 s | 1.000x | 1.000x |
+| `f32-k16` | 4.42 s | 1.005x | 1.008x |
+| `f16-mixed-k8` | 4.36 s | 1.018x | 1.021x |
+| `f16-chunked-k8` | 4.33 s | 1.026x | 1.031x |
+| `f16-chunked-k16` | 4.26 s | 1.044x | 1.046x |
 
-A 1.15x to 1.26x kernel is worth 1.044x here, so the dense projections are
-roughly a fifth to a quarter of this prediction. That fraction is
-input-dependent, and the 59-residue query is a small input.
+The whole measurement was repeated after everything else in this document was
+settled, and reproduced to within 0.003x, which is the last column.
+
+A 1.13x to 1.25x kernel is worth 1.046x here, so the dense projections are
+roughly a fifth of this prediction. That fraction is input-dependent, and the
+59-residue query is a small input: the 1,416-residue complex gets 1.117x from
+the same kernel, and it is the more useful number for anyone predicting real
+targets.
 
 ## Complexes and long inputs
 
