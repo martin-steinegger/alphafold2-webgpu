@@ -27,6 +27,14 @@ The confidence is low because this is a 24-copy homomer with no alignment at
 all, one sequence deep. That is expected and is not what the run measures: the
 question is whether 1,416 residues completes and comes back finite.
 
+The kernel named in the second row is identified rather than read off: that
+run predates a fix to the capacity probe, which asked which variant was
+installed before the prediction rather than after, and so reported the f32
+default. It is `f16-chunked-64x128k16` because that is what the per-device
+probe chooses on this adapter, and because the run differs from `main` in
+confidence and in time, neither of which the f32 kernel could do — it is
+emitted byte for byte as `main` emits it.
+
 Mean pLDDT moves by 0.008 and pTM and ipTM by 0.00002, far inside the gate.
 An earlier run of this input recorded confidence identical to `main` in every
 printed digit, which looked like the kernel toggle having failed; it was the
