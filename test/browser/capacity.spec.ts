@@ -36,6 +36,18 @@ test(`predicts a ${copies}-chain complex with ${recycles} extra recycles`, async
           readonly chains: readonly string[]; readonly sequence: string; readonly multimer: boolean;
         };
       };
+    // Which kernel this branch chose for itself. On main there is no such
+    // module and no such choice, and the import failing is the answer.
+    let selected = "f32 (this branch has no projection selection)";
+    try {
+      const gemm = await import(/* @vite-ignore */ `/@fs${root}/src/runtime/gemm.ts`) as {
+        gemmVariant?: () => { precision: string; inner: number };
+      };
+      const variant = gemm.gemmVariant?.();
+      if (variant !== undefined) selected = `${variant.precision}-k${variant.inner}`;
+    } catch {
+      // Left as the default above.
+    }
     const inferenceUrl = "/inference.ts";
     const inference = await import(/* @vite-ignore */ inferenceUrl) as {
       runInference(job: unknown, reporter: unknown): Promise<{ prediction: Record<string, unknown> }>;
@@ -70,14 +82,14 @@ test(`predicts a ${copies}-chain complex with ${recycles} extra recycles`, async
       const final = result.prediction.final as { confidence?: Record<string, number> };
       const confidence = final.confidence ?? {};
       return {
-        seconds: (performance.now() - started) / 1000,
+        selected, seconds: (performance.now() - started) / 1000,
         residues: parsed.sequence.replace(/:/gu, "").length,
         meanPlddt: confidence.meanPlddt ?? Number.NaN, ptm: confidence.ptm ?? Number.NaN,
         iptm: confidence.iptm ?? Number.NaN, failure: undefined as string | undefined,
       };
     } catch (error) {
       return {
-        seconds: (performance.now() - started) / 1000,
+        selected, seconds: (performance.now() - started) / 1000,
         residues: parsed.sequence.replace(/:/gu, "").length,
         meanPlddt: Number.NaN, ptm: Number.NaN, iptm: Number.NaN, failure: String(error),
       };
@@ -85,7 +97,7 @@ test(`predicts a ${copies}-chain complex with ${recycles} extra recycles`, async
   }, { root, chain: CHAIN, copies, recycles });
 
   console.log(`\nCAPACITY\n${copies} chains, ${outcome.residues} residues, `
-    + `${recycles} extra recycles, `
+    + `${recycles} extra recycles, kernel ${outcome.selected}, `
     + `${outcome.seconds.toFixed(0)} s\n`
     + (outcome.failure === undefined
       ? `pLDDT ${outcome.meanPlddt.toFixed(4)}  pTM ${outcome.ptm.toFixed(5)}  `

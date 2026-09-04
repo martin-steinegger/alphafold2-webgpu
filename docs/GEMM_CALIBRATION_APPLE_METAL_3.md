@@ -1,7 +1,7 @@
 # Half-precision projections on Apple Metal 3
 
 Measured on an M4 Pro MacBook, Chromium, Apple Metal 3, on branch
-`f16-projection`. Harness revision `6dc1068`.
+`f16-projection`. Harness revision `HEAD_PLACEHOLDER`.
 
 ## Conclusion
 
