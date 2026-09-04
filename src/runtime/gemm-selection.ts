@@ -293,7 +293,7 @@ export interface GemmVariantMeasurement {
   readonly relativeError: number;
 }
 
-/** Measures every candidate on this device, fastest first among the correct ones. */
+/** Measures every candidate on this device, in candidate order. */
 export async function measureGemmVariants(
   device: GPUDevice,
 ): Promise<readonly GemmVariantMeasurement[]> {
@@ -317,9 +317,10 @@ export async function measureGemmVariants(
  * Picks the projection variant for this device and installs it.
  *
  * Correctness first: a candidate that does not reproduce the reference cannot
- * win however fast it is. Among the rest the fastest wins, and f32 keeps the
- * tie so that an adapter where half precision buys nothing stays exact.
- * Anything that throws leaves the f32 kernel in place.
+ * win however fast it is. Among the rest the fastest f32 tile is the one to
+ * beat, and half precision has to beat it by `HALF_PRECISION_MARGIN` to be
+ * chosen, so an adapter where f16 buys nothing stays exact. Anything that
+ * throws leaves the f32 kernel in place.
  */
 export function calibrateGemmVariant(device: GPUDevice): Promise<GemmVariant> {
   if (pinnedVariant !== undefined) {
