@@ -199,6 +199,21 @@ Half precision must also beat f32 by a margin of 1.1x before it is chosen, so
 an adapter that merely emulates f16 stays exact rather than trading accuracy
 for measurement noise.
 
+## A side effect worth someone's attention
+
+`src/triangle/webgpu.ts` already accepts a `precision: "f16"` option, guards it
+on `device.features.has("shader-f16")`, and defaults to `"f32"`. Until now that
+guard could never pass, because no device the model built requested the
+feature. Requesting it makes the triangle multiply's existing half-precision
+path reachable on Apple for the first time.
+
+Nothing here enables it. That file belongs to the other branch, and the
+evidence above is a reason for caution rather than enthusiasm: the triangle
+multiply reduces over the residue axis, which is exactly the long reduction
+that made pure f16 unusable in the projections. If it is tried, it should be
+tried against a deep MSA, recycle by recycle, and the `f16-chunked`
+arrangement is the one to reach for.
+
 ## Subgroup matrix units
 
 `matrix-f32-8x8x8` and `matrix-f16-8x8x8` remain slower than production, at
