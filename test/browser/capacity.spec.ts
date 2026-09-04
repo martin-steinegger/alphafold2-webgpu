@@ -36,18 +36,24 @@ test(`predicts a ${copies}-chain complex with ${recycles} extra recycles`, async
           readonly chains: readonly string[]; readonly sequence: string; readonly multimer: boolean;
         };
       };
-    // Which kernel this branch chose for itself. On main there is no such
-    // module and no such choice, and the import failing is the answer.
-    let selected = "f32 (this branch has no projection selection)";
-    try {
-      const gemm = await import(/* @vite-ignore */ `/@fs${root}/src/runtime/gemm.ts`) as {
-        gemmVariant?: () => { precision: string; inner: number };
-      };
-      const variant = gemm.gemmVariant?.();
-      if (variant !== undefined) selected = `${variant.precision}-k${variant.inner}`;
-    } catch {
-      // Left as the default above.
-    }
+    // Which kernel this branch chose for itself. Read after the prediction,
+    // not before: the choice is installed while the device is being created,
+    // so asking beforehand reports the f32 default and reports it confidently.
+    // On main there is no such module and no such choice, and the import
+    // failing is itself the answer.
+    const readVariant = async (): Promise<string> => {
+      try {
+        const gemm = await import(/* @vite-ignore */ `/@fs${root}/src/runtime/gemm.ts`) as {
+          gemmVariant?: () => { precision: string; inner: number };
+        };
+        const variant = gemm.gemmVariant?.();
+        return variant === undefined
+          ? "f32 (this branch has no projection selection)"
+          : `${variant.precision}-k${variant.inner}`;
+      } catch {
+        return "f32 (this branch has no projection selection)";
+      }
+    };
     const inferenceUrl = "/inference.ts";
     const inference = await import(/* @vite-ignore */ inferenceUrl) as {
       runInference(job: unknown, reporter: unknown): Promise<{ prediction: Record<string, unknown> }>;
@@ -82,14 +88,14 @@ test(`predicts a ${copies}-chain complex with ${recycles} extra recycles`, async
       const final = result.prediction.final as { confidence?: Record<string, number> };
       const confidence = final.confidence ?? {};
       return {
-        selected, seconds: (performance.now() - started) / 1000,
+        selected: await readVariant(), seconds: (performance.now() - started) / 1000,
         residues: parsed.sequence.replace(/:/gu, "").length,
         meanPlddt: confidence.meanPlddt ?? Number.NaN, ptm: confidence.ptm ?? Number.NaN,
         iptm: confidence.iptm ?? Number.NaN, failure: undefined as string | undefined,
       };
     } catch (error) {
       return {
-        selected, seconds: (performance.now() - started) / 1000,
+        selected: await readVariant(), seconds: (performance.now() - started) / 1000,
         residues: parsed.sequence.replace(/:/gu, "").length,
         meanPlddt: Number.NaN, ptm: Number.NaN, iptm: Number.NaN, failure: String(error),
       };
