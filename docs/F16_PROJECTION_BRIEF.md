@@ -41,20 +41,34 @@ precision. Add it to `tools/gemm-candidates.ts` as `f16-chunked-*` and
 measure. If it reaches 1.3x at under 0.1%, it is the answer and the rest of
 this brief is about shipping it.
 
-## Accuracy gate, in order
+## Accuracy gate
 
-1. Microbenchmark: the calibration's own accuracy check at both depths.
-2. End to end: the same input predicted with and without the new kernel, same
-   model, comparing mean pLDDT, pTM and predicted aligned error. How you
-   toggle it is yours; do not ship a user-facing switch, the project has one
-   model and no modes.
-3. Absolute anchor: the 59-residue acceptance alignment reaches 96.058 pLDDT
-   and 0.7536 pTM, against AlphaFold's own 96.0625 and 0.7534 recorded in
-   `test/fixtures/evoformer/model1-a3m-59-stack/manifest.json`. A change that
-   moves pLDDT by more than 0.05 has failed.
+The end-to-end result decides. The microbenchmark is a screen, not a gate: a
+worst-case error on random inputs does not predict the model's output error,
+because real activations are not random, errors partly cancel, and recycling
+is self-correcting. A candidate that fails the screen has to work harder to
+pass, it is not disqualified.
 
-If pure f16 clears gate 3, ship it. If it does not, ship whichever of chunked
-or mixed is fastest among those that do. Report the numbers either way.
+1. **Screen.** The calibration's accuracy check at both depths. Under 0.1% and
+   the candidate is as safe as the packed storage already shipped. Over 0.5%
+   and it owes the extra evidence in step 2.
+2. **Differential prediction.** The same input predicted with and without the
+   new kernel, same model and same weights, compared recycle by recycle on
+   mean pLDDT, pTM and predicted aligned error. Under 0.05 pLDDT and 0.005 pTM
+   at every recycle, it passes. A candidate that failed the screen must show
+   this on at least two inputs, one of them a complex, since a single sequence
+   can pass by luck and errors can compound across recycles.
+3. How you toggle the kernel for that comparison is yours. Do not ship a
+   user-facing switch: the project has one model and no modes.
+
+Ship the fastest candidate that passes. Report the numbers either way,
+including for the candidates that did not.
+
+The absolute anchor, 96.0625 pLDDT and 0.75342 pTM in
+`test/fixtures/alphafold-a3m/model1-reference-59/manifest.json`, is not a gate
+for this work: it measures the model, not the kernel, and no machine today has
+both an f32 bundle and `shader-f16`. The f32 kernel already matches it to
+0.005. Once the branch lands, that check runs where the bundle is.
 
 ## Guardrails
 
@@ -63,9 +77,18 @@ or mixed is fastest among those that do. Report the numbers either way.
   differential test against an independent reference, and correctness comes
   before performance.
 - Half precision must be selected by capability, never by a user setting.
-  Devices without `shader-f16` keep the f32 kernel, and the selection belongs
-  next to the existing runtime calibration in `attention-calibration.ts`,
-  which measures candidates on the real device and caches the winner.
+  Devices without `shader-f16` keep the f32 kernel.
+- Put the selection in a new `src/runtime/gemm-selection.ts`. It owns both
+  questions, which precision and which tile, since both are "measure the
+  candidates on this device once and cache the winner". Model it on
+  `src/evoformer/attention-calibration.ts`, which already does exactly that
+  for the flash kernels, but do not edit that file: it is outside your scope
+  and a new file cannot conflict.
+- Tile selection is yours as well. The other agent will not build a competing
+  mechanism. What is known: this workstation prefers a 64x64 tile for the two
+  outer-product shapes and 128x128 for the wide ones, and your machine
+  disagreed, which is the whole reason the choice should be measured rather
+  than written down.
 - Commits in this repository carry no Claude attribution: no `Co-Authored-By`
   and no session trailer.
 - Work on a branch named `f16-projection` and push the branch. Do not merge to
@@ -74,8 +97,12 @@ or mixed is fastest among those that do. Report the numbers either way.
 ## Files you own
 
 `src/runtime/gemm.ts`, `src/evoformer/transition.ts`,
-`tools/gemm-candidates.ts`, `test/browser/gemm-calibration.spec.ts`. Stay out
-of everything else so the branches do not collide.
+`tools/gemm-candidates.ts`, `test/browser/gemm-calibration.spec.ts`, and new
+files under `src/runtime/`. Not the GEMM callers: `attention.ts`, `block.ts`,
+`outer-product-mean.ts` and `triangle/shaders.ts` belong to the other agent.
+You should not need them, as you observed: the epilogue contract holds if the
+accumulator arrives at it as `vec4<f32>`. If a design needs a caller changed,
+say so rather than reaching for it.
 
 ## Commands
 
@@ -87,9 +114,13 @@ npm run build && npx vitest run          # types and the CPU suite
 AFWEBGPU_GPU_TESTS=1 npx vitest run      # the GPU suite, if dawn-node works there
 ```
 
-For an end-to-end prediction without local model assets, run `npm run dev` and
-point the page's monomer model URL at the deployed manifest:
+There are no model bundles on that machine and only the quantised one is
+deployed. That is enough: gate 2 compares the same model against itself, so
+what the weights are does not matter, only that both sides use the same ones.
+Run `npm run dev` and point the page's monomer model URL at the deployed
+manifest,
 `https://martin-steinegger.github.io/alphafold2-webgpu/model/manifest.json`.
+Report which bundle you used.
 
 ## What to report
 
