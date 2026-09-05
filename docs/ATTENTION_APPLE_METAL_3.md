@@ -9,12 +9,14 @@ A 24-chain, 1,416-residue complex, one pass, whole prediction:
 
 | | elapsed | vs `main` |
 |---|---:|---:|
-| `main` | 746 s | 1.00x |
+| `main` | 746 s, and 775 on a second run | 1.00x |
 | the projection work in `GEMM_CALIBRATION_APPLE_METAL_3.md` | 668 s | 1.12x |
-| **plus the two attention changes below** | **407 s** | **1.83x** |
+| plus the two attention changes below | 407 s | 1.83x |
+| plus filling the contraction's tile | **288 s** | **2.6x** |
 
 Nothing here is a cleverer kernel. One is a constant that was measured on
-different hardware, and the other is the width of two operands.
+different hardware, one is the width of two operands, and the third is a block
+budget that nobody had costed against the tile it feeds.
 
 ## How the projections turned out to be the wrong place to look
 
