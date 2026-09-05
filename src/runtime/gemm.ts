@@ -187,10 +187,10 @@ export function usesMatrixUnits(shader: TiledGemmShader, variant: GemmVariant): 
   return variant.precision === "matrix"
     && shader.sourceArray !== undefined && shader.weightArray !== undefined
     // A whole-tile epilogue is written against `acc{n}` in the hand-tiled
-    // thread mapping, which a matrix kernel does not have; `storeVector`
-    // writes four columns at once, which is how a packed half-precision
-    // output is written and which the per-element store below cannot do.
-    && shader.epilogue === undefined && shader.storeVector === undefined;
+    // thread mapping, which a matrix kernel does not have. `storeVector` is
+    // fine: the result is staged in workgroup memory, so an invocation can
+    // read four adjacent columns of it as easily as one.
+    && shader.epilogue === undefined;
 }
 
 /**
@@ -279,7 +279,7 @@ ${lines(tiles, (r) => lines(tiles, (c) =>
     `        subgroupMatrixStore(&gemm_matrix_stage, ${r * size}u * ${region}u + ${c * size}u,
           acc_${r}_${c}, false, ${region}u);`))}
         workgroupBarrier();
-        for (var item = lane; item < ${region * region}u; item += ${MATRIX_LANES}u) {
+${shader.storeVector === undefined ? `        for (var item = lane; item < ${region * region}u; item += ${MATRIX_LANES}u) {
           let row = row_origin + item / ${region}u;
           let column = column_origin + item % ${region}u;
           if (row < gemm_rows && column < gemm_columns) {
@@ -287,14 +287,27 @@ ${lines(tiles, (r) => lines(tiles, (c) =>
             let element = gemm_matrix_stage[(row - load_origin) * ${region}u + item % ${region}u];
             ${shader.store}
           }
-        }
+        }` : `        // Four adjacent columns at a time, which is how a packed
+        // half-precision output is written. The caller bounds the columns
+        // itself, as it does for the hand-tiled kernel.
+        for (var item = lane * 4u; item < ${region * region}u; item += ${MATRIX_LANES * 4}u) {
+          let local_column = item % ${region}u;
+          let row = row_origin + item / ${region}u;
+          let column = column_origin + local_column;
+          if (row < gemm_rows) {
+            let staged = (row - load_origin) * ${region}u + local_column;
+            let values = vec4<f32>(gemm_matrix_stage[staged], gemm_matrix_stage[staged + 1u],
+              gemm_matrix_stage[staged + 2u], gemm_matrix_stage[staged + 3u]);
+            ${shader.storeVector}
+          }
+        }`}
         workgroupBarrier();
       }
     }
   } else {
     // Fewer rows than one region: there is nowhere to pull back to, so the
     // whole tile is computed directly. Only the smallest shapes reach this.
-    for (var item = lane; item < ${GEMM_TILE_ROWS * tileColumns}u; item += ${MATRIX_LANES}u) {
+${shader.storeVector === undefined ? `    for (var item = lane; item < ${GEMM_TILE_ROWS * tileColumns}u; item += ${MATRIX_LANES}u) {
       let row = tile_row_origin + item / ${tileColumns}u;
       let column = tile_column_origin + item % ${tileColumns}u;
       if (row < gemm_rows && column < gemm_columns) {
@@ -306,7 +319,23 @@ ${lines(tiles, (r) => lines(tiles, (c) =>
         let element = total;
         ${shader.store}
       }
-    }
+    }` : `    for (var item = lane * 4u; item < ${GEMM_TILE_ROWS * tileColumns}u; item += ${MATRIX_LANES * 4}u) {
+      let row = tile_row_origin + item / ${tileColumns}u;
+      let column = tile_column_origin + item % ${tileColumns}u;
+      if (row < gemm_rows) {
+        var values = vec4<f32>(0.0);
+        for (var lane_column = 0u; lane_column < 4u; lane_column += 1u) {
+          if (column + lane_column >= gemm_columns) { continue; }
+          var total = 0.0;
+          for (var k = 0u; k < gemm_inner; k += 1u) {
+            total += ${source.array}[${base(source)} + row * (${source.stride}) + k]
+              * ${weight.array}[${base(weight)} + k * (${weight.stride}) + column + lane_column];
+          }
+          values[lane_column] = total;
+        }
+        ${shader.storeVector}
+      }
+    }`}
   }
 }`;
 }

@@ -26,6 +26,26 @@ struct Parameters {
 @group(0) @binding(2) var<uniform> parameters: Parameters;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;`;
 
+/**
+ * The projection as a caller writes it when its output is packed half
+ * precision: four columns a time, two to a word. The widest contraction in
+ * the model takes this path, so the matrix kernel has to serve it.
+ */
+function packedSpec() {
+  return {
+    ...projectionSpec(false),
+    preamble: PREAMBLE.replace("var<storage, read_write> output: array<f32>;",
+      "var<storage, read_write> output: array<u32>;"),
+    store: "output[row * parameters.columns + column] = u32(element);",
+    storeVector: `let base = row * parameters.columns + column;
+${[0, 2].map((pair) => `          if (column + ${pair + 1}u < parameters.columns) {
+            let stored = vec2<f32>(values[${pair}] + weights[parameters.bias_offset + column + ${pair}u],
+              values[${pair + 1}] + weights[parameters.bias_offset + column + ${pair + 1}u]);
+            output[(base + ${pair}u) >> 1u] = pack2x16float(stored);
+          }`).join("\n")}`,
+  } as const;
+}
+
 /** The shape of the projection every caller writes, including the bias. */
 function projectionSpec(residual: boolean) {
   return {
@@ -69,10 +89,11 @@ test("the emitted matrix kernel computes A x W + bias at every shape", async ({ 
   page.on("console", (message) => console.log(`browser: ${message.text()}`));
   await page.goto("/");
 
-  const shaders = SHAPES.map(() => ({
-    plain: createTiledGemmShader(projectionSpec(false), { precision: "matrix", inner: 8 }),
-    reference: createTiledGemmShader(projectionSpec(false), { precision: "f32", inner: 8 }),
-  }));
+  const matrix = { precision: "matrix", inner: 8 } as const;
+  const shaders = {
+    plain: createTiledGemmShader(projectionSpec(false), matrix),
+    packed: createTiledGemmShader(packedSpec(), matrix),
+  };
 
   const report = await page.evaluate(async ({ shapes, shaders }) => {
     const adapter = await navigator.gpu?.requestAdapter({ powerPreference: "high-performance" });
@@ -97,13 +118,14 @@ test("the emitted matrix kernel computes A x W + bias at every shape", async ({ 
       const source = values(rows * inner, 0x1234567);
       const weightCount = inner * columns + columns;
       const weights = values(weightCount, 0x89abcdef);
-      const run = async (code: string, label: string): Promise<Float32Array> => {
+      const run = async (code: string, label: string, packed: boolean): Promise<Float32Array> => {
         const storage = 128 | 8;
         const sourceBuffer = device.createBuffer({ size: source.byteLength, usage: storage });
         const weightBuffer = device.createBuffer({ size: weights.byteLength, usage: storage });
         const params = device.createBuffer({ size: 32, usage: 64 | 8 });
-        const output = device.createBuffer({ size: rows * columns * 4, usage: 128 | 4 });
-        const readback = device.createBuffer({ size: rows * columns * 4, usage: 1 | 8 });
+        const bytes = packed ? Math.ceil(rows * columns / 2) * 4 : rows * columns * 4;
+        const output = device.createBuffer({ size: bytes, usage: 128 | 4 });
+        const readback = device.createBuffer({ size: bytes, usage: 1 | 8 });
         device.queue.writeBuffer(sourceBuffer, 0, source);
         device.queue.writeBuffer(weightBuffer, 0, weights);
         device.queue.writeBuffer(params, 0, new Uint32Array([
@@ -126,15 +148,30 @@ test("the emitted matrix kernel computes A x W + bias at every shape", async ({ 
         pass.setBindGroup(0, group);
         pass.dispatchWorkgroups(Math.ceil(columns / 128), Math.ceil(rows / 64), 1);
         pass.end();
-        encoder.copyBufferToBuffer(output, 0, readback, 0, rows * columns * 4);
+        encoder.copyBufferToBuffer(output, 0, readback, 0, bytes);
         device.queue.submit([encoder.finish()]);
         await readback.mapAsync(1);
-        const result = new Float32Array(readback.getMappedRange().slice(0));
+        const raw = readback.getMappedRange().slice(0);
+        // A packed output holds two half-precision values per word.
+        const half = (bits: number): number => {
+          const sign = (bits & 0x8000) !== 0 ? -1 : 1;
+          const exponent = (bits >> 10) & 0x1f;
+          const mantissa = bits & 0x3ff;
+          if (exponent === 0) return sign * mantissa * 2 ** -24;
+          if (exponent === 31) return mantissa === 0 ? sign * Infinity : Number.NaN;
+          return sign * (1 + mantissa / 1024) * 2 ** (exponent - 15);
+        };
+        const result = packed
+          ? Float32Array.from({ length: rows * columns }, (_unused, index) => {
+            const word = new Uint32Array(raw)[index >> 1]!;
+            return half((index & 1) === 0 ? word & 0xffff : word >>> 16);
+          })
+          : new Float32Array(raw);
         readback.unmap();
         for (const buffer of [sourceBuffer, weightBuffer, params, output, readback]) buffer.destroy();
         return result;
       };
-      const actual = await run(shaders[index]!.plain, `matrix.${rows}x${inner}x${columns}`);
+      const actual = await run(shaders.plain, `matrix.${rows}x${inner}x${columns}`, false);
       // Worst error against a reference summed here, relative to the largest.
       let worst = 0;
       let scale = 0;
@@ -154,6 +191,25 @@ test("the emitted matrix kernel computes A x W + bias at every shape", async ({ 
       }
       lines.push(`M=${rows} K=${inner} N=${columns}: worst ${worst.toExponential(2)} `
         + `(${(100 * worst / scale).toFixed(4)}%), ${wrongCount} of ${rows * columns} wrong`);
+      // The same shape with a packed half-precision output, which rounds to
+      // about three digits, so it is checked against that rather than exactly.
+      const packedActual = await run(shaders.packed, `packed.${rows}x${inner}x${columns}`, true);
+      let packedWrong = 0;
+      let packedWorst = 0;
+      for (let row = 0; row < rows; row += 1) {
+        for (let column = 0; column < columns; column += 1) {
+          let total = 0;
+          for (let k = 0; k < inner; k += 1) {
+            total += source[row * inner + k]! * weights[k * columns + column]!;
+          }
+          total += weights[inner * columns + column]!;
+          const difference = Math.abs(packedActual[row * columns + column]! - total);
+          if (difference > 2e-2 * Math.max(1, Math.abs(total))) packedWrong += 1;
+          packedWorst = Math.max(packedWorst, difference);
+        }
+      }
+      lines.push(`  packed output: worst ${packedWorst.toExponential(2)}, `
+        + `${packedWrong} of ${rows * columns} wrong`);
     }
     device.destroy();
     return lines;

@@ -132,13 +132,24 @@ describe("the matrix units and what they can serve", () => {
     expect(shader).toContain("var<workgroup> gemm_source");
   });
 
-  it("keeps the hand-tiled kernel for an epilogue or a vector store", () => {
+  it("keeps the hand-tiled kernel for a whole-tile epilogue", () => {
+    // Its fragments are written against acc{n} in the hand-tiled thread
+    // mapping, which a matrix kernel does not have.
     const withEpilogue = createTiledGemmShader(
       { ...spec, ...arrays, epilogue: "  let z = acc0[0];", stageElements: 4 }, matrix);
     expect(withEpilogue).not.toContain("subgroup_matrix");
-    const withVectorStore = createTiledGemmShader(
+  });
+
+  it("serves a vector store, which is how a packed output is written", () => {
+    // The result is staged in workgroup memory, so reading four adjacent
+    // columns of it is no harder than reading one. This is what lets the
+    // second transition linear, the widest contraction in the model, reach
+    // the units at all when the pair representation is stored packed.
+    const packed = createTiledGemmShader(
       { ...spec, ...arrays, storeVector: "  let z = values;" }, matrix);
-    expect(withVectorStore).not.toContain("subgroup_matrix");
+    expect(packed).toContain("subgroupMatrixMultiplyAccumulate");
+    expect(packed).toContain("let z = values;");
+    expect(packed).toContain("let values = vec4<f32>(gemm_matrix_stage[staged]");
   });
 
   it("covers the same output tile as the kernel it replaces", () => {
