@@ -1,4 +1,7 @@
-import { createAttentionRegisterFlashShader } from "../evoformer/attention.js";
+import { packHalfWords } from "./storage.js";
+import {
+  createAttentionRegisterFlashShader, type AttentionKeyValueStorage,
+} from "../evoformer/attention.js";
 
 /**
  * How many queries one attention invocation should carry, measured.
@@ -24,37 +27,63 @@ import { createAttentionRegisterFlashShader } from "../evoformer/attention.js";
 /** Rows and keys enough to be throughput-bound, small enough to stay cheap. */
 const PROBE_BATCH = 4;
 const PROBE_QUERIES = 512;
-const PROBE_HEADS = 1;
+// The model's attentions carry four to eight heads, and the dispatch grid is
+// queries by batch by head: at one head the probe launched 32 workgroups,
+// far too few to occupy any GPU, so it ranked kernels on launch overhead.
+const PROBE_HEADS = 8;
 const PROBE_REPEATS = 2;
 const PROBE_BATCH_MILLISECONDS = 8;
 
 /**
- * Every combination worth trying: how many queries an invocation carries, and
- * whether it reads the keys and values as half words.
+ * How far a candidate may depart from the single-precision kernel.
  *
- * Both are measured rather than assumed, and for the same reason. Packing the
- * operands halves what the key loop reads and costs an unpack for each; on a
- * device that is waiting for memory that is 1.29x and on one that is waiting
- * for issue slots it may be nothing. Writing either down is how the threshold
- * this replaces came to cost Apple 40% of a long prediction.
+ * Speed cannot be the only thing measured. The block's differential test
+ * against official AlphaFold intermediates holds its MSA output to a mean
+ * absolute error of 5e-5, and this kernel feeds that output, so an
+ * arrangement contributing more than that cannot be admitted however fast it
+ * is: reading the keys and values as half words contributes about 4e-4, which
+ * is how a green suite turned red on a machine the packing was never measured
+ * on. The same rule as the projection selection, which filters on accuracy
+ * before it ranks on time.
  */
-const CANDIDATES: readonly { readonly slots: number; readonly keyValue: "f32" | "f16" }[] = [
-  { slots: 1, keyValue: "f32" }, { slots: 1, keyValue: "f16" },
-  { slots: 2, keyValue: "f32" }, { slots: 2, keyValue: "f16" },
+const PROBE_ERROR_TOLERANCE = 5e-5;
+
+/**
+ * How many queries an invocation carries. Measured, not written down: the
+ * threshold this replaces was recorded on one GPU and cost Apple 40% of a long
+ * prediction.
+ *
+ * Only the keys are offered as half words, not the values. Packing both
+ * measured 1.29x on Apple but moved the Evoformer block's MSA output 4.06e-4
+ * from the official AlphaFold intermediates, eight times what that block's
+ * differential test allows. The values are the half that costs it: they are
+ * averaged under weights summing to one and land in the output directly, so
+ * rounding them shows up undamped, and packing them alone still reads 4.05e-4.
+ * A key's error is normalised away by the softmax, and packing keys alone
+ * keeps every reference test green while still halving what the hot loop reads
+ * of them.
+ *
+ * The probe cannot be what decides this. On its synthetic inputs the packing
+ * that breaks the model reads 6e-7, six hundred times smaller, so its accuracy
+ * filter catches gross divergence only; the differential tests are the gate.
+ */
+const CANDIDATES: readonly { readonly slots: number; readonly keyValue: AttentionKeyValueStorage }[] = [
+  { slots: 1, keyValue: "f32" }, { slots: 1, keyValue: "f16-key" },
+  { slots: 2, keyValue: "f32" }, { slots: 2, keyValue: "f16-key" },
 ];
 
 export interface AttentionShapeChoice {
   /** Queries one invocation carries, for shapes the rule would give two. */
   readonly slots: number;
-  readonly keyValue: "f32" | "f16";
+  readonly keyValue: AttentionKeyValueStorage;
 }
 
 const calibrations = new WeakMap<GPUDevice, Map<number, Promise<AttentionShapeChoice | undefined>>>();
 
-async function timeCandidate(
+async function runCandidate(
   device: GPUDevice, headDim: number, candidate: AttentionShapeChoice,
-  buffers: readonly GPUBuffer[],
-): Promise<number> {
+  buffers: readonly GPUBuffer[], readback: GPUBuffer, outputBytes: number,
+): Promise<{ readonly milliseconds: number; readonly output: Float32Array }> {
   const { slots } = candidate;
   const code = createAttentionRegisterFlashShader(headDim, slots, candidate.keyValue);
   const pipeline = await device.createComputePipelineAsync({
@@ -92,7 +121,14 @@ async function timeCandidate(
   for (let repeat = 0; repeat < PROBE_REPEATS; repeat += 1) {
     best = Math.min(best, await batch(iterations));
   }
-  return best;
+  // What it computed, so speed is not the only thing measured.
+  const encoder = device.createCommandEncoder({ label: "attention-queries.readback" });
+  encoder.copyBufferToBuffer(buffers[buffers.length - 1]!, 0, readback, 0, outputBytes);
+  device.queue.submit([encoder.finish()]);
+  await readback.mapAsync(GPUMapMode.READ);
+  const output = new Float32Array(readback.getMappedRange().slice(0));
+  readback.unmap();
+  return { milliseconds: best, output };
 }
 
 /**
@@ -130,8 +166,24 @@ export function calibrateAttentionShape(
       const gate = create(elements * 4, storage);
       const mask = create(PROBE_BATCH * PROBE_QUERIES * 4, storage);
       const bias = create(PROBE_HEADS * PROBE_QUERIES * PROBE_QUERIES * 4, storage);
-      const output = create(elements * 4, GPUBufferUsage.STORAGE);
+      const output = create(elements * 4, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+      const readback = create(elements * 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
       const parameters = create(80, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+      // Real values, not zeros. A kernel reading an all-zero key buffer is not
+      // the kernel the model runs: every logit is equal, and the memory it is
+      // supposed to be waiting for compresses away. Zeros are how a probe
+      // measures something other than the thing it is choosing between.
+      let state = 0x9e3779b9;
+      const noise = (count: number): Float32Array => Float32Array.from({ length: count }, () => {
+        state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+        return state / 0x100000000 - 0.5;
+      });
+      const keyValues = noise(elements);
+      device.queue.writeBuffer(full, 0, keyValues);
+      device.queue.writeBuffer(half, 0, packHalfWords(keyValues));
+      device.queue.writeBuffer(query, 0, noise(elements));
+      device.queue.writeBuffer(gate, 0, noise(elements));
+      device.queue.writeBuffer(bias, 0, noise(PROBE_HEADS * PROBE_QUERIES * PROBE_QUERIES));
       device.queue.writeBuffer(mask, 0, new Float32Array(PROBE_BATCH * PROBE_QUERIES).fill(1));
       // batch, queries, channels, heads, head_dim, transpose, has_pair_bias,
       // then the weight offsets, then batch_offset and batch_total.
@@ -139,15 +191,36 @@ export function calibrateAttentionShape(
       fields[0] = PROBE_BATCH; fields[1] = PROBE_QUERIES; fields[2] = PROBE_HEADS * headDim;
       fields[3] = PROBE_HEADS; fields[4] = headDim; fields[6] = 1; fields[17] = PROBE_BATCH;
       device.queue.writeBuffer(parameters, 0, fields);
-      let winner = CANDIDATES[0]!;
-      let best = Number.POSITIVE_INFINITY;
+      const measured: { candidate: AttentionShapeChoice; milliseconds: number; error: number }[] = [];
+      let reference: Float32Array | undefined;
       for (const candidate of CANDIDATES) {
-        const kv = candidate.keyValue === "f16" ? half : full;
-        const milliseconds = await timeCandidate(device, headDim, candidate,
-          [query, kv, kv, gate, mask, bias, parameters, output]);
-        if (milliseconds < best) { best = milliseconds; winner = candidate; }
+        // The keys and the values are packed independently, so each binding
+        // takes the width its own kernel declares.
+        const keyBuffer = candidate.keyValue === "f16" || candidate.keyValue === "f16-key" ? half : full;
+        const valueBuffer = candidate.keyValue === "f16" || candidate.keyValue === "f16-value" ? half : full;
+        const result = await runCandidate(device, headDim, candidate,
+          [query, keyBuffer, valueBuffer, gate, mask, bias, parameters, output], readback, elements * 4);
+        // The first candidate is single precision with one query, which is what
+        // the model ran before any of this: every other arrangement has to
+        // reproduce it, not merely beat it.
+        reference ??= result.output;
+        let total = 0;
+        for (let index = 0; index < result.output.length; index += 1) {
+          total += Math.abs(result.output[index]! - reference[index]!);
+        }
+        measured.push({
+          candidate, milliseconds: result.milliseconds, error: total / Math.max(1, result.output.length),
+        });
       }
-      return winner;
+      if (process.env.AFWEBGPU_PROBE_DEBUG === "1") {
+        for (const entry of measured) {
+          console.error(`probe ${entry.candidate.slots}q ${entry.candidate.keyValue}`
+            + ` ${entry.milliseconds.toFixed(4)} ms error ${entry.error.toExponential(2)}`);
+        }
+      }
+      const usable = measured.filter((entry) => entry.error <= PROBE_ERROR_TOLERANCE);
+      if (usable.length === 0) return CANDIDATES[0];
+      return usable.sort((left, right) => left.milliseconds - right.milliseconds)[0]!.candidate;
     } finally {
       for (const buffer of buffers) buffer.destroy();
     }

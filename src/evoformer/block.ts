@@ -665,8 +665,8 @@ async function encodeAttention(
   // Packing halves what the key loop reads and costs an unpack for each, which
   // is 1.29x on a device waiting for memory and may be nothing on one waiting
   // for issue slots. Measured with the query count, for the same reason.
-  const packKeyValue = registerFamily && choice?.keyValue === "f16";
-  const keyValueStorage = attentionKeyValueStorage(packKeyValue ? "f16" : "f32");
+  const keyValueStorage = attentionKeyValueStorage(
+    registerFamily && choice !== undefined ? choice.keyValue : "f32");
   const flashShader = flashKernel.variant.startsWith("register")
     ? createAttentionRegisterFlashShader(
       options.channels / options.heads, slots, keyValueStorage)
@@ -803,8 +803,11 @@ async function encodeAttention(
 
   const outputViews = output === options.source ? sourceViews : shardsOf(output);
   const query = execution.allocate(`${options.label}.query`, windowElements);
-  const key = execution.allocate(`${options.label}.key`, storageWords(windowElements, keyValueStorage));
-  const value = execution.allocate(`${options.label}.value`, storageWords(windowElements, keyValueStorage));
+  // The projection writes each in the width the flash kernel will read it.
+  const keyWords = keyValueStorage === "f16" || keyValueStorage === "f16-key" ? "f16" : "f32";
+  const valueWords = keyValueStorage === "f16" || keyValueStorage === "f16-value" ? "f16" : "f32";
+  const key = execution.allocate(`${options.label}.key`, storageWords(windowElements, keyWords));
+  const value = execution.allocate(`${options.label}.value`, storageWords(windowElements, valueWords));
   const gate = execution.allocate(`${options.label}.gate`, windowElements);
   // Within a window the normalized input dies at the projection and the
   // attention result is born at the flash, so one windowed tensor serves both,

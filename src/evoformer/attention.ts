@@ -427,7 +427,7 @@ fn mask_index(batch: u32, key_index: u32) -> u32 {
  * once per invocation rather than once per key, so narrowing them would buy
  * nothing and round something for free.
  */
-export type AttentionKeyValueStorage = "f32" | "f16";
+export type AttentionKeyValueStorage = "f32" | "f16" | "f16-value" | "f16-key";
 
 /**
  * A key/value width pinned ahead of any device, for differential testing.
@@ -476,7 +476,10 @@ export function attentionQueriesPerThread(preferred: number): number {
 export function attentionProjectShader(
   keyValueStorage: AttentionKeyValueStorage = "f32",
 ): string {
-  const packed = keyValueStorage === "f16";
+  // The projection stores what the flash kernel reads: keys packed only when
+  // the keys are packed, values whenever either half-precision mode is on.
+  const packedKey = keyValueStorage === "f16" || keyValueStorage === "f16-key";
+  const packedValue = keyValueStorage === "f16" || keyValueStorage === "f16-value";
   // Built on demand, not at module load: the projection variant is installed
   // while the device is created, and this module is imported before that
   // happens. A module-scope constant would freeze the f32 kernel in place and
@@ -487,8 +490,8 @@ export function attentionProjectShader(
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> p: Parameters;
 @group(0) @binding(3) var<storage, read_write> query: array<f32>;
-@group(0) @binding(4) var<storage, read_write> key: array<${packed ? "u32" : "f32"}>;
-@group(0) @binding(5) var<storage, read_write> value: array<${packed ? "u32" : "f32"}>;
+@group(0) @binding(4) var<storage, read_write> key: array<${packedKey ? "u32" : "f32"}>;
+@group(0) @binding(5) var<storage, read_write> value: array<${packedValue ? "u32" : "f32"}>;
 @group(0) @binding(6) var<storage, read_write> gate: array<f32>;
 
 fn projection_weight_offset(matrix: u32) -> u32 {
@@ -518,7 +521,7 @@ fn projection_weight_offset(matrix: u32) -> u32 {
     // a multiple of four and an invocation's four columns start at a multiple
     // of four, so the pair is always its own; the head dimension is even, so a
     // word never straddles two heads.
-    ...(packed ? { storeVector: `let projected = p.heads * p.head_dim;
+    ...(packedKey || packedValue ? { storeVector: `let projected = p.heads * p.head_dim;
           // A guard, not a return: this runs once per row of the register
           // block, and returning would abandon the rows after it.
           if (column + 3u < 4u * projected) {
@@ -527,11 +530,15 @@ fn projection_weight_offset(matrix: u32) -> u32 {
             if (matrix == 0u) {
 ${[0, 1, 2, 3].map((lane) => `              query[index + ${lane}u] = values[${lane}] * inverseSqrt(f32(p.head_dim));`).join("\n")}
             } else if (matrix == 1u) {
-              key[index >> 1u] = pack2x16float(vec2<f32>(values[0], values[1]));
-              key[(index >> 1u) + 1u] = pack2x16float(vec2<f32>(values[2], values[3]));
+${packedKey
+  ? `              key[index >> 1u] = pack2x16float(vec2<f32>(values[0], values[1]));
+              key[(index >> 1u) + 1u] = pack2x16float(vec2<f32>(values[2], values[3]));`
+  : [0, 1, 2, 3].map((lane) => `              key[index + ${lane}u] = values[${lane}];`).join("\n")}
             } else if (matrix == 2u) {
-              value[index >> 1u] = pack2x16float(vec2<f32>(values[0], values[1]));
-              value[(index >> 1u) + 1u] = pack2x16float(vec2<f32>(values[2], values[3]));
+${packedValue
+  ? `              value[index >> 1u] = pack2x16float(vec2<f32>(values[0], values[1]));
+              value[(index >> 1u) + 1u] = pack2x16float(vec2<f32>(values[2], values[3]));`
+  : [0, 1, 2, 3].map((lane) => `              value[index + ${lane}u] = values[${lane}];`).join("\n")}
             } else {
 ${[0, 1, 2, 3].map((lane) => `              {
                 let biased = values[${lane}] + weights[p.gating_bias + column % projected + ${lane}u];
@@ -650,8 +657,17 @@ export function createAttentionRegisterFlashShader(
   // Keys and values are read once per key index per invocation, which is the
   // whole cost of this kernel; the query and the gate are read once. Halving
   // the width of the two that are read in the loop measured 1.29x.
-  const packedKv = keyValueStorage === "f16";
-  const loadKv = (name: string, buffer: string, index: number): string => packedKv
+  // Keys and values are packed separately. A key's error is amplified: it
+  // enters a dot product that goes through exp(), so a rounding of one part in
+  // a thousand moves the weight it produces. A value's is not: it is averaged
+  // under weights that sum to one, where errors of both signs cancel. Packing
+  // both moved the block's MSA output 4.06e-4 from AlphaFold's own
+  // intermediates, eight times what its differential test allows; packing only
+  // the values keeps most of the traffic saved and stays inside it.
+  const packedKey = keyValueStorage === "f16" || keyValueStorage === "f16-key";
+  const packedValue = keyValueStorage === "f16" || keyValueStorage === "f16-value";
+  const loadKv = (name: string, buffer: string, index: number): string =>
+    (name === "kv" ? packedKey : packedValue)
     ? `let ${name}_word${index} = ${buffer}[k_base + ${index}u];`
       + `\n    let ${name}${index} = vec4<f32>(unpack2x16float(${name}_word${index}.x), `
       + `unpack2x16float(${name}_word${index}.y));`
@@ -665,8 +681,8 @@ export function createAttentionRegisterFlashShader(
   return `${COMMON}
 const HD4: u32 = ${vectors}u;
 @group(0) @binding(0) var<storage, read> query: array<vec4<f32>>;
-@group(0) @binding(1) var<storage, read> key: array<${packedKv ? "vec2<u32>" : "vec4<f32>"}>;
-@group(0) @binding(2) var<storage, read> value: array<${packedKv ? "vec2<u32>" : "vec4<f32>"}>;
+@group(0) @binding(1) var<storage, read> key: array<${packedKey ? "vec2<u32>" : "vec4<f32>"}>;
+@group(0) @binding(2) var<storage, read> value: array<${packedValue ? "vec2<u32>" : "vec4<f32>"}>;
 @group(0) @binding(3) var<storage, read> gate: array<vec4<f32>>;
 @group(0) @binding(4) var<storage, read> mask: array<f32>;
 @group(0) @binding(5) var<storage, read> pair_bias: array<f32>;
