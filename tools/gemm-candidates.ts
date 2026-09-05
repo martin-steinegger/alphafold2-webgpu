@@ -500,6 +500,74 @@ ${guard}    var value = f32(scratch[item]) + weights[parameters.bias_offset + co
 }`;
 }
 
+/**
+ * The matrix kernel over the shipped 64x128 output tile.
+ *
+ * `matrix-bounded-f32` covers a 32x32 region per workgroup, which means a
+ * different dispatch grid from the hand-tiled kernel. That is fatal to
+ * integration: `gemmGrid` derives the grid from the output tile and does not
+ * know which shader is asking, so if some callers opt into a matrix path and
+ * others do not, one of them gets the wrong grid. Keeping the 64x128 tile
+ * keeps the grid identical and makes opting in a per-shader decision.
+ *
+ * The cost is parallelism: one workgroup now covers eight 32x32 sub-regions
+ * instead of one, so there are eight times fewer of them. Whether the reuse
+ * survives that is the question this candidate exists to answer.
+ */
+function subgroupMatrixWideTileGemm(componentType: "f32" | "f16", size: number): string {
+  const tiles = 4;
+  const region = tiles * size;
+  const rowBlocks = 2;
+  const columnBlocks = 4;
+  const enables = `${componentType === "f16" ? "enable f16;\n" : ""}`
+    + "enable chromium_experimental_subgroup_matrix;\n";
+  const each = (count: number, body: (index: number) => string): string =>
+    Array.from({ length: count }, (_, index) => body(index)).join("\n");
+  return `${enables}${PARAMETERS}
+var<workgroup> scratch: array<${componentType}, ${region * region}>;
+
+@compute @workgroup_size(32, 1, 1)
+fn main(
+  @builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>,
+) {
+  let lane = local.x;
+  let tile_row = group.y * ${region * rowBlocks}u;
+  let tile_column = group.x * ${region * columnBlocks}u;
+  // Uniform: both counters are loop indices and every invocation runs them.
+  for (var rb = 0u; rb < ${rowBlocks}u; rb += 1u) {
+    for (var cb = 0u; cb < ${columnBlocks}u; cb += 1u) {
+      let row_origin = tile_row + rb * ${region}u;
+      let column_origin = tile_column + cb * ${region}u;
+${each(tiles, (r) => each(tiles, (c) =>
+    `      var acc_${r}_${c} = subgroup_matrix_result<${componentType}, ${size}, ${size}>();`))}
+      for (var k0 = 0u; k0 < parameters.inner; k0 += ${size}u) {
+${each(tiles, (r) => `        let left_${r} = subgroupMatrixLoad<subgroup_matrix_left<${componentType}, ${size}, ${size}>>(
+          &source, (row_origin + ${r * size}u) * parameters.inner + k0, false, parameters.inner);`)}
+${each(tiles, (c) => `        let right_${c} = subgroupMatrixLoad<subgroup_matrix_right<${componentType}, ${size}, ${size}>>(
+          &weights, parameters.weight_offset + k0 * parameters.columns + column_origin + ${c * size}u,
+          false, parameters.columns);`)}
+${each(tiles, (r) => each(tiles, (c) =>
+    `        acc_${r}_${c} = subgroupMatrixMultiplyAccumulate(left_${r}, right_${c}, acc_${r}_${c});`))}
+      }
+      workgroupBarrier();
+${each(tiles, (r) => each(tiles, (c) =>
+    `      subgroupMatrixStore(&scratch, ${r * size}u * ${region}u + ${c * size}u,
+        acc_${r}_${c}, false, ${region}u);`))}
+      workgroupBarrier();
+      for (var item = lane; item < ${region * region}u; item += 32u) {
+        let row = row_origin + item / ${region}u;
+        let column = column_origin + item % ${region}u;
+        if (row >= parameters.rows || column >= parameters.columns) { continue; }
+        var value = f32(scratch[item]) + weights[parameters.bias_offset + column];
+        if (parameters.activation == 1u) { value = max(value, 0.0); }
+        output[row * parameters.columns + column] = value;
+      }
+    }
+  }
+}`;
+}
+
 export const CANDIDATES: readonly Candidate[] = [
   // The kernel the model actually runs, so the baseline is not a
   // reimplementation of it that may have drifted.
@@ -553,6 +621,10 @@ export const CANDIDATES: readonly Candidate[] = [
     tileRows: 32, tileColumns: 32,
     requiresSubgroupMatrix: { componentType: "f32", size: 8 } },
 
+  // The same reuse over the shipped 64x128 tile, so the grid does not change.
+  { name: "matrix-wide-f32", shader: subgroupMatrixWideTileGemm("f32", 8),
+    tileRows: 64, tileColumns: 128,
+    requiresSubgroupMatrix: { componentType: "f32", size: 8 } },
   { name: "matrix-f32-8x8x8", shader: subgroupMatrixGemm("f32", 8), tileRows: 8, tileColumns: 8,
     requiresSubgroupMatrix: { componentType: "f32", size: 8 }, alignment: 8, throughputOnly: true },
   // An f16 matrix produces an f16 result, which only an f16 buffer can hold.

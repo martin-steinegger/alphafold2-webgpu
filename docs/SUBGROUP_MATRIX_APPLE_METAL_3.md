@@ -127,10 +127,46 @@ Two further constraints for whoever picks it up:
   `gemm_stage` contract, so a common form is probably reachable — but it is a
   design question for the owner of that file, not a mechanical change.
 
+## The grid is a second obstacle, and it costs about a fifth of the win
+
+`matrix-bounded-f32` covers a 32x32 region per workgroup, which is a different
+dispatch grid from the hand-tiled kernel. `gemmGrid` derives the grid from the
+output tile and does not know which shader is asking, so if some callers opt
+into a matrix path and others do not, one of them gets the wrong grid and
+silently leaves output unwritten.
+
+Keeping the shipped 64x128 tile fixes that — one subgroup walks eight 32x32
+sub-regions instead of eight times as many workgroups each doing one — and
+`matrix-wide-f32` measures what it costs:
+
+| shape | 64x128 tile | 32x32 tile |
+|---|---:|---:|
+| opm-contract | 1.28x | 1.68x |
+| opm-out | **0.50x** | 2.16x |
+| opm-out2 | **0.40x** | 1.75x |
+| project | 1.66x | 1.67x |
+| output | 1.56x | 1.71x |
+| trans1 | 1.57x | 1.67x |
+| trans2 | 1.45x | 1.70x |
+| extra1 | 1.34x | 1.39x |
+
+It holds on the wide shapes and collapses on the narrow ones. `opm-out` and
+`opm-out2` have N=128, so a 128-wide tile makes the grid one workgroup across:
+64 workgroups of 32 lanes, which does not fill the machine. The 32x32 tile gets
+four times the column blocks.
+
+Weighted by the time each shape takes in a block, that is about **1.39x** for
+the grid-compatible geometry against **1.69x** for the 32x32 one, and 1.17x for
+the half-precision kernel that ships today.
+
+Both still need the operand declaration below. The grid only decides how much
+the change is worth, not whether it is needed.
+
 ## What is in the tree
 
 `tools/gemm-candidates.ts` carries `matrix-tiled-f32` (requires M and N
-divisible by 32) and `matrix-bounded-f32` (any shape), both verified against
+divisible by 32), `matrix-bounded-f32` (any shape, 32x32 tile) and
+`matrix-wide-f32` (any shape, the shipped 64x128 tile), all verified against
 the harness's own reference at both depths, both applying bias and the
 activation so they are checked rather than throughput-only. Four 32-aligned
 shapes were added alongside the real ones so the aligned and bounded kernels
