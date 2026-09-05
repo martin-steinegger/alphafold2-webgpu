@@ -10,6 +10,7 @@
  */
 import { expect, test } from "@playwright/test";
 import { CANDIDATES, SHAPES } from "../../tools/gemm-candidates.js";
+import { SHIPPABLE_GEMM_PRECISIONS } from "../../src/runtime/gemm-selection.js";
 
 test.skip(process.env.AFWEBGPU_GEMM_CALIBRATION !== "1", "set AFWEBGPU_GEMM_CALIBRATION=1");
 
@@ -268,7 +269,7 @@ test("the per-device probe picks what the sweep picks", async ({ page }) => {
       `/@fs${root}/src/runtime/gemm-selection.ts`) as {
         measureGemmVariants(device: GPUDevice): Promise<readonly {
           variant: { precision: string; inner: number };
-          milliseconds: number; relativeError: number;
+          milliseconds: number; perShape: readonly number[]; relativeError: number;
         }[]>;
         calibrateGemmVariant(device: GPUDevice): Promise<{ precision: string; inner: number }>;
         gemmVariantName(variant: { precision: string; inner: number }): string;
@@ -280,7 +281,10 @@ test("the per-device probe picks what the sweep picks", async ({ page }) => {
         fastest: Number.NaN, chosenMilliseconds: Number.NaN,
       };
     }
-    const features = (["shader-f16", "subgroups"] as GPUFeatureName[])
+    // The same features `requestAlphaFoldDevice` asks for, or the probe cannot
+    // measure the candidates the real device would have.
+    const features = (["shader-f16", "subgroups",
+      "chromium-experimental-subgroup-matrix"] as GPUFeatureName[])
       .filter((feature) => adapter.features.has(feature));
     const device = await adapter.requestDevice({ requiredFeatures: features });
     const started = performance.now();
@@ -292,29 +296,42 @@ test("the per-device probe picks what the sweep picks", async ({ page }) => {
     const lines = [`probe cost: ${probeMilliseconds.toFixed(0)} ms`];
     for (const measurement of [...measurements].sort((a, b) => a.milliseconds - b.milliseconds)) {
       lines.push(`  ${selection.gemmVariantName(measurement.variant).padEnd(24)} `
-        + `${measurement.milliseconds.toFixed(3)} ms   `
+        + `${measurement.milliseconds.toFixed(3)} ms total  `
+        + `[${measurement.perShape.map((value) => value.toFixed(3)).join(", ")}]  `
         + `error ${(measurement.relativeError * 100).toFixed(3)}%`);
     }
     device.destroy();
-    const ranked = [...measurements].sort((a, b) => a.milliseconds - b.milliseconds);
     const chosen = measurements.find(
       (measurement) => selection.gemmVariantName(measurement.variant) === selection.gemmVariantName(winner),
     );
+    // The matrix kernel is judged on the wide shape, because only the wide
+    // projections can declare their operands as arrays and reach it; the
+    // hand-tiled kernel serves every shape and is judged on the total. So the
+    // check below has to compare each against what it was chosen on.
+    const onMatrix = winner.precision === "matrix";
+    const score = (measurement: { milliseconds: number; perShape: readonly number[] }): number =>
+      onMatrix ? measurement.perShape[0]! : measurement.milliseconds;
+    const eligible = measurements.filter(
+      (measurement) => onMatrix || measurement.variant.precision !== "matrix",
+    );
+    const ranked = [...eligible].sort((a, b) => score(a) - score(b));
     return {
       lines, winner: selection.gemmVariantName(winner), probeMilliseconds,
-      fastest: ranked[0]?.milliseconds ?? Number.NaN,
-      chosenMilliseconds: chosen?.milliseconds ?? Number.NaN,
+      fastest: ranked[0] === undefined ? Number.NaN : score(ranked[0]),
+      chosenMilliseconds: chosen === undefined ? Number.NaN : score(chosen),
     };
   }, { root });
   console.log(`\nGEMM PROBE\n${outcome.lines.join("\n")}\nchose: ${outcome.winner}\n`);
   // Whatever it chooses has to be one the prediction gate cleared.
-  expect(["f32", "f16-chunked", "f16-mixed"].some((precision) => outcome.winner.startsWith(precision)))
+  expect(SHIPPABLE_GEMM_PRECISIONS.some((precision) => outcome.winner.startsWith(precision)))
     .toBe(true);
+  // Pure f16 in particular: it is the fastest kernel here and it takes a deep
+  // MSA to NaN, so it must never be installed.
   expect(outcome.winner).not.toMatch(/^f16-64x/u);
-  // And it has to be one of the fast ones. A probe whose batch is too short to
-  // resolve these variants apart picks by noise, and picked the slowest
-  // half-precision arrangement over the fastest until the batch was sized to
-  // the clock. Being within a tenth of the best is the loosest check that
-  // still fails that.
+  // And it has to be one of the fast ones, on whatever it was judged by. A
+  // probe whose batch is too short to resolve these variants apart picks by
+  // noise, and picked the slowest half-precision arrangement over the fastest
+  // until the batch was sized to the clock. Being within a tenth of the best
+  // is the loosest check that still fails that.
   expect(outcome.chosenMilliseconds).toBeLessThan(outcome.fastest * 1.1);
 });

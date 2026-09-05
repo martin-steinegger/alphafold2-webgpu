@@ -108,6 +108,15 @@ struct MatmulParameters {
     columns: "parameters.columns",
     sourceElement: storedElement(sourceStorage, "source", "row * parameters.inner + k"),
     weightElement: "weights[parameters.weight_offset + k * parameters.columns + column]",
+    // The same operands as arrays, which the hardware matrix units need and
+    // which is only true while the source is unpacked: half-precision storage
+    // puts two values in a word, so `source` is a u32 array and nothing can
+    // load an 8x8 tile out of it. Saying nothing keeps the hand-tiled kernel.
+    ...(sourceStorage === "f32"
+      ? { sourceArray: { array: "source", stride: "parameters.inner" } } : {}),
+    weightArray: {
+      array: "weights", base: "parameters.weight_offset", stride: "parameters.columns",
+    },
     store: `var stored = element + weights[parameters.bias_offset + column];
           if (parameters.activation == 1u) { stored = max(stored, 0.0); }
           output[row * parameters.columns + column] ${residual ? "+=" : "="} stored;`,

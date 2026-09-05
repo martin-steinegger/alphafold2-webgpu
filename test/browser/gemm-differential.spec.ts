@@ -14,15 +14,15 @@
  * MSA with 1,024 extra rows. The deep case is the one that matters. Pure f16
  * passes the shallow one and takes the deep one to NaN.
  *
- * Every arrangement in `SHIPPABLE_GEMM_PRECISIONS` has to pass, since the
- * per-device calibration may pick any of them on hardware neither of us has.
- * The comparison is also checked in the other direction: a half-precision
- * variant must *differ* from f32 somewhere, or a toggle that silently failed
- * to reach the kernel would report perfect agreement, the one result that
- * looks like success while proving nothing.
+ * Every arrangement the per-device calibration may install has to pass, since
+ * it picks on hardware neither of us has. The comparison is also checked in
+ * the other direction: a variant that rounds must *differ* from f32 somewhere,
+ * or a toggle that silently failed to reach the kernel would report perfect
+ * agreement, the one result that looks like success while proving nothing. An
+ * exact variant is exempt from that: agreeing to the bit is what it is for.
  */
 import { expect, test } from "@playwright/test";
-import { SHIPPABLE_GEMM_PRECISIONS } from "../../src/runtime/gemm-selection.js";
+
 
 const enabled = process.env.AFWEBGPU_GEMM_DIFFERENTIAL === "1";
 
@@ -30,10 +30,33 @@ const enabled = process.env.AFWEBGPU_GEMM_DIFFERENTIAL === "1";
 const PLDDT_GATE = 0.05;
 const PTM_GATE = 0.005;
 
+interface Candidate {
+  readonly name: string;
+  readonly precision: string;
+  readonly inner: number;
+  readonly fallback?: string;
+  /** Whether the per-device selection may install it, so whether it is gated. */
+  readonly shippable: boolean;
+  /** Whether it rounds. An exact kernel is allowed to agree with f32 exactly. */
+  readonly approximate: boolean;
+}
+
 /** Pure f16 is measured for the record; it is not in the shippable set. */
-const MEASURED: readonly { readonly precision: string; readonly inner: number }[] =
-  ([8, 16] as const).flatMap((inner) =>
-    (["f32", "f16", "f16-chunked", "f16-mixed"] as const).map((precision) => ({ precision, inner })));
+const MEASURED: readonly Candidate[] = [
+  ...([8, 16] as const).flatMap((inner) => [
+    { name: `f32-k${inner}`, precision: "f32", inner, shippable: true, approximate: false },
+    { name: `f16-k${inner}`, precision: "f16", inner, shippable: false, approximate: true },
+    { name: `f16-chunked-k${inner}`, precision: "f16-chunked", inner, shippable: true, approximate: true },
+    { name: `f16-mixed-k${inner}`, precision: "f16-mixed", inner, shippable: true, approximate: true },
+  ]),
+  // The matrix units, with each fallback the selection can pair them with.
+  // Only some callers can reach them, so the fallback is what everyone else
+  // computes and both halves have to hold.
+  { name: "matrix+f32", precision: "matrix", inner: 8, fallback: "f32",
+    shippable: true, approximate: false },
+  { name: "matrix+chunked", precision: "matrix", inner: 16, fallback: "f16-chunked",
+    shippable: true, approximate: true },
+];
 
 interface Prediction {
   readonly recycles: readonly { readonly meanPlddt: number; readonly ptm: number }[];
@@ -110,7 +133,9 @@ test("every shippable projection variant predicts what the f32 kernel predicts",
     // the prediction below sees.
     const selection = await import(/* @vite-ignore */
       `/@fs${root}/src/runtime/gemm-selection.ts`) as {
-        forceGemmVariant(variant: { precision: string; inner: number } | undefined): void;
+        forceGemmVariant(variant: {
+          precision: string; inner: number; fallback?: string;
+        } | undefined): void;
       };
     const qualificationUrl = "/monomer-qualification.ts";
     const qualification = await import(/* @vite-ignore */ qualificationUrl) as {
@@ -129,11 +154,10 @@ test("every shippable projection variant predicts what the f32 kernel predicts",
         ) as unknown as Record<string, unknown>;
         results.push({
           ...result, precision: variant.precision, inner: variant.inner,
-          name: `${variant.precision}-k${variant.inner}`,
-          seconds: (performance.now() - started) / 1000,
+          name: variant.name, seconds: (performance.now() - started) / 1000,
         });
       } catch (error) {
-        console.log(`${variant.precision}-k${variant.inner} threw: ${String(error).slice(0, 200)}`);
+        console.log(`${variant.name} threw: ${String(error).slice(0, 200)}`);
       }
     }
     selection.forceGemmVariant(undefined);
@@ -152,7 +176,7 @@ test("every shippable projection variant predicts what the f32 kernel predicts",
     const queryOnly = diverge(baseline.queryOnly, side.queryOnly);
     const deepMsa = diverge(baseline.deepMsa, side.deepMsa);
     divergences.set(side.name, { queryOnly, deepMsa });
-    const shippable = SHIPPABLE_GEMM_PRECISIONS.includes(side.precision as never);
+    const shippable = MEASURED.find((entry) => entry.name === side.name)?.shippable === true;
     lines.push(`${side.name.padEnd(18)} ${side.seconds.toFixed(1).padStart(6)} s   `
       + `${(baseline.seconds / side.seconds).toFixed(2)}x   `
       + `${show(Math.max(queryOnly.plddt, deepMsa.plddt)).padStart(12)}   `
@@ -165,8 +189,8 @@ test("every shippable projection variant predicts what the f32 kernel predicts",
 
   // Recycle by recycle for the shippable arrangements, where compounding shows.
   for (const side of measured) {
-    if (!SHIPPABLE_GEMM_PRECISIONS.includes(side.precision as never)) continue;
-    if (side.precision === "f32") continue;
+    const entry = MEASURED.find((candidate) => candidate.name === side.name);
+    if (entry === undefined || !entry.shippable || side.name === "f32-k8") continue;
     lines.push("", `${side.name}:`);
     for (const [label, exact, half] of [
       ["query-only, 4 recycles", baseline.queryOnly, side.queryOnly],
@@ -183,25 +207,26 @@ test("every shippable projection variant predicts what the f32 kernel predicts",
   }
   console.log(`\nGEMM DIFFERENTIAL\n${lines.join("\n")}\n`);
 
-  for (const precision of SHIPPABLE_GEMM_PRECISIONS) {
-    for (const inner of [8, 16]) {
-      const name = `${precision}-k${inner}`;
-      const divergence = divergences.get(name);
-      expect(divergence, `${name} produced a prediction`).toBeDefined();
-      if (divergence === undefined) continue;
-      for (const [label, result] of [
-        ["query-only", divergence.queryOnly], ["deep MSA", divergence.deepMsa],
-      ] as const) {
-        expect(result.finite, `${name} ${label} stayed finite`).toBe(true);
-        expect(result.plddt, `${name} ${label} worst mean-pLDDT shift`).toBeLessThan(PLDDT_GATE);
-        expect(result.ptm, `${name} ${label} worst pTM shift`).toBeLessThan(PTM_GATE);
-      }
-      // The f32 variants are the baseline's own kernel at another k depth, so
-      // they legitimately agree exactly; a half-precision one must not.
-      if (precision !== "f32") {
-        expect(divergence.queryOnly.identical && divergence.deepMsa.identical,
-          `${name} changed nothing at all, so the toggle did not reach the model`).toBe(false);
-      }
+  for (const candidate of MEASURED) {
+    if (!candidate.shippable) continue;
+    const divergence = divergences.get(candidate.name);
+    expect(divergence, `${candidate.name} produced a prediction`).toBeDefined();
+    if (divergence === undefined) continue;
+    for (const [label, result] of [
+      ["query-only", divergence.queryOnly], ["deep MSA", divergence.deepMsa],
+    ] as const) {
+      expect(result.finite, `${candidate.name} ${label} stayed finite`).toBe(true);
+      expect(result.plddt, `${candidate.name} ${label} worst mean-pLDDT shift`)
+        .toBeLessThan(PLDDT_GATE);
+      expect(result.ptm, `${candidate.name} ${label} worst pTM shift`).toBeLessThan(PTM_GATE);
+    }
+    // A kernel that rounds has to change something, or the agreement above is
+    // measuring one kernel against itself. An exact one is under no such
+    // obligation: agreeing with f32 to the bit is what it is for.
+    if (candidate.approximate) {
+      expect(divergence.queryOnly.identical && divergence.deepMsa.identical,
+        `${candidate.name} changed nothing at all, so the toggle did not reach the model`)
+        .toBe(false);
     }
   }
 });

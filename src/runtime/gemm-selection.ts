@@ -27,11 +27,27 @@ import {
  * happened.
  */
 
-/** Large enough to be throughput-bound, small enough to stay under 6 MiB. */
-const PROBE_ROWS = 1024;
-const PROBE_INNER = 512;
-const PROBE_COLUMNS = 512;
-const PROBE_REPEATS = 3;
+/**
+ * Two shapes, because one kernel has to serve both and they do not rank the
+ * same. The model runs wide projections and narrow ones, and the matrix kernel
+ * in particular is fast on the wide shapes and slow on the narrow ones, where
+ * a 128-column output leaves the dispatch grid one workgroup across.
+ *
+ * The row count of the first is not arbitrary and is the expensive part. The
+ * matrix kernel puts one subgroup in a workgroup, so its occupancy comes
+ * entirely from having many workgroups, and a probe with too few rows starves
+ * it: measured against `f16-chunked`, a 1,024-row shape ranks it at 0.53 while
+ * the projections the model actually runs rank it between 1.23 and 1.45. At
+ * 16,384 rows the probe reproduces that ordering at 1.17, which is the
+ * cheapest shape tried that still gets the answer right rather than backwards.
+ * It costs about 34 MiB while it runs, and it is freed before the device is
+ * handed out.
+ */
+const PROBE_SHAPES = [
+  { rows: 16384, inner: 256, columns: 256 },
+  { rows: 2048, inner: 512, columns: 128 },
+] as const;
+const PROBE_REPEATS = 2;
 
 /**
  * How long one timed batch should take, and the resolution that forces.
@@ -43,7 +59,7 @@ const PROBE_REPEATS = 3;
  * arrangement over the fastest. So a rough pass sizes the real batch to reach
  * this many milliseconds, the way `gemm-calibration.spec.ts` already does.
  */
-const PROBE_BATCH_MILLISECONDS = 20;
+const PROBE_BATCH_MILLISECONDS = 12;
 const PROBE_ROUGH_DISPATCHES = 4;
 const PROBE_MAX_DISPATCHES = 2000;
 
@@ -72,6 +88,17 @@ const CHECK_TOLERANCE = 0.02;
  * noise. Apple clears it comfortably.
  */
 const HALF_PRECISION_MARGIN = 1.1;
+
+/**
+ * How much faster the matrix units have to be before they are used.
+ *
+ * Lower than the half-precision margin, and deliberately: the matrix kernel
+ * accumulates in f32 and reproduces the reference to the digit, so there is no
+ * accuracy being traded and nothing to be cautious about beyond measurement
+ * noise. It still has to win, because it is an experimental extension and
+ * because it is slow on narrow outputs.
+ */
+const MATRIX_MARGIN = 1.05;
 
 const selections = new WeakMap<GPUDevice, Promise<GemmVariant>>();
 
@@ -126,20 +153,37 @@ function hasHalfPrecision(device: GPUDevice): boolean {
  * every variant in this list to the prediction gate.
  */
 export const SHIPPABLE_GEMM_PRECISIONS: readonly GemmVariant["precision"][] = [
-  "f32", "f16-chunked", "f16-mixed",
+  "f32", "matrix", "f16-chunked", "f16-mixed",
 ];
+
+/** The matrix units are an experimental Chromium extension, not core WGSL. */
+const MATRIX_FEATURE = "chromium-experimental-subgroup-matrix";
+
+function hasMatrixUnits(device: GPUDevice): boolean {
+  const features: GPUSupportedFeatures | undefined = device.features;
+  return features?.has(MATRIX_FEATURE as GPUFeatureName) === true;
+}
 
 /** Variants worth measuring against each other on this device. */
 export function gemmVariantCandidates(device: GPUDevice): readonly GemmVariant[] {
   const depths = [8, 16] as const;
-  const usable = hasHalfPrecision(device) && !sawDeviceWithoutHalfPrecision
-    ? SHIPPABLE_GEMM_PRECISIONS
-    : SHIPPABLE_GEMM_PRECISIONS.filter((precision) => precision === "f32");
-  return usable.flatMap((precision) => depths.map((inner) => ({ precision, inner })));
+  const half = hasHalfPrecision(device) && !sawDeviceWithoutHalfPrecision;
+  const candidates: GemmVariant[] = [];
+  for (const precision of SHIPPABLE_GEMM_PRECISIONS) {
+    if (precision === "matrix") {
+      // The units fix the contraction step, so there is one of these.
+      if (hasMatrixUnits(device)) candidates.push({ precision, inner: 8 });
+      continue;
+    }
+    if (precision !== "f32" && !half) continue;
+    for (const inner of depths) candidates.push({ precision, inner });
+  }
+  return candidates;
 }
 
 export function gemmVariantName(variant: GemmVariant): string {
-  return `${variant.precision}-64x128k${variant.inner}`;
+  return variant.precision === "matrix"
+    ? "matrix-64x128" : `${variant.precision}-64x128k${variant.inner}`;
 }
 
 /** A bias-free projection with the shared tiling, for probing one variant. */
@@ -157,6 +201,9 @@ struct ProbeParameters { rows: u32, inner: u32, columns: u32, padding: u32 };
     sourceElement: "source[row * parameters.inner + k]",
     weightElement: "weights[k * parameters.columns + column]",
     store: "output[row * parameters.columns + column] = element;",
+    // Plain row-major arrays, so this probe can measure the matrix units too.
+    sourceArray: { array: "source", stride: "parameters.inner" },
+    weightArray: { array: "weights", stride: "parameters.columns" },
   }, variant);
 }
 
@@ -307,27 +354,45 @@ async function measureTime(device: GPUDevice, variant: GemmVariant, probe: Probe
 
 export interface GemmVariantMeasurement {
   readonly variant: GemmVariant;
+  /** Total across the probe shapes; what the hand-tiled kernel is ranked by. */
   readonly milliseconds: number;
+  /** Per shape, in `PROBE_SHAPES` order, so unlike things are not compared. */
+  readonly perShape: readonly number[];
   readonly relativeError: number;
 }
 
-/** Measures every candidate on this device, in candidate order. */
+/**
+ * Measures every candidate on this device, in candidate order.
+ *
+ * A candidate that will not compile or run is dropped rather than allowed to
+ * end the whole calibration: an experimental extension may be advertised and
+ * still reject a kernel, and losing the other candidates over it would leave
+ * the device on f32 for no reason.
+ */
 export async function measureGemmVariants(
   device: GPUDevice,
 ): Promise<readonly GemmVariantMeasurement[]> {
-  const probe = createProbe(device, PROBE_ROWS, PROBE_INNER, PROBE_COLUMNS, false);
+  const probes = PROBE_SHAPES.map(
+    (shape) => createProbe(device, shape.rows, shape.inner, shape.columns, false),
+  );
   try {
     const measurements: GemmVariantMeasurement[] = [];
     for (const variant of gemmVariantCandidates(device)) {
-      const relativeError = await measureError(device, variant);
-      measurements.push({
-        variant, relativeError,
-        milliseconds: await measureTime(device, variant, probe),
-      });
+      try {
+        const relativeError = await measureError(device, variant);
+        const perShape: number[] = [];
+        for (const probe of probes) perShape.push(await measureTime(device, variant, probe));
+        measurements.push({
+          variant, relativeError, perShape,
+          milliseconds: perShape.reduce((total, value) => total + value, 0),
+        });
+      } catch {
+        // Left out of the ranking entirely.
+      }
     }
     return measurements;
   } finally {
-    destroyProbe(probe);
+    for (const probe of probes) destroyProbe(probe);
   }
 }
 
@@ -368,9 +433,26 @@ export function calibrateGemmVariant(device: GPUDevice): Promise<GemmVariant> {
       // If the f32 kernel itself did not reproduce the reference, the probe is
       // what is broken, not the arithmetic: there is nothing to compare
       // against, so nothing is changed.
-      const winner = exact === undefined ? GEMM_VARIANT_F32
+      const classic = exact === undefined ? GEMM_VARIANT_F32
         : half !== undefined && half.milliseconds * HALF_PRECISION_MARGIN < exact.milliseconds
           ? half.variant : exact.variant;
+      // The matrix units are a separate question from the arithmetic, because
+      // they serve a different set of callers: only the wide projections can
+      // declare their operands as arrays. So they are judged on the wide probe
+      // shape alone, against whatever the hand-tiled kernel does on that same
+      // shape — comparing a one-shape score against a two-shape total would
+      // simply make the matrix kernel look slower than everything.
+      const wideTime = (measurement: GemmVariantMeasurement): number =>
+        measurement.perShape[0] ?? Number.POSITIVE_INFINITY;
+      const matrix = usable.find((measurement) => measurement.variant.precision === "matrix");
+      const bestClassicWide = usable
+        .filter((measurement) => measurement.variant.precision !== "matrix")
+        .sort((left, right) => wideTime(left) - wideTime(right))[0];
+      const winner: GemmVariant = matrix !== undefined && bestClassicWide !== undefined
+        && wideTime(matrix) * MATRIX_MARGIN < wideTime(bestClassicWide)
+        ? { precision: "matrix", inner: classic.inner, fallback: classic.precision as
+            "f32" | "f16-mixed" | "f16-chunked" }
+        : classic;
       setGemmVariant(winner);
       return winner;
     } catch {

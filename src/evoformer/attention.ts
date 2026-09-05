@@ -411,8 +411,13 @@ fn mask_index(batch: u32, key_index: u32) -> u32 {
   return key_index * p.batch_total + b;
 }`;
 
-export const ATTENTION_PROJECT_SHADER = createTiledGemmShader({
-  preamble: `${COMMON}
+export function attentionProjectShader(): string {
+  // Built on demand, not at module load: the projection variant is installed
+  // while the device is created, and this module is imported before that
+  // happens. A module-scope constant would freeze the f32 kernel in place and
+  // quietly miss every selection made afterwards.
+  return createTiledGemmShader({
+    preamble: `${COMMON}
 @group(0) @binding(0) var<storage, read> source: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> p: Parameters;
@@ -427,13 +432,13 @@ fn projection_weight_offset(matrix: u32) -> u32 {
   if (matrix == 2u) { return p.value_weight; }
   return p.gating_weight;
 }`,
-  rows: "p.batch * p.queries",
-  inner: "p.channels",
-  columns: "4u * p.heads * p.head_dim",
-  sourceElement: "source[row * p.channels + k]",
-  weightElement: `weights[projection_weight_offset(column / (p.heads * p.head_dim))
+    rows: "p.batch * p.queries",
+    inner: "p.channels",
+    columns: "4u * p.heads * p.head_dim",
+    sourceElement: "source[row * p.channels + k]",
+    weightElement: `weights[projection_weight_offset(column / (p.heads * p.head_dim))
         + k * p.heads * p.head_dim + column % (p.heads * p.head_dim)]`,
-  store: `let projected = p.heads * p.head_dim;
+    store: `let projected = p.heads * p.head_dim;
           let matrix = column / projected;
           let index = row * projected + column % projected;
           if (matrix == 0u) { query[index] = element * inverseSqrt(f32(p.head_dim)); }
@@ -443,7 +448,8 @@ fn projection_weight_offset(matrix: u32) -> u32 {
             let biased = element + weights[p.gating_bias + column % projected];
             gate[index] = 1.0 / (1.0 + exp(-biased));
           }`,
-});
+  });
+}
 
 export const ATTENTION_PAIR_BIAS_SHADER = `${COMMON}
 @group(0) @binding(0) var<storage, read> pair: array<f32>;
@@ -1014,6 +1020,12 @@ ${storage === "f16" ? shardWordLoader(shards, "output") : (residual ? shardLoade
     columns: "p.channels",
     sourceElement: "source[row * p.heads * p.head_dim + k]",
     weightElement: "weights[p.output_weight + k * p.channels + column]",
+    // The same operands as arrays, for the hardware matrix units. Both really
+    // are row-major f32 here whatever the output storage is; a packed output
+    // takes the vector store below instead, which the matrix kernel does not
+    // offer, so it keeps the hand-tiled one without anything being said.
+    sourceArray: { array: "source", stride: "p.heads * p.head_dim" },
+    weightArray: { array: "weights", base: "p.output_weight", stride: "p.channels" },
     store: `${outputRow}
           let slot = output_row * p.channels + column;
           let written = element + weights[p.output_bias + column];
@@ -1058,7 +1070,7 @@ export class AttentionGpu {
     );
     const [normalize, project, pairProject, flash, outputProject] = await Promise.all([
       this.pipelines.get("attention:normalize", ATTENTION_NORMALIZE_SHADER),
-      this.pipelines.get("attention:project", ATTENTION_PROJECT_SHADER),
+      this.pipelines.get("attention:project", attentionProjectShader()),
       this.pipelines.get("attention:pair-bias", ATTENTION_PAIR_BIAS_SHADER),
       this.pipelines.get(flashKernel.cacheKey, flashKernel.shader),
       this.pipelines.get("attention:output", ATTENTION_OUTPUT_SHADER),

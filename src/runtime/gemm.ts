@@ -25,6 +25,11 @@ const GEMM_THREADS = 256;
  */
 const GEMM_WORKGROUP_BYTES = 16384;
 
+/** The matrix shape Apple offers, the region one subgroup owns, and its width. */
+const MATRIX_TILE = 8;
+const MATRIX_REGION = 32;
+const MATRIX_LANES = 32;
+
 /**
  * How the k loop computes, chosen per device rather than written down.
  *
@@ -52,9 +57,26 @@ export interface GemmVariant {
    * tile and folds that into an f32 running sum once per tile, so the error
    * grows with the square root of 8 or 16 terms rather than of K while all but
    * one add per tile stays in half precision.
+   *
+   * `matrix` is not half precision at all: it is the hardware matrix units,
+   * accumulating in f32, and it is both faster than any of the above and
+   * exact. It serves only callers that declared their operands as arrays and
+   * store one element at a time, and `inner` does not apply to it — the units
+   * fix the contraction step at 8.
    */
-  readonly precision: "f32" | "f16" | "f16-mixed" | "f16-chunked";
+  readonly precision: "f32" | "f16" | "f16-mixed" | "f16-chunked" | "matrix";
   readonly inner: 8 | 16;
+  /**
+   * What a caller that cannot reach the matrix units computes instead.
+   *
+   * Only some projections can use them: an operand that is a function call, or
+   * four weight matrices selected by column, is not something
+   * `subgroupMatrixLoad` can address. Those callers would otherwise drop all
+   * the way back to f32 whenever the matrix units won, losing the
+   * half-precision gain they did qualify for — which on this model is most of
+   * the projection time, since the largest single shape is one of them.
+   */
+  readonly fallback?: "f32" | "f16-mixed" | "f16-chunked";
 }
 
 export const GEMM_VARIANT_F32: GemmVariant = { precision: "f32", inner: GEMM_TILE_INNER };
@@ -115,6 +137,34 @@ export interface TiledGemmShader {
   readonly stageElements?: number;
   /** Narrower tile for outputs that would otherwise waste most of a workgroup. */
   readonly tileColumns?: number;
+  /**
+   * The same operands again, as arrays rather than as expressions.
+   *
+   * `sourceElement` and `weightElement` are expressions because a caller may
+   * unpack a half-precision word, window a tensor past a binding limit, or
+   * index something else entirely. The hardware matrix units cannot consume an
+   * expression: `subgroupMatrixLoad` takes an array, a base offset and a row
+   * stride, and loads a whole 8x8 tile itself.
+   *
+   * A caller whose operands really are plain `array<f32>` in row-major order
+   * says so here, and becomes eligible for the matrix kernel on a device that
+   * has the units. Saying nothing is always safe and keeps the hand-tiled
+   * kernel. Declaring this when it is not true is not detectable here and will
+   * compute the wrong answer, so it is a claim, not a hint: element `[row][k]`
+   * of A must live at `base + row * stride + k`, and `[k][column]` of W at
+   * `base + k * stride + column`.
+   */
+  readonly sourceArray?: GemmOperandArray;
+  readonly weightArray?: GemmOperandArray;
+}
+
+export interface GemmOperandArray {
+  /** Name of an `array<f32>` binding in the preamble. */
+  readonly array: string;
+  /** Expression for the element index the operand starts at. Defaults to zero. */
+  readonly base?: string;
+  /** Expression for the distance in elements between consecutive rows. */
+  readonly stride: string;
 }
 
 /**
@@ -132,16 +182,151 @@ export function gemmGrid(
   return [Math.ceil(columns / tileColumns), Math.ceil(rows / GEMM_TILE_ROWS)];
 }
 
+/** Whether this shader and this variant can use the hardware matrix units. */
+export function usesMatrixUnits(shader: TiledGemmShader, variant: GemmVariant): boolean {
+  return variant.precision === "matrix"
+    && shader.sourceArray !== undefined && shader.weightArray !== undefined
+    // A whole-tile epilogue is written against `acc{n}` in the hand-tiled
+    // thread mapping, which a matrix kernel does not have; `storeVector`
+    // writes four columns at once, which is how a packed half-precision
+    // output is written and which the per-element store below cannot do.
+    && shader.epilogue === undefined && shader.storeVector === undefined;
+}
+
+/**
+ * The projection over the hardware matrix units.
+ *
+ * One subgroup owns the whole 64x128 output tile and walks it as eight 32x32
+ * sub-regions, four left tiles by four right tiles at a time: sixteen
+ * multiply-accumulates per eight loads, where the naive arrangement gets one
+ * per two. Keeping the tile the hand-tiled kernel uses is what lets callers
+ * opt in one at a time — `gemmGrid` does not know which shader is asking, so
+ * two kernels with different tiles would hand one of them the wrong grid.
+ *
+ * `subgroupMatrixStore` requires a uniform offset and WGSL's uniformity
+ * analysis is workgroup-scoped, so one subgroup per workgroup and every offset
+ * from the workgroup id.
+ *
+ * The edges are the whole difficulty. A tile of columns that runs off the
+ * right-hand side is harmless: the load stays inside the weights and only the
+ * columns that do not exist come back wrong, and those are not stored. A tile
+ * of rows that runs off the *end of the source* is not harmless, and not in
+ * the way one would guess — it does not merely return zeros for the rows that
+ * are missing, it returns nothing usable for the valid rows in the same tile.
+ * At 81 rows that silently corrupted row 80 and nothing else, which end to end
+ * moved the prediction by 6.5 pLDDT.
+ *
+ * So a region that would run past the end is loaded from an origin pulled back
+ * far enough to fit, and the store maps each output row to wherever it landed
+ * in the staged result. Rows are still written exactly once, by exactly one
+ * workgroup, which matters because some callers accumulate into their output.
+ * Below one region's worth of rows there is nowhere to pull back to, and that
+ * case is computed without the units at all.
+ */
+function createMatrixGemmShader(shader: TiledGemmShader, variant: GemmVariant): string {
+  const size = MATRIX_TILE;
+  const region = MATRIX_REGION;
+  const tiles = region / size;
+  const tileColumns = shader.tileColumns ?? GEMM_TILE_COLUMNS;
+  const rowBlocks = GEMM_TILE_ROWS / region;
+  const columnBlocks = tileColumns / region;
+  if (!Number.isInteger(rowBlocks) || !Number.isInteger(columnBlocks)) {
+    throw new RangeError(`matrix GEMM needs a tile in multiples of ${region}`);
+  }
+  const source = shader.sourceArray!;
+  const weight = shader.weightArray!;
+  const lines = (count: number, body: (index: number) => string): string =>
+    Array.from({ length: count }, (_, index) => body(index)).join("\n");
+  const base = (operand: GemmOperandArray): string => operand.base ?? "0u";
+  return `enable chromium_experimental_subgroup_matrix;
+${shader.preamble}
+
+var<workgroup> gemm_matrix_stage: array<f32, ${region * region}>;
+
+@compute @workgroup_size(${MATRIX_LANES}, 1, 1)
+fn main(
+  @builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>,
+) {
+  let gemm_rows = ${shader.rows};
+  let gemm_inner = ${shader.inner};
+  let gemm_columns = ${shader.columns};
+  let lane = local.x;
+  let tile_row_origin = group.y * ${GEMM_TILE_ROWS}u;
+  let tile_column_origin = group.x * ${tileColumns}u;
+  // Uniform: every invocation of the workgroup takes the same branch.
+  if (gemm_rows >= ${region}u) {
+    for (var row_block = 0u; row_block < ${rowBlocks}u; row_block += 1u) {
+      for (var column_block = 0u; column_block < ${columnBlocks}u; column_block += 1u) {
+        let row_origin = tile_row_origin + row_block * ${region}u;
+        let column_origin = tile_column_origin + column_block * ${region}u;
+        // Pulled back so the last tile still lies inside the source.
+        let load_origin = min(row_origin, gemm_rows - ${region}u);
+${lines(tiles, (r) => lines(tiles, (c) =>
+    `        var acc_${r}_${c} = subgroup_matrix_result<f32, ${size}, ${size}>();`))}
+        for (var k0 = 0u; k0 < gemm_inner; k0 += ${size}u) {
+${lines(tiles, (r) => `          let left_${r} = subgroupMatrixLoad<subgroup_matrix_left<f32, ${size}, ${size}>>(
+            &${source.array}, ${base(source)} + (load_origin + ${r * size}u) * (${source.stride}) + k0,
+            false, ${source.stride});`)}
+${lines(tiles, (c) => `          let right_${c} = subgroupMatrixLoad<subgroup_matrix_right<f32, ${size}, ${size}>>(
+            &${weight.array}, ${base(weight)} + k0 * (${weight.stride}) + column_origin + ${c * size}u,
+            false, ${weight.stride});`)}
+${lines(tiles, (r) => lines(tiles, (c) =>
+    `          acc_${r}_${c} = subgroupMatrixMultiplyAccumulate(left_${r}, right_${c}, acc_${r}_${c});`))}
+        }
+        workgroupBarrier();
+${lines(tiles, (r) => lines(tiles, (c) =>
+    `        subgroupMatrixStore(&gemm_matrix_stage, ${r * size}u * ${region}u + ${c * size}u,
+          acc_${r}_${c}, false, ${region}u);`))}
+        workgroupBarrier();
+        for (var item = lane; item < ${region * region}u; item += ${MATRIX_LANES}u) {
+          let row = row_origin + item / ${region}u;
+          let column = column_origin + item % ${region}u;
+          if (row < gemm_rows && column < gemm_columns) {
+            // Where this row landed once the origin was pulled back.
+            let element = gemm_matrix_stage[(row - load_origin) * ${region}u + item % ${region}u];
+            ${shader.store}
+          }
+        }
+        workgroupBarrier();
+      }
+    }
+  } else {
+    // Fewer rows than one region: there is nowhere to pull back to, so the
+    // whole tile is computed directly. Only the smallest shapes reach this.
+    for (var item = lane; item < ${GEMM_TILE_ROWS * tileColumns}u; item += ${MATRIX_LANES}u) {
+      let row = tile_row_origin + item / ${tileColumns}u;
+      let column = tile_column_origin + item % ${tileColumns}u;
+      if (row < gemm_rows && column < gemm_columns) {
+        var total = 0.0;
+        for (var k = 0u; k < gemm_inner; k += 1u) {
+          total += ${source.array}[${base(source)} + row * (${source.stride}) + k]
+            * ${weight.array}[${base(weight)} + k * (${weight.stride}) + column];
+        }
+        let element = total;
+        ${shader.store}
+      }
+    }
+  }
+}`;
+}
+
 export function createTiledGemmShader(
   shader: TiledGemmShader, variant: GemmVariant = gemmVariant(),
 ): string {
+  if (usesMatrixUnits(shader, variant)) return createMatrixGemmShader(shader, variant);
   const tileColumns = shader.tileColumns ?? GEMM_TILE_COLUMNS;
-  const half = variant.precision !== "f32";
+  // A caller that cannot reach the matrix units computes the same thing with
+  // the hand-tiled kernel, in whatever precision the device settled on for
+  // the callers that were never eligible in the first place.
+  const precision = variant.precision === "matrix"
+    ? variant.fallback ?? "f32" : variant.precision;
+  const half = precision !== "f32";
   const scalar = half ? "f16" : "f32";
   // Only the pure arrangement keeps the running sum in half precision; the
   // other two reduce in f32 and differ in what they do inside one tile.
-  const halfAccumulator = variant.precision === "f16";
-  const chunked = variant.precision === "f16-chunked";
+  const halfAccumulator = precision === "f16";
+  const chunked = precision === "f16-chunked";
   const stageBytes = shader.epilogue === undefined ? 0 : (shader.stageElements ?? 2048) * 4;
   const operandBytes = (inner: number): number =>
     GEMM_TILE_ROWS * inner * (half ? 2 : 4) + inner * tileColumns * (half ? 2 : 4);
@@ -230,7 +415,7 @@ ${lines(vectorsPerThread, (vector) => `      let a${vector} = vec4<${scalar}>(${
 ${lines(rowsPerThread, (row) => {
     const product = `a${Math.floor(row / 4)}[${row % 4}u] * w`;
     if (chunked) return `      chunk${row} += ${product};`;
-    if (variant.precision === "f16-mixed") return `      acc${row} += vec4<f32>(${product});`;
+    if (precision === "f16-mixed") return `      acc${row} += vec4<f32>(${product});`;
     return `      ${register}${row} += ${product};`;
   })}
     }${chunked ? `\n${lines(rowsPerThread, (row) => `    acc${row} += vec4<f32>(chunk${row});`)}` : ""}

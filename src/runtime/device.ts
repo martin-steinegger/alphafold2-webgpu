@@ -325,9 +325,13 @@ export async function requestAlphaFoldDevice(
   },
 ): Promise<GPUDevice> {
   // subgroup-size-control is shipping ahead of the current @webgpu/types union.
-  // shader-f16 is requested wherever it exists but never assumed to be worth
-  // using: gemm-selection measures it below and keeps f32 unless it wins.
-  const optional = ["subgroups", "subgroup-size-control", "timestamp-query", "shader-f16"] as const;
+  // shader-f16 and the subgroup matrix units are requested wherever they
+  // exist but never assumed to be worth using: gemm-selection measures them
+  // below and keeps f32 unless one of them wins. The matrix extension is
+  // experimental and Chromium-only, which is exactly why it is asked for
+  // rather than depended on.
+  const optional = ["subgroups", "subgroup-size-control", "timestamp-query", "shader-f16",
+    "chromium-experimental-subgroup-matrix"] as const;
   const requiredFeatures = optional.filter(
     (feature) => adapter.features.has(feature as GPUFeatureName),
   ) as GPUFeatureName[];

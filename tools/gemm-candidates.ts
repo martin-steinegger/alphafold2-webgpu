@@ -657,5 +657,14 @@ export const SHAPES: readonly Shape[] = [
   { name: "output32   M=29984 K=256 N=256", rows: 29984, inner: 256, columns: 256 },
   { name: "trans2-32  M=29984 K=1024 N=256", rows: 29984, inner: 1024, columns: 256 },
   { name: "opmcon32   M=128 K=512 N=32000", rows: 128, inner: 512, columns: 32000 },
+  // Candidate shapes for the device probe in src/runtime/gemm-selection.ts.
+  // The probe has to rank the matrix kernel the way the real shapes do while
+  // staying small enough to run at device creation, and the row count is what
+  // decides that: one subgroup per workgroup means occupancy comes from having
+  // many workgroups, which a 1,024-row shape does not have.
+  { name: "probeA     M=1024 K=512 N=512", rows: 1024, inner: 512, columns: 512 },
+  { name: "probeB     M=8192 K=128 N=512", rows: 8192, inner: 128, columns: 512 },
+  { name: "probeC     M=16384 K=256 N=256", rows: 16384, inner: 256, columns: 256 },
+  { name: "probeD     M=4096 K=256 N=512", rows: 4096, inner: 256, columns: 512 },
 ];
 

@@ -8,7 +8,7 @@ import {
   ATTENTION_OUTPUT_SHADER,
   ATTENTION_OUTPUT_RESIDUAL_SHADER,
   ATTENTION_PAIR_BIAS_SHADER,
-  ATTENTION_PROJECT_SHADER,
+  attentionProjectShader,
   ATTENTION_WINDOW_TARGET_BYTES,
   attentionBatchWindow,
   createAttentionNormParameters,
@@ -319,19 +319,25 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
 }
 
 /** Projects the per-column mean into every head's query. */
-const GLOBAL_ATTENTION_QUERY_SHADER = createTiledGemmShader({
-  preamble: `${GLOBAL_ATTENTION_COMMON}
+function globalAttentionQueryShader(): string {
+  // Built on demand, not at module load: the projection variant is installed
+  // while the device is created, and this module is imported before that
+  // happens. A module-scope constant would freeze the f32 kernel in place and
+  // quietly miss every selection made afterwards.
+  return createTiledGemmShader({
+    preamble: `${GLOBAL_ATTENTION_COMMON}
 @group(0) @binding(0) var<storage, read> means: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> p: Parameters;
 @group(0) @binding(3) var<storage, read_write> query: array<f32>;`,
-  rows: "p.length",
-  inner: "p.channels",
-  columns: "p.heads * p.head_dim",
-  sourceElement: "means[row * p.channels + k]",
-  weightElement: "weights[p.query_weight + k * p.heads * p.head_dim + column]",
-  store: `query[row * p.heads * p.head_dim + column] = element * inverseSqrt(f32(p.head_dim));`,
-});
+    rows: "p.length",
+    inner: "p.channels",
+    columns: "p.heads * p.head_dim",
+    sourceElement: "means[row * p.channels + k]",
+    weightElement: "weights[p.query_weight + k * p.heads * p.head_dim + column]",
+    store: `query[row * p.heads * p.head_dim + column] = element * inverseSqrt(f32(p.head_dim));`,
+  });
+}
 
 /**
  * Global column attention over the sequence axis.
@@ -640,7 +646,7 @@ async function encodeAttention(
   const [normalize, project, pairProject, flash, outputProject, pairNormalize] = await Promise.all([
     execution.pipelines.get(`block:attention:normalize:${shardKey}`,
       createAttentionNormalizeShader(storage, sourceShards)),
-    execution.pipelines.get("block:attention:project", ATTENTION_PROJECT_SHADER),
+    execution.pipelines.get("block:attention:project", attentionProjectShader()),
     execution.pipelines.get("block:attention:pair-bias", ATTENTION_PAIR_BIAS_SHADER),
     execution.pipelines.get(`block:${flashKernel.cacheKey}`, flashKernel.shader),
     execution.pipelines.get(
@@ -826,7 +832,7 @@ async function encodeGlobalAttention(
     execution.pipelines.get(`block:global-attention:kv:${key}`, createGlobalAttentionKvShader(storage, shards)),
     execution.pipelines.get(`block:global-attention:column-mean:${key}`,
       createGlobalAttentionColumnMeanShader(storage, shards)),
-    execution.pipelines.get("block:global-attention:query", GLOBAL_ATTENTION_QUERY_SHADER),
+    execution.pipelines.get("block:global-attention:query", globalAttentionQueryShader()),
     execution.pipelines.get("block:global-attention:flash", GLOBAL_ATTENTION_FLASH_SHADER),
     execution.pipelines.get(
       `block:global-attention:output${residualTarget === undefined ? "" : "-residual"}:${key}`,
