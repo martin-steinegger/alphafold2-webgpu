@@ -1034,9 +1034,6 @@ function updateInputMode(): void {
   maxExtra.max = multimer ? "2048" : "1024";
   if (multimer && maxExtra.value === "1024") maxExtra.value = "2048";
   else if (!multimer && maxExtra.valueAsNumber > 1024) maxExtra.value = "1024";
-  const recycleSelect = element<HTMLSelectElement>("recycles");
-  if (multimer && recycleSelect.value === "3") recycleSelect.value = "20";
-  else if (!multimer && recycleSelect.value === "20") recycleSelect.value = "3";
 }
 inputMode.addEventListener("change", updateInputMode);
 element<HTMLTextAreaElement>("sequence").addEventListener("input", () => { generatedMsa = undefined;

@@ -21,7 +21,9 @@ test("auto-detects monomers and multimers and switches to custom A3M", async ({ 
   await page.locator("#sequence").fill(HOMODIMER);
   await expect(page.locator("#sequence-length")).toHaveText("118 residues · 2 chains");
   await expect(page.locator("#predict-label")).toHaveText("Generate complex MSA & predict");
-  await expect(page.locator("#recycles")).toHaveValue("20");
+  // Three recycles for a complex as well: the page no longer raises it to
+  // AlphaFold-Multimer's twenty when it detects one.
+  await expect(page.locator("#recycles")).toHaveValue("3");
   await expect(page.locator("#max-msa")).toBeEnabled();
   await expect(page.locator("#max-extra")).toHaveValue("2048");
   await page.locator("#input-mode").selectOption("single");
