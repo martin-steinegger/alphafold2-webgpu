@@ -4484,6 +4484,36 @@
         37
       ],
       "dtype": "float32"
+    },
+    "template_haiku_0067": {
+      "file": "template_haiku_0067.f32.bin",
+      "shape": [
+        256
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0068": {
+      "file": "template_haiku_0068.f32.bin",
+      "shape": [
+        256,
+        256
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0069": {
+      "file": "template_haiku_0069.f32.bin",
+      "shape": [
+        256
+      ],
+      "dtype": "float32"
+    },
+    "template_haiku_0070": {
+      "file": "template_haiku_0070.f32.bin",
+      "shape": [
+        57,
+        256
+      ],
+      "dtype": "float32"
     }
   },
   "evoformerStack": {
@@ -5010,6 +5040,14 @@
       "single_template_embedding/template_pair_stack/__layer_stack_no_state/triangle_multiplication_outgoing/right_projection": {
         "bias": "template_haiku_0065",
         "weights": "template_haiku_0066"
+      },
+      "template_projection": {
+        "bias": "template_haiku_0067",
+        "weights": "template_haiku_0068"
+      },
+      "template_single_embedding": {
+        "bias": "template_haiku_0069",
+        "weights": "template_haiku_0070"
       }
     },
     "queryOnlySimplification": "all mock-template atom masks are zero; one template_mask entry is valid"

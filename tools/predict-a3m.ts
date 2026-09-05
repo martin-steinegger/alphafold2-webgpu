@@ -6,11 +6,14 @@
  * Usage: tsx tools/predict-a3m.ts <file.a3m> [msaRows] [extraRows] [recycles]
  */
 import { EXACT_STORAGE } from "../src/model/monomer.js";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { create, globals } from "webgpu";
 import { AlphaFoldMonomerGpu } from "../src/model/monomer.js";
 import { parseA3m } from "../src/input/a3m.js";
-import { makeA3mFeatures } from "../src/input/a3m-features.js";
+import { makeA3mFeatures, type RecycleFeatureSource } from "../src/input/a3m-features.js";
+import type { MonomerRecycleFeatures } from "../src/model/monomer.js";
+import { prepareTemplate, withTemplate } from "../src/input/template.js";
+import { predictionToPdb } from "../web/prediction-results.js";
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
 import { planMonomerDevice, requestAlphaFoldDevice } from "../src/runtime/device.js";
@@ -32,9 +35,26 @@ const [embedding, template, extraStack, mainStack, structure, confidence, geomet
   model.embeddingWeights(), model.templateWeights(), model.extraStackWeights(), model.mainStackWeights(),
   model.structureWeights(), model.confidenceWeights(), model.geometryTables(), model.queryOnlyFeatureTables(),
 ]);
-const features = makeA3mFeatures(a3m, featureTables, {
+let features: RecycleFeatureSource<MonomerRecycleFeatures> = makeA3mFeatures(a3m, featureTables, {
   recycles: recycles - 1, maxMsaSequences: msaRows, maxExtraSequences: extraRows, randomSeed: 0,
 });
+// AFWEBGPU_TEMPLATE=<structure> folds with a custom template, the way the page
+// does; AFWEBGPU_TEMPLATE_CHAIN picks a chain other than the first.
+const templatePath = process.env.AFWEBGPU_TEMPLATE;
+let templateReport: Record<string, unknown> | undefined;
+if (templatePath !== undefined && templatePath !== "") {
+  const prepared = prepareTemplate(readFileSync(templatePath, "utf8"), alignment.query, {
+    ...(process.env.AFWEBGPU_TEMPLATE_CHAIN === undefined
+      ? {} : { chainId: process.env.AFWEBGPU_TEMPLATE_CHAIN }),
+  });
+  features = withTemplate(features, prepared.features);
+  templateReport = {
+    file: templatePath, chain: prepared.chain.id, residues: prepared.chain.sequence.length,
+    covered: prepared.alignment.alignedResidues,
+    coverage: Number((prepared.alignment.coverage * 100).toFixed(1)),
+    identity: Number((prepared.alignment.identity * 100).toFixed(1)),
+  };
+}
 const gpu = create([]);
 const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
 if (adapter === null) throw new Error("no WebGPU adapter");
@@ -52,8 +72,16 @@ try {
     embedding, template, extraStack, mainStack, structure,
     lddt: confidence.lddt, pae: confidence.pae, geometry,
   }, await model.tensor("confidencePaeBreaks"));
+  // AFWEBGPU_PDB=<file> writes the structure, for comparing against a template.
+  const pdbPath = process.env.AFWEBGPU_PDB;
+  if (pdbPath !== undefined && pdbPath !== "") {
+    writeFileSync(pdbPath, predictionToPdb(
+      alignment.query, prediction.final.structure, prediction.final.confidence.plddt,
+    ));
+  }
   console.log(JSON.stringify({
     file, length, depth, msaRows: clustered, extraRows: extra, recycles,
+    ...(templateReport === undefined ? {} : { template: templateReport }),
     millisecondsPerRecycle: Math.round(prediction.elapsedMilliseconds / recycles),
     peakConcurrentMiB: Math.round(prediction.memory.peakBytes / 1024 ** 2),
     peakResidentMiB: Math.round(prediction.memory.combinedPeakResidentBytes / 1024 ** 2),
