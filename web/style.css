@@ -74,9 +74,13 @@ input:disabled, select:disabled { color: #888; background: #eee; }
    every line the run produced, which is a different thing with a different
    audience, so it waits behind a disclosure and is only opened by default when
    a run fails and its detail is the point. */
-.run-summary { margin: .7rem 0 0; color: #444; font-size: .8rem; line-height: 1.6; }
+.run-summary { margin-top: .7rem; margin-bottom: 0; color: #444; font-size: .8rem; line-height: 1.6; }
 .run-summary strong { color: #111; font-weight: 500; }
 .run-log-details { margin-top: .9rem; margin-bottom: 18px; }
+.run-log-details > summary, .capability-details > summary { position: relative; list-style: none; }
+.run-log-details > summary::-webkit-details-marker, .capability-details > summary::-webkit-details-marker { display: none; }
+.run-log-details > summary::before, .capability-details > summary::before { content: "\25b8"; position: absolute; left: -1.05rem; }
+.run-log-details[open] > summary::before, .capability-details[open] > summary::before { content: "\25be"; }
 .run-log-details > summary { color: var(--primary); font: .72rem "Roboto Mono", monospace; cursor: pointer; }
 .run-log { max-height: 190px; margin: .6rem 0 0; padding: 0; white-space: pre-wrap; overflow: auto; background: transparent; color: #666; font: .68rem/1.65 "Roboto Mono", monospace; }
 
