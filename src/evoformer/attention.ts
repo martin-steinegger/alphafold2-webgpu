@@ -411,7 +411,52 @@ fn mask_index(batch: u32, key_index: u32) -> u32 {
   return key_index * p.batch_total + b;
 }`;
 
-export function attentionProjectShader(): string {
+/**
+ * Whether the keys and values this projection writes are packed half words.
+ *
+ * The flash kernel reads a key and a value for every key index and every
+ * query, and it is not compute-bound: it runs at about a third of the rate
+ * the projection kernel reaches on the same device, so what it waits for is
+ * the operands. Halving their width is worth 1.29x, measured, which at long
+ * chain lengths is the largest single speedup available anywhere in the model
+ * — triangle attention is 57% of an Evoformer block at 708 residues and more
+ * beyond that.
+ *
+ * `pack2x16float` is core WGSL and needs no device feature, so this costs no
+ * portability. The query and the gate stay single precision: they are read
+ * once per invocation rather than once per key, so narrowing them would buy
+ * nothing and round something for free.
+ */
+export type AttentionKeyValueStorage = "f32" | "f16";
+
+/**
+ * A key/value width pinned ahead of any device, for differential testing.
+ *
+ * Whether narrowing them costs the model anything can only be answered by
+ * predicting one input both ways, which needs the choice held still across two
+ * runs that would otherwise make it themselves. The counterpart of
+ * `forceGemmVariant`, and not a setting: no URL, environment variable or
+ * stored preference reaches it, and production never calls it.
+ */
+let pinnedKeyValueStorage: AttentionKeyValueStorage | undefined;
+
+export function forceAttentionKeyValueStorage(
+  storage: AttentionKeyValueStorage | undefined,
+): void {
+  pinnedKeyValueStorage = storage;
+}
+
+/** The width to use, unless a differential test is holding it still. */
+export function attentionKeyValueStorage(
+  preferred: AttentionKeyValueStorage,
+): AttentionKeyValueStorage {
+  return pinnedKeyValueStorage ?? preferred;
+}
+
+export function attentionProjectShader(
+  keyValueStorage: AttentionKeyValueStorage = "f32",
+): string {
+  const packed = keyValueStorage === "f16";
   // Built on demand, not at module load: the projection variant is installed
   // while the device is created, and this module is imported before that
   // happens. A module-scope constant would freeze the f32 kernel in place and
@@ -422,8 +467,8 @@ export function attentionProjectShader(): string {
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> p: Parameters;
 @group(0) @binding(3) var<storage, read_write> query: array<f32>;
-@group(0) @binding(4) var<storage, read_write> key: array<f32>;
-@group(0) @binding(5) var<storage, read_write> value: array<f32>;
+@group(0) @binding(4) var<storage, read_write> key: array<${packed ? "u32" : "f32"}>;
+@group(0) @binding(5) var<storage, read_write> value: array<${packed ? "u32" : "f32"}>;
 @group(0) @binding(6) var<storage, read_write> gate: array<f32>;
 
 fn projection_weight_offset(matrix: u32) -> u32 {
@@ -448,6 +493,32 @@ fn projection_weight_offset(matrix: u32) -> u32 {
             let biased = element + weights[p.gating_bias + column % projected];
             gate[index] = 1.0 / (1.0 + exp(-biased));
           }`,
+    // Packed keys and values are written a word at a time, which needs the two
+    // channels sharing that word in one invocation. Every projection width is
+    // a multiple of four and an invocation's four columns start at a multiple
+    // of four, so the pair is always its own; the head dimension is even, so a
+    // word never straddles two heads.
+    ...(packed ? { storeVector: `let projected = p.heads * p.head_dim;
+          // A guard, not a return: this runs once per row of the register
+          // block, and returning would abandon the rows after it.
+          if (column + 3u < 4u * projected) {
+            let matrix = column / projected;
+            let index = row * projected + column % projected;
+            if (matrix == 0u) {
+${[0, 1, 2, 3].map((lane) => `              query[index + ${lane}u] = values[${lane}] * inverseSqrt(f32(p.head_dim));`).join("\n")}
+            } else if (matrix == 1u) {
+              key[index >> 1u] = pack2x16float(vec2<f32>(values[0], values[1]));
+              key[(index >> 1u) + 1u] = pack2x16float(vec2<f32>(values[2], values[3]));
+            } else if (matrix == 2u) {
+              value[index >> 1u] = pack2x16float(vec2<f32>(values[0], values[1]));
+              value[(index >> 1u) + 1u] = pack2x16float(vec2<f32>(values[2], values[3]));
+            } else {
+${[0, 1, 2, 3].map((lane) => `              {
+                let biased = values[${lane}] + weights[p.gating_bias + column % projected + ${lane}u];
+                gate[index + ${lane}u] = 1.0 / (1.0 + exp(-biased));
+              }`).join("\n")}
+            }
+          }` } : {}),
   });
 }
 
@@ -544,7 +615,10 @@ fn main(
  * the workgroup barriers and tree reductions from the key loop without relying
  * on subgroup extensions, which Chrome-on-Metal does not currently expose.
  */
-export function createAttentionRegisterFlashShader(headDim: number, queriesPerThread = 1): string {
+export function createAttentionRegisterFlashShader(
+  headDim: number, queriesPerThread = 1,
+  keyValueStorage: AttentionKeyValueStorage = "f32",
+): string {
   if (!Number.isSafeInteger(headDim) || headDim <= 0 || headDim > 32 || headDim % 4 !== 0) {
     throw new RangeError("register attention requires a positive head dimension divisible by four and at most 32");
   }
@@ -553,6 +627,15 @@ export function createAttentionRegisterFlashShader(headDim: number, queriesPerTh
   }
   const vectors = headDim / 4;
   const slots = queriesPerThread;
+  // Keys and values are read once per key index per invocation, which is the
+  // whole cost of this kernel; the query and the gate are read once. Halving
+  // the width of the two that are read in the loop measured 1.29x.
+  const packedKv = keyValueStorage === "f16";
+  const loadKv = (name: string, buffer: string, index: number): string => packedKv
+    ? `let ${name}_word${index} = ${buffer}[k_base + ${index}u];`
+      + `\n    let ${name}${index} = vec4<f32>(unpack2x16float(${name}_word${index}.x), `
+      + `unpack2x16float(${name}_word${index}.y));`
+    : `let ${name}${index} = ${buffer}[k_base + ${index}u];`;
   const perSlot = (slot: number, indent: string, body: (index: number) => string): string => Array.from(
     { length: vectors }, (_, index) => `${indent}${body(index)}`,
   ).join("\n");
@@ -562,8 +645,8 @@ export function createAttentionRegisterFlashShader(headDim: number, queriesPerTh
   return `${COMMON}
 const HD4: u32 = ${vectors}u;
 @group(0) @binding(0) var<storage, read> query: array<vec4<f32>>;
-@group(0) @binding(1) var<storage, read> key: array<vec4<f32>>;
-@group(0) @binding(2) var<storage, read> value: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> key: array<${packedKv ? "vec2<u32>" : "vec4<f32>"}>;
+@group(0) @binding(2) var<storage, read> value: array<${packedKv ? "vec2<u32>" : "vec4<f32>"}>;
 @group(0) @binding(3) var<storage, read> gate: array<vec4<f32>>;
 @group(0) @binding(4) var<storage, read> mask: array<f32>;
 @group(0) @binding(5) var<storage, read> pair_bias: array<f32>;
@@ -593,8 +676,8 @@ var running_sum_${slot} = 0.0;`)}
 
   for (var k_index = 0u; k_index < p.queries; k_index += 1u) {
     let k_base = ((batch_index * p.queries + k_index) * p.heads + head) * HD4;
-${perSlot(0, "    ", (index) => `let kv${index} = key[k_base + ${index}u];`)}
-${perSlot(0, "    ", (index) => `let vv${index} = value[k_base + ${index}u];`)}
+${perSlot(0, "    ", (index) => loadKv("kv", "key", index))}
+${perSlot(0, "    ", (index) => loadKv("vv", "value", index))}
     let masked = 1e9 * (mask[mask_index(batch_index, k_index)] - 1.0);
 ${eachSlot("    ", (slot) => `{
   var score = 0.0;

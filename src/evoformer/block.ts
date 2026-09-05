@@ -8,7 +8,9 @@ import {
   ATTENTION_OUTPUT_SHADER,
   ATTENTION_OUTPUT_RESIDUAL_SHADER,
   ATTENTION_PAIR_BIAS_SHADER,
+  attentionKeyValueStorage,
   attentionProjectShader,
+  createAttentionRegisterFlashShader,
   ATTENTION_WINDOW_TARGET_BYTES,
   attentionBatchWindow,
   createAttentionNormParameters,
@@ -629,6 +631,21 @@ async function encodeAttention(
     execution.device, options.channels / options.heads, options.queries,
   );
   const storage = options.storage ?? "f32";
+  // Keys and values are the operands this kernel spends its time reading, and
+  // packing them as half words measured 1.29x on the shape triangle attention
+  // runs. Only the register kernel reads them packed; every other flash
+  // variant keeps the single-precision pair it was written against, so a
+  // device that selects one of those is untouched. `pack2x16float` is core
+  // WGSL, so this needs no device feature and costs no portability.
+  const packKeyValue = flashKernel.variant === "register";
+  const keyValueStorage = attentionKeyValueStorage(packKeyValue ? "f16" : "f32");
+  const flashShader = keyValueStorage === "f16"
+    ? createAttentionRegisterFlashShader(
+      options.channels / options.heads, flashKernel.queryTile / 64, "f16")
+    : flashKernel.variant === "register"
+      ? createAttentionRegisterFlashShader(
+        options.channels / options.heads, flashKernel.queryTile / 64, "f32")
+      : flashKernel.shader;
   // The source and the residual target are the same tensor, and at long chain
   // lengths it outgrows one binding, so both are bound as windows of it.
   const sourceShards = planShards(options.batch * options.queries * options.channels, options.channels,
@@ -646,9 +663,10 @@ async function encodeAttention(
   const [normalize, project, pairProject, flash, outputProject, pairNormalize] = await Promise.all([
     execution.pipelines.get(`block:attention:normalize:${shardKey}`,
       createAttentionNormalizeShader(storage, sourceShards)),
-    execution.pipelines.get("block:attention:project", attentionProjectShader()),
+    execution.pipelines.get(`block:attention:project:${keyValueStorage}`,
+      attentionProjectShader(keyValueStorage)),
     execution.pipelines.get("block:attention:pair-bias", ATTENTION_PAIR_BIAS_SHADER),
-    execution.pipelines.get(`block:${flashKernel.cacheKey}`, flashKernel.shader),
+    execution.pipelines.get(`block:${flashKernel.cacheKey}:kv-${keyValueStorage}`, flashShader),
     execution.pipelines.get(
       `block:attention:output${options.residualTarget === undefined ? "" : "-residual"}:${shardKey}`,
       createAttentionOutputShader(options.residualTarget !== undefined, storage, sourceShards),
@@ -757,8 +775,8 @@ async function encodeAttention(
 
   const outputViews = output === options.source ? sourceViews : shardsOf(output);
   const query = execution.allocate(`${options.label}.query`, windowElements);
-  const key = execution.allocate(`${options.label}.key`, windowElements);
-  const value = execution.allocate(`${options.label}.value`, windowElements);
+  const key = execution.allocate(`${options.label}.key`, storageWords(windowElements, keyValueStorage));
+  const value = execution.allocate(`${options.label}.value`, storageWords(windowElements, keyValueStorage));
   const gate = execution.allocate(`${options.label}.gate`, windowElements);
   // Within a window the normalized input dies at the projection and the
   // attention result is born at the flash, so one windowed tensor serves both,
