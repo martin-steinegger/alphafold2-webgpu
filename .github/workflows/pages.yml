@@ -34,8 +34,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download model1-ptm-q8-v1 --pattern afwebgpu-model1-ptm-q8-v1.tar.gz
-          tar -xzf afwebgpu-model1-ptm-q8-v1.tar.gz -C dist/web
+          gh release download model1-ptm-q8-v2 --pattern afwebgpu-model1-ptm-q8-v2.tar.gz
+          tar -xzf afwebgpu-model1-ptm-q8-v2.tar.gz -C dist/web
       - name: Validate model bundle
         if: ${{ vars.AFWEBGPU_INCLUDE_MODEL == 'true' }}
         run: npm run verify:web-model -- dist/web/model/manifest.json --require-sha256 --require-license

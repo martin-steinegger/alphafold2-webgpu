@@ -138,6 +138,20 @@ export interface ResultPackage {
   /** Whether the alignment came from the MMseqs2 server, which changes the citations. */
   readonly usedMmseqs2: boolean;
   readonly multimer: boolean;
+  /**
+   * The template the run folded against, if any.
+   *
+   * A prediction that used a template cannot be reproduced without it, so the
+   * structure travels in the archive with the alignment rather than being left
+   * on whatever machine happened to upload it.
+   */
+  readonly template?: {
+    readonly name: string;
+    readonly text: string;
+    readonly chainId: string;
+    readonly coverage: number;
+    readonly identity: number;
+  };
 }
 
 const round = (value: number, decimals: number): number => Number(value.toFixed(decimals));
@@ -235,6 +249,9 @@ export function resultPackageEntries(result: ResultPackage): ZipEntry[] {
   ];
   for (const image of result.images) {
     entries.push({ name: `${folder}${result.jobName}_${image.suffix}.png`, data: image.png, store: true });
+  }
+  if (result.template !== undefined) {
+    entries.push({ name: `${folder}template_${result.template.name}`, data: result.template.text });
   }
   entries.push(
     { name: `${folder}${result.jobName}.a3m`, data: result.a3m },

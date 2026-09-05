@@ -6,12 +6,14 @@
  * for the minutes a long chain takes.
  */
 import {
-  AlphaFoldMonomerGpu, type MonomerPrediction, type MonomerProgress, type MonomerRecycleSummary,
+  AlphaFoldMonomerGpu, type MonomerPrediction, type MonomerProgress, type MonomerRecycleFeatures,
+  type MonomerRecycleSummary,
 } from "../src/model/monomer.js";
 import {
   AlphaFoldMultimerGpu, type MultimerPrediction, type MultimerRecycleSummary,
 } from "../src/model/multimer.js";
-import { iterateA3mFeatures } from "../src/input/a3m-features.js";
+import { iterateA3mFeatures, type RecycleFeatureSource } from "../src/input/a3m-features.js";
+import { prepareTemplate, withTemplate } from "../src/input/template.js";
 import {
   iterateMultimerA3mFeatures, iterateMultimerQueryOnlyFeatures, type MultimerRecycleFeatures,
 } from "../src/input/multimer-features.js";
@@ -29,10 +31,18 @@ export type InferenceStage = typeof inferenceStages[number];
 export type InferenceStageState = "active" | "done" | "error";
 
 /** The alignment and sequence the page prepared; plain data so it crosses to a worker. */
+/** An uploaded structure to fold against, as text so it crosses to the worker. */
+export interface TemplateStructure {
+  readonly name: string;
+  readonly text: string;
+  readonly chainId?: string;
+}
+
 export interface InferenceInput {
   readonly a3m: string; readonly sequence: string; readonly depth: number;
   readonly multimer: boolean; readonly chains?: readonly string[];
   readonly alignmentMask?: Float32Array;
+  readonly template?: TemplateStructure;
 }
 
 export interface InferenceJob {
@@ -276,11 +286,22 @@ export async function runInference(job: InferenceJob, reporter: InferenceReporte
     recycles: job.recycles, randomSeed: job.randomSeed,
     maxMsaSequences: job.maxMsaSequences, maxExtraSequences: job.maxExtraSequences,
   };
-  const features = input.multimer
+  let features = input.multimer
     ? input.alignmentMask === undefined
       ? iterateMultimerQueryOnlyFeatures(input.chains!, featureTables, featureOptions)
       : iterateMultimerA3mFeatures(input.chains!, input.a3m, input.alignmentMask, featureTables, featureOptions)
     : iterateA3mFeatures(input.a3m, featureTables, featureOptions);
+  if (input.template !== undefined) {
+    if (input.multimer) throw new Error("A custom template is not supported for complexes yet.");
+    const prepared = prepareTemplate(input.template.text, input.sequence,
+      input.template.chainId === undefined ? {} : { chainId: input.template.chainId });
+    features = withTemplate(features as RecycleFeatureSource<MonomerRecycleFeatures>, prepared.features);
+    reporter.log(`Template: ${input.template.name} chain ${prepared.chain.id}, `
+      + `${prepared.chain.sequence.length} residues, covering `
+      + `${prepared.alignment.alignedResidues}/${input.sequence.length} of the query `
+      + `(${(prepared.alignment.coverage * 100).toFixed(0)}% coverage, `
+      + `${(prepared.alignment.identity * 100).toFixed(0)}% identity).`);
+  }
   reporter.stage("features", "done", `${input.sequence.length} aa · ${input.depth} rows`);
   reporter.log(`Features: ${input.sequence.length} residues, ${input.multimer ? `${input.chains!.length} chains` : `A3M depth ${input.depth}`}.`);
 

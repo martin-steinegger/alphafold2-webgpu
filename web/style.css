@@ -40,6 +40,18 @@ input:disabled, select:disabled { color: #888; background: #eee; }
 .file-field { position: relative; min-height: 170px; place-content: center; padding: 20px; border: 1px dashed #999; text-align: center; background: #fafafa; cursor: pointer; }
 .file-field input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
 .file-name { color: var(--primary); font-size: .9rem; }
+/* The template is one optional line in a panel that is mostly one long field,
+   so it takes a third of the alignment drop zone's height and none of its
+   drama until something is actually loaded. */
+.file-field.compact { min-height: 74px; padding: 12px 20px; }
+.template-summary { display: flex; flex-wrap: wrap; align-items: baseline; gap: .5rem 1.1rem; margin: .7rem 0 1rem; color: #444; font-size: .8rem; }
+.template-summary label { display: flex; align-items: center; gap: .45rem; width: auto; color: var(--muted); font-size: .74rem; }
+.template-summary select { width: auto; padding: .25rem .4rem; font-size: .78rem; }
+.template-summary strong { color: #111; font-weight: 500; }
+.template-summary[data-state="failed"] { color: var(--danger); }
+.template-summary[data-state="warning"] { color: var(--warning); }
+.template-summary[data-state="warning"] strong { color: var(--warning); font-weight: 700; }
+.link-button { padding: 0; border: 0; color: var(--primary); background: none; font-size: .74rem; text-decoration: underline; cursor: pointer; }
 .advanced { border: 1px solid var(--line); background: #fafafa; }
 .advanced summary { cursor: pointer; padding: .8rem 1rem; color: #424242; font-size: .8rem; }
 .advanced-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); padding: 0 1rem 1rem; }

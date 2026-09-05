@@ -79,6 +79,20 @@ describe("resultPackageEntries", () => {
     expect(JSON.parse(text(files.get("test_abc12/config.json")))).toEqual({ recycles: 3, seed: 0 });
   });
 
+  it("carries the template a run folded against", async () => {
+    // A prediction that used a template cannot be reproduced without it, so the
+    // structure travels in the archive rather than staying on one machine.
+    const files = await readArchive(await packageResults({
+      ...samplePackage(),
+      template: {
+        name: "1ubq.pdb", text: "ATOM      1  N   MET A   1      27.340  24.430   2.614\n",
+        chainId: "A", coverage: 1, identity: 1,
+      },
+    }));
+    expect([...files.keys()]).toContain("test_abc12/template_1ubq.pdb");
+    expect(text(files.get("test_abc12/template_1ubq.pdb"))).toContain("ATOM      1  N   MET A   1");
+  });
+
   it("keeps already-compressed plots stored verbatim", async () => {
     const png = Uint8Array.from({ length: 64 }, (_, index) => (index * 37) % 251);
     const files = await readArchive(await packageResults(samplePackage({ images: [{ suffix: "pae", png }] })));

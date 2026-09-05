@@ -16,6 +16,7 @@ import type { WorkerRequest, WorkerResponse } from "./prediction-worker.js";
 import { confidenceJson, predictionToPdb, safeJobName } from "./prediction-results.js";
 import { packageResults } from "./result-package.js";
 import { drawMsaCoverage } from "./msa-plot.js";
+import { prepareTemplate, templateChains } from "../src/input/template.js";
 import {
   CHAIN_LETTERS, chainBoundaries, chainColor, chainMeanPlddt, chainPairError, chainSpans,
 } from "./chains.js";
@@ -622,6 +623,7 @@ async function downloadResultPackage(
       log: element<HTMLPreElement>("run-log").textContent ?? "",
       usedMmseqs2: context.inputMode === "mmseqs2",
       multimer: context.multimer,
+      ...(currentTemplateRecord === undefined ? {} : { template: currentTemplateRecord }),
     });
     downloadBlob(`${context.jobName}.result.zip`, blob);
     log(`Packaged the results as ${context.jobName}.result.zip (${formatMib(blob.size)}).`);
@@ -929,8 +931,24 @@ async function runPrediction(): Promise<void> {
     // The model downloads while the alignment is being generated.
     await runner.prepare(manifestUrl, domReporter);
     const input = await inputPromise;
+    currentTemplateRecord = undefined;
+    if (templateStructure !== undefined && !input.multimer) {
+      const prepared = prepareTemplate(templateStructure.text, input.sequence,
+        templateChainId === undefined ? {} : { chainId: templateChainId });
+      currentTemplateRecord = {
+        name: templateStructure.name, text: templateStructure.text, chainId: prepared.chain.id,
+        coverage: prepared.alignment.coverage, identity: prepared.alignment.identity,
+      };
+    }
     const job: InferenceJob = {
-      manifestUrl, input,
+      manifestUrl,
+      input: templateStructure === undefined || input.multimer ? input : {
+        ...input,
+        template: {
+          name: templateStructure.name, text: templateStructure.text,
+          ...(templateChainId === undefined ? {} : { chainId: templateChainId }),
+        },
+      },
       maxMsaSequences: element<HTMLInputElement>("max-msa").valueAsNumber,
       maxExtraSequences: element<HTMLInputElement>("max-extra").valueAsNumber,
       recycles: Number(element<HTMLSelectElement>("recycles").value),
@@ -1068,6 +1086,8 @@ function updateInputMode(): void {
   element<HTMLElement>("predict-label").textContent = multimer && remote ? "Generate complex MSA & predict"
     : multimer ? "Run Multimer-v3"
     : remote ? "Generate MSA & predict" : "Run prediction";
+  element<HTMLElement>("template-field").hidden = multimer;
+  if (multimer) element<HTMLElement>("template-summary").hidden = true; else describeTemplate();
   element<HTMLInputElement>("max-msa").disabled = multimer && inputMode.value === "single";
   const maxExtra = element<HTMLInputElement>("max-extra");
   maxExtra.disabled = multimer && inputMode.value === "single";
@@ -1078,6 +1098,96 @@ function updateInputMode(): void {
 inputMode.addEventListener("change", updateInputMode);
 element<HTMLTextAreaElement>("sequence").addEventListener("input", () => { generatedMsa = undefined;
   element<HTMLButtonElement>("download-msa").hidden = true; updateInputMode(); });
+
+/**
+ * The uploaded template, and what the query makes of it.
+ *
+ * The alignment is run here as well as in the worker, because someone choosing
+ * a structure wants to know straight away whether it covers their query — a
+ * template at 12% coverage is a mistake worth catching before a prediction
+ * rather than after one.
+ */
+const LOW_TEMPLATE_COVERAGE = .1;
+/** The template the run in progress folded against, for the results archive. */
+let currentTemplateRecord: {
+  readonly name: string; readonly text: string; readonly chainId: string;
+  readonly coverage: number; readonly identity: number;
+} | undefined;
+let templateStructure: { readonly name: string; readonly text: string } | undefined;
+let templateChainId: string | undefined;
+
+function clearTemplate(): void {
+  templateStructure = undefined; templateChainId = undefined;
+  element<HTMLInputElement>("template-file").value = "";
+  element<HTMLElement>("template-file-name").textContent = "Choose a PDB or mmCIF file";
+  element<HTMLElement>("template-summary").hidden = true;
+}
+
+function describeTemplate(): void {
+  const summary = element<HTMLElement>("template-summary");
+  const detail = element<HTMLElement>("template-detail");
+  const chainField = element<HTMLElement>("template-chain-field");
+  if (templateStructure === undefined) { summary.hidden = true; return; }
+  summary.hidden = false;
+  const select = element<HTMLSelectElement>("template-chain");
+  try {
+    const chains = templateChains(templateStructure.text);
+    chainField.hidden = chains.length < 2;
+    if (select.options.length !== chains.length
+      || [...select.options].some((option, index) => option.value !== chains[index]!.id)) {
+      select.replaceChildren();
+      for (const chain of chains) {
+        const option = document.createElement("option");
+        option.value = chain.id;
+        option.textContent = `${chain.id} · ${chain.sequence.length} residues`;
+        select.append(option);
+      }
+    }
+    if (templateChainId === undefined || !chains.some((chain) => chain.id === templateChainId)) {
+      templateChainId = chains[0]!.id;
+    }
+    select.value = templateChainId;
+    const sequence = normalizedSequence();
+    if (sequence === "") {
+      summary.dataset.state = "";
+      detail.textContent = `${templateStructure.name} · ${chains.length} chain${chains.length === 1 ? "" : "s"}`;
+      return;
+    }
+    const prepared = prepareTemplate(templateStructure.text, sequence, { chainId: templateChainId });
+    // A structure covering almost none of the query is usually the wrong file,
+    // or the wrong chain of the right one, and it is worth saying so before a
+    // prediction rather than after one.
+    summary.dataset.state = prepared.alignment.coverage < LOW_TEMPLATE_COVERAGE ? "warning" : "";
+    detail.replaceChildren();
+    const covered = document.createElement("strong");
+    covered.textContent = `${(prepared.alignment.coverage * 100).toFixed(0)}% of the query`;
+    detail.append(`${templateStructure.name} · chain ${prepared.chain.id} covers `, covered,
+      `, ${(prepared.alignment.identity * 100).toFixed(0)}% identical`);
+  } catch (error) {
+    summary.dataset.state = "failed";
+    chainField.hidden = true;
+    detail.textContent = error instanceof Error ? error.message : String(error);
+  }
+}
+
+element<HTMLInputElement>("template-file").addEventListener("change", (event) => {
+  const input = event.currentTarget as HTMLInputElement;
+  const file = input.files?.[0];
+  if (file === undefined) { clearTemplate(); return; }
+  element<HTMLElement>("template-file-name").textContent = file.name;
+  void (async () => {
+    const text = await file.text();
+    if (input.files?.[0] !== file) return;
+    templateStructure = { name: file.name, text };
+    templateChainId = undefined;
+    describeTemplate();
+  })();
+});
+element<HTMLSelectElement>("template-chain").addEventListener("change", (event) => {
+  templateChainId = (event.currentTarget as HTMLSelectElement).value;
+  describeTemplate();
+});
+element<HTMLButtonElement>("template-clear").addEventListener("click", () => { clearTemplate(); });
 element<HTMLInputElement>("a3m-file").addEventListener("change", (event) => {
   const input = event.currentTarget as HTMLInputElement;
   const file = input.files?.[0];

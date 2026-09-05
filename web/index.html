@@ -48,6 +48,18 @@
               <span id="a3m-file-name" class="file-name">Choose an A3M file</span>
               <span class="hint">Accepts monomer A3M or ColabFold's serialized complex-A3M format.</span>
             </label>
+            <label id="template-field" class="file-field compact">Template structure (optional)
+              <input id="template-file" type="file" accept=".pdb,.cif,.mmcif,.ent,text/plain" />
+              <span id="template-file-name" class="file-name">Choose a PDB or mmCIF file</span>
+              <span class="hint">Folds the query against a structure you provide.</span>
+            </label>
+            <div id="template-summary" class="template-summary" hidden>
+              <span id="template-detail"></span>
+              <label id="template-chain-field" hidden>Chain
+                <select id="template-chain"></select>
+              </label>
+              <button id="template-clear" class="link-button" type="button">Remove template</button>
+            </div>
             <details class="advanced">
               <summary>Advanced settings</summary>
               <div class="advanced-grid">

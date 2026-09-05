@@ -28,8 +28,10 @@ const a3m = readFileSync(file, "utf8");
 // A3Ms begin with a `#length\tchains` metadata line, which is not a sequence.
 const alignment = parseA3m(a3m);
 const { length, depth } = alignment;
+// AFWEBGPU_MANIFEST runs against a different bundle, such as the quantized one
+// the site serves, rather than the local float32 fixture.
 const model = AlphaFoldFixture.fromStore(await FileTensorStore.open(
-  "test/fixtures/evoformer/model1-query-59-stack/manifest.json",
+  process.env.AFWEBGPU_MANIFEST ?? "test/fixtures/evoformer/model1-query-59-stack/manifest.json",
 ));
 const [embedding, template, extraStack, mainStack, structure, confidence, geometry, featureTables] = await Promise.all([
   model.embeddingWeights(), model.templateWeights(), model.extraStackWeights(), model.mainStackWeights(),
