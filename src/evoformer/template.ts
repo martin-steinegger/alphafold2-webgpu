@@ -1,6 +1,6 @@
 import { encodeTemplatePairBlock, type TemplatePairBlockWeights } from "./block.js";
 import { rowWindows } from "../runtime/sharded.js";
-import { storageArray, storageWords, type ActivationStorage } from "../runtime/storage.js";
+import { storageArray, storageWords, storedElement, type ActivationStorage } from "../runtime/storage.js";
 import { type GpuTensor, WebGpuExecution } from "../runtime/execution.js";
 import type { AllocationSnapshot } from "../runtime/allocator.js";
 import type { TemplateMsaWeights } from "../input/template-msa-row.js";
@@ -54,6 +54,13 @@ export interface QueryOnlyTemplateInput {
   /** Absent for the query-only case, which is a template of nothing. */
   readonly template?: TemplatePairInput;
   /**
+   * Storage of the module's own 64-channel pair.
+   *
+   * Packed it is half the size, which at 597 residues is 44 MiB off the run's
+   * peak, and it is the same storage the trunk keeps its pair in.
+   */
+  readonly templateStorage?: ActivationStorage;
+  /**
    * Add the update straight into a pair the model is already holding.
    *
    * Without this the module writes it to a tensor of its own, which at 597
@@ -95,7 +102,12 @@ export interface QueryOnlyTemplateResult {
  * With no template every mask is zero and every channel with it, which leaves
  * the bias alone: the same answer the query-only path has always produced.
  */
-const TEMPLATE_EMBED_SHADER = `
+function createTemplateEmbedShader(storage: ActivationStorage = "f32"): string {
+  const write = storage === "f16"
+    ? `output[(base + channel) >> 1u] = pack2x16float(vec2<f32>(first, second));`
+    : `output[base + channel] = first;
+      output[base + channel + 1u] = second;`;
+  return `
 struct Parameters {
   length: u32, channels: u32, pair_offset: u32, pairs: u32,
 };
@@ -113,7 +125,7 @@ const CHANNEL_FRAME_MASK: u32 = 87u;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<storage, read> bias: array<f32>;
 @group(0) @binding(3) var<uniform> p: Parameters;
-@group(0) @binding(4) var<storage, read_write> output: array<f32>;
+@group(0) @binding(4) var<storage, read_write> output: array<${storageArray(storage)}>;
 
 fn lower_edge(bin: u32) -> f32 {
   let edge = DGRAM_MINIMUM + DGRAM_STEP * f32(bin);
@@ -133,8 +145,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let mask_2d = residues[a + 3u] * residues[b + 3u];
   let base = local * p.channels;
   if (mask_2d == 0.0) {
-    for (var channel = 0u; channel < p.channels; channel += 1u) {
-      output[base + channel] = bias[channel];
+    for (var channel = 0u; channel < p.channels; channel += 2u) {
+      let first = bias[channel];
+      let second = bias[channel + 1u];
+      ${write}
     }
     return;
   }
@@ -164,14 +178,24 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let row_i = (CHANNEL_AATYPE_I + aatype_i) * p.channels;
   let row_frame = CHANNEL_FRAME_MASK * p.channels;
   let row_bin = u32(max(bin, 0)) * p.channels;
-  for (var channel = 0u; channel < p.channels; channel += 1u) {
-    var value = bias[channel] + weights[row_mask + channel]
+  // Two channels at a time, because a packed pair holds two in one word.
+  for (var channel = 0u; channel < p.channels; channel += 2u) {
+    var first = bias[channel] + weights[row_mask + channel]
       + weights[row_j + channel] + weights[row_i + channel];
-    if (bin >= 0) { value += weights[row_bin + channel]; }
-    if (frame_2d != 0.0) { value += weights[row_frame + channel]; }
-    output[base + channel] = value;
+    var second = bias[channel + 1u] + weights[row_mask + channel + 1u]
+      + weights[row_j + channel + 1u] + weights[row_i + channel + 1u];
+    if (bin >= 0) {
+      first += weights[row_bin + channel];
+      second += weights[row_bin + channel + 1u];
+    }
+    if (frame_2d != 0.0) {
+      first += weights[row_frame + channel];
+      second += weights[row_frame + channel + 1u];
+    }
+    ${write}
   }
 }`;
+}
 
 /** The residue axis the embedding kernel reads, packed one row per residue. */
 const RESIDUE_STRIDE = 8;
@@ -208,8 +232,9 @@ export function packTemplateResidues(length: number, template?: TemplatePairInpu
  * prediction against 8192 per pair every time.
  */
 export function createTemplateOutputShader(
-  storage: ActivationStorage, residual = false,
+  storage: ActivationStorage, residual = false, sourceStorage: ActivationStorage = "f32",
 ): string {
+  const source = (index: string): string => storedElement(sourceStorage, "source", index);
   const word = "(base + channel) >> 1u";
   const store = storage === "f16"
     ? residual
@@ -224,7 +249,7 @@ export function createTemplateOutputShader(
   return `
 struct Parameters { pairs: u32, template_channels: u32, pair_channels: u32, epsilon: f32 };
 const GRID_WIDTH: u32 = 32768u;
-@group(0) @binding(0) var<storage, read> source: array<f32>;
+@group(0) @binding(0) var<storage, read> source: array<${storageArray(sourceStorage)}>;
 @group(0) @binding(1) var<storage, read> weight: array<f32>;
 @group(0) @binding(2) var<storage, read> bias: array<f32>;
 @group(0) @binding(3) var<storage, read> norm_weights: array<f32>;
@@ -238,11 +263,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let source_base = row * p.template_channels;
 
   var mean = 0.0;
-  for (var c = 0u; c < p.template_channels; c += 1u) { mean += source[source_base + c]; }
+  for (var c = 0u; c < p.template_channels; c += 1u) { mean += ${source("source_base + c")}; }
   mean /= f32(p.template_channels);
   var variance = 0.0;
   for (var c = 0u; c < p.template_channels; c += 1u) {
-    let difference = source[source_base + c] - mean;
+    let difference = ${source("source_base + c")} - mean;
     variance += difference * difference;
   }
   let inverse_deviation = inverseSqrt(variance / f32(p.template_channels) + p.epsilon);
@@ -254,7 +279,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     var first = bias[channel];
     var second = bias[channel + 1u];
     for (var c = 0u; c < p.template_channels; c += 1u) {
-      let normalized = (source[source_base + c] - mean) * inverse_deviation * norm_weights[c]
+      let normalized = (${source("source_base + c")} - mean) * inverse_deviation * norm_weights[c]
         + norm_weights[p.template_channels + c];
       first += normalized * weight[c * p.pair_channels + channel];
       second += normalized * weight[c * p.pair_channels + channel + 1u];
@@ -314,8 +339,10 @@ export class QueryOnlyTemplateGpu {
     let retainOutput = false;
     try {
       const pairs = input.length * input.length;
+      const templateStorage = input.templateStorage ?? "f32";
       const pair = execution.allocate(
-        "template.pair", pairs * input.templateChannels, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+        "template.pair", storageWords(pairs * input.templateChannels, templateStorage),
+        GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
       );
       const pairMask = execution.upload("template.pair-mask", input.pairMask);
       const bias = execution.upload("template.embedding-bias", input.weights.embeddingBias);
@@ -323,7 +350,8 @@ export class QueryOnlyTemplateGpu {
       const residues = execution.upload(
         "template.residues", packTemplateResidues(input.length, input.template),
       );
-      const embed = await execution.pipelines.get("template:embed", TEMPLATE_EMBED_SHADER);
+      const embed = await execution.pipelines.get(`template:embed:${templateStorage}`,
+        createTemplateEmbedShader(templateStorage));
       // One command buffer and one validation scope for the whole module: every
       // submission awaited from the page is a round trip to the GPU process.
       const encoder = this.device.createCommandEncoder({ label: "template" });
@@ -332,9 +360,11 @@ export class QueryOnlyTemplateGpu {
       // this has to reach, so the embedding walks it a window of rows at a time
       // and each window is told which pair it starts at.
       let grid = execution.linearGrid(pairs);
-      for (const window of rowWindows(pairs, execution.bindingLimitBytes, [input.templateChannels * 4])) {
+      for (const window of rowWindows(pairs, execution.bindingLimitBytes,
+        [storageWords(input.templateChannels, templateStorage) * 4])) {
         const outputWindow = execution.view(pair,
-          window.offset * input.templateChannels, window.count * input.templateChannels);
+          storageWords(window.offset * input.templateChannels, templateStorage),
+          storageWords(window.count * input.templateChannels, templateStorage));
         const embedParams = execution.upload(`template.embed-parameters-${window.offset}`, new Uint32Array([
           input.length, input.templateChannels, window.offset, window.count,
         ]), GPUBufferUsage.UNIFORM);
@@ -353,6 +383,9 @@ export class QueryOnlyTemplateGpu {
           cZ: input.templateChannels,
           cOuter: 0,
           triangleHidden: input.weights.blockWeights[block]!.triangleMultiplicationOutgoing.linearAPBias.length,
+          // The module's pair is the one these blocks operate on, so its
+          // storage is theirs, and the projection they keep whole follows it.
+          pairStorage: templateStorage, triangleWholeStorage: templateStorage,
         }, input.weights.blockWeights[block]!, pair, pairMask);
         execution.releaseSince(persistentCheckpoint);
       }
@@ -370,15 +403,17 @@ export class QueryOnlyTemplateGpu {
         "template.output", pairs * input.pairChannels, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
       );
       const outputPipeline = await execution.pipelines.get(
-        `template:output:${storage}:${input.residual === undefined ? "write" : "add"}`,
-        createTemplateOutputShader(storage, input.residual !== undefined),
+        `template:output:${storage}:${input.residual === undefined ? "write" : "add"}:${templateStorage}`,
+        createTemplateOutputShader(storage, input.residual !== undefined, templateStorage),
       );
       // The update is written a window of rows at a time, like the embedding,
       // and reads its own window of the template pair alongside.
       for (const window of rowWindows(pairs, execution.bindingLimitBytes,
-        [input.templateChannels * 4, input.pairChannels * 4])) {
+        [storageWords(input.templateChannels, templateStorage) * 4,
+          storageWords(input.pairChannels, storage) * 4])) {
         const sourceWindow = execution.view(pair,
-          window.offset * input.templateChannels, window.count * input.templateChannels);
+          storageWords(window.offset * input.templateChannels, templateStorage),
+          storageWords(window.count * input.templateChannels, templateStorage));
         const destinationWindow = execution.view(output,
           storageWords(window.offset * input.pairChannels, storage),
           storageWords(window.count * input.pairChannels, storage));

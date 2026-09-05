@@ -13,9 +13,10 @@ Ubiquitin, from its sequence alone with no alignment at all:
 | no template    | 49.35 | 0.398 | 11.69 A      |
 | with 1UBQ      | 94.26 | 0.800 | 0.38 A       |
 
-ACE2, 597 residues, against chain A of 6M0J: pLDDT 97.03, 0.20 A RMSD, and the
-template costs 55 MiB of live memory on top of the 241 the run needs without
-one.
+ACE2, 597 residues, against chain A of 6M0J: pLDDT 97.05, 0.20 A RMSD, and the
+template costs **nothing** in live memory — 241 MiB with it or without it, 326
+resident against 319. Its two pair-shaped tensors are stored the way the model
+stores its pair, and packed they fit inside the peak the trunk already reaches.
 
 Checked against AlphaFold itself at every layer, not only end to end:
 
@@ -51,6 +52,11 @@ Two things came out of doing it that way and are worth keeping in mind:
 - The memory estimate needed the template's *two* pair-shaped tensors, its own
   64-channel pair and the whole projection its triangle multiplication keeps
   beside it. With one of the two it under-predicted a templated run.
+- Those two are packed, like every other activation. Threading the storage
+  through the pair stack meant giving its transition and its two attentions the
+  storage the shape already carried; missing either produced the signature this
+  repo has seen before, a constant pLDDT of 69.9 with a NaN pTM, which is what
+  a packed tensor read as float32 looks like.
 - Multimer is untouched and refuses a template rather than ignoring one.
 
 Everything below is the reasoning the implementation followed, kept because it
@@ -258,10 +264,6 @@ None was.
   recycle, with the query pair as its query. One template is the common case for
   an uploaded structure and it is the cheap one.
 - Multimer, as its own project (see above).
-- The template's own 64-channel pair is float32 while the trunk's activations
-  are packed. Packing it would halve 87 MiB at 597 residues; the pair stack
-  blocks already take a storage option, so it is a matter of threading it
-  through and re-running the differential.
 - The published bundle is `model1-ptm-q8-v2`. A bundle without
   `template_single_embedding` refuses a template with a message saying so
   rather than folding without one.

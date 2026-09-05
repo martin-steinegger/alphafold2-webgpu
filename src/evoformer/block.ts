@@ -1408,6 +1408,9 @@ export async function encodeTemplatePairBlock(
   pair: GpuTensor,
   pairMask: GpuTensor,
 ): Promise<void> {
+  // The pair these read, bias themselves from and write back into is the
+  // template's own, so every storage here is that one.
+  const storage = shape.pairStorage ?? "f32";
   await encodeAttention(execution, encoder, {
     source: pair, mask: pairMask, batch: shape.length, queries: shape.length,
     channels: shape.cZ, heads: weights.triangleAttentionStarting.heads, transpose: false,
@@ -1416,6 +1419,7 @@ export async function encodeTemplatePairBlock(
       source: "normalized-input", projectionWeight: weights.triangleAttentionStarting.pairProjectionWeight,
     },
     label: "template.triangle-attention-starting", residualTarget: pair,
+    storage, pairStorage: storage,
   });
   await encodeAttention(execution, encoder, {
     source: pair, mask: pairMask, batch: shape.length, queries: shape.length,
@@ -1425,6 +1429,7 @@ export async function encodeTemplatePairBlock(
       source: "normalized-input", projectionWeight: weights.triangleAttentionEnding.pairProjectionWeight,
     },
     label: "template.triangle-attention-ending", residualTarget: pair,
+    storage, pairStorage: storage,
   });
   await encodeTriangleMultiplication(
     execution, encoder, pair, pairMask, shape, weights.triangleMultiplicationOutgoing, "outgoing", pair,
@@ -1434,7 +1439,7 @@ export async function encodeTemplatePairBlock(
   );
   await encodeTransition(
     execution, encoder, pair, shape.length * shape.length, shape.cZ,
-    weights.pairTransition, "template.pair-transition", pair,
+    weights.pairTransition, "template.pair-transition", pair, shape.pairStorage ?? "f32",
   );
 }
 

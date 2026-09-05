@@ -574,6 +574,9 @@ export class AlphaFoldMonomerGpu {
           await new QueryOnlyTemplateGpu(this.device).run({
             length, templateChannels: 64, pairChannels: 128, pairMask, weights: templateWeights,
             template: templateFeatures.pair, execution,
+            // The module's own pair is a pair-shaped activation like any other,
+            // so it is stored the way the model stores the rest.
+            templateStorage: this.pairStorage,
             residual: { pair: embedding.pairWithoutTemplates, storage: this.pairStorage },
           });
           execution.releaseSince(checkpoint);

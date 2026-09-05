@@ -176,11 +176,12 @@ export function estimateMonomerMemory(
   // into it. What it needs beyond what is already live is its own 64-channel
   // pair and the scratch its two blocks take.
   // Two pair-shaped tensors, not one: its own 64-channel pair, and the whole
-  // projection its triangle multiplication keeps beside that. Measurement at
-  // 597 residues found exactly those two plus the model's pair live together
-  // at the peak, which is 261 MiB of the 296 the run reached.
+  // projection its triangle multiplication keeps beside that. Both are stored
+  // the way the model stores its pair, so packed they are half of this.
+  const monomerTemplatePair = checkedBytes("monomer template pair", length, length, 64, pairBytes);
+  const monomerTemplateBlock = triangleBlockRows(length, 64, 64) * length * 64 * pairBytes;
   const monomerTemplateBytes = options.template === true && options.multimer !== true
-    ? persistentBytes + 2 * templatePair + 3 * templateBlock : 0;
+    ? persistentBytes + 2 * monomerTemplatePair + 3 * monomerTemplateBlock : 0;
   const livePeakBytes = Math.max(
     persistentBytes + scratchBytes, embedderBytes + 16 * 1024 ** 2, templateModuleBytes + 16 * 1024 ** 2,
     monomerTemplateBytes + 16 * 1024 ** 2,
@@ -285,7 +286,8 @@ export function monomerDeviceRequirements(
     // the widest being its 64-channel pair in f32 and its update in the pair's
     // storage. Leaving them out asked for a buffer smaller than the run needs,
     // which failed inside WebGPU with a size and no name.
-    options.multimer === true || options.template === true ? length * length * 64 * bytes : 0,
+    options.multimer === true ? length * length * 64 * bytes : 0,
+    options.template === true ? length * length * 64 * pairBytes : 0,
     options.multimer === true ? length * length * 128 * pairBytes : 0,
     OUTER_PRODUCT_BLOCK_LIMIT_BYTES,
   );

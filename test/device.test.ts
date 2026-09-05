@@ -229,22 +229,28 @@ describe("estimateMonomerMemory", () => {
   });
 
   it("makes room for a monomer's template module", () => {
-    // The template's own 64-channel pair and the whole projection its triangle
-    // multiplication keeps beside it are both pair-shaped, and at 597 residues
-    // measurement found them live together with the model's pair.
-    const options = {
+    // The template keeps two pair-shaped tensors of its own — its 64-channel
+    // pair and the whole projection its triangle multiplication holds beside
+    // it — stored the way the model stores its pair. Packed, both fit inside
+    // the peak the trunk already reaches at every shape here, which is what
+    // measurement found too: 241 MiB live at 597 residues with a template or
+    // without one. So the estimate must account for them and must never come
+    // out lower than the same run without a template.
+    const packed = {
       triangleWholeStorage: "f16" as const, msaStorage: "f16" as const, pairStorage: "f16" as const,
     };
-    const plain = estimateMonomerMemory(597, 1, 1, "full", options);
-    const templated = estimateMonomerMemory(597, 1, 1, "full", { ...options, template: true });
-    expect(templated.estimatedPeakBytes).toBeGreaterThan(plain.estimatedPeakBytes);
-    // The peak is a maximum over moments, not a sum, so the template only
-    // shows where its own moment is the largest: two pair-shaped tensors at 64
-    // channels in float32, on top of everything the trunk keeps live.
-    const pairShaped = 597 * 597 * 64 * 4;
-    expect(templated.estimatedPeakBytes).toBeGreaterThan(2 * pairShaped + templated.persistentBytes);
+    for (const [length, msa, extra] of [[256, 1, 1], [597, 1, 1], [597, 508, 1024], [1500, 508, 1024]] as const) {
+      const plain = estimateMonomerMemory(length, msa, extra, "full", packed);
+      const templated = estimateMonomerMemory(length, msa, extra, "full", { ...packed, template: true });
+      expect(templated.estimatedPeakBytes).toBeGreaterThanOrEqual(plain.estimatedPeakBytes);
+      // And the buffer the device has to be able to make covers the template's
+      // own pair; leaving it out asks for one smaller than the run needs.
+      expect(monomerDeviceRequirements(length, msa, extra, { template: true }).maxStorageBufferBindingSize)
+        .toBeGreaterThanOrEqual(length * length * 64 * 2);
+    }
     // A complex has its own template accounting, which this must not disturb.
-    expect(estimateMonomerMemory(597, 1, 1, "full", { ...options, multimer: true }).estimatedPeakBytes)
-      .toBe(estimateMonomerMemory(597, 1, 1, "full", { ...options, multimer: true, template: true }).estimatedPeakBytes);
+    const complex = { ...packed, multimer: true };
+    expect(estimateMonomerMemory(597, 1, 1, "full", complex).estimatedPeakBytes)
+      .toBe(estimateMonomerMemory(597, 1, 1, "full", { ...complex, template: true }).estimatedPeakBytes);
   });
 });
