@@ -55,6 +55,15 @@ function variants(): readonly {
     .replace(/let vv(\d+) = value\[k_base \+ (\d+)u\];/gu,
       "let vw$1 = value[k_base + $2u];\n    let vv$1 = vec4<f32>("
       + "unpack2x16float(vw$1.x), unpack2x16float(vw$1.y));");
+  // The bias as packed half words: it is read once per query per key and is
+  // unique to each lane, so unlike the key and the value no cache line is
+  // shared. Now that those are halved it may be the larger traffic.
+  const halfBias = (code: string): string => code
+    .replace("@group(0) @binding(5) var<storage, read> pair_bias: array<f32>;",
+      "@group(0) @binding(5) var<storage, read> pair_bias: array<u32>;")
+    .replace(/logit \+= pair_bias\[(.+?)\];/gu,
+      "{ let bias_at = $1;\n      let bias_pair = unpack2x16float(pair_bias[bias_at >> 1u]);\n"
+      + "      logit += select(bias_pair.x, bias_pair.y, (bias_at & 1u) == 1u); }");
   // The bias indexed so that neighbouring lanes read neighbouring words.
   const transposedBias = (code: string): string => code.replace(
     /pair_bias\[\(head \* p\.queries \+ select\(0u, q_index_(\d+), live_\1\)\) \* p\.queries \+ k_index\]/gu,
@@ -70,6 +79,8 @@ function variants(): readonly {
     out.push({ name: `${slots}q f16 kv`, code: halfKv(kernel), halfKv: true, slots });
   }
   out.push({ name: "1q transposed bias", code: transposedBias(base), halfKv: false, slots: 1 });
+  out.push({ name: "1q f16 kv+bias", code: halfBias(halfKv(base)), halfKv: true, slots: 1 });
+  out.push({ name: "1q f16 bias only", code: halfBias(base), halfKv: false, slots: 1 });
   return out;
 }
 

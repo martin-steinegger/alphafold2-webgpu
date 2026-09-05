@@ -17,12 +17,23 @@ kernel, so each branch uses whatever it would select for itself.
 | `main` | f32 64x128k8 | 0 | 746 s | 32.3469 | 0.19455 | 0.17473 |
 | `f16-projection` | f16-chunked 64x128k16 | 0 | 668 s | 32.3388 | 0.19457 | 0.17472 |
 | `f16-projection` | f16-chunked 64x128k16 | 1 | 1,334 s | 33.7754 | 0.19168 | 0.17200 |
-| `f16-projection`, with the attention work | matrix 64x128, 1 query/invocation | 0 | **407 s** | 32.3419 | 0.19456 | 0.17474 |
+| `f16-projection`, with the attention work | matrix 64x128, 1 query/invocation | 0 | 407 s | 32.3419 | 0.19456 | 0.17474 |
+| `f16-projection`, and the triangle block filling its tile | as above | 0 | **288 s** | 32.3419 | 0.19456 | 0.17474 |
 
-**The final number is 407 seconds against `main`'s 746: 1.83x.** Almost all of
-that is the two attention changes in `docs/ATTENTION_APPLE_METAL_3.md` rather
-than the projections — the projections are 1.12x of it and the attention path
-the rest. Everything is selected by measurement; nothing is forced.
+**The final number is 288 seconds against `main`'s 746 and 775: 2.6x.**
+`main` was measured twice and so was this, which matters because a single pass
+on this machine drifts by a few percent.
+
+Almost none of it is the projections this work was scoped to. They are 1.12x;
+the two attention changes in `docs/ATTENTION_APPLE_METAL_3.md` are 1.64x on
+top of that, and giving the triangle block enough rows to fill the
+contraction's tile is a further 1.41x. Everything is selected by measurement or
+derived from the tile; nothing is forced.
+
+Estimated peak went from 2,440 MiB to 2,487, against a 5,734 MiB safety
+budget — 47 MiB for a quarter of the runtime. The confidence is identical to
+four decimal places, because filling the tile changes only how the work is
+divided.
 
 **The input still runs, and it runs 1.117x faster.** That is a much larger
 gain than the 1.044x the 59-residue monomer showed, which is what you would

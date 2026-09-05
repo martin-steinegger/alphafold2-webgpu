@@ -136,8 +136,20 @@ report perfect agreement, which is what the first version of the packing did.
 
 ## What is still on the table
 
-The triangle multiply's contraction is the other term that grows with length:
-6.7% of a block at 236 residues, 14.0% at 708. Nothing here touched it.
+The triangle multiply's contraction was the other term that grows with length,
+6.7% of a block at 236 residues and 14.0% at 708, and it turned out not to be a
+slow kernel at all: at the production channel count it reaches 2,161 GFLOP/s
+against the projection kernel's 2,800. It was being fed eleven-row blocks of a
+sixty-four-row tile. Filling the tile took the 1,416-residue complex from 407
+seconds to 288 and is described in `LONG_COMPLEX_APPLE_METAL_3.md`.
+
+Two things measured and rejected while looking at it: the contraction's second
+operand is addressed `column * L + k`, so its staging never coalesces, and
+making it row-major is worth only 1.06x; and packing the attention pair bias as
+half words, which is 1.20x against 1.30x for packing the keys and values alone —
+it costs more in unpacking than it saves in traffic. The transposed-bias result
+had already said that operand was not the constraint, and testing the same
+operand a second way was the wrong call.
 
 The first three attempts at the microbenchmark measured nothing: the uniform
 buffer was sixteen bytes short of the `Parameters` struct, so every bind group
