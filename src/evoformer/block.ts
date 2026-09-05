@@ -21,7 +21,7 @@ import {
   type AttentionWeights,
 } from "./attention.js";
 import { attentionFlashKernelForShape } from "./attention-calibration.js";
-import { calibrateAttentionQueriesPerThread } from "../runtime/attention-queries.js";
+import { calibrateAttentionShape } from "../runtime/attention-queries.js";
 import { createTiledGemmShader, gemmGrid } from "../runtime/gemm.js";
 import { releaseScratch } from "./execution-scratch.js";
 import {
@@ -644,18 +644,29 @@ async function encodeAttention(
   // and long chains are entirely above 128 queries, so gating on the exact
   // name left the packing switched off for precisely the predictions it was
   // built for.
-  const packKeyValue = flashKernel.variant.startsWith("register");
+
+  // The shape rule takes two queries per invocation above 128 of them, from a
+  // threshold its own comment records as measured on an NVIDIA GB10. On Apple
+  // that is 2.2x the wrong way and costs a 1,416-residue complex 40% of its
+  // runtime, so the count is measured here instead.
+  //
+  // But only where the rule would have taken two. Below its threshold the rule
+  // is right on both devices — the same comment records two queries at 0.89x
+  // for 59 of them — and a probe run at 512 queries has nothing to say about a
+  // shape with 59. So a small shape keeps one query whatever the probe found,
+  // and the measurement decides only the case the rule was guessing at.
+  const registerFamily = flashKernel.variant.startsWith("register");
+  const byShape = registerFamily ? flashKernel.queryTile / 64 : 1;
+  const choice = registerFamily
+    ? await calibrateAttentionShape(execution.device, options.channels / options.heads)
+    : undefined;
+  const slots = attentionQueriesPerThread(
+    byShape === 1 || choice === undefined ? byShape : choice.slots);
+  // Packing halves what the key loop reads and costs an unpack for each, which
+  // is 1.29x on a device waiting for memory and may be nothing on one waiting
+  // for issue slots. Measured with the query count, for the same reason.
+  const packKeyValue = registerFamily && choice?.keyValue === "f16";
   const keyValueStorage = attentionKeyValueStorage(packKeyValue ? "f16" : "f32");
-  // What the shape rule wants, and what this device says when asked. The rule
-  // takes two queries per invocation above 128 from a threshold its own
-  // comment records as measured on an NVIDIA GB10; on Apple that is 2.2x the
-  // wrong way and costs a 1,416-residue complex 40% of its runtime. A measured
-  // zero means the probe could not run, and the rule stands.
-  const byShape = flashKernel.variant.startsWith("register") ? flashKernel.queryTile / 64 : 1;
-  const measured = flashKernel.variant.startsWith("register")
-    ? await calibrateAttentionQueriesPerThread(execution.device, options.channels / options.heads)
-    : 0;
-  const slots = attentionQueriesPerThread(measured === 0 ? byShape : measured);
   const flashShader = flashKernel.variant.startsWith("register")
     ? createAttentionRegisterFlashShader(
       options.channels / options.heads, slots, keyValueStorage)

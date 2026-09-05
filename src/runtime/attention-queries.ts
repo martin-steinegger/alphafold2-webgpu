@@ -28,15 +28,35 @@ const PROBE_HEADS = 1;
 const PROBE_REPEATS = 2;
 const PROBE_BATCH_MILLISECONDS = 8;
 
-/** What the shape rule would choose, and what it is measured against. */
-const CANDIDATES = [1, 2] as const;
+/**
+ * Every combination worth trying: how many queries an invocation carries, and
+ * whether it reads the keys and values as half words.
+ *
+ * Both are measured rather than assumed, and for the same reason. Packing the
+ * operands halves what the key loop reads and costs an unpack for each; on a
+ * device that is waiting for memory that is 1.29x and on one that is waiting
+ * for issue slots it may be nothing. Writing either down is how the threshold
+ * this replaces came to cost Apple 40% of a long prediction.
+ */
+const CANDIDATES: readonly { readonly slots: number; readonly keyValue: "f32" | "f16" }[] = [
+  { slots: 1, keyValue: "f32" }, { slots: 1, keyValue: "f16" },
+  { slots: 2, keyValue: "f32" }, { slots: 2, keyValue: "f16" },
+];
 
-const calibrations = new WeakMap<GPUDevice, Map<number, Promise<number>>>();
+export interface AttentionShapeChoice {
+  /** Queries one invocation carries, for shapes the rule would give two. */
+  readonly slots: number;
+  readonly keyValue: "f32" | "f16";
+}
 
-async function timeQueriesPerThread(
-  device: GPUDevice, headDim: number, slots: number, buffers: readonly GPUBuffer[],
+const calibrations = new WeakMap<GPUDevice, Map<number, Promise<AttentionShapeChoice | undefined>>>();
+
+async function timeCandidate(
+  device: GPUDevice, headDim: number, candidate: AttentionShapeChoice,
+  buffers: readonly GPUBuffer[],
 ): Promise<number> {
-  const code = createAttentionRegisterFlashShader(headDim, slots, "f16");
+  const { slots } = candidate;
+  const code = createAttentionRegisterFlashShader(headDim, slots, candidate.keyValue);
   const pipeline = await device.createComputePipelineAsync({
     label: `attention-queries.${slots}`, layout: "auto",
     compute: {
@@ -76,14 +96,15 @@ async function timeQueriesPerThread(
 }
 
 /**
- * Measures one query per invocation against two and caches the faster.
+ * Measures the four arrangements and caches the fastest.
  *
- * Anything that throws leaves the shape rule alone, since a device that cannot
- * run the probe can still run the model.
+ * Anything that throws returns nothing and leaves the shape rule and the
+ * single-precision operands alone, since a device that cannot run the probe
+ * can still run the model.
  */
-export function calibrateAttentionQueriesPerThread(
+export function calibrateAttentionShape(
   device: GPUDevice, headDim: number,
-): Promise<number> {
+): Promise<AttentionShapeChoice | undefined> {
   let byHeadDim = calibrations.get(device);
   if (byHeadDim === undefined) {
     byHeadDim = new Map();
@@ -91,7 +112,7 @@ export function calibrateAttentionQueriesPerThread(
   }
   const cached = byHeadDim.get(headDim);
   if (cached !== undefined) return cached;
-  const measurement = (async (): Promise<number> => {
+  const measurement = (async (): Promise<AttentionShapeChoice | undefined> => {
     const buffers: GPUBuffer[] = [];
     try {
       const elements = PROBE_BATCH * PROBE_QUERIES * PROBE_HEADS * headDim;
@@ -101,9 +122,10 @@ export function calibrateAttentionQueriesPerThread(
         return buffer;
       };
       const storage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
-      // Keys and values are read as packed half words, as the kernel reads
-      // them in production; the query and the gate stay single precision.
+      // Keys and values in both widths, so the two can be compared; the query
+      // and the gate stay single precision, being read once per invocation.
       const half = create(elements * 2, storage);
+      const full = create(elements * 4, storage);
       const query = create(elements * 4, storage);
       const gate = create(elements * 4, storage);
       const mask = create(PROBE_BATCH * PROBE_QUERIES * 4, storage);
@@ -117,18 +139,19 @@ export function calibrateAttentionQueriesPerThread(
       fields[0] = PROBE_BATCH; fields[1] = PROBE_QUERIES; fields[2] = PROBE_HEADS * headDim;
       fields[3] = PROBE_HEADS; fields[4] = headDim; fields[6] = 1; fields[17] = PROBE_BATCH;
       device.queue.writeBuffer(parameters, 0, fields);
-      const operands = [query, half, half, gate, mask, bias, parameters, output];
-      let winner: number = CANDIDATES[0];
+      let winner = CANDIDATES[0]!;
       let best = Number.POSITIVE_INFINITY;
-      for (const slots of CANDIDATES) {
-        const milliseconds = await timeQueriesPerThread(device, headDim, slots, operands);
-        if (milliseconds < best) { best = milliseconds; winner = slots; }
+      for (const candidate of CANDIDATES) {
+        const kv = candidate.keyValue === "f16" ? half : full;
+        const milliseconds = await timeCandidate(device, headDim, candidate,
+          [query, kv, kv, gate, mask, bias, parameters, output]);
+        if (milliseconds < best) { best = milliseconds; winner = candidate; }
       }
       return winner;
     } finally {
       for (const buffer of buffers) buffer.destroy();
     }
-  })().catch(() => 0);
+  })().catch(() => undefined);
   byHeadDim.set(headDim, measurement);
   return measurement;
 }
