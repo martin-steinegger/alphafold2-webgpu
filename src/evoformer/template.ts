@@ -3,6 +3,7 @@ import { encodeTemplatePairBlock, type TemplatePairBlockWeights } from "./block.
 import { rowWindows } from "../runtime/sharded.js";
 import { type GpuTensor, WebGpuExecution } from "../runtime/execution.js";
 import type { AllocationSnapshot } from "../runtime/allocator.js";
+import type { TemplateMsaWeights } from "../input/template-msa-row.js";
 
 export interface QueryOnlyTemplateWeights {
   /** `embedding2d`, the [88, 64] projection of the template pair features. */
@@ -15,6 +16,16 @@ export interface QueryOnlyTemplateWeights {
   readonly outputWeight: Float32Array;
   readonly outputBias: Float32Array;
   readonly heads: number;
+  /**
+   * `template_single_embedding` and `template_projection`, which turn a
+   * template's torsion angles into an MSA row.
+   *
+   * Optional because they are siblings of the template module in AlphaFold
+   * rather than part of it, so a bundle exported before templates were
+   * supported carries the whole pair stack and not these. A prediction without
+   * a template never reads them.
+   */
+  readonly msa?: TemplateMsaWeights;
 }
 
 /**
@@ -42,12 +53,22 @@ export interface QueryOnlyTemplateInput {
   readonly weights: QueryOnlyTemplateWeights;
   /** Absent for the query-only case, which is a template of nothing. */
   readonly template?: TemplatePairInput;
+  /**
+   * Run inside the model's own execution and hand the update back as a tensor.
+   *
+   * Without this the module allocates for itself and reads the update home,
+   * which is what the tests want and what a pair-sized readback costs. The
+   * model instead adds the tensor straight into its resident pair.
+   */
+  readonly execution?: WebGpuExecution;
 }
 
 export interface QueryOnlyTemplateResult {
   readonly pairUpdate: Float32Array;
   readonly elapsedMilliseconds: number;
   readonly memory: AllocationSnapshot;
+  /** Present, in place of `pairUpdate`, when the model supplied its execution. */
+  readonly pairUpdateTensor?: GpuTensor;
 }
 
 /**
@@ -218,7 +239,9 @@ export class QueryOnlyTemplateGpu {
   async run(
     input: QueryOnlyTemplateInput,
   ): Promise<QueryOnlyTemplateResult> {
-    const execution = new WebGpuExecution(this.device);
+    const execution = input.execution ?? new WebGpuExecution(this.device);
+    const entryCheckpoint = execution.checkpoint();
+    let retainOutput = false;
     try {
       const pairs = input.length * input.length;
       const pair = execution.allocate(
@@ -298,19 +321,28 @@ export class QueryOnlyTemplateGpu {
       grid = execution.linearGrid(output.elements);
       execution.dispatch(encoder, outputPipeline, [value, outputWeight, outputBias, params, output],
         grid[0], grid[1], 1, "template.output");
-      const readback = execution.createReadback("template.readback", output, encoder);
+      const readback = input.execution === undefined
+        ? execution.createReadback("template.readback", output, encoder) : undefined;
       execution.endComputePass(encoder);
       this.device.queue.submit([encoder.finish()]);
       execution.noteSubmitted();
       const error = await this.device.popErrorScope();
       if (error !== null) throw new Error(`WebGPU template module failed: ${error.message}`);
+      if (readback === undefined) {
+        retainOutput = true;
+        return {
+          pairUpdate: new Float32Array(0), elapsedMilliseconds: performance.now() - start,
+          memory: execution.snapshot(), pairUpdateTensor: output,
+        };
+      }
       return {
         pairUpdate: await execution.mapFloat32(readback),
         elapsedMilliseconds: performance.now() - start,
         memory: execution.snapshot(),
       };
     } finally {
-      execution.release();
+      if (input.execution === undefined) execution.release();
+      else if (!retainOutput) execution.releaseSince(entryCheckpoint);
     }
   }
 }

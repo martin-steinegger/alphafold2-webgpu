@@ -17,13 +17,30 @@ def main() -> None:
     args = parser.parse_args()
     manifest = json.loads(args.manifest.read_text())
     parameters = np.load(args.params, allow_pickle=False)
-    prefix = "alphafold/alphafold_iteration/evoformer/template_embedding/"
+    evoformer = "alphafold/alphafold_iteration/evoformer/"
+    prefix = f"{evoformer}template_embedding/"
+    # The torsion angles a template contributes to the MSA are embedded outside
+    # the template_embedding module, by two siblings of it. model_1_ptm sets
+    # embed_torsion_angles, so they are as required as the rest.
+    siblings = ("template_single_embedding", "template_projection")
+
+    def selected() -> list[tuple[str, str, str]]:
+        chosen: list[tuple[str, str, str]] = []
+        for key in sorted(parameters.files):
+            if key.startswith(prefix):
+                module, name = key.removeprefix(prefix).split("//")
+                chosen.append((key, module, name))
+        # Appended after them, so the tensors already in a published bundle keep
+        # the names they have.
+        for key in sorted(parameters.files):
+            for sibling in siblings:
+                if key.startswith(f"{evoformer}{sibling}//"):
+                    chosen.append((key, sibling, key.split("//")[1]))
+        return chosen
+
     records: dict[str, dict[str, str]] = {}
     index = 0
-    for key in sorted(parameters.files):
-        if not key.startswith(prefix):
-            continue
-        module, name = key.removeprefix(prefix).split("//")
+    for key, module, name in selected():
         tensor_name = f"template_haiku_{index:04d}"
         index += 1
         value = np.asarray(parameters[key], dtype="<f4", order="C")
@@ -35,6 +52,9 @@ def main() -> None:
             "dtype": "float32",
         }
         records.setdefault(module, {})[name] = tensor_name
+    for sibling in siblings:
+        if sibling not in records:
+            raise SystemExit(f"parameters contain no {sibling}; templates need it for the MSA rows")
     manifest["templateEmbedding"] = {
         "parameterFormat": "haiku",
         "parameters": records,

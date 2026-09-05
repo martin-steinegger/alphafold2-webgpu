@@ -455,6 +455,15 @@ export class AlphaFoldFixture {
       outputWeight: await this.#parameter(p, "attention", "output_w"),
       outputBias: await this.#parameter(p, "attention", "output_b"),
       heads: this.#parameterShape(p, "attention", "value_w", false)[1]!,
+      // Only bundles exported with template support carry these.
+      ...(p["template_single_embedding"] === undefined ? {} : {
+        msa: {
+          inputWeight: await this.#parameter(p, "template_single_embedding", "weights"),
+          inputBias: await this.#parameter(p, "template_single_embedding", "bias"),
+          outputWeight: await this.#parameter(p, "template_projection", "weights"),
+          outputBias: await this.#parameter(p, "template_projection", "bias"),
+        },
+      }),
     };
   }
 

@@ -13,7 +13,8 @@ import {
   encodeEvoformerBlock, encodeExtraMsaBlock, type EvoformerBlockWeights, type ExtraMsaBlockWeights,
 } from "../evoformer/block.js";
 import {
-  QueryOnlyTemplateGpu, queryOnlyTemplateConstant, type QueryOnlyTemplateWeights,
+  QueryOnlyTemplateGpu, queryOnlyTemplateConstant,
+  type QueryOnlyTemplateWeights, type TemplatePairInput,
 } from "../evoformer/template.js";
 import { MultimerMockTemplateGpu, type MultimerMockTemplateWeights } from "../evoformer/multimer-template.js";
 import { WebGpuExecution, type GpuTensor, type GpuTimestampEntry } from "../runtime/execution.js";
@@ -23,9 +24,26 @@ import {
   iterateA3mFeatures, type A3mFeatureOptions, type RecycleFeatureSource,
 } from "../input/a3m-features.js";
 import type { QueryOnlyFeatureTables } from "../input/query-only-features.js";
+import { templateMsaRow } from "../input/template-msa-row.js";
 import { TRANSITION_CHUNK_TARGET_BYTES } from "../evoformer/transition.js";
 import { COMPACT_GPU_POOL_BYTES, type AllocationShare, type AllocationSnapshot } from "../runtime/allocator.js";
 import { multimerRecycleDistanceRms } from "./multimer-recycling.js";
+
+/**
+ * A structural template, as features.
+ *
+ * AlphaFold carries these in the same feature dict as the sequence and the
+ * alignment, and so do we: a template is an input, not a setting. It does not
+ * change between recycles, and neither does anything computed from it.
+ */
+export interface MonomerTemplateFeatures {
+  /** What the pair features are built from, one value per residue. */
+  readonly pair: TemplatePairInput;
+  /** `template_angle_feat`, `[length, 57]`. */
+  readonly angleFeatures: Float32Array;
+  /** The psi mask, which is the MSA mask for the row the template adds. */
+  readonly rowMask: Float32Array;
+}
 
 export interface MonomerRecycleFeatures {
   readonly targetFeatures: Float32Array; readonly msaFeatures: Float32Array; readonly msaMask: Float32Array;
@@ -37,6 +55,8 @@ export interface MonomerRecycleFeatures {
   readonly chainRelative?: {
     readonly asymId: Float32Array; readonly entityId: Float32Array; readonly symId: Float32Array;
   };
+  /** Read from the first recycle's features; a template is per prediction. */
+  readonly template?: MonomerTemplateFeatures;
 }
 
 export interface MonomerModelWeights {
@@ -330,10 +350,27 @@ export class AlphaFoldMonomerGpu {
     // activations take at long lengths. It holds only for an unpadded chain,
     // where the pair mask is everywhere one; anything else runs the module.
     const uniformPairMask = pairMask.every((value) => value === 1);
+    // A template makes the module's output depend on the structure, so the
+    // constant no longer stands; and its own MSA row is computed once here,
+    // since nothing about a template changes between recycles.
+    const templateFeatures = featureStep.value.template;
+    let templateMsaRowValue: Float32Array | undefined;
+    if (templateFeatures !== undefined) {
+      if (this.multimer) throw new Error("Multimer does not take a custom template yet");
+      const msaWeights = (weights as MonomerModelWeights).template.msa;
+      if (msaWeights === undefined) {
+        throw new Error(
+          "This model bundle has no template_single_embedding, so it cannot embed a template's "
+          + "torsion angles. Re-export the model with template support.",
+        );
+      }
+      templateMsaRowValue = templateMsaRow(featureStep.value.template!.angleFeatures, length, msaWeights);
+    }
     let embeddingWeights = weights.embedding;
     let templateConstantMilliseconds: number | undefined;
     let templateConstantApplied = false;
-    if (this.collapseQueryOnlyTemplate && templateWeights !== undefined && uniformPairMask) {
+    if (this.collapseQueryOnlyTemplate && templateWeights !== undefined && uniformPairMask
+      && templateFeatures === undefined) {
       const started = performance.now();
       const constant = await queryOnlyTemplateConstant(this.device, templateWeights);
       if (constant !== undefined) {
@@ -355,6 +392,7 @@ export class AlphaFoldMonomerGpu {
     // The module's update does not change between recycles, so the fallback
     // computes it once and adds it in each time.
     const templateUpdateValue = templateModule === undefined || templateWeights === undefined
+      || templateFeatures !== undefined
       ? undefined
       : (await templateModule.run({
         length, templateChannels: 64, pairChannels: 128, pairMask, weights: templateWeights,
@@ -524,6 +562,26 @@ export class AlphaFoldMonomerGpu {
           await submit(templateEncoder, `template residual recycle ${recycle}`);
           releaseTensor(templateUpdate);
           templateMilliseconds = performance.now() - templateStart;
+        } else if (templateFeatures !== undefined && templateWeights !== undefined) {
+          // A real template's update is the same every recycle, but holding it
+          // costs a pair-sized tensor for the whole trunk — 288 MiB packed at
+          // 1500 residues — while recomputing it costs a two-block stack at 64
+          // channels, well under a percent of a recycle. So it is recomputed,
+          // in the model's own execution, and added straight into the pair
+          // without ever being read home.
+          const templateStart = performance.now();
+          const checkpoint = execution.checkpoint();
+          const update = await new QueryOnlyTemplateGpu(this.device).run({
+            length, templateChannels: 64, pairChannels: 128, pairMask, weights: templateWeights,
+            template: templateFeatures.pair, execution,
+          });
+          const templateEncoder = this.device.createCommandEncoder({ label: `monomer.template-residual-${recycle}` });
+          this.device.pushErrorScope("validation");
+          await execution.addInPlace(templateEncoder, embedding.pairWithoutTemplates, update.pairUpdateTensor!,
+            `monomer.template-residual-${recycle}`, this.pairStorage);
+          await submit(templateEncoder, `template residual recycle ${recycle}`);
+          execution.releaseSince(checkpoint);
+          templateMilliseconds = performance.now() - templateStart;
         }
         const releaseMsaInputs = (): void => {
           for (const temporary of embedding.msaTemporaries) releaseTensor(temporary);
@@ -536,6 +594,26 @@ export class AlphaFoldMonomerGpu {
         let multimerMainMsaMask: GpuTensor | undefined;
         let templateRows: GpuTensor | undefined;
         let templateSubmissions = 0;
+        if (templateMsaRowValue !== undefined) {
+          mainSequences += 1;
+          const uploaded = execution.upload(`monomer.template-msa-row-${recycle}`, templateMsaRowValue);
+          if (this.msaStorage === "f32") {
+            templateRows = uploaded;
+          } else {
+            // The row joins a packed MSA, so it is packed on the way in.
+            templateRows = execution.allocate(`monomer.template-msa-rows-${recycle}`,
+              storageWords(length * 256, this.msaStorage),
+              GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST);
+            const packEncoder = this.device.createCommandEncoder(
+              { label: `monomer.template-msa-pack-${recycle}` });
+            this.device.pushErrorScope("validation");
+            await execution.packHalves(packEncoder, uploaded, templateRows,
+              `monomer.template-msa-pack-${recycle}`);
+            await submit(packEncoder, `template MSA row recycle ${recycle}`);
+            releaseTensor(uploaded);
+            templateSubmissions += 1;
+          }
+        }
         if (this.multimer) {
           // The template module's pair update is needed before the extra stack;
           // its MSA rows are not, so only they are kept (a few rows) and the
@@ -633,24 +711,27 @@ export class AlphaFoldMonomerGpu {
         execution.allocator.destroyPooled();
         let mainMsa = clusteredMsa;
         if (templateRows !== undefined) {
-          // Multimer's main-stack MSA is the clustered rows followed by the
-          // template rows kept from before the extra stack.
-          const multimerWeights = weights as MultimerCompatibleModelWeights;
-          multimerMainMsa = execution.allocate(`multimer.main-msa-${recycle}`,
+          // The main stack's MSA is the clustered rows followed by the template
+          // rows kept from before the extra stack: Multimer's mock rows, or the
+          // one row a custom template contributes.
+          const templateRowCount = this.multimer
+            ? (weights as MultimerCompatibleModelWeights).multimerTemplate.templateRows : 1;
+          multimerMainMsa = execution.allocate(`monomer.main-msa-${recycle}`,
             storageWords(mainSequences * length * 256, this.msaStorage),
             GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST);
-          const combinedMask = new Float32Array(
-            features.msaMask.length + multimerWeights.multimerTemplate.templateRows * length,
-          );
+          const combinedMask = new Float32Array(features.msaMask.length + templateRowCount * length);
           combinedMask.set(features.msaMask);
-          multimerMainMsaMask = execution.upload(`multimer.main-msa-mask-${recycle}`, combinedMask);
-          const mergeEncoder = this.device.createCommandEncoder({ label: `multimer.msa-merge-${recycle}` });
+          // A mock template resolves no atoms, so its rows stay masked out; a
+          // real one is masked by where it covered the query.
+          if (templateFeatures !== undefined) combinedMask.set(templateFeatures.rowMask, features.msaMask.length);
+          multimerMainMsaMask = execution.upload(`monomer.main-msa-mask-${recycle}`, combinedMask);
+          const mergeEncoder = this.device.createCommandEncoder({ label: `monomer.msa-merge-${recycle}` });
           this.device.pushErrorScope("validation");
           mergeEncoder.copyBufferToBuffer(clusteredMsa.allocation.buffer, 0,
             multimerMainMsa.allocation.buffer, 0, clusteredMsa.elements * 4);
           mergeEncoder.copyBufferToBuffer(templateRows.allocation.buffer, 0,
             multimerMainMsa.allocation.buffer, clusteredMsa.elements * 4, templateRows.elements * 4);
-          await submit(mergeEncoder, `Multimer MSA merge recycle ${recycle}`);
+          await submit(mergeEncoder, `MSA merge recycle ${recycle}`);
           releaseTensor(clusteredMsa); releaseTensor(templateRows);
           mainMsaMask = multimerMainMsaMask;
           mainMsa = multimerMainMsa;

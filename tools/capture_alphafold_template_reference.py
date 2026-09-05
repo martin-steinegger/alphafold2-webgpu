@@ -139,16 +139,36 @@ def main() -> None:
     out = args.out if args.out is not None else args.dump
     out.mkdir(parents=True, exist_ok=True)
     pair_feature, pair_update = template_embedding(args.params, aatype, positions, mask)
-    for name, tensor in (("templatePairFeature", pair_feature), ("templatePairUpdate", pair_update)):
+    msa_row = template_msa_row(args.params, angle_features)
+    for name, tensor in (("templatePairFeature", pair_feature), ("templatePairUpdate", pair_update),
+                         ("templateMsaRow", msa_row)):
         tensor.astype("<f4").tofile(out / f"{name}.bin")
         print(f"  wrote {name} {tensor.shape}")
     (out / "reference.json").write_text(json.dumps({
         "source": "alphafold model_1_ptm, template_embedding",
         "query": meta["query"], "chain": meta["chain"],
         "shapes": {"templatePairFeature": list(pair_feature.shape),
-                   "templatePairUpdate": list(pair_update.shape)},
+                   "templatePairUpdate": list(pair_update.shape),
+                   "templateMsaRow": list(msa_row.shape)},
         "worstFeatureDisagreement": worst,
     }, indent=2) + "\n")
+
+
+def template_msa_row(params_path: Path, angle_features):
+    """`template_single_embedding` then relu then `template_projection`."""
+    import jax
+    import jax.numpy as jnp
+
+    parameters = np.load(params_path, allow_pickle=False)
+    evoformer = "alphafold/alphafold_iteration/evoformer/"
+
+    def weight(module: str, name: str):
+        return jnp.asarray(parameters[f"{evoformer}{module}//{name}"])
+
+    hidden = jnp.dot(jnp.asarray(angle_features), weight("template_single_embedding", "weights"))
+    hidden = jax.nn.relu(hidden + weight("template_single_embedding", "bias"))
+    row = jnp.dot(hidden, weight("template_projection", "weights"))
+    return np.asarray(row + weight("template_projection", "bias"))
 
 
 def template_embedding(params_path: Path, aatype, positions, mask):
