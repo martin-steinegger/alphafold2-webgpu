@@ -18,9 +18,22 @@ kernel, so each branch uses whatever it would select for itself.
 | `f16-projection` | f16-chunked 64x128k16 | 0 | 668 s | 32.3388 | 0.19457 | 0.17472 |
 | `f16-projection` | f16-chunked 64x128k16 | 1 | 1,334 s | 33.7754 | 0.19168 | 0.17200 |
 | `f16-projection`, with the attention work | matrix 64x128, 1 query/invocation | 0 | 407 s | 32.3419 | 0.19456 | 0.17474 |
-| `f16-projection`, and the triangle block filling its tile | as above | 0 | **288 s** | 32.3419 | 0.19456 | 0.17474 |
+| `f16-projection`, and the triangle block filling its tile | as above | 0 | 288 s | 32.3419 | 0.19456 | 0.17474 |
+| the same, once the GB10 restricted packing to the keys | matrix 64x128, 1 query, keys packed | 0 | **358 s** | 32.3534 | 0.19457 | 0.17471 |
 
-**The final number is 288 seconds against `main`'s 746 and 775: 2.6x.**
+**The final number is 358 seconds against `main`'s 746 and 775: 2.1x.**
+
+It was 288 while the attention values were packed as well as the keys. That
+is not available: on the GB10, with the reference fixtures this machine does
+not have, packing values moved an Evoformer block's MSA output 4.06e-4 from
+the official AlphaFold intermediates against the 5e-5 that test allows. A
+value is averaged under weights summing to one and lands in the output
+undamped, where a key's error is normalised away by the softmax. The
+differential tests here could never have caught it, because they compare the
+model against itself rather than against a reference — which is exactly why
+the fixture suite had to run somewhere.
+
+Seventy seconds is what that correctness costs, and it is worth paying.
 `main` was measured twice and so was this, which matters because a single pass
 on this machine drifts by a few percent.
 

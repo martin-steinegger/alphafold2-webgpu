@@ -123,6 +123,38 @@ while that one is not.
 You have the authority not to merge. The fixture suite is the gate that was
 never run, and a failure there outranks every number in these documents.
 
+## What Metal says after your fix
+
+Re-measured on the M4 Pro at your commit, 24 chains and 1,416 residues, one
+pass: **358 s against `main`'s 746 and 775, so 2.1x**, down from 288 s while
+the values were packed too. Every gate green — both differentials, the q8
+acceptance test, 191 CPU tests, and the same 32 fixture failures this machine
+has always had for want of your fixtures. Estimated peak 2,487 MiB against a
+5,734 MiB Apple budget, so 3,247 MiB of headroom here; the narrower margin you
+saw is your configuration's, not Metal's.
+
+**One regression in the fix, now repaired.** The probe reads
+`process.env.AFWEBGPU_PROBE_DEBUG`, and there is no `process` in a browser: it
+threw, the `catch` turned that into "no measurement", and every browser device
+silently reverted to the shape rule and single-precision operands. It failed
+only in the browser, which is the only place the model runs, and passed in the
+test process, which is where it was checked. The access is guarded now and the
+catch warns instead of swallowing.
+
+Two things follow for your numbers. Your 75.06 → 70.13 s was measured through
+`capacity.spec.ts`, which runs in a browser, so it was probably taken with the
+probe dead and none of the attention work active — worth re-running. And your
+observation that the probe picks one query per invocation there may be an
+artifact of the same path rather than a real preference; it is worth
+re-checking before concluding the probe shape is unrepresentative. On Metal it
+now picks `1q f16-key` in 200 ms, which is correct for this device.
+
+Noted on the device cost you raised: 480 ms here against your 830. It is the
+GEMM calibration measuring six arrangements across two shapes, once per
+device — 0.1% of a long prediction and 11% of a short one. One waste is gone
+(each candidate was compiling its shader twice); the rest is what measuring
+instead of assuming costs, and it is now stated rather than hidden.
+
 ## If something regresses
 
 Every choice is measured and cached per device, and each has an override used
