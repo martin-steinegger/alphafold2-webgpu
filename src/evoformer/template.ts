@@ -1,6 +1,6 @@
-import { ATTENTION_NORMALIZE_SHADER, createAttentionNormParameters } from "./attention.js";
 import { encodeTemplatePairBlock, type TemplatePairBlockWeights } from "./block.js";
 import { rowWindows } from "../runtime/sharded.js";
+import { storageArray, storageWords, type ActivationStorage } from "../runtime/storage.js";
 import { type GpuTensor, WebGpuExecution } from "../runtime/execution.js";
 import type { AllocationSnapshot } from "../runtime/allocator.js";
 import type { TemplateMsaWeights } from "../input/template-msa-row.js";
@@ -54,11 +54,20 @@ export interface QueryOnlyTemplateInput {
   /** Absent for the query-only case, which is a template of nothing. */
   readonly template?: TemplatePairInput;
   /**
-   * Run inside the model's own execution and hand the update back as a tensor.
+   * Add the update straight into a pair the model is already holding.
+   *
+   * Without this the module writes it to a tensor of its own, which at 597
+   * residues is 182 MiB that nothing else ever reads.
+   */
+  readonly residual?: {
+    readonly pair: GpuTensor;
+    readonly storage: ActivationStorage;
+  };
+  /**
+   * Run inside the model's own execution.
    *
    * Without this the module allocates for itself and reads the update home,
-   * which is what the tests want and what a pair-sized readback costs. The
-   * model instead adds the tensor straight into its resident pair.
+   * which is what the tests want and what a pair-sized readback costs.
    */
   readonly execution?: WebGpuExecution;
 }
@@ -183,46 +192,107 @@ export function packTemplateResidues(length: number, template?: TemplatePairInpu
 }
 
 
-const VALUE_SHADER = `
-struct Parameters { pairs: u32, template_channels: u32, projected: u32, pair_channels: u32 };
+/**
+ * The output norm, the pointwise attention and the residual, in one pass.
+ *
+ * Written separately these are three tensors the size of the pair: a
+ * normalized copy of the template pair, the attention's value projection, and
+ * the 128-channel update itself, which at 597 residues is 91, 91 and 182 MiB.
+ * None of them is read by anything else, so none of them needs to exist. One
+ * invocation takes one pair row, normalises it, applies the attention and adds
+ * the result into the pair the model is already holding.
+ *
+ * The attention's two matrices are composed on the host first. With a single
+ * template the softmax is 1, so the value and output projections are just
+ * multiplied through, and 64 by 64 by 128 is half a million products once per
+ * prediction against 8192 per pair every time.
+ */
+export function createTemplateOutputShader(
+  storage: ActivationStorage, residual = false,
+): string {
+  const word = "(base + channel) >> 1u";
+  const store = storage === "f16"
+    ? residual
+      ? `let existing = unpack2x16float(destination[${word}]);
+    destination[${word}] = pack2x16float(vec2<f32>(existing.x + first, existing.y + second));`
+      : `destination[${word}] = pack2x16float(vec2<f32>(first, second));`
+    : residual
+      ? `destination[base + channel] = destination[base + channel] + first;
+    destination[base + channel + 1u] = destination[base + channel + 1u] + second;`
+      : `destination[base + channel] = first;
+    destination[base + channel + 1u] = second;`;
+  return `
+struct Parameters { pairs: u32, template_channels: u32, pair_channels: u32, epsilon: f32 };
 const GRID_WIDTH: u32 = 32768u;
 @group(0) @binding(0) var<storage, read> source: array<f32>;
-@group(0) @binding(1) var<storage, read> weights: array<f32>;
-@group(0) @binding(2) var<uniform> p: Parameters;
-@group(0) @binding(3) var<storage, read_write> output: array<f32>;
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x + id.y * GRID_WIDTH * 64u;
-  if (index >= p.pairs * p.projected) { return; }
-  let row = index / p.projected;
-  let channel = index % p.projected;
-  var result = 0.0;
-  for (var c = 0u; c < p.template_channels; c += 1u) {
-    result += source[row * p.template_channels + c] * weights[c * p.projected + channel];
-  }
-  output[index] = result;
-}`;
+@group(0) @binding(1) var<storage, read> weight: array<f32>;
+@group(0) @binding(2) var<storage, read> bias: array<f32>;
+@group(0) @binding(3) var<storage, read> norm_weights: array<f32>;
+@group(0) @binding(4) var<uniform> p: Parameters;
+@group(0) @binding(5) var<storage, read_write> destination: array<${storageArray(storage)}>;
 
-const OUTPUT_SHADER = `
-struct Parameters { pairs: u32, template_channels: u32, projected: u32, pair_channels: u32 };
-const GRID_WIDTH: u32 = 32768u;
-@group(0) @binding(0) var<storage, read> source: array<f32>;
-@group(0) @binding(1) var<storage, read> output_weight: array<f32>;
-@group(0) @binding(2) var<storage, read> output_bias: array<f32>;
-@group(0) @binding(3) var<uniform> p: Parameters;
-@group(0) @binding(4) var<storage, read_write> output: array<f32>;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x + id.y * GRID_WIDTH * 64u;
-  if (index >= p.pairs * p.pair_channels) { return; }
-  let row = index / p.pair_channels;
-  let channel = index % p.pair_channels;
-  var result = output_bias[channel];
-  for (var c = 0u; c < p.projected; c += 1u) {
-    result += source[row * p.projected + c] * output_weight[c * p.pair_channels + channel];
+  let row = id.x + id.y * GRID_WIDTH * 64u;
+  if (row >= p.pairs) { return; }
+  let source_base = row * p.template_channels;
+
+  var mean = 0.0;
+  for (var c = 0u; c < p.template_channels; c += 1u) { mean += source[source_base + c]; }
+  mean /= f32(p.template_channels);
+  var variance = 0.0;
+  for (var c = 0u; c < p.template_channels; c += 1u) {
+    let difference = source[source_base + c] - mean;
+    variance += difference * difference;
   }
-  output[index] = result;
+  let inverse_deviation = inverseSqrt(variance / f32(p.template_channels) + p.epsilon);
+
+  // Two output channels at a time: a packed pair holds two values in one word,
+  // and either way it halves the work of normalising the row again.
+  let base = row * p.pair_channels;
+  for (var channel = 0u; channel < p.pair_channels; channel += 2u) {
+    var first = bias[channel];
+    var second = bias[channel + 1u];
+    for (var c = 0u; c < p.template_channels; c += 1u) {
+      let normalized = (source[source_base + c] - mean) * inverse_deviation * norm_weights[c]
+        + norm_weights[p.template_channels + c];
+      first += normalized * weight[c * p.pair_channels + channel];
+      second += normalized * weight[c * p.pair_channels + channel + 1u];
+    }
+    ${store}
+  }
 }`;
+}
+
+/**
+ * The pointwise attention's value and output projections, multiplied through.
+ *
+ * `value_w` is [template channels, heads, head channels] and `output_w` is
+ * [heads, head channels, pair channels]; with one template the attention
+ * between them is the identity, so their product is a single [template
+ * channels, pair channels] matrix.
+ */
+export function composePointwiseWeights(
+  valueWeight: Float32Array, outputWeight: Float32Array,
+  templateChannels: number, pairChannels: number,
+): Float32Array {
+  const projected = valueWeight.length / templateChannels;
+  if (outputWeight.length !== projected * pairChannels) {
+    throw new RangeError("template attention value and output projections disagree on shape");
+  }
+  const composed = new Float32Array(templateChannels * pairChannels);
+  for (let input = 0; input < templateChannels; input += 1) {
+    for (let hidden = 0; hidden < projected; hidden += 1) {
+      const factor = valueWeight[input * projected + hidden]!;
+      if (factor === 0) continue;
+      for (let output = 0; output < pairChannels; output += 1) {
+        composed[input * pairChannels + output] = composed[input * pairChannels + output]!
+          + factor * outputWeight[hidden * pairChannels + output]!;
+      }
+    }
+  }
+  return composed;
+}
 
 export class QueryOnlyTemplateGpu {
   readonly device: GPUDevice;
@@ -291,36 +361,41 @@ export class QueryOnlyTemplateGpu {
       normWeights.set(input.weights.outputNormScale);
       normWeights.set(input.weights.outputNormOffset, input.templateChannels);
       const normWeightBuffer = execution.upload("template.output-norm-weights", normWeights);
-      const normParams = execution.upload("template.output-norm-parameters", createAttentionNormParameters(
-        pairs, input.templateChannels, 0, input.templateChannels, false, 1, pairs, 1e-5,
-      ), GPUBufferUsage.UNIFORM);
-      const normalized = execution.allocate("template.normalized", pair.elements);
-      const projected = input.weights.valueWeight.length / input.templateChannels;
-      const value = execution.allocate("template.value", pairs * projected);
-      const output = execution.allocate(
+      const composed = execution.upload("template.pointwise-weight", composePointwiseWeights(
+        input.weights.valueWeight, input.weights.outputWeight, input.templateChannels, input.pairChannels,
+      ));
+      const outputBias = execution.upload("template.output-bias", input.weights.outputBias);
+      const storage = input.residual?.storage ?? "f32";
+      const output = input.residual?.pair ?? execution.allocate(
         "template.output", pairs * input.pairChannels, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
       );
-      const valueWeight = execution.upload("template.value-weight", input.weights.valueWeight);
-      const outputWeight = execution.upload("template.output-weight", input.weights.outputWeight);
-      const outputBias = execution.upload("template.output-bias", input.weights.outputBias);
-      const params = execution.upload("template.pointwise-parameters", new Uint32Array([
-        pairs, input.templateChannels, projected, input.pairChannels,
-      ]), GPUBufferUsage.UNIFORM);
-      const [normalize, valuePipeline, outputPipeline] = await Promise.all([
-        execution.pipelines.get("template:normalize", ATTENTION_NORMALIZE_SHADER),
-        execution.pipelines.get("template:value", VALUE_SHADER),
-        execution.pipelines.get("template:output", OUTPUT_SHADER),
-      ]);
-      grid = execution.linearGrid(pairs, 1);
-      execution.dispatch(encoder, normalize, [pair, normWeightBuffer, normParams, normalized],
-        grid[0], grid[1], 1,
-        "template.output-normalize");
-      grid = execution.linearGrid(value.elements);
-      execution.dispatch(encoder, valuePipeline, [normalized, valueWeight, params, value],
-        grid[0], grid[1], 1, "template.value");
-      grid = execution.linearGrid(output.elements);
-      execution.dispatch(encoder, outputPipeline, [value, outputWeight, outputBias, params, output],
-        grid[0], grid[1], 1, "template.output");
+      const outputPipeline = await execution.pipelines.get(
+        `template:output:${storage}:${input.residual === undefined ? "write" : "add"}`,
+        createTemplateOutputShader(storage, input.residual !== undefined),
+      );
+      // The update is written a window of rows at a time, like the embedding,
+      // and reads its own window of the template pair alongside.
+      for (const window of rowWindows(pairs, execution.bindingLimitBytes,
+        [input.templateChannels * 4, input.pairChannels * 4])) {
+        const sourceWindow = execution.view(pair,
+          window.offset * input.templateChannels, window.count * input.templateChannels);
+        const destinationWindow = execution.view(output,
+          storageWords(window.offset * input.pairChannels, storage),
+          storageWords(window.count * input.pairChannels, storage));
+        // Three counts and an epsilon, so the buffer is built by hand.
+        const parameterBytes = new ArrayBuffer(16);
+        const parameterView = new DataView(parameterBytes);
+        parameterView.setUint32(0, window.count, true);
+        parameterView.setUint32(4, input.templateChannels, true);
+        parameterView.setUint32(8, input.pairChannels, true);
+        parameterView.setFloat32(12, 1e-5, true);
+        const outputParams = execution.upload(`template.output-parameters-${window.offset}`,
+          new Uint32Array(parameterBytes), GPUBufferUsage.UNIFORM);
+        grid = execution.linearGrid(window.count);
+        execution.dispatch(encoder, outputPipeline,
+          [sourceWindow, composed, outputBias, normWeightBuffer, outputParams, destinationWindow],
+          grid[0], grid[1], 1, `template.output-${window.offset}`);
+      }
       const readback = input.execution === undefined
         ? execution.createReadback("template.readback", output, encoder) : undefined;
       execution.endComputePass(encoder);

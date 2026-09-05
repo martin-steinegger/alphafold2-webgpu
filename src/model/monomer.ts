@@ -571,15 +571,11 @@ export class AlphaFoldMonomerGpu {
           // without ever being read home.
           const templateStart = performance.now();
           const checkpoint = execution.checkpoint();
-          const update = await new QueryOnlyTemplateGpu(this.device).run({
+          await new QueryOnlyTemplateGpu(this.device).run({
             length, templateChannels: 64, pairChannels: 128, pairMask, weights: templateWeights,
             template: templateFeatures.pair, execution,
+            residual: { pair: embedding.pairWithoutTemplates, storage: this.pairStorage },
           });
-          const templateEncoder = this.device.createCommandEncoder({ label: `monomer.template-residual-${recycle}` });
-          this.device.pushErrorScope("validation");
-          await execution.addInPlace(templateEncoder, embedding.pairWithoutTemplates, update.pairUpdateTensor!,
-            `monomer.template-residual-${recycle}`, this.pairStorage);
-          await submit(templateEncoder, `template residual recycle ${recycle}`);
           execution.releaseSince(checkpoint);
           templateMilliseconds = performance.now() - templateStart;
         }
