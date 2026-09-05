@@ -22,7 +22,7 @@ import {
 } from "./attention.js";
 import { attentionFlashKernelForShape } from "./attention-calibration.js";
 import { calibrateAttentionShape } from "../runtime/attention-queries.js";
-import { createTiledGemmShader, gemmGrid } from "../runtime/gemm.js";
+import { createTiledGemmShader, GEMM_TILE_ROWS, gemmGrid } from "../runtime/gemm.js";
 import { releaseScratch } from "./execution-scratch.js";
 import {
   createOuterProductMeanNormalizeShader,
@@ -1048,6 +1048,14 @@ async function encodeOuterProductMean(
  */
 export const TRIANGLE_BLOCK_TARGET_BYTES = 8 * 1024 * 1024;
 
+/**
+ * The storage binding size every WebGPU implementation guarantees.
+ *
+ * A block tensor is bound whole, so the block cannot be grown past this
+ * however much it would help.
+ */
+const WEBGPU_GUARANTEED_BINDING_BYTES = 128 * 1024 * 1024;
+
 export function triangleBlockRows(
   length: number, cZ: number, triangleHidden: number,
   budgetBytes: number = TRIANGLE_BLOCK_TARGET_BYTES,
@@ -1056,10 +1064,31 @@ export function triangleBlockRows(
     throw new RangeError("triangle block dimensions must be positive safe integers");
   }
   const bytesPerRow = length * Math.max(cZ, triangleHidden) * Float32Array.BYTES_PER_ELEMENT;
-  const rows = Math.max(1, Math.min(length, Math.floor(budgetBytes / bytesPerRow)));
+  // A block shorter than the contraction's tile pays for the rows it does not
+  // have. The GEMM dispatches whole 64-row tiles and masks what falls outside
+  // the block, so an eleven-row block does a sixth of the work in the same
+  // time: 428 GFLOP/s against 2,106 for a full tile, measured. An 8 MiB budget
+  // gives exactly eleven rows at 1,416 residues, which is where a long
+  // prediction spends its time.
+  //
+  // So the budget holds at least one whole tile. At 1,416 residues that is
+  // 46 MiB rather than 8, it raises the estimated peak from 2,440 MiB to
+  // 2,573 against a 5,734 MiB safety budget, and it takes the prediction from
+  // 407 seconds to 310. The raise is capped at the binding size every WebGPU
+  // implementation guarantees, since a block tensor is bound whole and a
+  // longer chain would otherwise ask for more than one binding can hold.
+  const perTile = GEMM_TILE_ROWS * bytesPerRow;
+  const effective = Math.max(budgetBytes, Math.min(perTile, WEBGPU_GUARANTEED_BINDING_BYTES));
+  const rows = Math.max(1, Math.min(length, Math.floor(effective / bytesPerRow)));
+  // Whole tiles, so the last one is not mostly masked either — but never at
+  // the cost of splitting a block that already covered the whole length, which
+  // rounding down would do to any chain a little over one tile.
+  const tiled = rows >= length ? length
+    : rows >= GEMM_TILE_ROWS ? Math.floor(rows / GEMM_TILE_ROWS) * GEMM_TILE_ROWS
+      : rows;
   // Blocks start on even pair rows so packed half-precision pairs never span
   // two words; a single block covering every row starts at zero anyway.
-  return rows < length && (length % 2 === 1) ? Math.max(2, rows - (rows % 2)) : rows;
+  return tiled < length && (length % 2 === 1) ? Math.max(2, tiled - (tiled % 2)) : tiled;
 }
 
 async function encodeTriangleMultiplication(
