@@ -5,14 +5,15 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#071512" />
     <meta name="description" content="Run AlphaFold2 monomer inference locally in your browser with WebGPU." />
-    <title>AlphaFold2 WebGPU</title>
+    <title>AlphaFold2 using MMseqs2 and WebGPU</title>
+    <link rel="icon" type="image/png" sizes="32x32" href="./marv-32.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="./marv-180.png" />
     <link rel="stylesheet" href="./style.css" />
   </head>
   <body>
     <header class="site-header">
-      <a class="brand" href="./" aria-label="AlphaFold2 WebGPU home">
-        <span class="brand-mark" aria-hidden="true">α</span>
-        <span>AlphaFold2 WebGPU</span>
+      <a class="brand" href="./" aria-label="AlphaFold2 using MMseqs2 and WebGPU home">
+        <span>AlphaFold2 using MMseqs2 and WebGPU</span>
       </a>
       <nav class="header-links" aria-label="External links">
         <a href="https://github.com/martin-steinegger/alphafold2-webgpu">GitHub</a>
@@ -39,7 +40,7 @@
               <label>Alignment<select id="input-mode"><option value="mmseqs2" selected>MMseqs2 MSA</option><option value="single">Single sequence</option><option value="custom">Custom A3M</option></select></label>
             </div>
             <label id="sequence-field">Protein sequence
-              <textarea id="sequence" rows="3" spellcheck="false">PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK</textarea>
+              <textarea id="sequence" rows="6" spellcheck="false">PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK</textarea>
               <span id="sequence-hint" class="hint">Enter one chain for AlphaFold2 or colon-separated chains for Multimer-v3.</span>
             </label>
             <label id="a3m-field" class="file-field" hidden>Custom alignment (.a3m)
@@ -157,11 +158,11 @@
       <section class="reference" aria-labelledby="reference-heading">
         <h2 id="reference-heading">Reference</h2>
         <p>AlphaFold2: Jumper J, Evans R, Pritzel A, et al. <a href="https://doi.org/10.1038/s41586-021-03819-2">Highly accurate protein structure prediction with AlphaFold.</a> Nature, 2021.</p>
-        <p>MMseqs2 MSA generation is provided by the public <a href="https://github.com/sokrypton/ColabFold">ColabFold</a> service. Mirdita M, Schütze K, Moriwaki Y, et al. <a href="https://doi.org/10.1038/s41592-022-01488-1">ColabFold: making protein folding accessible to all.</a> Nature Methods, 2022.</p>
+        <p>MMseqs2 MSA generation is provided by the public <a href="https://github.com/sokrypton/ColabFold">ColabFold</a> service. Mirdita M, Schütze K, Moriwaki Y, et al. <a href="https://doi.org/10.1038/s41592-022-01488-1">ColabFold: making protein folding accessible to all.</a> Nature Methods, 2022. Marv, the mascot on this page, is ColabFold’s, under its MIT licence.</p>
       </section>
 
     </main>
-    <footer><span>AlphaFold2 WebGPU · experimental research software</span><span>AlphaFold parameters: CC BY 4.0</span></footer>
+    <footer><span>AlphaFold2 using MMseqs2 and WebGPU · experimental research software</span><span>AlphaFold parameters: CC BY 4.0</span></footer>
     <script type="module" src="./main.ts"></script>
   </body>
 </html>

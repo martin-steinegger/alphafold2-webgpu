@@ -445,12 +445,25 @@ async function showStructure(pdb: string, chainCount: number, mode: string): Pro
     viewer.zoomTo(); viewer.render();
     currentViewer = viewer;
     watchViewerContext(container);
+    // A camera fitted to one size does not frame the model at another, so the
+    // fit follows the container: the viewer is sized against the window, and
+    // the results scrolling into view is the first time it has its real size.
+    // Once someone has taken hold of the model, their own framing is the one
+    // worth keeping and only the canvas is resized.
+    let viewerHeld = false;
+    for (const event of ["pointerdown", "wheel"] as const) {
+      container.addEventListener(event, () => { viewerHeld = true; }, { passive: true });
+    }
     viewerResizeObserver = new ResizeObserver(() => {
       // Starting another prediction hides the results, which resizes the
       // container to nothing: drawing into a zero-sized canvas fails in the
       // renderer and says so, for a frame nobody can see.
       if (container.clientWidth === 0 || container.clientHeight === 0) return;
-      withViewer("resizing", () => { viewer.resize(); viewer.render(); });
+      withViewer("resizing", () => {
+        viewer.resize();
+        if (!viewerHeld) viewer.zoomTo();
+        viewer.render();
+      });
     });
     viewerResizeObserver.observe(container);
   } catch (error) {
