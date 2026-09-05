@@ -26,6 +26,29 @@ stronger statement than anything measured on the Mac. **This is the highest
 value check in this document.** If it is red, stop and report which test;
 everything below is secondary.
 
+### What that suite does and does not reach
+
+Worth knowing before leaning on a green run. Only five of the thirty-nine GPU
+test files build their device with `requestAlphaFoldDevice`, which is what runs
+the projection calibration and installs the variant: `a3m-model`,
+`a3m-raw-input`, `binding-limit-model`, `evoformer-attention` and
+`evoformer-stack-a3m`. The other thirty-four request a device directly, so the
+module default stands and they exercise the f32 projection kernel rather than
+whichever one your device selects.
+
+The attention work is not affected by this — the width of the keys and the
+query count are decided inside `encodeAttention` from whatever device is
+handed to it, so every test exercises them. That is why packing the values
+showed up where it did.
+
+So a green suite means: the attention changes are right against the
+references everywhere, and the selected projection kernel is right in the five
+tests that run the whole model or the whole stack. It does not mean the
+f16-chunked or matrix projection has been compared against a reference at the
+level of a single kernel. If that is wanted, `forceGemmVariant` at the top of
+those thirty-four tests would get it, and only a machine with the fixtures can
+run it.
+
 ## What changed for you specifically
 
 Three things, none of which was measured on your hardware.
