@@ -24,6 +24,18 @@ const copies = Number(process.env.AFWEBGPU_COMPLEX_CHAINS ?? "2");
 const variants = (process.env.AFWEBGPU_COMPLEX_VARIANTS ?? "f32-k8,f16-chunked-k16")
   .split(",").map((entry) => entry.trim()).filter((entry) => entry.length > 0);
 
+/**
+ * Variant names, in the two forms the selection can produce: an arithmetic and
+ * a k depth, or the matrix units plus what everyone who cannot reach them
+ * computes instead.
+ */
+function parseVariant(name: string): { precision: string; inner: number; fallback?: string } | undefined {
+  const matrix = /^matrix\+(f32|f16-chunked|f16-mixed)$/u.exec(name);
+  if (matrix !== null) return { precision: "matrix", inner: 16, fallback: matrix[1]! };
+  const classic = /^(.*)-k(8|16)$/u.exec(name);
+  return classic === null ? undefined : { precision: classic[1]!, inner: Number(classic[2]) };
+}
+
 interface Summary {
   readonly name: string;
   readonly seconds: number;
@@ -50,10 +62,14 @@ test(`predicts a ${copies}-chain complex with each projection variant`, async ({
   // variant to reach it.
   await page.goto("/?worker=0");
 
-  const summaries = await page.evaluate(async ({ root, chain, copies, variants }) => {
+  const summaries = await page.evaluate(async ({ root, chain, copies, variants, variantSpecs }) => {
+    const parse = (name: string): { precision: string; inner: number; fallback?: string } | undefined =>
+      variantSpecs[name];
     const selection = await import(/* @vite-ignore */
       `/@fs${root}/src/runtime/gemm-selection.ts`) as {
-        forceGemmVariant(variant: { precision: string; inner: number } | undefined): void;
+        forceGemmVariant(variant: {
+          precision: string; inner: number; fallback?: string;
+        } | undefined): void;
       };
     const expression = await import(/* @vite-ignore */
       `/@fs${root}/src/input/sequence-expression.ts`) as {
@@ -77,9 +93,8 @@ test(`predicts a ${copies}-chain complex with each projection variant`, async ({
     };
     const results: Summary[] = [];
     for (const requested of variants) {
-      const match = /^(.*)-k(8|16)$/u.exec(requested);
-      if (match === null) continue;
-      const variant = { precision: match[1]!, inner: Number(match[2]) };
+      const variant = parse(requested);
+      if (variant === undefined) continue;
       const recycles: { meanPlddt: number; ptm: number; iptm: number }[] = [];
       const reporter = {
         stage: () => undefined,
@@ -141,7 +156,11 @@ test(`predicts a ${copies}-chain complex with each projection variant`, async ({
     }
     selection.forceGemmVariant(undefined);
     return results;
-  }, { root, chain: CHAIN, copies, variants });
+  }, {
+    root, chain: CHAIN, copies, variants,
+    variantSpecs: Object.fromEntries(variants.map((name) => [name, parseVariant(name)])) as
+      Record<string, { precision: string; inner: number; fallback?: string } | undefined>,
+  });
 
   const results = summaries as unknown as Summary[];
   const lines = [`${copies} chains, ${results[0]?.length ?? "?"} residues`, "",
