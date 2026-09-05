@@ -71,6 +71,15 @@ export interface MonomerMemoryOptions {
    */
   readonly multimer?: boolean;
   readonly templateRows?: number;
+  /**
+   * A monomer folding against a custom template.
+   *
+   * Its module runs each recycle over the pair the embedder just wrote, with a
+   * 64-channel pair of its own and the scratch its two blocks need. It adds its
+   * update straight into the pair, so unlike Multimer's there is no pair-sized
+   * update tensor to account for.
+   */
+  readonly template?: boolean;
 }
 
 export function estimateMonomerMemory(
@@ -162,8 +171,19 @@ export function estimateMonomerMemory(
   // Readbacks, uniforms and allocation padding, none of which scale with the
   // shape, plus headroom for the operator this model does not enumerate.
   const scratchBytes = Math.ceil(operatorScratch * 1.15) + 16 * 1024 ** 2;
+  // A monomer's template module runs between the embedder and the extra stack,
+  // over the pair the embedder has just written, and adds its update straight
+  // into it. What it needs beyond what is already live is its own 64-channel
+  // pair and the scratch its two blocks take.
+  // Two pair-shaped tensors, not one: its own 64-channel pair, and the whole
+  // projection its triangle multiplication keeps beside that. Measurement at
+  // 597 residues found exactly those two plus the model's pair live together
+  // at the peak, which is 261 MiB of the 296 the run reached.
+  const monomerTemplateBytes = options.template === true && options.multimer !== true
+    ? persistentBytes + 2 * templatePair + 3 * templateBlock : 0;
   const livePeakBytes = Math.max(
     persistentBytes + scratchBytes, embedderBytes + 16 * 1024 ** 2, templateModuleBytes + 16 * 1024 ** 2,
+    monomerTemplateBytes + 16 * 1024 ** 2,
   );
   // The browser has to retain physical GPUBuffer objects, not only logically
   // live tensors. Whole-MiB allocation rounding and the reusable scratch pool
@@ -265,7 +285,7 @@ export function monomerDeviceRequirements(
     // the widest being its 64-channel pair in f32 and its update in the pair's
     // storage. Leaving them out asked for a buffer smaller than the run needs,
     // which failed inside WebGPU with a size and no name.
-    options.multimer === true ? length * length * 64 * bytes : 0,
+    options.multimer === true || options.template === true ? length * length * 64 * bytes : 0,
     options.multimer === true ? length * length * 128 * pairBytes : 0,
     OUTER_PRODUCT_BLOCK_LIMIT_BYTES,
   );

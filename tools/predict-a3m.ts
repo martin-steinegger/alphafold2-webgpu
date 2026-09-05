@@ -65,7 +65,8 @@ const extra = Math.max(1, Math.min(extraRows, Math.max(0, depth - clustered)));
 // The model stores its activations packed. AFWEBGPU_EXACT=1 selects the f32
 // storages the differential tests use, for comparison.
 const memoryOptions = process.env.AFWEBGPU_EXACT === "1" ? { ...EXACT_STORAGE } : {};
-const plan = planMonomerDevice(adapter, length, clustered, extra, undefined, false, memoryOptions);
+const plan = planMonomerDevice(adapter, length, clustered, extra, undefined, false,
+  templateReport === undefined ? memoryOptions : { ...memoryOptions, template: true });
 const device = await requestAlphaFoldDevice(adapter, plan.requirements);
 try {
   const prediction = await new AlphaFoldMonomerGpu(device, {
@@ -85,12 +86,18 @@ try {
     file, length, depth, msaRows: clustered, extraRows: extra, recycles,
     ...(templateReport === undefined ? {} : { template: templateReport }),
     millisecondsPerRecycle: Math.round(prediction.elapsedMilliseconds / recycles),
+    estimatedPeakMiB: Math.round(plan.memory.estimatedPeakBytes / 1024 ** 2),
     peakConcurrentMiB: Math.round(prediction.memory.peakBytes / 1024 ** 2),
     peakResidentMiB: Math.round(prediction.memory.combinedPeakResidentBytes / 1024 ** 2),
     meanPlddt: Number(prediction.final.confidence.meanPlddt.toFixed(2)),
     ptm: Number(prediction.final.confidence.ptm.toFixed(3)),
     recyclePlddt: prediction.recycles.map((result) => Number(result.confidence.meanPlddt.toFixed(2))),
   }));
+  if (process.env.AFWEBGPU_MEMORY === "1") {
+    for (const share of prediction.memory.peakComposition ?? []) {
+      console.log(`  ${(share.bytes / 1024 ** 2).toFixed(1).padStart(8)} MiB  x ${share.count}  ${share.label}`);
+    }
+  }
 } finally {
   device.destroy();
 }

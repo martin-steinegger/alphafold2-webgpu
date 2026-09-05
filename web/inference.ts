@@ -235,6 +235,7 @@ export async function runInference(job: InferenceJob, reporter: InferenceReporte
   const memoryOptions = {
     triangleWholeStorage: "f16" as const, msaStorage: "f16" as const, pairStorage: "f16" as const,
     ...(input.multimer ? { multimer: true, templateRows: multimerTemplate?.templateRows ?? 4 } : {}),
+    ...(input.template === undefined || input.multimer ? {} : { template: true }),
   };
   const memoryBudget = unifiedMemoryBudget(appleUnifiedMemory);
   const devicePlan = planMonomerDevice(

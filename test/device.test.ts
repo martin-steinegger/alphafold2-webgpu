@@ -227,4 +227,24 @@ describe("estimateMonomerMemory", () => {
       expect(estimate / resident, label).toBeLessThan(1.4);
     }
   });
+
+  it("makes room for a monomer's template module", () => {
+    // The template's own 64-channel pair and the whole projection its triangle
+    // multiplication keeps beside it are both pair-shaped, and at 597 residues
+    // measurement found them live together with the model's pair.
+    const options = {
+      triangleWholeStorage: "f16" as const, msaStorage: "f16" as const, pairStorage: "f16" as const,
+    };
+    const plain = estimateMonomerMemory(597, 1, 1, "full", options);
+    const templated = estimateMonomerMemory(597, 1, 1, "full", { ...options, template: true });
+    expect(templated.estimatedPeakBytes).toBeGreaterThan(plain.estimatedPeakBytes);
+    // The peak is a maximum over moments, not a sum, so the template only
+    // shows where its own moment is the largest: two pair-shaped tensors at 64
+    // channels in float32, on top of everything the trunk keeps live.
+    const pairShaped = 597 * 597 * 64 * 4;
+    expect(templated.estimatedPeakBytes).toBeGreaterThan(2 * pairShaped + templated.persistentBytes);
+    // A complex has its own template accounting, which this must not disturb.
+    expect(estimateMonomerMemory(597, 1, 1, "full", { ...options, multimer: true }).estimatedPeakBytes)
+      .toBe(estimateMonomerMemory(597, 1, 1, "full", { ...options, multimer: true, template: true }).estimatedPeakBytes);
+  });
 });
