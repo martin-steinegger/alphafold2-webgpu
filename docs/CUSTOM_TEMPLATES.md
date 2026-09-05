@@ -1,9 +1,62 @@
 # Custom templates
 
-A plan for letting someone upload a structure and have it used as an AlphaFold
-template. Every claim about what exists today was checked against this tree and
-against the AlphaFold source in the ColabFold environment on 2026-09-06; the
-weight shapes come from the manifests the site currently serves.
+How someone uploads a structure and has it used as an AlphaFold template. This
+began as a plan and is now a record: everything below was built on 2026-09-06,
+and the numbers are measured rather than projected.
+
+## What it does
+
+Ubiquitin, from its sequence alone with no alignment at all:
+
+|                | pLDDT | pTM   | RMSD to 1UBQ |
+|----------------|-------|-------|--------------|
+| no template    | 49.35 | 0.398 | 11.69 A      |
+| with 1UBQ      | 94.26 | 0.800 | 0.38 A       |
+
+ACE2, 597 residues, against chain A of 6M0J: pLDDT 97.03, 0.20 A RMSD, and the
+template costs 55 MiB of live memory on top of the 241 the run needs without
+one.
+
+Checked against AlphaFold itself at every layer, not only end to end:
+
+| layer | against | worst |
+|---|---|---|
+| structure reading | Biopython, on the same file | exact |
+| every template feature | `templates.py`, `all_atom.py` | 6.1e-06 |
+| the MSA row | `template_single_embedding` + `template_projection` | 7.4e-05 |
+| the whole GPU module | official `TemplateEmbedding` with real weights | 1.9e-04 |
+
+`tools/dump-template-features.ts` writes the features out and
+`tools/capture_alphafold_template_reference.py` recomputes each one with the
+official implementation, reading the structure a second time through Biopython
+so the coordinates it compares against did not come from the port.
+
+Two things came out of doing it that way and are worth keeping in mind:
+
+- **The collapse is real, and measured.** With one template the pointwise
+  attention softmaxes over a single key, so the pair update cannot depend on the
+  query pair. Running the official module against a random query moves the
+  output by exactly 0.0. The module is therefore a constant for the prediction,
+  and its two matrices are composed on the host into one.
+- **Undefined torsion angles are noise.** See the deviation note at the end.
+
+## What changed from the plan
+
+- The pair update is **not** held between recycles. Holding it would cost a
+  pair-sized tensor for the whole trunk; recomputing costs a two-block stack at
+  64 channels, well under a percent of a recycle.
+- The output norm, the pointwise attention and the residual are **one kernel**
+  writing straight into the model's pair. Written separately they were three
+  pair-sized tensors nothing else reads: 91, 91 and 182 MiB at 597 residues.
+- The memory estimate needed the template's *two* pair-shaped tensors, its own
+  64-channel pair and the whole projection its triangle multiplication keeps
+  beside it. With one of the two it under-predicted a templated run.
+- Multimer is untouched and refuses a template rather than ignoring one.
+
+Everything below is the reasoning the implementation followed, kept because it
+explains why the module is shaped the way it is. Claims about what exists were
+checked against this tree and against the AlphaFold source in the ColabFold
+environment; the weight shapes come from the manifests the site serves.
 
 ## The surprise: most of the machinery is already here
 
@@ -183,8 +236,8 @@ collapse that makes the monomer case cheap. Treat it as its own project.
 
 ## Verification
 
-Non-negotiable, per AGENTS.md: no reference tensor or tolerance may be touched to
-make this pass.
+Non-negotiable, per AGENTS.md: no reference tensor or tolerance was touched.
+None was.
 
 1. Capture an official reference with a real template through
    `tools/capture_alphafold_reference*.py`, one small case with one template.
@@ -198,6 +251,20 @@ make this pass.
    plumbing gap, so the whole-prediction test is the one that matters.
 5. A no-template run must produce bit-identical output to today's, since the
    constant-collapse path must still be taken when no template is given.
+
+## What is still open
+
+- Multiple templates. The pointwise attention would have to run for real, per
+  recycle, with the query pair as its query. One template is the common case for
+  an uploaded structure and it is the cheap one.
+- Multimer, as its own project (see above).
+- The template's own 64-channel pair is float32 while the trunk's activations
+  are packed. Packing it would halve 87 MiB at 597 residues; the pair stack
+  blocks already take a storage option, so it is a matter of threading it
+  through and re-running the differential.
+- The published bundle is `model1-ptm-q8-v2`. A bundle without
+  `template_single_embedding` refuses a template with a message saying so
+  rather than folding without one.
 
 ## Order of work
 

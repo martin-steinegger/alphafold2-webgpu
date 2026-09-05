@@ -36,9 +36,10 @@ The browser uses `model_1_ptm` for a single chain and `model_1_multimer_v3` for 
    - **Single sequence** runs without a remote search and is useful for testing, but confidence can be substantially lower.
    - **Custom A3M** uses a monomer alignment or a ColabFold serialized complex A3M that you provide.
    Colon-separated sequences are detected as complexes. MMseqs2 mode generates ColabFold-style paired and unpaired complex MSAs; single-sequence mode creates a query-only complex input.
-4. Choose the number of recycles and press **Fold protein**.
-5. Inspect the MSA coverage, per-recycle confidence, pLDDT, PAE, and interactive 3D structure.
-6. Download the predicted PDB, scores JSON, and generated A3M.
+4. Optionally upload a **template structure** (PDB or mmCIF) to fold against. Single chains only.
+5. Choose the number of recycles and press **Fold protein**.
+6. Inspect the MSA coverage, per-recycle confidence, pLDDT, PAE, and interactive 3D structure.
+7. Download the predicted PDB, scores JSON, and generated A3M.
 
 The first prediction downloads the selected model bundle and compiles WebGPU pipelines. The qualified monomer
 mixed-q8 bundle is approximately 97 MiB, and the Multimer mixed-f16 bundle is approximately 182 MiB. Their
@@ -62,6 +63,18 @@ Single-sequence mode creates an alignment containing only the query. Neither the
 ### Custom A3M
 
 Upload A3M text. An ordinary A3M uses its first ungapped FASTA entry as a monomer query. A ColabFold serialized complex A3M with a `#lengths<TAB>cardinalities` header is split back into its paired and unpaired per-chain alignments, cropped, and merged through the same Multimer path as a live MMseqs2 result. Custom A3M input and model inference stay on the device.
+
+### Custom templates
+
+Upload a PDB or mmCIF and the query is folded against it, which is the same idea as ColabFold's `--custom-template-path` reached a shorter way. ColabFold has to drive AlphaFold's own template pipeline from outside, and that pipeline expects a search: it writes a fake pdb70 database out of the uploaded files, runs hhsearch against it to find the template it was just handed by name, and then calls kalign to realign the structure's SEQRES to the hit. Here the query is aligned to the chain directly, with Gotoh's affine-gap algorithm over BLOSUM62 and free terminal gaps, so a domain aligns inside a longer query and a construct with tags on either end aligns to the part it covers. Nothing needs a filesystem, which matters in a browser tab.
+
+The sequence and the coordinates are read from the same records, so there is nothing for a realignment to reconcile: residues a structure did not resolve are simply absent, and the geometry stays true because every distance is measured between coordinates that exist. Modified residues stand in for the standard ones they replace, selenomethionine included; ligands, ions and waters are not part of a polymer chain and are dropped. The first model of an NMR ensemble is used.
+
+The page shows which chain was used, how much of the query it covers and how much of that is identical, before the run rather than after it, and warns when the coverage is under ten percent. The structure travels in the results archive, since a prediction that used a template cannot be reproduced without it.
+
+Templates are monomer-only for now. Multimer-v3's template embedder is a different module — nine summed linears that take the query pair as one of their inputs — so it gets none of the simplification the monomer case allows and is its own project.
+
+One deliberate difference from an official run. A torsion angle whose four atoms are not all present is computed from a degenerate frame, and what AlphaFold emits there is floating-point noise: perturbing the coordinates by one part in a million swings the first residue's pre-omega from (0.052, 0.999) to (0.408, 0.913), while a real angle moves in the seventh digit. Those channels reach the network raw. No port can reproduce that on any platform, so this takes AlphaFold's own `placeholder_for_undefined` branch, which pins an undefined angle to (1, 0). It differs only where the torsion mask is already zero.
 
 ### Multimer-v3
 
@@ -125,7 +138,7 @@ This is expected for many proteins. For the 59-residue acceptance sequence below
 
 ### Are complexes, templates, or Amber relaxation supported?
 
-No-template AlphaFold-Multimer-v3 model 1 complexes are supported with ColabFold paired/unpaired MMseqs2 MSAs, ColabFold serialized complex A3Ms, or query-only input. Real template hits, models 2–5, and Amber relaxation are not supported.
+No-template AlphaFold-Multimer-v3 model 1 complexes are supported with ColabFold paired/unpaired MMseqs2 MSAs, ColabFold serialized complex A3Ms, or query-only input. Monomers accept a custom template structure; template *search* against the PDB, complexes with templates, models 2–5, and Amber relaxation are not supported.
 
 ### Is this the same as ColabFold?
 
