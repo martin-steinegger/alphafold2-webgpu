@@ -13,7 +13,7 @@ test("auto-detects monomers and multimers and switches to custom A3M", async ({ 
   await expect(page.locator("#predict-label")).toHaveText("Generate MSA & predict");
   await expect(page.locator("#monomer-model-url")).toHaveValue("./model/manifest.json");
   await expect(page.locator("#multimer-model-url")).toHaveValue("./model-multimer/manifest.json");
-  await expect(page.locator("#sequence")).toHaveCSS("min-height", "80px");
+  await expect(page.locator("#sequence")).toHaveCSS("min-height", "150px");
   await page.getByText("Advanced settings").click();
   await expect(page.getByRole("button", { name: "Clear downloaded model" })).toBeVisible();
   // Activations are packed for every run, so the page offers no storage choice.
