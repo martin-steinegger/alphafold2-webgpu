@@ -23,9 +23,10 @@ test(`profiles one Evoformer block of a ${copies}-chain complex`, async ({ page 
   test.setTimeout(6 * 60 * 60_000);
   const profileLines: string[] = [];
   page.on("console", (message) => {
-    const text = message.text();
-    if (/^browser: (profile|  )/u.test(text) || /profile /u.test(text)) profileLines.push(text);
-    console.log(text);
+    // Everything is kept and the aggregation below picks out the per-dispatch
+    // lines; filtering here once cost a whole run to a prefix that was never
+    // there.
+    profileLines.push(message.text());
   });
   page.on("pageerror", (error) => console.log(`page error: ${error.message}`));
   const root = process.cwd();
@@ -74,7 +75,7 @@ test(`profiles one Evoformer block of a ${copies}-chain complex`, async ({ page 
   // Aggregate the per-dispatch lines into what a block is actually made of.
   const totals = new Map<string, { milliseconds: number; count: number }>();
   for (const line of profileLines) {
-    const entry = /^(?:browser: )?\s{2}(\S+)\s+([\d.]+)ms$/u.exec(line);
+    const entry = /^\s{2}(\S+)\s+([\d.]+)ms$/u.exec(line);
     if (entry === null) continue;
     const label = entry[1]!.replace(/[.:-]?\d+$/u, "");
     const previous = totals.get(label) ?? { milliseconds: 0, count: 0 };
