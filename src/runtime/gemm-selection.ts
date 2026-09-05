@@ -279,7 +279,9 @@ function bindProbe(
  * Worst error of one variant against a reference computed here, relative to
  * the largest value in it.
  */
-async function measureError(device: GPUDevice, variant: GemmVariant): Promise<number> {
+async function measureError(
+  device: GPUDevice, variant: GemmVariant, pipeline: GPUComputePipeline,
+): Promise<number> {
   const probe = createProbe(device, CHECK_ROWS, CHECK_INNER, CHECK_COLUMNS, true);
   const readback = device.createBuffer({
     label: "gemm-selection.readback",
@@ -287,7 +289,6 @@ async function measureError(device: GPUDevice, variant: GemmVariant): Promise<nu
     usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
   });
   try {
-    const pipeline = await pipelineFor(device, variant);
     const encoder = device.createCommandEncoder({ label: `gemm-selection.check.${variant.precision}` });
     const pass = encoder.beginComputePass();
     pass.setPipeline(pipeline);
@@ -322,8 +323,9 @@ async function measureError(device: GPUDevice, variant: GemmVariant): Promise<nu
 }
 
 /** Milliseconds per dispatch of one variant, best of several batches. */
-async function measureTime(device: GPUDevice, variant: GemmVariant, probe: Probe): Promise<number> {
-  const pipeline = await pipelineFor(device, variant);
+async function measureTime(
+  device: GPUDevice, variant: GemmVariant, probe: Probe, pipeline: GPUComputePipeline,
+): Promise<number> {
   const group = bindProbe(device, pipeline, probe);
   const [x, y] = gemmGrid(probe.rows, probe.columns);
   // A submission costs a millisecond or two to come back and the clock is
@@ -379,9 +381,12 @@ export async function measureGemmVariants(
     const measurements: GemmVariantMeasurement[] = [];
     for (const variant of gemmVariantCandidates(device)) {
       try {
-        const relativeError = await measureError(device, variant);
+        // One pipeline per candidate, not one per measurement: compiling each
+        // shader twice was most of what this probe cost at device creation.
+        const pipeline = await pipelineFor(device, variant);
+        const relativeError = await measureError(device, variant, pipeline);
         const perShape: number[] = [];
-        for (const probe of probes) perShape.push(await measureTime(device, variant, probe));
+        for (const probe of probes) perShape.push(await measureTime(device, variant, probe, pipeline));
         measurements.push({
           variant, relativeError, perShape,
           milliseconds: perShape.reduce((total, value) => total + value, 0),
