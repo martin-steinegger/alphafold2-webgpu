@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  AFWEBGPU_REQUIRED_LIMITS, identifyBrowser, preflightErrorMessage, runWebGpuPreflight,
+  AFWEBGPU_REQUIRED_LIMITS, adapterDisplayName, angleRendererName, identifyBrowser, preflightErrorMessage, runWebGpuPreflight,
   type PreflightAdapterLike, type PreflightEnvironment, type PreflightLimits,
 } from "../web/webgpu-preflight.js";
 
@@ -179,5 +179,31 @@ describe("runWebGpuPreflight", () => {
     expect(message.startsWith(preflight.headline)).toBe(true);
     expect(message).toContain(preflight.remedies[0]!);
     expect(message).not.toContain("\n");
+  });
+
+  it("names the adapter from whatever the browser is willing to report", () => {
+    const none = () => "";
+    expect(adapterDisplayName({ description: "Apple M3 Pro", vendor: "apple" }, none)).toBe("Apple M3 Pro");
+    expect(adapterDisplayName({ device: "NVIDIA GB10", vendor: "nvidia" }, none)).toBe("NVIDIA GB10");
+    expect(adapterDisplayName({ vendor: "apple", architecture: "metal-3" }, none)).toBe("apple metal-3");
+    // A bare vendor names a company and an empty info names nothing, so both
+    // ask WebGL, which usually still knows the GPU by name.
+    expect(adapterDisplayName({ vendor: "apple" }, () => "Apple M3 Pro")).toBe("Apple M3 Pro");
+    expect(adapterDisplayName(undefined, () => "Apple M3 Pro")).toBe("Apple M3 Pro");
+    expect(adapterDisplayName({ vendor: "apple" }, none)).toBe("apple GPU");
+    expect(adapterDisplayName(undefined, none)).toBe("unnamed WebGPU adapter");
+  });
+
+  it("pulls the GPU out of an ANGLE renderer string", () => {
+    expect(angleRendererName("ANGLE (Apple, ANGLE Metal Renderer: Apple M3 Pro, Unspecified Version)"))
+      .toBe("Apple M3 Pro");
+    expect(angleRendererName("ANGLE (NVIDIA, NVIDIA GB10 (0x00002941) Direct3D11 vs_5_0 ps_5_0, D3D11)"))
+      .toBe("NVIDIA GB10 (0x00002941) Direct3D11 vs_5_0 ps_5_0");
+    // The renderer field carries commas and brackets of its own.
+    expect(angleRendererName("ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (LLVM 10.0.0) (0x0000C0DE)), SwiftShader driver)"))
+      .toBe("Vulkan 1.3.0 (SwiftShader Device (LLVM 10.0.0) (0x0000C0DE))");
+    // Safari and Firefox answer plainly.
+    expect(angleRendererName("Apple GPU")).toBe("Apple GPU");
+    expect(angleRendererName("")).toBe("");
   });
 });

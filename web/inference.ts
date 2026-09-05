@@ -22,6 +22,7 @@ import {
 } from "../src/runtime/device.js";
 import { setGpuMemoryBudget } from "../src/runtime/allocator.js";
 import { remainingPhrase, remainingTrunkSeconds } from "./progress.js";
+import { adapterDisplayName } from "./webgpu-preflight.js";
 
 export const inferenceStages = ["device", "msa", "model", "features", "inference", "results"] as const;
 export type InferenceStage = typeof inferenceStages[number];
@@ -189,7 +190,7 @@ export async function runInference(job: InferenceJob, reporter: InferenceReporte
   if (typeof navigator.gpu === "undefined") throw new Error("WebGPU is not available in this context");
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
   if (adapter === null) throw new Error("No WebGPU adapter is available");
-  const adapterName = adapter.info.description || adapter.info.device || adapter.info.vendor || "WebGPU adapter";
+  const adapterName = adapterDisplayName(adapter.info);
   const appleUnifiedMemory = isAppleUnifiedMemory(adapter);
   const compactMemoryPolicy = appleUnifiedMemory || job.compactPolicy;
   reporter.stage("device", "active", `${adapterName} · sizing buffers`);

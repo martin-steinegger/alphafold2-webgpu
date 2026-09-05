@@ -244,13 +244,64 @@ export function formatLimit(name: RequiredLimitName, value: number | undefined):
   return name.endsWith("Size") && value >= MIB ? `${(value / MIB).toFixed(0)} MiB` : value.toLocaleString();
 }
 
+/**
+ * What the browser will admit the GPU is.
+ *
+ * WebGPU's adapter info is deliberately thin. Chromium fills in a vendor and an
+ * architecture family and leaves the device and description empty; other
+ * browsers report empty strings for all four, which is a privacy decision
+ * rather than a fault. WebGL's unmasked renderer string is the one place the
+ * same GPU is usually named outright, so it stands in when WebGPU says nothing
+ * useful: an Apple laptop that reports no adapter info at all still answers
+ * "Apple M3 Pro" here.
+ */
+export function angleRendererName(raw: string): string {
+  // Chromium answers through ANGLE, as "ANGLE (vendor, renderer, version)". The
+  // renderer in the middle is the only interesting field and it can hold commas
+  // and brackets of its own, so it is what lies between the first separator and
+  // the last rather than the second of three splits.
+  const angle = /^ANGLE \((.*)\)$/s.exec(raw.trim());
+  const inner = angle?.[1];
+  const first = inner === undefined ? -1 : inner.indexOf(", ");
+  const last = inner === undefined ? -1 : inner.lastIndexOf(", ");
+  const renderer = inner === undefined || first === -1 || last <= first
+    ? (inner ?? raw) : inner.slice(first + 2, last);
+  // "ANGLE Metal Renderer: Apple M3 Pro" is a backend talking about itself.
+  return renderer.replace(/^ANGLE\b.*?Renderer:\s*/, "").trim();
+}
+
+export function webglRendererName(): string {
+  if (typeof document === "undefined") return "";
+  try {
+    const context = document.createElement("canvas").getContext("webgl2")
+      ?? document.createElement("canvas").getContext("webgl");
+    if (context === null) return "";
+    const debug = context.getExtension("WEBGL_debug_renderer_info");
+    const reported = debug === null ? undefined : context.getParameter(debug.UNMASKED_RENDERER_WEBGL) as unknown;
+    const raw = String(reported ?? context.getParameter(context.RENDERER) ?? "");
+    return angleRendererName(raw);
+  } catch { return ""; }
+}
+
+export function adapterDisplayName(
+  info: PreflightAdapterLike["info"], rendererHint: () => string = webglRendererName,
+): string {
+  const vendor = info?.vendor ?? "";
+  const architecture = info?.architecture ?? "";
+  const reported = info?.description || info?.device
+    || [vendor, architecture].filter((part) => part !== "").join(" ");
+  // A bare vendor names a company, not a GPU, so it is worth asking WebGL too.
+  const hinted = reported === "" || reported === vendor ? rendererHint() : "";
+  if (hinted !== "") return hinted;
+  if (reported === "") return "unnamed WebGPU adapter";
+  return reported === vendor ? `${vendor} GPU` : reported;
+}
+
 function summarizeAdapter(adapter: PreflightAdapterLike): PreflightAdapterSummary {
   const info = adapter.info;
   const vendor = info?.vendor ?? "";
   const architecture = info?.architecture ?? "";
-  // Chromium reports only the vendor unless the page is cross-origin isolated.
-  const named = info?.description || info?.device || [vendor, architecture].filter((part) => part !== "").join(" ");
-  const name = named === "" ? "unnamed WebGPU adapter" : named === vendor ? `${vendor} GPU` : named;
+  const name = adapterDisplayName(info);
   const fallback = adapter.isFallbackAdapter === true || info?.isFallbackAdapter === true;
   const identity = `${vendor} ${architecture} ${info?.device ?? ""} ${info?.description ?? ""}`;
   return { name, vendor, architecture, fallback, software: fallback || SOFTWARE_RENDERER.test(identity) };
