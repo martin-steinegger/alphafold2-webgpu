@@ -1,5 +1,5 @@
 import { parseA3m } from "../src/input/a3m.js";
-import { chainBoundaries, chainSpans } from "./chains.js";
+import { chainBoundaries, chainSpans, type ChainSpan } from "./chains.js";
 
 export interface MsaCoverageData {
   readonly sequences: readonly string[];
@@ -19,51 +19,72 @@ export interface MsaCoverageData {
   readonly length: number;
 }
 
-/** Which chains a row has any residue in, as a bit set, and how many that is. */
-function chainCoverageKey(sequence: string, chainLengths: readonly number[]): { key: number; chains: number } {
-  let key = 0; let chains = 0;
-  chainSpans(chainLengths).forEach((span) => {
+/**
+ * Row scores and grouping, following ColabFold's `plot_msa_v2`.
+ *
+ * A row is scored against the chains it actually covers: the mean identity to
+ * the query over each covered chain's own columns, averaged over those chains.
+ * A hit that matches one chain of a complex closely is therefore drawn as a
+ * close hit, not as a distant one diluted by the chains it is gapped in, and a
+ * monomer reduces to plain identity over the whole query.
+ */
+interface RowScore {
+  readonly identity: number;
+  /** Which chains the row covers, chain A in the highest bit. */
+  readonly key: number;
+}
+
+function scoreRow(sequence: string, query: string, spans: readonly ChainSpan[]): RowScore {
+  let covered = 0; let total = 0; let key = 0;
+  for (const span of spans) {
+    let matches = 0; let residues = 0;
     for (let position = span.start; position < span.end; position += 1) {
-      if (sequence[position] !== "-") { key |= 1 << span.index; chains += 1; return; }
+      if (sequence[position] === query[position]) matches += 1;
+      if (sequence[position] !== "-") residues += 1;
     }
-  });
-  return { key, chains };
+    total += matches / span.length;
+    if (residues > 0) { covered += 1; key |= 1 << (spans.length - 1 - span.index); }
+  }
+  return { identity: covered === 0 ? 0 : total / covered, key };
 }
 
 export function analyzeMsa(a3m: string, chainLengths?: readonly number[]): MsaCoverageData {
   const alignment = parseA3m(a3m); const { sequences, depth, length } = alignment;
+  const chains = chainLengths !== undefined && chainLengths.length > 1 ? chainLengths : undefined;
+  const spans = chainSpans(chains ?? [length]);
   const identities = new Float32Array(depth); const coverage = new Uint32Array(length);
+  const keys = new Uint32Array(depth);
   for (let row = 0; row < depth; row += 1) {
-    let matches = 0; const sequence = sequences[row]!;
+    const sequence = sequences[row]!;
     for (let position = 0; position < length; position += 1) {
       if (sequence[position] !== "-") coverage[position] = coverage[position]! + 1;
-      if (sequence[position] === sequences[0]![position]) matches += 1;
     }
-    identities[row] = matches / length;
+    const score = scoreRow(sequence, sequences[0]!, spans);
+    identities[row] = score.identity; keys[row] = score.key;
   }
   const sorted = Array.from({ length: depth }, (_, index) => index)
     .sort((left, right) => identities[left]! - identities[right]! || left - right);
 
-  // A complex draws its rows in blocks: first the rows that align to every
-  // chain, then the rows each chain matched on its own, each block sorted by
-  // identity. A monomer has one block, so this is just the sorted rows.
-  const chains = chainLengths !== undefined && chainLengths.length > 1 ? chainLengths : undefined;
-  const blocks = new Map<number, { readonly chains: number; readonly rows: number[] }>();
+  // A complex draws its rows in blocks, one per set of covered chains, each
+  // block sorted by identity. ColabFold orders the blocks by that set read as a
+  // binary number, largest first, which puts the rows covering every chain at
+  // the top and then each chain's own hits in chain order. A monomer has one
+  // block, so this is just the sorted rows.
+  const blocks = new Map<number, number[]>();
   // Most similar first, and the query ahead of anything that ties with it.
   const byIdentity = Array.from({ length: depth }, (_, index) => index)
     .sort((left, right) => identities[right]! - identities[left]! || left - right);
   for (const row of byIdentity) {
-    const { key, chains: covered } = chains === undefined ? { key: 0, chains: 1 } : chainCoverageKey(sequences[row]!, chains);
-    const block = blocks.get(key) ?? { chains: covered, rows: [] };
-    block.rows.push(row);
+    const key = chains === undefined ? 0 : keys[row]!;
+    const block = blocks.get(key) ?? [];
+    block.push(row);
     blocks.set(key, block);
   }
-  const ordered = [...blocks.entries()].sort(([leftKey, left], [rightKey, right]) =>
-    right.chains - left.chains || leftKey - rightKey);
+  const ordered = [...blocks.entries()].sort(([left], [right]) => right - left);
   const rows: number[] = []; const blockStarts: number[] = [];
   for (const [, block] of ordered) {
     if (rows.length > 0) blockStarts.push(rows.length);
-    rows.push(...block.rows);
+    rows.push(...block);
   }
   return {
     sequences, identities, order: Uint32Array.from(sorted), rows: Uint32Array.from(rows), blockStarts,
@@ -71,16 +92,18 @@ export function analyzeMsa(a3m: string, chainLengths?: readonly number[]): MsaCo
   };
 }
 
-function identityColor(value: number): readonly [number, number, number] {
-  const anchors = [
-    [222, 67, 63], [244, 153, 54], [237, 214, 72], [55, 183, 180], [45, 81, 190],
-  ] as const;
-  const scaled = Math.max(0, Math.min(1, value)) * (anchors.length - 1);
-  const left = Math.min(anchors.length - 2, Math.floor(scaled)); const fraction = scaled - left;
-  const interpolate = (channel: 0 | 1 | 2): number => Math.round(
-    anchors[left]![channel] + (anchors[left + 1]![channel] - anchors[left]![channel]) * fraction,
-  );
-  return [interpolate(0), interpolate(1), interpolate(2)];
+/**
+ * Matplotlib's `rainbow_r`, which is the colormap ColabFold's coverage plot
+ * uses: red at no identity, through green and blue, to violet at the query
+ * itself. Matplotlib defines `rainbow` by these three functions and samples
+ * them into a 256-entry table, so the quantization is reproduced too and the
+ * colours match to a level.
+ */
+export function identityColor(value: number): readonly [number, number, number] {
+  const entry = Math.min(255, Math.floor(Math.max(0, Math.min(1, value)) * 256));
+  const x = 1 - entry / 255;
+  const byte = (channel: number): number => Math.round(Math.max(0, Math.min(1, channel)) * 255);
+  return [byte(Math.abs(2 * x - .5)), byte(Math.sin(x * Math.PI)), byte(Math.cos(x * Math.PI / 2))];
 }
 
 export function drawMsaCoverage(

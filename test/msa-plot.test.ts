@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { analyzeMsa } from "../web/msa-plot.js";
+import { analyzeMsa, identityColor } from "../web/msa-plot.js";
 
 describe("MSA coverage plot", () => {
   it("computes query identity, per-position coverage, and sorted row order", () => {
@@ -30,5 +30,25 @@ describe("MSA coverage plot", () => {
     // closer row is drawn first.
     expect(Array.from(data.rows)).toEqual([0, 3, 2, 1]);
     expect(data.blockStarts).toEqual([1, 2]);
+  });
+
+  it("scores a complex row against the chains it covers, as ColabFold does", () => {
+    const data = analyzeMsa(
+      ">query\nACDE\n>paired\nACDE\n>chainA\nAC--\n>halfB\n--D-\n", [2, 2],
+    );
+    // A row matching one chain of a complex exactly is a full-identity hit, not
+    // a half-identity one diluted by the chain it is gapped in.
+    expect(Array.from(data.identities)).toEqual([1, 1, 1, .5]);
+    // Without chains the same rows are scored over the whole query instead.
+    expect(Array.from(analyzeMsa(">query\nACDE\n>chainA\nAC--\n").identities)).toEqual([1, .5]);
+  });
+
+  it("colours identity with matplotlib's rainbow_r, the colormap ColabFold uses", () => {
+    // matplotlib.colormaps["rainbow_r"] at these values, to a level.
+    expect(Array.from(identityColor(0))).toEqual([255, 0, 0]);
+    expect(Array.from(identityColor(.25))).toEqual([255, 181, 98]);
+    expect(Array.from(identityColor(.5))).toEqual([127, 255, 181]);
+    expect(Array.from(identityColor(.75))).toEqual([1, 179, 236]);
+    expect(Array.from(identityColor(1))).toEqual([128, 0, 255]);
   });
 });
