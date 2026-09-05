@@ -105,7 +105,11 @@
             <li data-stage="results"><span>6</span><div><strong>Results</strong><small>Waiting</small></div></li>
           </ol>
           <div id="prediction-status" class="run-status" data-state="idle">Ready to predict</div>
-          <pre id="run-log" class="run-log">The first run downloads and parses the model weights.</pre>
+          <p id="run-summary" class="run-summary">The first run downloads and parses the model weights.</p>
+          <details id="run-log-details" class="run-log-details">
+            <summary>Run log</summary>
+            <pre id="run-log" class="run-log"></pre>
+          </details>
           <button id="download-msa" class="secondary" type="button" hidden>Download generated A3M</button>
         </aside>
       </section>

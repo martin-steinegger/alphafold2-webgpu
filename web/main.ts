@@ -138,6 +138,25 @@ function setPredictionStatus(text: string, state = "running"): void {
   status.textContent = text;
 }
 
+/**
+ * The one sentence a finished run is worth, in type meant to be read.
+ *
+ * The log carries everything the run produced, which is the right thing to
+ * keep and the wrong thing to put in front of someone who wants to know
+ * whether it worked.
+ */
+function setRunSummary(...parts: readonly (string | { readonly value: string })[]): void {
+  const target = element<HTMLParagraphElement>("run-summary");
+  target.replaceChildren();
+  parts.forEach((part, index) => {
+    if (index > 0) target.append(" · ");
+    if (typeof part === "string") { target.append(part); return; }
+    const strong = document.createElement("strong");
+    strong.textContent = part.value;
+    target.append(strong);
+  });
+}
+
 function log(text: string, append = true): void {
   const target = element<HTMLPreElement>("run-log");
   target.textContent = append ? `${target.textContent ?? ""}${target.textContent ? "\n" : ""}${text}` : text;
@@ -866,7 +885,9 @@ async function runPrediction(): Promise<void> {
   const stopButton = element<HTMLButtonElement>("stop");
   const clearCacheButton = element<HTMLButtonElement>("clear-model-cache"); clearCacheButton.disabled = true;
   element<HTMLElement>("results-section").hidden = true;
-  element<HTMLButtonElement>("download-results").hidden = true; resetStages(); log("Starting prediction…", false); lastMsaStatus = "";
+  element<HTMLButtonElement>("download-results").hidden = true; resetStages();
+  log("Starting prediction…", false); lastMsaStatus = "";
+  setRunSummary("Running…"); element<HTMLDetailsElement>("run-log-details").open = false;
   try {
     stage("device", "active", "Checking WebGPU support"); setPredictionStatus("Preparing WebGPU");
     const preflight = await webGpuPreflight();
@@ -919,6 +940,16 @@ async function runPrediction(): Promise<void> {
     });
     stage("results", "done", "Ready"); setPredictionStatus("Prediction complete", "passed");
     log(`Finished in ${formatSeconds(prediction.elapsedMilliseconds)}.`);
+    const confidence = prediction.final.confidence as { meanPlddt: number; ptm: number; iptm?: number };
+    // The job name, the length and the scores are all on the cards below, and
+    // the panel is a narrow column: repeating them here only makes a line that
+    // wraps mid-number. What is not below is how long it took.
+    setRunSummary(
+      { value: `pLDDT ${confidence.meanPlddt.toFixed(1)}` },
+      confidence.iptm === undefined
+        ? `pTM ${confidence.ptm.toFixed(3)}` : `ipTM ${confidence.iptm.toFixed(3)}`,
+      formatSeconds(prediction.elapsedMilliseconds),
+    );
     element<HTMLElement>("results-section").scrollIntoView({ behavior: "smooth", block: "start" });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -929,6 +960,9 @@ async function runPrediction(): Promise<void> {
       log("The WebGPU device could not retain this allocation set. Reduce clustered/extra MSA rows or sequence length, then retry.");
     }
     setPredictionStatus(message === "Prediction stopped" ? "Prediction stopped" : "Prediction failed", "failed");
+    setRunSummary(message);
+    // A failure is the one case where the detail is the point.
+    element<HTMLDetailsElement>("run-log-details").open = true;
     log(error instanceof Error ? error.stack ?? message : message);
   } finally { button.disabled = false; clearCacheButton.disabled = false; stopButton.hidden = true; }
 }

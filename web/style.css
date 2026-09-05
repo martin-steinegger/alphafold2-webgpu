@@ -64,22 +64,35 @@ input:disabled, select:disabled { color: #888; background: #eee; }
 .model-progress progress { width: 100%; height: 5px; border: 0; overflow: hidden; background: #ddd; }
 .model-progress progress::-webkit-progress-bar { background: #ddd; } .model-progress progress::-webkit-progress-value { background: var(--primary); transition: width .18s ease; } .model-progress progress::-moz-progress-bar { background: var(--primary); }
 .model-progress small { min-width: 36px; margin: 0; color: #777; text-align: right; font-size: .56rem; }
-.run-status, .run-log, .run-panel > .secondary { margin-inline: 20px; width: calc(100% - 40px); }
+.run-status, .run-summary, .run-log-details, .run-panel > .secondary {
+  margin-inline: 20px; width: calc(100% - 40px); }
+.run-panel > .secondary { margin-bottom: 18px; }
 .run-status { padding-top: 14px; border-top: 1px solid #ddd; color: var(--primary); font-size: .8rem; font-weight: 500; }
 .run-status[data-state="failed"] { color: var(--danger); }
-.run-log { max-height: 190px; margin-top: .7rem; margin-bottom: 18px; padding: 0; white-space: pre-wrap; overflow: auto; background: transparent; color: #777; font: .64rem/1.6 "Roboto Mono", monospace; }
+/* What a finished run is: one sentence in text meant to be read. The log is
+   every line the run produced, which is a different thing with a different
+   audience, so it waits behind a disclosure and is only opened by default when
+   a run fails and its detail is the point. */
+.run-summary { margin: .7rem 0 0; color: #444; font-size: .8rem; line-height: 1.6; }
+.run-summary strong { color: #111; font-weight: 500; }
+.run-log-details { margin-top: .9rem; margin-bottom: 18px; }
+.run-log-details > summary { color: var(--primary); font: .72rem "Roboto Mono", monospace; cursor: pointer; }
+.run-log { max-height: 190px; margin: .6rem 0 0; padding: 0; white-space: pre-wrap; overflow: auto; background: transparent; color: #666; font: .68rem/1.65 "Roboto Mono", monospace; }
 
 .results { padding-top: 8px; }
 .score-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1px; padding: 1px; background: #d5d5d5; box-shadow: 0 2px 3px #0002; }
 .score-grid article { display: grid; gap: .3rem; padding: 1.2rem; background: #fff; }
 .score-grid span, .score-grid small { color: #777; font-size: .7rem; } .score-grid strong { font: 500 1.65rem "Roboto Mono", monospace; }
-.result-grid { display: grid; grid-template-columns: 1fr 1fr; grid-template-areas: "structure structure" "plddt pae" "msa recycle"; gap: 8px; margin-top: 8px; }
+.result-grid { display: grid; grid-template-columns: 1fr 1fr; grid-template-areas: "structure structure" "plddt pae" "msa recycle" "chains chains"; gap: 8px; margin-top: 8px; }
 .result-card { padding: 1.2rem; }
 .structure-card { grid-area: structure; }
 .plddt-card { grid-area: plddt; }
 .msa-card { grid-area: msa; }
 .pae-card { grid-area: pae; }
 .recycle-card { grid-area: recycle; }
+/* Full width: it only appears for a complex, and half a row left it with
+   nothing beside it. */
+.chain-card { grid-area: chains; }
 .card-title { display: flex; justify-content: space-between; align-items: center; gap: 1rem; padding-bottom: .8rem; border-bottom: 1px solid #ddd; }
 #structure-viewer { position: relative; width: 100%; height: 520px; display: grid; place-items: center; overflow: hidden; margin-top: 1rem; background: radial-gradient(circle, #fff, #eef1f3 72%); color: #777; }
 .quiet { width: auto; margin-left: .4rem; border: 1px solid #999; border-radius: 2px; padding: .45rem .7rem; color: #444; background: #fff; text-transform: uppercase; font-size: .68rem; cursor: pointer; }
@@ -103,7 +116,7 @@ input:disabled, select:disabled { color: #888; background: #eee; }
 th, td { padding: .65rem; border-bottom: 1px solid #ddd; text-align: right; } th:first-child, td:first-child { text-align: left; } th { color: #777; font-weight: 400; }
 /* The archive is what a finished prediction is for, so it closes the results
    rather than hiding in their heading. */
-.download-bar { padding: 4px 16px 22px; }
+.download-bar { padding-top: 8px; }
 .download-all { display: grid; gap: .3rem; width: 100%; padding: 1.15rem 1.25rem; border: 0; border-radius: 2px;
   color: #fff; background: var(--primary); text-align: left; cursor: pointer; box-shadow: 0 2px 3px #0003; }
 .download-all span { font-size: 1.05rem; font-weight: 500; letter-spacing: .06em; text-transform: uppercase; }
@@ -113,12 +126,16 @@ th, td { padding: .65rem; border-bottom: 1px solid #ddd; text-align: right; } th
 .download-all:disabled small { color: #888; }
 .reference { margin-top: 8px; padding: 1.15rem 1rem; }
 .reference h2 { margin-bottom: .55rem; font-size: 1.45rem; } .reference p { margin: .35rem 0; color: #444; font-size: .8rem; line-height: 1.5; }
-.capability { display: flex; align-items: start; gap: .6rem; line-height: 1.5; color: #777; font: .76rem "Roboto Mono", monospace; }
-.capability-dot { flex: 0 0 auto; margin-top: .35rem; width: 8px; height: 8px; border-radius: 50%; background: #d49a20; box-shadow: 0 0 0 4px #d49a201d; }
+/* The same two columns the stages below it use, a marker and its text, so the
+   run panel reads down one edge instead of three. */
+.capability { display: grid; grid-template-columns: 30px 1fr; gap: .7rem; align-items: start;
+  line-height: 1.5; color: #777; font: .76rem "Roboto Mono", monospace; }
+.capability-dot { justify-self: center; margin-top: .35rem; width: 8px; height: 8px; border-radius: 50%; background: #d49a20; box-shadow: 0 0 0 4px #d49a201d; }
+.capability-details { margin-left: calc(30px + .7rem); }
 .capability[data-state="ready"] { color: var(--success); } .capability[data-state="ready"] .capability-dot { background: var(--success); box-shadow: 0 0 0 4px #26834a1d; }
 .capability[data-state="failed"] { color: var(--danger); } .capability[data-state="failed"] .capability-dot { background: var(--danger); }
 .capability[data-state="warning"] { color: var(--warning); } .capability[data-state="warning"] .capability-dot { background: var(--warning); box-shadow: 0 0 0 4px #b26a001d; }
-.capability-block { display: grid; gap: .55rem; max-width: 46rem; padding: 0 16px 14px; }
+.capability-block { display: grid; gap: .55rem; max-width: 46rem; padding: 14px 20px 0; }
 .capability-details { color: #666; font-size: .78rem; line-height: 1.6; }
 .capability-details summary { color: var(--primary); font: .74rem "Roboto Mono", monospace; cursor: pointer; }
 .capability-details p { margin: .55rem 0 0; color: #555; font-size: .78rem; }
@@ -126,7 +143,7 @@ th, td { padding: .65rem; border-bottom: 1px solid #ddd; text-align: right; } th
 .capability-details li { color: #555; font-size: .78rem; }
 footer { display: flex; justify-content: space-between; padding: 1.5rem 1rem 2.5rem; color: #888; font-size: .7rem; }
 
-@media (max-width: 900px) { .workspace { grid-template-columns: 1fr; } .result-grid { grid-template-columns: 1fr; grid-template-areas: "structure" "plddt" "msa" "pae" "recycle"; } }
+@media (max-width: 900px) { .workspace { grid-template-columns: 1fr; } .result-grid { grid-template-columns: 1fr; grid-template-areas: "structure" "plddt" "msa" "pae" "chains" "recycle"; } }
 @media (max-width: 680px) { body { padding-left: 0; } .side-rail { display: none; } .site-header { padding-inline: 12px; } .header-links a:not(:first-child) { display: none; } .header-links { gap: .8rem; } main, footer { width: calc(100% - 12px); } .two-columns, .advanced-grid { grid-template-columns: 1fr; } .advanced-grid .wide { grid-column: auto; } .score-grid { grid-template-columns: 1fr 1fr; } .primary { width: 100%; } textarea { min-height: 76px; } }
 @media (max-width: 430px) { .brand { font-size: 1rem; } .score-grid { grid-template-columns: 1fr; } footer { display: grid; gap: .5rem; } #structure-viewer { height: 390px; } }
 
