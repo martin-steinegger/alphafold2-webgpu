@@ -107,6 +107,22 @@ should help you too, but it does raise peak memory — check
 allows, especially at lengths past 1,416 where a block is 44 MiB and grows
 linearly.
 
+## Then merge it
+
+If the fixture suite is green and no gate fails, merge to `main`. As of this
+writing `main` has not moved since the branch was cut, so it is a
+fast-forward.
+
+Merging is the point of the exercise rather than an afterthought, and the
+order matters. The branch changes 232 lines of `attention.ts` and `block.ts`,
+which is exactly where the binding-layout refactor — the hand-computed shader
+binding indices and the duplicated slot guards — is going to land. Whichever of
+the two goes second pays for the rebase, and this one is written and verified
+while that one is not.
+
+You have the authority not to merge. The fixture suite is the gate that was
+never run, and a failure there outranks every number in these documents.
+
 ## If something regresses
 
 Every choice is measured and cached per device, and each has an override used
