@@ -3,6 +3,20 @@
 Measured on an M4 Pro MacBook, Chromium, Apple Metal 3, on branch
 `f16-projection`. Harness revision `f16-projection`, 19 commits from `main`.
 
+## Read this first
+
+The projections are not where a long prediction spends its time, and this
+document optimises them anyway because that is what it was scoped to. A profile
+of one Evoformer block puts the dense projections at 54% of it at 236 residues
+but 27% at 708 and falling, while triangle attention alone goes from 36% to
+57% and rising. At 1,416 residues the main Evoformer stack is 92% of the whole
+run.
+
+So everything below is worth 1.12x on a long complex, and two changes in the
+attention path were worth another 1.64x on top of it —
+`docs/ATTENTION_APPLE_METAL_3.md`. If you are here to make the model faster,
+start there.
+
 ## Conclusion
 
 **Ship `f16-chunked`, with the k depth measured per device.** But read the
