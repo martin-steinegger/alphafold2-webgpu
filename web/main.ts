@@ -1065,13 +1065,6 @@ function updateInputMode(): void {
   element<HTMLElement>("sequence-length").textContent = custom ? "A3M input"
     : multimer ? `${raw.replaceAll(":", "").length} residues · ${chainCount} chains`
       : `${normalizedSequence().length} residues`;
-  element<HTMLElement>("sequence-hint").textContent = multimer
-    ? remote
-      ? `Detected ${chainCount} chains. ColabFold searches paired and unpaired MSAs before local Multimer-v3 inference.`
-      : `Detected ${chainCount} chains. Runs local query-only Multimer-v3.`
-    : remote
-      ? "Detected one chain. MMseqs2 sends it to the public ColabFold MSA server before local inference."
-      : "Detected one chain. Single-sequence inference stays on this device.";
   element<HTMLElement>("predict-label").textContent = multimer && remote ? "Generate complex MSA & predict"
     : multimer ? "Run Multimer-v3"
     : remote ? "Generate MSA & predict" : "Run prediction";
