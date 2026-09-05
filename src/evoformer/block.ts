@@ -21,6 +21,7 @@ import {
   type AttentionWeights,
 } from "./attention.js";
 import { attentionFlashKernelForShape } from "./attention-calibration.js";
+import { calibrateAttentionQueriesPerThread } from "../runtime/attention-queries.js";
 import { createTiledGemmShader, gemmGrid } from "../runtime/gemm.js";
 import { releaseScratch } from "./execution-scratch.js";
 import {
@@ -645,8 +646,16 @@ async function encodeAttention(
   // built for.
   const packKeyValue = flashKernel.variant.startsWith("register");
   const keyValueStorage = attentionKeyValueStorage(packKeyValue ? "f16" : "f32");
-  const slots = attentionQueriesPerThread(
-    flashKernel.variant.startsWith("register") ? flashKernel.queryTile / 64 : 1);
+  // What the shape rule wants, and what this device says when asked. The rule
+  // takes two queries per invocation above 128 from a threshold its own
+  // comment records as measured on an NVIDIA GB10; on Apple that is 2.2x the
+  // wrong way and costs a 1,416-residue complex 40% of its runtime. A measured
+  // zero means the probe could not run, and the rule stands.
+  const byShape = flashKernel.variant.startsWith("register") ? flashKernel.queryTile / 64 : 1;
+  const measured = flashKernel.variant.startsWith("register")
+    ? await calibrateAttentionQueriesPerThread(execution.device, options.channels / options.heads)
+    : 0;
+  const slots = attentionQueriesPerThread(measured === 0 ? byShape : measured);
   const flashShader = flashKernel.variant.startsWith("register")
     ? createAttentionRegisterFlashShader(
       options.channels / options.heads, slots, keyValueStorage)
