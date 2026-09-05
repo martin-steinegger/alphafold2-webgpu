@@ -453,6 +453,26 @@ export function attentionKeyValueStorage(
   return pinnedKeyValueStorage ?? preferred;
 }
 
+/**
+ * How many queries one invocation carries, when something wants to override it.
+ *
+ * `attentionFlashKernelForShape` picks two above 128 queries, from a threshold
+ * measured on an NVIDIA GB10. On this Apple device two is 2.2x *slower* than
+ * one and four is 10.9x slower, so the constant is a property of a driver that
+ * was written down rather than measured. This exists to compare them where it
+ * matters, on a whole prediction, before anything is concluded from a
+ * microbenchmark.
+ */
+let pinnedQueriesPerThread: number | undefined;
+
+export function forceAttentionQueriesPerThread(queries: number | undefined): void {
+  pinnedQueriesPerThread = queries;
+}
+
+export function attentionQueriesPerThread(preferred: number): number {
+  return pinnedQueriesPerThread ?? preferred;
+}
+
 export function attentionProjectShader(
   keyValueStorage: AttentionKeyValueStorage = "f32",
 ): string {

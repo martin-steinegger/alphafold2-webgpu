@@ -9,6 +9,7 @@ import {
   ATTENTION_OUTPUT_RESIDUAL_SHADER,
   ATTENTION_PAIR_BIAS_SHADER,
   attentionKeyValueStorage,
+  attentionQueriesPerThread,
   attentionProjectShader,
   createAttentionRegisterFlashShader,
   ATTENTION_WINDOW_TARGET_BYTES,
@@ -637,15 +638,21 @@ async function encodeAttention(
   // variant keeps the single-precision pair it was written against, so a
   // device that selects one of those is untouched. `pack2x16float` is core
   // WGSL, so this needs no device feature and costs no portability.
-  const packKeyValue = flashKernel.variant === "register";
+  // Every register kernel reads packed keys and values, not only the
+  // one-query one: above 128 queries the shape picks the two-query variant,
+  // and long chains are entirely above 128 queries, so gating on the exact
+  // name left the packing switched off for precisely the predictions it was
+  // built for.
+  const packKeyValue = flashKernel.variant.startsWith("register");
   const keyValueStorage = attentionKeyValueStorage(packKeyValue ? "f16" : "f32");
-  const flashShader = keyValueStorage === "f16"
+  const slots = attentionQueriesPerThread(
+    flashKernel.variant.startsWith("register") ? flashKernel.queryTile / 64 : 1);
+  const flashShader = flashKernel.variant.startsWith("register")
     ? createAttentionRegisterFlashShader(
-      options.channels / options.heads, flashKernel.queryTile / 64, "f16")
-    : flashKernel.variant === "register"
-      ? createAttentionRegisterFlashShader(
-        options.channels / options.heads, flashKernel.queryTile / 64, "f32")
-      : flashKernel.shader;
+      options.channels / options.heads, slots, keyValueStorage)
+    : flashKernel.shader;
+  const flashQueryTile = flashKernel.variant.startsWith("register")
+    ? 64 * slots : flashKernel.queryTile;
   // The source and the residual target are the same tensor, and at long chain
   // lengths it outgrows one binding, so both are bound as windows of it.
   const sourceShards = planShards(options.batch * options.queries * options.channels, options.channels,
@@ -666,7 +673,8 @@ async function encodeAttention(
     execution.pipelines.get(`block:attention:project:${keyValueStorage}`,
       attentionProjectShader(keyValueStorage)),
     execution.pipelines.get("block:attention:pair-bias", ATTENTION_PAIR_BIAS_SHADER),
-    execution.pipelines.get(`block:${flashKernel.cacheKey}:kv-${keyValueStorage}`, flashShader),
+    execution.pipelines.get(
+      `block:${flashKernel.cacheKey}:kv-${keyValueStorage}:q${slots}`, flashShader),
     execution.pipelines.get(
       `block:attention:output${options.residualTarget === undefined ? "" : "-residual"}:${shardKey}`,
       createAttentionOutputShader(options.residualTarget !== undefined, storage, sourceShards),
@@ -796,7 +804,7 @@ async function encodeAttention(
     execution.dispatch(encoder, project, [windowNormalized, weights, params, query, key, value, gate],
       projectGrid[0], projectGrid[1], 1, `${options.label}.project-${offset}`);
     execution.dispatch(encoder, flash, [query, key, value, gate, options.mask, pairBias, params, weighted],
-      Math.ceil(options.queries / flashKernel.queryTile), count, options.heads,
+      Math.ceil(options.queries / flashQueryTile), count, options.heads,
       `${options.label}.flash-${offset}`);
     const outputGrid = gemmGrid(rows, options.channels);
     execution.dispatch(encoder, outputProject, [weighted, weights, params, ...outputViews],

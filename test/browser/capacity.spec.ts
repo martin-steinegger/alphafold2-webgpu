@@ -19,6 +19,10 @@ const copies = Number(process.env.AFWEBGPU_COMPLEX_CHAINS ?? "24");
 // it costs memory as well as time; at this length that is the difference
 // between a prediction and a dead renderer, and it is worth measuring apart.
 const recycles = Number(process.env.AFWEBGPU_COMPLEX_RECYCLES ?? "0");
+// How many queries one attention invocation carries. Unset leaves the shape
+// rule alone, which picks two above 128 queries from a threshold measured on
+// another vendor's hardware.
+const queriesPerThread = process.env.AFWEBGPU_ATTENTION_QUERIES;
 
 test.skip(!enabled, "set AFWEBGPU_CAPACITY=1 and point AFWEBGPU_QUALIFICATION_ASSET_ROOT at a multimer model");
 test(`predicts a ${copies}-chain complex with ${recycles} extra recycles`, async ({ page }) => {
@@ -29,7 +33,7 @@ test(`predicts a ${copies}-chain complex with ${recycles} extra recycles`, async
   const root = process.cwd();
   await page.goto("/?worker=0");
 
-  const outcome = await page.evaluate(async ({ root, chain, copies, recycles }) => {
+  const outcome = await page.evaluate(async ({ root, chain, copies, recycles, queriesPerThread }) => {
     const expression = await import(/* @vite-ignore */
       `/@fs${root}/src/input/sequence-expression.ts`) as {
         parseSequenceExpression(value: string): {
@@ -54,6 +58,13 @@ test(`predicts a ${copies}-chain complex with ${recycles} extra recycles`, async
         return "f32 (this branch has no projection selection)";
       }
     };
+    if (queriesPerThread !== undefined) {
+      const attention = await import(/* @vite-ignore */
+        `/@fs${root}/src/evoformer/attention.ts`) as {
+          forceAttentionQueriesPerThread(queries: number | undefined): void;
+        };
+      attention.forceAttentionQueriesPerThread(Number(queriesPerThread));
+    }
     const inferenceUrl = "/inference.ts";
     const inference = await import(/* @vite-ignore */ inferenceUrl) as {
       runInference(job: unknown, reporter: unknown): Promise<{ prediction: Record<string, unknown> }>;
@@ -100,10 +111,11 @@ test(`predicts a ${copies}-chain complex with ${recycles} extra recycles`, async
         meanPlddt: Number.NaN, ptm: Number.NaN, iptm: Number.NaN, failure: String(error),
       };
     }
-  }, { root, chain: CHAIN, copies, recycles });
+  }, { root, chain: CHAIN, copies, recycles, queriesPerThread });
 
   console.log(`\nCAPACITY\n${copies} chains, ${outcome.residues} residues, `
     + `${recycles} extra recycles, kernel ${outcome.selected}, `
+    + `queries/thread ${queriesPerThread ?? "by shape"}, `
     + `${outcome.seconds.toFixed(0)} s\n`
     + (outcome.failure === undefined
       ? `pLDDT ${outcome.meanPlddt.toFixed(4)}  pTM ${outcome.ptm.toFixed(5)}  `
