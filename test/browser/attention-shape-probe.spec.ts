@@ -49,7 +49,9 @@ test("the attention probe measures the query count and the operand width", async
   // Whatever it picks has to be one the prediction gate cleared, and it has to
   // pick something: returning nothing means the probe failed and the shape
   // rule stands, which is safe but is not what this device should do.
-  expect(["1q f32", "1q f16", "2q f32", "2q f16"]).toContain(outcome.chosen);
+  // Keys and values are packed independently, so the arrangements are the
+  // product of the query count and which of the two is half width.
+  expect(outcome.chosen).toMatch(/^[12]q (f32|f16|f16-key|f16-value)$/u);
   // It must not cost more than it saves. One device, one head dimension, once.
   expect(outcome.milliseconds, "the probe stays cheap").toBeLessThan(2000);
 });

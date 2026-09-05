@@ -80,6 +80,20 @@ export interface AttentionShapeChoice {
 
 const calibrations = new WeakMap<GPUDevice, Map<number, Promise<AttentionShapeChoice | undefined>>>();
 
+/**
+ * Whether to report each candidate's time and error.
+ *
+ * Guarded, because this module runs in a browser as well as in a test process
+ * and `process` does not exist there. Reading it unguarded threw a
+ * ReferenceError that the catch below turned into "no measurement", which
+ * silently reverted every device to the arrangement this file exists to
+ * replace — and reverted it only in the browser, which is the only place the
+ * model actually runs.
+ */
+function probeDebugRequested(): boolean {
+  return typeof process !== "undefined" && process.env?.AFWEBGPU_PROBE_DEBUG === "1";
+}
+
 async function runCandidate(
   device: GPUDevice, headDim: number, candidate: AttentionShapeChoice,
   buffers: readonly GPUBuffer[], readback: GPUBuffer, outputBytes: number,
@@ -212,7 +226,7 @@ export function calibrateAttentionShape(
           candidate, milliseconds: result.milliseconds, error: total / Math.max(1, result.output.length),
         });
       }
-      if (process.env.AFWEBGPU_PROBE_DEBUG === "1") {
+      if (probeDebugRequested()) {
         for (const entry of measured) {
           console.error(`probe ${entry.candidate.slots}q ${entry.candidate.keyValue}`
             + ` ${entry.milliseconds.toFixed(4)} ms error ${entry.error.toExponential(2)}`);
@@ -224,7 +238,13 @@ export function calibrateAttentionShape(
     } finally {
       for (const buffer of buffers) buffer.destroy();
     }
-  })().catch(() => undefined);
+  })().catch((error: unknown) => {
+    // The fallback is safe — the shape rule stands and the model runs — but it
+    // is not free, and a probe that fails silently is indistinguishable from
+    // one that ran. Say so once per device.
+    console.warn("attention shape probe failed; keeping the shape rule", error);
+    return undefined;
+  });
   byHeadDim.set(headDim, measurement);
   return measurement;
 }
