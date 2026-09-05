@@ -1,13 +1,18 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { create, globals } from "webgpu";
 import type { AttentionWeights } from "../src/evoformer/attention.js";
 import type { TemplatePairBlockWeights, TriangleAttentionModuleWeights } from "../src/evoformer/block.js";
 import { QueryOnlyTemplateGpu, type QueryOnlyTemplateWeights } from "../src/evoformer/template.js";
 import type { TransitionWeights } from "../src/evoformer/transition.js";
+import { parseStructure } from "../src/input/structure.js";
+import { templateFeatures } from "../src/input/template-features.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
 import { errorMetrics, type TriangleMultiplicationWeights } from "../src/triangle/types.js";
 
 const enabled = process.env.AFWEBGPU_GPU_TESTS === "1";
+const reference = process.env.AFWEBGPU_TEMPLATE_REFERENCE;
 const MANIFEST = "test/fixtures/evoformer/model1-query-59-stack/manifest.json";
 
 interface Manifest {
@@ -38,8 +43,9 @@ describe.skipIf(!enabled)("query-only mock-template branch WebGPU", () => {
   });
   afterAll(() => device?.destroy());
 
-  it("matches the official template pair update", async () => {
-    const store = await FileTensorStore.open(MANIFEST);
+  async function templateWeights(store: Awaited<ReturnType<typeof FileTensorStore.open>>): Promise<{
+    readonly weights: QueryOnlyTemplateWeights; readonly templateChannels: number;
+  }> {
     const modules = (store.manifest as unknown as Manifest).templateEmbedding.parameters;
     const name = (module: string, parameter: string): string => {
       const tensor = modules[module]?.[parameter];
@@ -122,6 +128,7 @@ describe.skipIf(!enabled)("query-only mock-template branch WebGPU", () => {
     }
     const pointwiseValue = await parameter("attention", "value_w");
     const weights: QueryOnlyTemplateWeights = {
+      embeddingWeight: await parameter("single_template_embedding/embedding2d", "weights"),
       embeddingBias: await parameter("single_template_embedding/embedding2d", "bias"),
       blockWeights,
       outputNormScale: await parameter("single_template_embedding/output_layer_norm", "scale"),
@@ -131,6 +138,12 @@ describe.skipIf(!enabled)("query-only mock-template branch WebGPU", () => {
       outputBias: await parameter("attention", "output_b"),
       heads: parameterShape("attention", "value_w")[1]!,
     };
+    return { weights, templateChannels };
+  }
+
+  it("matches the official template pair update", async () => {
+    const store = await FileTensorStore.open(MANIFEST);
+    const { weights, templateChannels } = await templateWeights(store);
     const result = await new QueryOnlyTemplateGpu(device).run({
       length: 59,
       templateChannels,
@@ -142,4 +155,46 @@ describe.skipIf(!enabled)("query-only mock-template branch WebGPU", () => {
     expect(metrics.meanAbsoluteError).toBeLessThan(5e-4);
     expect(metrics.maxAbsoluteError).toBeLessThan(1e-2);
   });
+
+  /**
+   * The same module with a real template in it, against an official capture.
+   *
+   * `tools/dump-template-features.ts` writes the features and
+   * `tools/capture_alphafold_template_reference.py` runs AlphaFold's own
+   * `TemplateEmbedding` over them, so this compares the whole GPU path: the
+   * fused feature-and-projection kernel, the two-block pair stack, the output
+   * norm, and the pointwise attention one template collapses to two matrices.
+   */
+  it.skipIf(reference === undefined)("matches the official update for a real template", async () => {
+    const directory = resolve(reference!);
+    const meta = JSON.parse(readFileSync(resolve(directory, "template.json"), "utf8")) as {
+      readonly query: string; readonly chain: string;
+    };
+    const chain = parseStructure(readFileSync(resolve(directory, "1ubq.pdb"), "utf8")).chains
+      .find((candidate) => candidate.id === meta.chain)!;
+    const features = templateFeatures(meta.query, chain);
+    const expectedBytes = readFileSync(resolve(directory, "templatePairUpdate.bin"));
+    const expected = new Float32Array(
+      expectedBytes.buffer.slice(expectedBytes.byteOffset, expectedBytes.byteOffset + expectedBytes.byteLength),
+    );
+
+    const store = await FileTensorStore.open(MANIFEST);
+    const { weights, templateChannels } = await templateWeights(store);
+    const length = features.length;
+    const result = await new QueryOnlyTemplateGpu(device).run({
+      length, templateChannels, pairChannels: 128,
+      pairMask: new Float32Array(length * length).fill(1),
+      weights,
+      template: {
+        pseudoBeta: features.pseudoBeta, pseudoBetaMask: features.pseudoBetaMask,
+        backboneMask: features.backboneMask, aatype: features.aatype,
+      },
+    });
+    expect(result.pairUpdate.length).toBe(expected.length);
+    const metrics = errorMetrics(result.pairUpdate, expected);
+    console.log(`real template pair update: mean |error| ${metrics.meanAbsoluteError.toExponential(3)}, `
+      + `max ${metrics.maxAbsoluteError.toExponential(3)}`);
+    expect(metrics.meanAbsoluteError).toBeLessThan(5e-4);
+    expect(metrics.maxAbsoluteError).toBeLessThan(1e-2);
+  }, 600_000);
 });

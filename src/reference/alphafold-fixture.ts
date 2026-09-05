@@ -446,6 +446,7 @@ export class AlphaFoldFixture {
       });
     }
     return {
+      embeddingWeight: await this.#parameter(p, "single_template_embedding/embedding2d", "weights"),
       embeddingBias: await this.#parameter(p, "single_template_embedding/embedding2d", "bias"),
       blockWeights,
       outputNormScale: await this.#parameter(p, "single_template_embedding/output_layer_norm", "scale"),

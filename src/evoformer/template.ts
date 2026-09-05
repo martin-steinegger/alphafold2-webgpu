@@ -1,9 +1,12 @@
 import { ATTENTION_NORMALIZE_SHADER, createAttentionNormParameters } from "./attention.js";
 import { encodeTemplatePairBlock, type TemplatePairBlockWeights } from "./block.js";
+import { rowWindows } from "../runtime/sharded.js";
 import { type GpuTensor, WebGpuExecution } from "../runtime/execution.js";
 import type { AllocationSnapshot } from "../runtime/allocator.js";
 
 export interface QueryOnlyTemplateWeights {
+  /** `embedding2d`, the [88, 64] projection of the template pair features. */
+  readonly embeddingWeight: Float32Array;
   readonly embeddingBias: Float32Array;
   readonly blockWeights: readonly TemplatePairBlockWeights[];
   readonly outputNormScale: Float32Array;
@@ -14,12 +17,31 @@ export interface QueryOnlyTemplateWeights {
   readonly heads: number;
 }
 
+/**
+ * What the pair features are built from, all of it one value per residue.
+ *
+ * The 88-channel feature itself is never built: at 1500 residues it would be
+ * 792 MiB, and it holds at most five non-zero entries per pair. Everything the
+ * kernel needs is here, on the residue axis.
+ */
+export interface TemplatePairInput {
+  /** CB, or CA for glycine, `[length, 3]`. */
+  readonly pseudoBeta: Float32Array;
+  readonly pseudoBetaMask: Float32Array;
+  /** 1 where N, CA and C are all present. */
+  readonly backboneMask: Float32Array;
+  /** Template residue per query position, 21 for a gap. */
+  readonly aatype: Int32Array;
+}
+
 export interface QueryOnlyTemplateInput {
   readonly length: number;
   readonly templateChannels: number;
   readonly pairChannels: number;
   readonly pairMask: Float32Array;
   readonly weights: QueryOnlyTemplateWeights;
+  /** Absent for the query-only case, which is a template of nothing. */
+  readonly template?: TemplatePairInput;
 }
 
 export interface QueryOnlyTemplateResult {
@@ -28,16 +50,117 @@ export interface QueryOnlyTemplateResult {
   readonly memory: AllocationSnapshot;
 }
 
-const INIT_SHADER = `
+/**
+ * The template pair features and `embedding2d`, in one pass.
+ *
+ * AlphaFold builds an 88-channel feature per pair and projects it to 64. Both
+ * halves are done here at once, because the feature is far too big to hold —
+ * 792 MiB at 1500 residues — and far too sparse to be worth holding. Of its 88
+ * channels, 39 are a one-hot distance bin, 22 a one-hot residue along j, 22 a
+ * one-hot residue along i, three are the unit vector that model_1_ptm switches
+ * off, and the remaining two are masks. At most five entries are non-zero, so
+ * the projection is five rows of the weight matrix added to the bias rather
+ * than an 88-long dot product.
+ *
+ * With no template every mask is zero and every channel with it, which leaves
+ * the bias alone: the same answer the query-only path has always produced.
+ */
+const TEMPLATE_EMBED_SHADER = `
+struct Parameters {
+  length: u32, channels: u32, pair_offset: u32, pairs: u32,
+};
 const GRID_WIDTH: u32 = 32768u;
-@group(0) @binding(0) var<storage, read> bias: array<f32>;
-@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+const RESIDUE_STRIDE: u32 = 8u;
+const DGRAM_BINS: u32 = 39u;
+const DGRAM_MINIMUM: f32 = 3.25;
+const DGRAM_STEP: f32 = 1.25;
+const CHANNEL_PSEUDO_BETA_MASK: u32 = 39u;
+const CHANNEL_AATYPE_J: u32 = 40u;
+const CHANNEL_AATYPE_I: u32 = 62u;
+const CHANNEL_FRAME_MASK: u32 = 87u;
+
+@group(0) @binding(0) var<storage, read> residues: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<f32>;
+@group(0) @binding(2) var<storage, read> bias: array<f32>;
+@group(0) @binding(3) var<uniform> p: Parameters;
+@group(0) @binding(4) var<storage, read_write> output: array<f32>;
+
+fn lower_edge(bin: u32) -> f32 {
+  let edge = DGRAM_MINIMUM + DGRAM_STEP * f32(bin);
+  return edge * edge;
+}
+
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x + id.y * GRID_WIDTH * 64u;
-  if (index >= arrayLength(&output)) { return; }
-  output[index] = bias[index % arrayLength(&bias)];
+  let local = id.x + id.y * GRID_WIDTH * 64u;
+  if (local >= p.pairs) { return; }
+  let pair = p.pair_offset + local;
+  let i = pair / p.length;
+  let j = pair % p.length;
+  let a = i * RESIDUE_STRIDE;
+  let b = j * RESIDUE_STRIDE;
+
+  let mask_2d = residues[a + 3u] * residues[b + 3u];
+  let base = local * p.channels;
+  if (mask_2d == 0.0) {
+    for (var channel = 0u; channel < p.channels; channel += 1u) {
+      output[base + channel] = bias[channel];
+    }
+    return;
+  }
+
+  // AlphaFold's distogram is a half-open bucket, and its bins are the squares
+  // of 39 evenly spaced distances from 3.25 to 50.75 angstroms. A distance
+  // below the first edge falls in no bin at all, and so does one landing
+  // exactly on an edge, which both comparisons have to keep.
+  var difference = 0.0;
+  for (var axis = 0u; axis < 3u; axis += 1u) {
+    let delta = residues[a + axis] - residues[b + axis];
+    difference += delta * delta;
+  }
+  var bin = -1;
+  for (var candidate = 0u; candidate < DGRAM_BINS; candidate += 1u) {
+    if (difference > lower_edge(candidate)) { bin = i32(candidate); }
+  }
+  if (bin >= 0 && bin + 1 < i32(DGRAM_BINS) && !(difference < lower_edge(u32(bin) + 1u))) {
+    bin = -1;
+  }
+
+  let aatype_i = u32(residues[a + 5u]);
+  let aatype_j = u32(residues[b + 5u]);
+  let frame_2d = residues[a + 4u] * residues[b + 4u];
+  let row_mask = CHANNEL_PSEUDO_BETA_MASK * p.channels;
+  let row_j = (CHANNEL_AATYPE_J + aatype_j) * p.channels;
+  let row_i = (CHANNEL_AATYPE_I + aatype_i) * p.channels;
+  let row_frame = CHANNEL_FRAME_MASK * p.channels;
+  let row_bin = u32(max(bin, 0)) * p.channels;
+  for (var channel = 0u; channel < p.channels; channel += 1u) {
+    var value = bias[channel] + weights[row_mask + channel]
+      + weights[row_j + channel] + weights[row_i + channel];
+    if (bin >= 0) { value += weights[row_bin + channel]; }
+    if (frame_2d != 0.0) { value += weights[row_frame + channel]; }
+    output[base + channel] = value;
+  }
 }`;
+
+/** The residue axis the embedding kernel reads, packed one row per residue. */
+const RESIDUE_STRIDE = 8;
+
+export function packTemplateResidues(length: number, template?: TemplatePairInput): Float32Array {
+  const packed = new Float32Array(length * RESIDUE_STRIDE);
+  if (template === undefined) return packed;
+  for (let residue = 0; residue < length; residue += 1) {
+    const row = residue * RESIDUE_STRIDE;
+    packed[row] = template.pseudoBeta[residue * 3]!;
+    packed[row + 1] = template.pseudoBeta[residue * 3 + 1]!;
+    packed[row + 2] = template.pseudoBeta[residue * 3 + 2]!;
+    packed[row + 3] = template.pseudoBetaMask[residue]!;
+    packed[row + 4] = template.backboneMask[residue]!;
+    packed[row + 5] = template.aatype[residue]!;
+  }
+  return packed;
+}
+
 
 const VALUE_SHADER = `
 struct Parameters { pairs: u32, template_channels: u32, projected: u32, pair_channels: u32 };
@@ -103,13 +226,29 @@ export class QueryOnlyTemplateGpu {
       );
       const pairMask = execution.upload("template.pair-mask", input.pairMask);
       const bias = execution.upload("template.embedding-bias", input.weights.embeddingBias);
-      const init = await execution.pipelines.get("template:init", INIT_SHADER);
+      const embeddingWeight = execution.upload("template.embedding-weight", input.weights.embeddingWeight);
+      const residues = execution.upload(
+        "template.residues", packTemplateResidues(input.length, input.template),
+      );
+      const embed = await execution.pipelines.get("template:embed", TEMPLATE_EMBED_SHADER);
       // One command buffer and one validation scope for the whole module: every
       // submission awaited from the page is a round trip to the GPU process.
       const encoder = this.device.createCommandEncoder({ label: "template" });
       this.device.pushErrorScope("validation");
-      let grid = execution.linearGrid(pair.elements);
-      execution.dispatch(encoder, init, [bias, pair], grid[0], grid[1], 1, "template.initialize");
+      // The pair outgrows what one binding may cover well before the lengths
+      // this has to reach, so the embedding walks it a window of rows at a time
+      // and each window is told which pair it starts at.
+      let grid = execution.linearGrid(pairs);
+      for (const window of rowWindows(pairs, execution.bindingLimitBytes, [input.templateChannels * 4])) {
+        const outputWindow = execution.view(pair,
+          window.offset * input.templateChannels, window.count * input.templateChannels);
+        const embedParams = execution.upload(`template.embed-parameters-${window.offset}`, new Uint32Array([
+          input.length, input.templateChannels, window.offset, window.count,
+        ]), GPUBufferUsage.UNIFORM);
+        grid = execution.linearGrid(window.count);
+        execution.dispatch(encoder, embed, [residues, embeddingWeight, bias, embedParams, outputWindow],
+          grid[0], grid[1], 1, `template.embed-${window.offset}`);
+      }
       const persistentCheckpoint = execution.checkpoint();
       const start = performance.now();
 
