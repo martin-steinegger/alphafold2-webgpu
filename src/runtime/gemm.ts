@@ -262,11 +262,17 @@ export function gemmGrid(
 
 /** Whether this shader and this variant can use the hardware matrix units. */
 export function usesMatrixUnits(shader: TiledGemmShader, variant: GemmVariant): boolean {
+  // The f32 kernel hands the units a pointer and a stride, so its operands
+  // have to be plain arrays laid out the way it addresses them. The f16 one
+  // cannot do that at all — the units want the component type, and these
+  // operands are single precision — so it converts a tile into workgroup
+  // memory first, and whatever produced that tile is free to be a packed
+  // word, a windowed binding, or a choice between four weight blocks. The
+  // element expressions every caller already supplies are enough for it.
   return variant.precision === "matrix"
-    && shader.sourceArray !== undefined && shader.weightArray !== undefined
-    // Only the f16 kernel stages its operands, and staging is what lets it
-    // read one stored the other way round.
-    && (shader.sourceArray.columnMajor !== true || variant.matrix?.componentType === "f16")
+    && (variant.matrix?.componentType === "f16"
+      || (shader.sourceArray !== undefined && shader.weightArray !== undefined
+        && shader.sourceArray.columnMajor !== true))
     // A whole-tile epilogue is written against `acc{n}` in the hand-tiled
     // thread mapping, which a matrix kernel does not have. `storeVector` is
     // fine: the result is staged in workgroup memory, so an invocation can
@@ -353,9 +359,6 @@ function createMatrixGemmShaderF16(shader: TiledGemmShader, unit: MatrixUnitShap
   const aLength = reach((GEMM_TILE_ROWS - M) * aStride, aStride, M);
   const bLength = reach((columnTiles - 1) * N, bStride, K);
   const outLength = reach((subgroups - 1) * M * outStride, outStride, M);
-  const source = shader.sourceArray!;
-  const weight = shader.weightArray!;
-  const base = (operand: GemmOperandArray): string => operand.base ?? "0u";
   const lines = (count: number, body: (index: number) => string): string =>
     Array.from({ length: count }, (_, index) => body(index)).join(String.fromCharCode(10));
   // Each lane carries a fixed share of both staged tiles between steps.
@@ -364,23 +367,25 @@ function createMatrixGemmShaderF16(shader: TiledGemmShader, unit: MatrixUnitShap
   }
   const aPerLane = (GEMM_TILE_ROWS * K) / lanes;
   const bPerLane = (K * tileColumns) / lanes;
+  // The operands come from the caller's own element expressions, which name
+  // `row` and `k` for the source and `k` and `column` for the weight. They are
+  // read under an `if` rather than a `select` so an expression is never
+  // evaluated for an index outside the operand.
   const fetchA = (at: string): string => lines(aPerLane, (i) => `  {
     let item = lane + ${i * lanes}u;
-    let global_row = tile_row_origin + item / ${K}u;
-    let step = ${at} + item % ${K}u;
-    next_a_${i} = select(0.0,
-      ${source.array}[${base(source)} + ${source.columnMajor === true
-        ? "step * (" + source.stride + ") + global_row"
-        : "global_row * (" + source.stride + ") + step"}],
-      global_row < gemm_rows && step < gemm_inner);
+    let row = tile_row_origin + item / ${K}u;
+    let k = ${at} + item % ${K}u;
+    var held = 0.0;
+    if (row < gemm_rows && k < gemm_inner) { held = ${shader.sourceElement}; }
+    next_a_${i} = held;
   }`);
   const fetchB = (at: string): string => lines(bPerLane, (i) => `  {
     let item = lane + ${i * lanes}u;
-    let step = ${at} + item / ${tileColumns}u;
-    let global_column = tile_column_origin + item % ${tileColumns}u;
-    next_b_${i} = select(0.0,
-      ${weight.array}[${base(weight)} + step * (${weight.stride}) + global_column],
-      step < gemm_inner && global_column < gemm_columns);
+    let k = ${at} + item / ${tileColumns}u;
+    let column = tile_column_origin + item % ${tileColumns}u;
+    var held = 0.0;
+    if (k < gemm_inner && column < gemm_columns) { held = ${shader.weightElement}; }
+    next_b_${i} = held;
   }`);
   // Each subgroup stores and drains one unit-wide tile of its own, rather than
   // every subgroup staging the whole 64x128 output before any of it is read.
