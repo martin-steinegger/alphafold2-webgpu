@@ -113,7 +113,6 @@ export function attentionMatrixStorageBytes(headDim: number, storedHalf = false)
     + (storedHalf ? 0 : (keys + values) * 2)
     + scores * 4
     + probabilities * 2
-    + rows * headDim * 4                          // accumulated
     + 3 * rows * 4;                               // max, sum, rescale
 }
 
@@ -122,11 +121,9 @@ export function createAttentionMatrixFlashShader(
 ): string {
   if (headDim !== 32) throw new RangeError("matrix attention is written for a 32-channel head");
   const { M, N, K } = unit;
-  // Two lanes share a softmax row and take half the staged keys each. A half
-  // narrower than one unit measured wrong — sixteen keys per pass returned a
-  // relative error of 3.7 where thirty-two, forty-eight and sixty-four all
-  // return 4.6e-4 — so the shape is refused rather than shipped unexplained.
-  if (KEY_TILE % 2 !== 0 || KEY_TILE / 2 < N || KEY_TILE % N !== 0) {
+  // Two lanes share a softmax row and take half the staged keys each, and the
+  // units walk the pass in whole tiles.
+  if (KEY_TILE % 2 !== 0 || KEY_TILE % N !== 0) {
     throw new RangeError(`a ${KEY_TILE}-key pass cannot be halved into whole ${N}-wide units`);
   }
   const vectors = headDim / 4;
@@ -140,6 +137,27 @@ export function createAttentionMatrixFlashShader(
   const reach = (maxOffset: number, stride: number, rows: number): number =>
     maxOffset + stride * rows;
   const rows = ATTENTION_MATRIX_QUERY_TILE;
+  const lines = (count: number, body: (index: number) => string): string =>
+    Array.from({ length: count }, (_, index) => body(index)).join(String.fromCharCode(10));
+  // Each lane carries a fixed share of the staged key and value tiles between
+  // passes, so the fetch for the next one overlaps this one's multiplies.
+  if ((KEY_TILE * (headDim / 4)) % LANES !== 0) {
+    throw new RangeError("the staged key tile must divide evenly among the lanes");
+  }
+  const keyPerLane = (KEY_TILE * (headDim / 4)) / LANES;
+  if ((rows * (headDim / 4)) % LANES !== 0) {
+    throw new RangeError("the output tile must divide evenly among the lanes");
+  }
+  const outPerLane = (rows * (headDim / 4)) / LANES;
+  const fetchKeyValue = (at: string): string => lines(keyPerLane, (i) => `  {
+    let item = lane + ${i * LANES}u;
+    let global_key = ${at} + item / ${headDim / 4}u;
+    let live = global_key < p.queries;
+    let at_index = ((batch_index * p.queries + global_key) * p.heads + head)
+      * ${headDim / 4}u + item % ${headDim / 4}u;
+    next_k_${i} = select(vec4<f32>(0.0), key[at_index], live);
+    next_v_${i} = select(vec4<f32>(0.0), value[at_index], live);
+  }`);
   const queriesLength = reach((rows - M) * TILE_STRIDE, TILE_STRIDE, M);
   const keysLength = reach((keyTiles - 1) * N * TILE_STRIDE, TILE_STRIDE, N);
   const valuesLength = reach((keyTiles - 1) * K * TILE_STRIDE + (channelTiles - 1) * N,
@@ -183,7 +201,6 @@ var<workgroup> values_tile: array<f16, ${valuesLength}>;`}
 // other, and the scores are the larger, so one buffer serves both.
 var<workgroup> scores: array<f32, ${scoresLength}>;
 var<workgroup> probabilities: array<f16, ${probabilitiesLength}>;
-var<workgroup> accumulated: array<f32, ${ATTENTION_MATRIX_QUERY_TILE * headDim}>;
 var<workgroup> running_max: array<f32, ${ATTENTION_MATRIX_QUERY_TILE}>;
 var<workgroup> running_sum: array<f32, ${ATTENTION_MATRIX_QUERY_TILE}>;
 var<workgroup> rescale: array<f32, ${ATTENTION_MATRIX_QUERY_TILE}>;
@@ -204,6 +221,13 @@ fn main(
   // Which sixteen queries this subgroup owns.
   let rows_at = subgroup * ${UNIT}u;
   let query_origin = group.x * ${ATTENTION_MATRIX_QUERY_TILE}u;
+  // The running output stays in registers: read and written once a pass in
+  // workgroup memory it was a third of the traffic of the pass, and the array
+  // it needed is workgroup storage that occupancy wants back. Each lane owns a
+  // fixed set of four-channel groups, so the indices are computed once.
+${lines(outPerLane, (j) => `  let own_row_${j} = (lane + ${j * LANES}u) / ${vectors}u;
+  let own_vector_${j} = (lane + ${j * LANES}u) % ${vectors}u;
+  var out_${j} = vec4<f32>(0.0);`)}
   let batch_index = group.y;
   let head = group.z;
 
@@ -222,13 +246,13 @@ fn main(
     queries_tile[base + 2u] = f16(held.z);
     queries_tile[base + 3u] = f16(held.w);
   }
-  for (var item = lane; item < ${ATTENTION_MATRIX_QUERY_TILE * headDim}u; item += ${LANES}u) {
-    accumulated[item] = 0.0;
-  }
   if (lane < ${ATTENTION_MATRIX_QUERY_TILE}u) {
     running_max[lane] = -1e30;
     running_sum[lane] = 0.0;
   }
+${storedHalf ? "" : `${lines(keyPerLane, (i) => `  var next_k_${i} = vec4<f32>(0.0);
+  var next_v_${i} = vec4<f32>(0.0);`)}
+${fetchKeyValue("0u")}`}
   workgroupBarrier();
 
   for (var key_origin = 0u; key_origin < p.queries; key_origin += ${KEY_TILE}u) {
@@ -236,26 +260,18 @@ fn main(
     // workgroup takes one branch; the tail pass is the only checked one.
     let whole_pass = key_origin + ${KEY_TILE}u <= p.queries
       && query_origin + ${ATTENTION_MATRIX_QUERY_TILE}u <= p.queries;
-${storedHalf ? "" : `    for (var item = lane; item < ${KEY_TILE * vectors}u; item += ${LANES}u) {
-      let row = item / ${vectors}u;
-      let vector = item % ${vectors}u;
-      let global_key = key_origin + row;
-      var k = vec4<f32>(0.0);
-      var v = vec4<f32>(0.0);
-      // Uniform across the workgroup: every key of a whole pass is in range,
-      // so the common pass loads without testing each key.
-      if (whole_pass || global_key < p.queries) {
-        let at = ((batch_index * p.queries + global_key) * p.heads + head) * ${vectors}u + vector;
-        k = key[at];
-        v = value[at];
-      }
-      let base = row * ${TILE_STRIDE}u + vector * 4u;
-      keys_tile[base] = f16(k.x); keys_tile[base + 1u] = f16(k.y);
-      keys_tile[base + 2u] = f16(k.z); keys_tile[base + 3u] = f16(k.w);
-      values_tile[base] = f16(v.x); values_tile[base + 1u] = f16(v.y);
-      values_tile[base + 2u] = f16(v.z); values_tile[base + 3u] = f16(v.w);
-    }
-    workgroupBarrier();`}
+${storedHalf ? "" : `${lines(keyPerLane, (i) => `    {
+      let item = lane + ${i * LANES}u;
+      let base = (item / ${vectors}u) * ${TILE_STRIDE}u + (item % ${vectors}u) * 4u;
+      keys_tile[base] = f16(next_k_${i}.x); keys_tile[base + 1u] = f16(next_k_${i}.y);
+      keys_tile[base + 2u] = f16(next_k_${i}.z); keys_tile[base + 3u] = f16(next_k_${i}.w);
+      values_tile[base] = f16(next_v_${i}.x); values_tile[base + 1u] = f16(next_v_${i}.y);
+      values_tile[base + 2u] = f16(next_v_${i}.z); values_tile[base + 3u] = f16(next_v_${i}.w);
+    }`)}
+    workgroupBarrier();
+    // The next pass's keys and values are fetched while the units still work
+    // on these, so a global load is never what the multiplies wait for.
+${fetchKeyValue(`key_origin + ${KEY_TILE}u`)}`}
 
     // S = Q K^T. The key tile is [key][channel], so a column-major load of it
     // is the transpose the right operand wants, at no cost.
@@ -362,26 +378,21 @@ ${storedHalf ? "" : `    for (var item = lane; item < ${KEY_TILE * vectors}u; it
         product, false, ${WEIGHTED_STRIDE}u);
     }
     workgroupBarrier();
-    for (var item = lane; item < ${ATTENTION_MATRIX_QUERY_TILE * headDim}u; item += ${LANES}u) {
-      let row = item / ${headDim}u;
-      accumulated[item] = accumulated[item] * rescale[row]
-        + scores[row * ${WEIGHTED_STRIDE}u + item % ${headDim}u];
-    }
+${lines(outPerLane, (j) => `    {
+      let staged = own_row_${j} * ${WEIGHTED_STRIDE}u + own_vector_${j} * 4u;
+      out_${j} = out_${j} * rescale[own_row_${j}] + vec4<f32>(scores[staged],
+        scores[staged + 1u], scores[staged + 2u], scores[staged + 3u]);
+    }`)}
     workgroupBarrier();
   }
 
-  for (var item = lane; item < ${ATTENTION_MATRIX_QUERY_TILE * vectors}u; item += ${LANES}u) {
-    let row = item / ${vectors}u;
-    let vector = item % ${vectors}u;
-    let global_query = query_origin + row;
+${lines(outPerLane, (j) => `  {
+    let global_query = query_origin + own_row_${j};
     if (global_query < p.queries) {
-      let at = ((batch_index * p.queries + global_query) * p.heads + head) * ${vectors}u + vector;
-      let base = row * ${headDim}u + vector * 4u;
-      let sum = running_sum[row];
-      let held = vec4<f32>(accumulated[base], accumulated[base + 1u],
-        accumulated[base + 2u], accumulated[base + 3u]) / sum;
-      output[at] = held * gate[at];
+      let at = ((batch_index * p.queries + global_query) * p.heads + head)
+        * ${vectors}u + own_vector_${j};
+      output[at] = (out_${j} / running_sum[own_row_${j}]) * gate[at];
     }
-  }
+  }`)}
 }`;
 }
