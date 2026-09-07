@@ -86,7 +86,20 @@ const LANES = SUBGROUPS * 32;
  * gives `(17i) % 32`, and seventeen is coprime with thirty-two, so no two
  * lanes collide. The f32 rows take the same treatment with an odd stride.
  */
-const TILE_STRIDE = 34;
+/**
+ * Head widths this kernel takes, and the tile width each one spans.
+ *
+ * A head narrower than the unit is padded up to it: the channels past the head
+ * are never written, and workgroup memory starts at zero, so a contraction
+ * over the padded width is the contraction over the head. It costs multiplies
+ * that this kernel is not short of — the extra-MSA stack's eight-channel heads
+ * read a key for eight channels of work, and wait for memory rather than for
+ * the units.
+ */
+const paddedHeadDim = (headDim: number): number => Math.max(headDim, UNIT);
+
+/** Row length of the staged query, key and value tiles, padded past the head. */
+const tileStride = (headDim: number): number => paddedHeadDim(headDim) + 2;
 const SCORE_STRIDE = KEY_TILE + 1;
 const WEIGHTED_STRIDE = 33;
 const PROBABILITY_STRIDE = KEY_TILE + 2;
@@ -97,7 +110,7 @@ export function attentionMatrixShape(
   configs: readonly { componentType: string; resultComponentType: string;
     M: number; N: number; K: number }[],
 ): MatrixUnitShape | undefined {
-  if (headDim !== 32) return undefined;
+  if (headDim % 4 !== 0 || headDim > 32 || headDim < 4) return undefined;
   return attentionMatrixConfig(device, configs, UNIT);
 }
 
@@ -112,7 +125,8 @@ export function attentionMatrixStorageBytes(headDim: number, storedHalf = false)
   const rows = ATTENTION_MATRIX_QUERY_TILE;
   const unit = UNIT;
   const keyTiles = KEY_TILE / unit;
-  const channelTiles = headDim / unit;
+  const channelTiles = paddedHeadDim(headDim) / unit;
+  const TILE_STRIDE = tileStride(headDim);
   const reach = (maxOffset: number, stride: number, count: number): number =>
     maxOffset + stride * count;
   const queries = reach((rows - unit) * TILE_STRIDE, TILE_STRIDE, unit);
@@ -135,7 +149,10 @@ export function attentionMatrixStorageBytes(headDim: number, storedHalf = false)
 export function createAttentionMatrixFlashShader(
   headDim: number, unit: MatrixUnitShape, storedHalf = false,
 ): string {
-  if (headDim !== 32) throw new RangeError("matrix attention is written for a 32-channel head");
+  if (headDim % 4 !== 0 || headDim > 32 || headDim < 4) {
+    throw new RangeError("matrix attention takes a head of four to thirty-two channels");
+  }
+  const TILE_STRIDE = tileStride(headDim);
   const { M, N, K } = unit;
   // Two lanes share a softmax row and take half the staged keys each, and the
   // units walk the pass in whole tiles.
@@ -144,8 +161,10 @@ export function createAttentionMatrixFlashShader(
   }
   const vectors = headDim / 4;
   const keyTiles = KEY_TILE / N;
-  const channelTiles = headDim / N;
-  const contractions = headDim / K;
+  // The tiles span the padded width; the loads and stores that reach the
+  // model's own tensors keep the head's true width.
+  const channelTiles = paddedHeadDim(headDim) / N;
+  const contractions = paddedHeadDim(headDim) / K;
   // A matrix load or store reaches `offset + stride * rows` elements, not the
   // last element it actually touches. An array sized to the last element is
   // out of bounds by the extension's own rule, which is undefined behaviour

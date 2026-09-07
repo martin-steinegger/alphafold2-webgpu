@@ -22,7 +22,10 @@ import {
 import { recordSubgroupMatrixConfigs } from "../src/runtime/subgroups.js";
 
 const enabled = process.env.AFWEBGPU_GPU_TESTS === "1";
-const HEAD_DIM = 32;
+// Thirty-two is the width of the trunk's heads; eight is the extra-MSA
+// stack's, which the kernel pads up to the unit and so is the case that says
+// the padding carries no channel of its own into the answer.
+const HEAD_DIMS = [32, 8] as const;
 const HEADS = 4;
 
 /** The same deterministic values on every device, so a run is reproducible. */
@@ -64,11 +67,12 @@ describe.skipIf(!enabled)("flash attention over the matrix units", () => {
       },
     });
     recordSubgroupMatrixConfigs(candidate, adapter);
-    device = supportsAttentionMatrix(candidate, HEAD_DIM) ? candidate : undefined;
+    device = supportsAttentionMatrix(candidate, 32) ? candidate : undefined;
   });
 
+  for (const HEAD_DIM of HEAD_DIMS) {
   for (const [batch, queries] of [[8, 128], [8, 130], [6, 97]] as const) {
-    it(`reproduces the register kernel at ${batch}x${queries}`, async (context) => {
+    it(`reproduces the register kernel at ${batch}x${queries}, head ${HEAD_DIM}`, async (context) => {
       if (device === undefined) {
         context.skip("this adapter has no usable subgroup matrix configuration");
         return;
@@ -160,5 +164,6 @@ describe.skipIf(!enabled)("flash attention over the matrix units", () => {
         for (const buffer of created) buffer.destroy();
       }
     }, 60_000);
+  }
   }
 });
