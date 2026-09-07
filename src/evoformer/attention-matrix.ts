@@ -332,19 +332,25 @@ ${fetchKeyValue(`key_origin + ${KEY_TILE}u`)}`}
       let live_query = global_query < p.queries;
       let bias_row = (head * p.queries + global_query) * p.queries + key_origin;
       let score_row = row * ${SCORE_STRIDE}u;
+      // The row's own share of the logits, held between the two sweeps over
+      // it. Written back to the staged scores instead, each of the sixteen
+      // costs a workgroup write here and a workgroup read below, and the pass
+      // walks the tile three times over rather than once.
+${lines(KEY_TILE / 2, (j) => `      var held_${j} = 0.0;`)}
       if (whole_pass) {
-        for (var column = first; column < first + ${KEY_TILE / 2}u; column += 1u) {
+${lines(KEY_TILE / 2, (j) => `        {
+          let column = first + ${j}u;
           var logit = scores[score_row + column] + 1e9 * (mask_tile[column] - 1.0);
           if (p.has_pair_bias != 0u) {
             logit += pair_bias[bias_row + column];
           }
           // Scaled once here so the exponential below is the hardware's exp2.
-          let scaled = clamp(logit, -1e8, 1e8) * 1.44269504088896340736;
-          scores[score_row + column] = scaled;
-          next_max = max(next_max, scaled);
-        }
+          held_${j} = clamp(logit, -1e8, 1e8) * 1.44269504088896340736;
+          next_max = max(next_max, held_${j});
+        }`)}
       } else {
-        for (var column = first; column < first + ${KEY_TILE / 2}u; column += 1u) {
+${lines(KEY_TILE / 2, (j) => `        {
+          let column = first + ${j}u;
           var logit = -1e9;
           if (live_query && key_origin + column < p.queries) {
             logit = scores[score_row + column] + 1e9 * (mask_tile[column] - 1.0);
@@ -353,18 +359,17 @@ ${fetchKeyValue(`key_origin + ${KEY_TILE}u`)}`}
             }
             logit = clamp(logit, -1e8, 1e8);
           }
-          let scaled = logit * 1.44269504088896340736;
-          scores[score_row + column] = scaled;
-          next_max = max(next_max, scaled);
-        }
+          held_${j} = logit * 1.44269504088896340736;
+          next_max = max(next_max, held_${j});
+        }`)}
       }
       next_max = max(next_max, subgroupShuffleXor(next_max, 1u));
       var total = 0.0;
-      for (var column = first; column < first + ${KEY_TILE / 2}u; column += 1u) {
-        let weight = exp2(scores[score_row + column] - next_max);
-        probabilities[row * ${PROBABILITY_STRIDE}u + column] = f16(weight);
+${lines(KEY_TILE / 2, (j) => `      {
+        let weight = exp2(held_${j} - next_max);
+        probabilities[row * ${PROBABILITY_STRIDE}u + first + ${j}u] = f16(weight);
         total += weight;
-      }
+      }`)}
       total += subgroupShuffleXor(total, 1u);
       let previous_scale = exp2(previous_max - next_max);
       // One of the pair writes the row's carried state; both computed it.
