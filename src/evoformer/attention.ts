@@ -588,7 +588,24 @@ export function attentionPairBiasStride(queries: number): number {
 /** The same rounding, in the shaders that index the bias. */
 const PAIR_BIAS_STRIDE = "((p.queries + 3u) & 0xfffffffcu)";
 
-export const ATTENTION_PAIR_BIAS_SHADER = `${COMMON}
+/**
+ * The pair projection that becomes the attention bias, for a fixed head count.
+ *
+ * One invocation carries one residue pair and all of its heads. Carrying one
+ * head each, every head read the pair's whole channel row again: at 1,650
+ * residues that is the 1.4 GB pair tensor read four times over for triangle
+ * attention and eight for MSA row attention, and the kernel ran at the card's
+ * bandwidth for it. The heads share the row instead, and the weights they
+ * want for a channel sit next to each other.
+ *
+ * `heads` fixes how many accumulators the loop carries, so it is compiled per
+ * head count; `p.heads` still gives the weight stride, and the two are the
+ * same number by construction.
+ */
+export function createAttentionPairBiasShader(heads: number): string {
+  const each = (body: (head: number) => string): string =>
+    Array.from({ length: heads }, (_, head) => body(head)).join(String.fromCharCode(10));
+  return `${COMMON}
 @group(0) @binding(0) var<storage, read> pair: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> p: Parameters;
@@ -601,17 +618,21 @@ export const ATTENTION_PAIR_BIAS_SHADER = `${COMMON}
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let index = id.x + id.y * GRID_WIDTH * 64u;
-  if (index >= p.heads * p.batch * p.queries) { return; }
+  if (index >= p.batch * p.queries) { return; }
   let k = index % p.queries;
-  let row = (index / p.queries) % p.batch;
-  let head = index / (p.queries * p.batch);
-  var result = 0.0;
+  let row = index / p.queries;
+${each((head) => `  var total_${head} = 0.0;`)}
+  let source = (row * p.queries + k) * p.pair_channels;
   for (var c = 0u; c < p.pair_channels; c += 1u) {
-    result += pair[(row * p.queries + k) * p.pair_channels + c]
-      * weights[p.pair_weight + c * p.heads + head];
+    let held = pair[source + c];
+    let at = p.pair_weight + c * p.heads;
+${each((head) => `    total_${head} += held * weights[at + ${head}u];`)}
   }
-  output[(head * p.queries + p.batch_offset + row) * ${PAIR_BIAS_STRIDE} + k] = result;
+  let stride = ${PAIR_BIAS_STRIDE};
+  let at_row = (p.batch_offset + row) * stride + k;
+${each((head) => `  output[${head}u * p.queries * stride + at_row] = total_${head};`)}
 }`;
+}
 
 export const ATTENTION_FLASH_SHADER = `${COMMON}
 @group(0) @binding(0) var<storage, read> query: array<f32>;
@@ -1257,7 +1278,8 @@ export class AttentionGpu {
     const [normalize, project, pairProject, flash, outputProject] = await Promise.all([
       this.pipelines.get("attention:normalize", ATTENTION_NORMALIZE_SHADER),
       this.pipelines.get("attention:project", attentionProjectShader()),
-      this.pipelines.get("attention:pair-bias", ATTENTION_PAIR_BIAS_SHADER),
+      this.pipelines.get(`attention:pair-bias:h${input.heads}`,
+        createAttentionPairBiasShader(input.heads)),
       this.pipelines.get(flashKernel.cacheKey, flashKernel.shader),
       this.pipelines.get("attention:output", ATTENTION_OUTPUT_SHADER),
     ]);
@@ -1340,7 +1362,7 @@ export class AttentionGpu {
           grid[0], grid[1]);
       }
       if (input.pairBias !== undefined) {
-        const pairGrid = linearGrid(input.heads * biasRows * input.queryLength);
+        const pairGrid = linearGrid(biasRows * input.queryLength);
         pass(pairProject, [pairNormalized.buffer, weights.buffer, biasParams.buffer, pairBias.buffer],
           pairGrid[0], pairGrid[1]);
       }

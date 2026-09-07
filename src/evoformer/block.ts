@@ -7,7 +7,7 @@ import {
   createAttentionStatisticsShader,
   ATTENTION_OUTPUT_SHADER,
   ATTENTION_OUTPUT_RESIDUAL_SHADER,
-  ATTENTION_PAIR_BIAS_SHADER,
+  createAttentionPairBiasShader,
   attentionPairBiasStride,
   attentionKeyValueStorage,
   attentionQueriesPerThread,
@@ -699,7 +699,8 @@ async function encodeAttention(
       createAttentionNormalizeShader(storage, sourceShards)),
     execution.pipelines.get(`block:attention:project:${keyValueStorage}`,
       attentionProjectShader(keyValueStorage)),
-    execution.pipelines.get("block:attention:pair-bias", ATTENTION_PAIR_BIAS_SHADER),
+    execution.pipelines.get(`block:attention:pair-bias:h${options.heads}`,
+      createAttentionPairBiasShader(options.heads)),
     execution.pipelines.get(
       `block:${flashKernel.cacheKey}:kv-${keyValueStorage}:q${slots}`, flashShader),
     execution.pipelines.get(
@@ -794,7 +795,7 @@ async function encodeAttention(
         ], pairGrid[0], pairGrid[1], 1, `${options.label}.pair-normalize-${offset}`);
         const params = uniform(execution, `${options.label}.pair-parameters-${offset}`,
           createAttentionParameters(descriptor, packed.offsets, { offset, count }));
-        const grid = execution.linearGrid(options.heads * rows);
+        const grid = execution.linearGrid(rows);
         execution.dispatch(encoder, pairProject, [target, weights, params, pairBias],
           grid[0], grid[1], 1, `${options.label}.pair-bias-${offset}`);
       }
@@ -806,7 +807,7 @@ async function encodeAttention(
       // pair-shaped tensor held across the operation.
       for (const window of windowParameters) {
         const source = normalizeWindow(window);
-        const grid = execution.linearGrid(options.heads * window.count * options.queries);
+        const grid = execution.linearGrid(window.count * options.queries);
         execution.dispatch(encoder, pairProject, [source, weights, window.attention, pairBias],
           grid[0], grid[1], 1, `${options.label}.pair-bias-${window.offset}`);
       }
