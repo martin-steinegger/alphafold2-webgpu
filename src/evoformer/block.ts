@@ -834,9 +834,11 @@ async function encodeAttention(
     const projectGrid = gemmGrid(rows, 4 * options.channels);
     execution.dispatch(encoder, project, [windowNormalized, weights, params, query, key, value, gate],
       projectGrid[0], projectGrid[1], 1, `${options.label}.project-${offset}`);
+    const flashBlocks = Math.ceil(options.queries / flashQueryTile);
     execution.dispatch(encoder, flash, [query, key, value, gate, options.mask, pairBias, params, weighted],
-      Math.ceil(options.queries / flashQueryTile), count, options.heads,
-      `${options.label}.flash-${offset}`);
+      flashKernel.batchFirst === true ? count : flashBlocks,
+      flashKernel.batchFirst === true ? flashBlocks : count,
+      options.heads, `${options.label}.flash-${offset}`);
     const outputGrid = gemmGrid(rows, options.channels);
     execution.dispatch(encoder, outputProject, [weighted, weights, params, ...outputViews],
       outputGrid[0], outputGrid[1], 1, `${options.label}.output-${offset}`);

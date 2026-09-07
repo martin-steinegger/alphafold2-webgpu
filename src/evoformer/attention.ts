@@ -76,6 +76,20 @@ export interface AttentionFlashKernel {
   readonly shader: string;
   readonly queryTile: number;
   readonly variant: Exclude<AttentionFlashVariant, "auto">;
+  /**
+   * Whether the batch is the fastest-varying dispatch dimension.
+   *
+   * The pair bias does not depend on the batch: every row of the alignment,
+   * or every row of the pair in a triangle update, reads the same
+   * `bias[head][query][key]`. Dispatched with the query block varying fastest,
+   * neighbouring workgroups want different blocks of it and each one's read
+   * misses; dispatched with the batch varying fastest they want the same
+   * block, and all but the first of them find it in cache. At 1,650 residues
+   * the bias is 43 MiB and triangle attention reads it once per batch row,
+   * which is what made that kernel 3.1 TFLOP/s there against 23.9 on a shape
+   * whose bias stays resident.
+   */
+  readonly batchFirst?: boolean;
 }
 
 const GRID_WIDTH = 32_768;
@@ -1094,7 +1108,7 @@ export function selectAttentionFlashKernel(
     return {
       cacheKey: `attention:flash-matrix-${headDim}`,
       shader: createAttentionMatrixFlashShader(headDim, shape),
-      queryTile: ATTENTION_MATRIX_QUERY_TILE, variant: requested,
+      queryTile: ATTENTION_MATRIX_QUERY_TILE, variant: requested, batchFirst: true,
     };
   }
   const subgroup = supportsAttentionSubgroups(device, headDim);

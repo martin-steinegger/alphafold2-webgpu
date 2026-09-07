@@ -98,12 +98,21 @@ describe.skipIf(!enabled)("flash attention over the matrix units", () => {
           make(gate, storage), make(mask, storage), make(bias, storage),
           make(parameters, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST)];
         const output = device.createBuffer({ size: elements * 4,
-          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
         const readback = device.createBuffer({ size: elements * 4,
           usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
         created.push(output, readback);
 
-        const run = async (label: string, code: string, tile: number): Promise<Float32Array> => {
+        const run = async (
+          label: string, code: string, tile: number, batchFirst = false,
+        ): Promise<Float32Array> => {
+          // Cleared between kernels. Sharing it, a kernel that writes only part
+          // of the output leaves the previous kernel's answer in the rest, and
+          // the comparison passes on the strength of it: dispatched in the
+          // wrong order the matrix kernel covered half the batch and still
+          // matched, because the other half was the register kernel's own
+          // output read back again.
+          device!.queue.writeBuffer(output, 0, new Float32Array(elements));
           device!.pushErrorScope("validation");
           const pipeline = device!.createComputePipeline({ label, layout: "auto",
             compute: { module: device!.createShaderModule({ label, code }), entryPoint: "main" } });
@@ -116,7 +125,8 @@ describe.skipIf(!enabled)("flash attention over the matrix units", () => {
             layout: pipeline.getBindGroupLayout(0),
             entries: [...bound, output].map((buffer, binding) => ({ binding, resource: { buffer } })),
           }));
-          pass.dispatchWorkgroups(Math.ceil(queries / tile), batch, HEADS);
+          const blocks = Math.ceil(queries / tile);
+          pass.dispatchWorkgroups(batchFirst ? batch : blocks, batchFirst ? blocks : batch, HEADS);
           pass.end();
           encoder.copyBufferToBuffer(output, 0, readback, 0, elements * 4);
           device!.queue.submit([encoder.finish()]);
@@ -129,7 +139,8 @@ describe.skipIf(!enabled)("flash attention over the matrix units", () => {
         const expected = await run("register",
           createAttentionRegisterFlashShader(HEAD_DIM, 1, "f32"), 64);
         const kernel = selectAttentionFlashKernel(device, HEAD_DIM, "matrix");
-        const actual = await run("matrix", kernel.shader, kernel.queryTile);
+        const actual = await run("matrix", kernel.shader, kernel.queryTile,
+          kernel.batchFirst === true);
 
         let worst = 0;
         let scale = 0;

@@ -223,7 +223,9 @@ fn main(
   let lane = local.x;
   // Which sixteen queries this subgroup owns.
   let rows_at = subgroup * ${UNIT}u;
-  let query_origin = group.x * ${ATTENTION_MATRIX_QUERY_TILE}u;
+  // The batch is the fastest-varying dimension, so that neighbouring
+  // workgroups share the block of pair bias they read. See batchFirst.
+  let query_origin = group.y * ${ATTENTION_MATRIX_QUERY_TILE}u;
   // The running output stays in registers: read and written once a pass in
   // workgroup memory it was a third of the traffic of the pass, and the array
   // it needed is workgroup storage that occupancy wants back. Each lane owns a
@@ -231,7 +233,7 @@ fn main(
 ${lines(outPerLane, (j) => `  let own_row_${j} = (lane + ${j * LANES}u) / ${vectors}u;
   let own_vector_${j} = (lane + ${j * LANES}u) % ${vectors}u;
   var out_${j} = vec4<f32>(0.0);`)}
-  let batch_index = group.y;
+  let batch_index = group.x;
   let head = group.z;
 
   // Q is read once for the whole key loop, so it is staged once.
