@@ -227,6 +227,18 @@ export interface GemmOperandArray {
   readonly base?: string;
   /** Expression for the distance in elements between consecutive rows. */
   readonly stride: string;
+  /**
+   * Whether the operand is stored with the contraction axis outermost.
+   *
+   * The default is `[row][k]`: element `[row][k]` at `base + row * stride + k`.
+   * A contraction whose operand is accumulated over its sequences, as the
+   * outer-product mean's is, has it the other way round — `[k][row]` at
+   * `base + k * stride + row` — and transposing it to satisfy this would cost
+   * a pass over the whole tensor. Only the f16 matrix kernel honours this; the
+   * f32 one addresses the operand where it lies and has no such freedom, so a
+   * caller declaring it is not offered that kernel.
+   */
+  readonly columnMajor?: boolean;
 }
 
 /**
@@ -248,6 +260,9 @@ export function gemmGrid(
 export function usesMatrixUnits(shader: TiledGemmShader, variant: GemmVariant): boolean {
   return variant.precision === "matrix"
     && shader.sourceArray !== undefined && shader.weightArray !== undefined
+    // Only the f16 kernel stages its operands, and staging is what lets it
+    // read one stored the other way round.
+    && (shader.sourceArray.columnMajor !== true || variant.matrix?.componentType === "f16")
     // A whole-tile epilogue is written against `acc{n}` in the hand-tiled
     // thread mapping, which a matrix kernel does not have. `storeVector` is
     // fine: the result is staged in workgroup memory, so an invocation can
@@ -339,6 +354,30 @@ function createMatrixGemmShaderF16(shader: TiledGemmShader, unit: MatrixUnitShap
   const base = (operand: GemmOperandArray): string => operand.base ?? "0u";
   const lines = (count: number, body: (index: number) => string): string =>
     Array.from({ length: count }, (_, index) => body(index)).join(String.fromCharCode(10));
+  // Each lane carries a fixed share of both staged tiles between steps.
+  if ((GEMM_TILE_ROWS * K) % lanes !== 0 || (K * tileColumns) % lanes !== 0) {
+    throw new RangeError("the staged tiles must divide evenly among the lanes");
+  }
+  const aPerLane = (GEMM_TILE_ROWS * K) / lanes;
+  const bPerLane = (K * tileColumns) / lanes;
+  const fetchA = (at: string): string => lines(aPerLane, (i) => `  {
+    let item = lane + ${i * lanes}u;
+    let global_row = tile_row_origin + item / ${K}u;
+    let step = ${at} + item % ${K}u;
+    next_a_${i} = select(0.0,
+      ${source.array}[${base(source)} + ${source.columnMajor === true
+        ? "step * (" + source.stride + ") + global_row"
+        : "global_row * (" + source.stride + ") + step"}],
+      global_row < gemm_rows && step < gemm_inner);
+  }`);
+  const fetchB = (at: string): string => lines(bPerLane, (i) => `  {
+    let item = lane + ${i * lanes}u;
+    let step = ${at} + item / ${tileColumns}u;
+    let global_column = tile_column_origin + item % ${tileColumns}u;
+    next_b_${i} = select(0.0,
+      ${weight.array}[${base(weight)} + step * (${weight.stride}) + global_column],
+      step < gemm_inner && global_column < gemm_columns);
+  }`);
   // The whole tile is drained once, by every lane, after each subgroup has
   // stored its own columns of it.
   const drain = shader.storeVector === undefined
@@ -388,28 +427,22 @@ fn main(
   let tile_column_origin = group.x * ${tileColumns}u;
 ${lines(groupTiles, (c) => `  var acc_${c} = subgroup_matrix_result<f32, ${N}, ${M}>();`)}
 
+  // Software pipelined: the operands for the next step are fetched into
+  // registers while the units still work on the staged ones, so a global load
+  // is never what the multiplies wait for. One staging buffer is enough for
+  // that; a second would double the workgroup memory to hide the same latency.
+${lines(aPerLane, (i) => `  var next_a_${i} = 0.0;`)}
+${lines(bPerLane, (i) => `  var next_b_${i} = 0.0;`)}
+${fetchA("0u")}
+${fetchB("0u")}
   for (var k0 = 0u; k0 < gemm_inner; k0 += ${K}u) {
-    for (var item = lane; item < ${GEMM_TILE_ROWS * K}u; item += ${lanes}u) {
-      let row = item / ${K}u;
-      let step = item % ${K}u;
-      let global_row = tile_row_origin + row;
-      var held = 0.0;
-      if (global_row < gemm_rows && k0 + step < gemm_inner) {
-        held = ${source.array}[${base(source)} + global_row * (${source.stride}) + k0 + step];
-      }
-      gemm_matrix_a[row * ${aStride}u + step] = f16(held);
-    }
-    for (var item = lane; item < ${K * tileColumns}u; item += ${lanes}u) {
-      let step = item / ${tileColumns}u;
-      let column = item % ${tileColumns}u;
-      let global_column = tile_column_origin + column;
-      var held = 0.0;
-      if (k0 + step < gemm_inner && global_column < gemm_columns) {
-        held = ${weight.array}[${base(weight)} + (k0 + step) * (${weight.stride}) + global_column];
-      }
-      gemm_matrix_b[step * ${bStride}u + column] = f16(held);
-    }
+${lines(aPerLane, (i) => `    gemm_matrix_a[((lane + ${i * lanes}u) / ${K}u) * ${aStride}u`
+    + ` + (lane + ${i * lanes}u) % ${K}u] = f16(next_a_${i});`)}
+${lines(bPerLane, (i) => `    gemm_matrix_b[((lane + ${i * lanes}u) / ${tileColumns}u) * ${bStride}u`
+    + ` + (lane + ${i * lanes}u) % ${tileColumns}u] = f16(next_b_${i});`)}
     workgroupBarrier();
+${fetchA(`k0 + ${K}u`)}
+${fetchB(`k0 + ${K}u`)}
     let left = subgroupMatrixLoad<subgroup_matrix_left<f16, ${K}, ${M}>>(
       &gemm_matrix_a, rows_at * ${aStride}u, false, ${aStride}u);
 ${lines(groupTiles, (c) => `    acc_${c} = subgroupMatrixMultiplyAccumulate(left,

@@ -286,6 +286,18 @@ ${shardLoader(shards, "right", "f32")}`,
   columns: "p.length * p.c_outer",
   sourceElement: "left_load(k * p.length * p.c_outer + tile.offset * p.c_outer + row)",
   weightElement: "right_load(k * p.length * p.c_outer + column)",
+  // One binding covering the whole projection is a plain array, so the matrix
+  // units can address it. The left operand is accumulated over the sequences
+  // and so is stored with the contraction axis outermost; the right one is
+  // already row-major in it. A sharded projection keeps the expressions,
+  // whose loader chooses a binding per element.
+  ...(shards.count === 1 ? {
+    sourceArray: {
+      array: "left_0", base: "tile.offset * p.c_outer",
+      stride: "p.length * p.c_outer", columnMajor: true,
+    },
+    weightArray: { array: "right_0", stride: "p.length * p.c_outer" },
+  } : {}),
   store: `let block_i = row / p.c_outer;
           let outer_left = row % p.c_outer;
           let j = column / p.c_outer;
