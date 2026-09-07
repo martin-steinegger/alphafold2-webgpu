@@ -33,6 +33,11 @@ import { attentionMatrixConfig, type MatrixUnitShape } from "../runtime/gemm.js"
  * anyway, because what a multiprocessor can hold matters more here than what a
  * workgroup can reuse. One subgroup is past the other side of it: too little
  * work in flight to cover the latency of its own staging.
+ *
+ * Measured against the stack rather than a standalone dispatch, four and eight
+ * subgroups still lose: the flash dispatches of an 800-residue stack read
+ * 51.0 ms at two, 54.1 ms at four and 62.9 ms at eight. A standalone
+ * dispatch ranks them the other way round, and is the wrong instrument here.
  */
 const SUBGROUPS = 2;
 /** The M of every tile, fixed by the unit shape the device reports. */
@@ -42,12 +47,20 @@ export const ATTENTION_MATRIX_QUERY_TILE = SUBGROUPS * UNIT;
 /**
  * Keys staged per pass, shared by every subgroup.
  *
- * One unit wide. A wider pass buys back barriers and amortises the staging,
- * and measured slower for it at every subgroup count, for the same reason the
- * subgroup count is small: the storage it takes costs more than the barriers
- * it saves.
+ * Two units wide. One unit is too narrow: the pass then stages a key tile and
+ * runs the whole online softmax over it for four multiplies, and the staging
+ * and the barriers around it cost more than the multiplies. Two units halve
+ * that overhead per multiply and still fit the storage a multiprocessor wants
+ * back, and the stack's flash dispatches fall from 51.0 ms to 47.5 ms over two
+ * runs at 800 residues, and the main stack from 25.07 s to 24.42 s at 1,650.
+ * Three and four units cross the occupancy cliff and read 69.6 ms and 70.4 ms.
+ *
+ * The earlier note here said the opposite, on a microbenchmark whose key and
+ * value tensors were small enough to sit in L2. The model's are not: at 1,650
+ * residues triangle attention alone streams 1.4 GB of each. Measure this
+ * against the stack, not against a standalone dispatch.
  */
-const KEY_TILE = 16;
+const KEY_TILE = 32;
 const LANES = SUBGROUPS * 32;
 
 /**
