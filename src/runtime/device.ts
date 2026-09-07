@@ -3,7 +3,9 @@ import { COMPACT_GPU_POOL_BYTES } from "./allocator.js";
 import {
   OUTER_PRODUCT_BLOCK_LIMIT_BYTES, outerProductMeanNormalizeWindow, outerProductMeanRowBlock,
 } from "../evoformer/outer-product-mean.js";
-import { ATTENTION_WINDOW_TARGET_BYTES, attentionBatchWindow } from "../evoformer/attention.js";
+import {
+  ATTENTION_WINDOW_TARGET_BYTES, attentionBatchWindow, attentionPairBiasStride,
+} from "../evoformer/attention.js";
 import { triangleBlockRows } from "../evoformer/block.js";
 import type { TriangleWholeStorage } from "../triangle/shaders.js";
 import type { ActivationStorage } from "./storage.js";
@@ -160,8 +162,9 @@ export function estimateMonomerMemory(
   const triangleBlock = triangleBlockRows(length, 128, 128) * length * 128 * bytes;
 
   // Attention over the pair adds a bias of one value per head and query pair,
-  // built from the pair one row window at a time.
-  const pairBias = 8 * length * length * bytes
+  // built from the pair one row window at a time. Its rows are padded to four,
+  // so the flash kernels can read four of one at once.
+  const pairBias = 8 * length * attentionPairBiasStride(length) * bytes
     + Math.min(pair, scratchBudget(ATTENTION_WINDOW_TARGET_BYTES));
   const operatorScratch = Math.max(
     // Row and column attention over the clustered and extra alignments: the
