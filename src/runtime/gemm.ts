@@ -419,25 +419,28 @@ function createMatrixGemmShaderF16(
   const stagedA = (offset: number): string => rowFirst
     ? `((lane + ${offset}u) % ${GEMM_TILE_ROWS}u) * ${aStride}u + (lane + ${offset}u) / ${GEMM_TILE_ROWS}u`
     : `((lane + ${offset}u) / ${kStep}u) * ${aStride}u + (lane + ${offset}u) % ${kStep}u`;
-  const fetchA = (at: string): string => lines(aPerLane, (i) => `  {
+  // A tile wholly inside the operand needs no test at all. The condition is
+  // uniform across the workgroup, so the whole of it takes one branch, and
+  // only the last tile of a row or of the contraction takes the checked one.
+  const fetchA = (at: string, whole: boolean): string => lines(aPerLane, (i) => `  {
     let item = lane + ${i * lanes}u;
     let row = tile_row_origin + item ${rowFirst ? `% ${GEMM_TILE_ROWS}u` : `/ ${kStep}u`};
     let k = ${at} + item ${rowFirst ? `/ ${GEMM_TILE_ROWS}u` : `% ${kStep}u`};
-    var held = 0.0;
+    ${whole ? `next_a_${i} = ${shader.sourceElement};` : `var held = 0.0;
     if (row < gemm_rows && k < gemm_inner) { held = ${shader.sourceElement}; }
-    next_a_${i} = held;
+    next_a_${i} = held;`}
   }`);
   const kFirst = shader.weightContiguous === "k";
   const stagedB = (offset: number): string => kFirst
     ? `((lane + ${offset}u) % ${kStep}u) * ${bStride}u + (lane + ${offset}u) / ${kStep}u`
     : `((lane + ${offset}u) / ${tileColumns}u) * ${bStride}u + (lane + ${offset}u) % ${tileColumns}u`;
-  const fetchB = (at: string): string => lines(bPerLane, (i) => `  {
+  const fetchB = (at: string, whole: boolean): string => lines(bPerLane, (i) => `  {
     let item = lane + ${i * lanes}u;
     let k = ${at} + item ${kFirst ? `% ${kStep}u` : `/ ${tileColumns}u`};
     let column = tile_column_origin + item ${kFirst ? `/ ${kStep}u` : `% ${tileColumns}u`};
-    var held = 0.0;
+    ${whole ? `next_b_${i} = ${shader.weightElement};` : `var held = 0.0;
     if (k < gemm_inner && column < gemm_columns) { held = ${shader.weightElement}; }
-    next_b_${i} = held;
+    next_b_${i} = held;`}
   }`);
   // Each subgroup stores and drains one unit-wide tile of its own, rather than
   // every subgroup staging the whole 64x128 output before any of it is read.
@@ -498,14 +501,27 @@ ${lines(groupTiles, (c) => `  var acc_${c} = subgroup_matrix_result<f32, ${N}, $
   // that; a second would double the workgroup memory to hide the same latency.
 ${lines(aPerLane, (i) => `  var next_a_${i} = 0.0;`)}
 ${lines(bPerLane, (i) => `  var next_b_${i} = 0.0;`)}
-${fetchA("0u")}
-${fetchB("0u")}
+  // Whole in the operands' other index; the contraction is tested per step.
+  let whole_tile = tile_row_origin + ${GEMM_TILE_ROWS}u <= gemm_rows
+    && tile_column_origin + ${tileColumns}u <= gemm_columns;
+  if (whole_tile && ${kStep}u <= gemm_inner) {
+${fetchA("0u", true)}
+${fetchB("0u", true)}
+  } else {
+${fetchA("0u", false)}
+${fetchB("0u", false)}
+  }
   for (var k0 = 0u; k0 < gemm_inner; k0 += ${kStep}u) {
 ${lines(aPerLane, (i) => `    gemm_matrix_a[${stagedA(i * lanes)}] = f16(next_a_${i});`)}
 ${lines(bPerLane, (i) => `    gemm_matrix_b[${stagedB(i * lanes)}] = f16(next_b_${i});`)}
     workgroupBarrier();
-${fetchA(`k0 + ${kStep}u`)}
-${fetchB(`k0 + ${kStep}u`)}
+    if (whole_tile && k0 + ${2 * kStep}u <= gemm_inner) {
+${fetchA(`k0 + ${kStep}u`, true)}
+${fetchB(`k0 + ${kStep}u`, true)}
+    } else {
+${fetchA(`k0 + ${kStep}u`, false)}
+${fetchB(`k0 + ${kStep}u`, false)}
+    }
 ${lines(steps, (s) => `    {
       let left = subgroupMatrixLoad<subgroup_matrix_left<f16, ${K}, ${M}>>(
         &gemm_matrix_a, rows_at * ${aStride}u + ${s * K}u, false, ${aStride}u);
