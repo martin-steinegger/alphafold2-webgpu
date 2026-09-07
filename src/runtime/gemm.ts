@@ -71,13 +71,17 @@ const GEMM_STAGE_STEPS = 1;
 export function matrixGemmStorageBytes(unit: MatrixUnitShape, tileColumns = GEMM_TILE_COLUMNS): number {
   if (unit.componentType !== "f16") return 0;
   const { M, N, K } = unit;
+  const columnTiles = tileColumns / N;
+  const columnGroups = columnTiles % 2 === 0 ? 2 : 1;
+  const subgroups = (GEMM_TILE_ROWS / M) * columnGroups;
   const aStride = K + 2;
   const bStride = tileColumns + 8;
-  const outStride = tileColumns + 1;
-  const reach = (maxOffset: number, stride: number, rows: number): number => maxOffset + stride * rows;
+  const outStride = N + 1;
+  const reach = (maxOffset: number, stride: number, count: number): number =>
+    maxOffset + stride * count;
   return reach((GEMM_TILE_ROWS - M) * aStride, aStride, M) * 2
-    + reach((tileColumns / N - 1) * N, bStride, K) * 2
-    + reach((GEMM_TILE_ROWS - M) * outStride + (tileColumns / N - 1) * N, outStride, M) * 4;
+    + reach((columnTiles - 1) * N, bStride, K) * 2
+    + reach((subgroups - 1) * M * outStride, outStride, M) * 4;
 }
 
 /** Apple's configuration, and what a variant naming no shape means. */
@@ -340,7 +344,7 @@ function createMatrixGemmShaderF16(shader: TiledGemmShader, unit: MatrixUnitShap
   const groupTiles = columnTiles / columnGroups;
   const aStride = K + 2;
   const bStride = tileColumns + 8;
-  const outStride = tileColumns + 1;
+  const outStride = N + 1;
   // A load or store reaches `offset + stride * rows`, not the last element it
   // touches; an array sized to the latter is out of bounds by the extension's
   // own rule however valid every index in it is.
@@ -348,7 +352,7 @@ function createMatrixGemmShaderF16(shader: TiledGemmShader, unit: MatrixUnitShap
     maxOffset + stride * count;
   const aLength = reach((GEMM_TILE_ROWS - M) * aStride, aStride, M);
   const bLength = reach((columnTiles - 1) * N, bStride, K);
-  const outLength = reach((GEMM_TILE_ROWS - M) * outStride + (columnTiles - 1) * N, outStride, M);
+  const outLength = reach((subgroups - 1) * M * outStride, outStride, M);
   const source = shader.sourceArray!;
   const weight = shader.weightArray!;
   const base = (operand: GemmOperandArray): string => operand.base ?? "0u";
@@ -378,31 +382,34 @@ function createMatrixGemmShaderF16(shader: TiledGemmShader, unit: MatrixUnitShap
       ${weight.array}[${base(weight)} + step * (${weight.stride}) + global_column],
       step < gemm_inner && global_column < gemm_columns);
   }`);
-  // The whole tile is drained once, by every lane, after each subgroup has
-  // stored its own columns of it.
-  const drain = shader.storeVector === undefined
-    ? `  for (var item = lane; item < ${GEMM_TILE_ROWS * tileColumns}u; item += ${lanes}u) {
-    let local_row = item / ${tileColumns}u;
-    let local_column = item % ${tileColumns}u;
-    let row = tile_row_origin + local_row;
-    let column = tile_column_origin + local_column;
-    if (row < gemm_rows && column < gemm_columns) {
-      let element = gemm_matrix_out[local_row * ${outStride}u + local_column];
-      ${shader.store}
-    }
-  }`
-    : `  for (var item = lane * 4u; item < ${GEMM_TILE_ROWS * tileColumns}u; item += ${lanes * 4}u) {
-    let local_row = item / ${tileColumns}u;
-    let local_column = item % ${tileColumns}u;
-    let row = tile_row_origin + local_row;
-    let column = tile_column_origin + local_column;
-    if (row < gemm_rows) {
-      let at = local_row * ${outStride}u + local_column;
-      let values = vec4<f32>(gemm_matrix_out[at], gemm_matrix_out[at + 1u],
-        gemm_matrix_out[at + 2u], gemm_matrix_out[at + 3u]);
-      ${shader.storeVector}
-    }
-  }`;
+  // Each subgroup stores and drains one unit-wide tile of its own, rather than
+  // every subgroup staging the whole 64x128 output before any of it is read.
+  // That buffer was 33 KiB of the kernel's 40 KiB, and this kernel ranks by
+  // the workgroup storage it declares as plainly as the attention one does.
+  const drain = (columnTile: number): string => shader.storeVector === undefined
+    ? `    for (var item = in_subgroup; item < ${M * N}u; item += ${MATRIX_LANES}u) {
+      let local_row = item / ${N}u;
+      let local_column = item % ${N}u;
+      let row = tile_row_origin + rows_at + local_row;
+      let column = tile_column_origin + columns_at + ${columnTile * N}u + local_column;
+      if (row < gemm_rows && column < gemm_columns) {
+        let element = gemm_matrix_out[subgroup * ${M * outStride}u
+          + local_row * ${outStride}u + local_column];
+        ${shader.store}
+      }
+    }`
+    : `    for (var item = in_subgroup * 4u; item < ${M * N}u; item += ${MATRIX_LANES * 4}u) {
+      let local_row = item / ${N}u;
+      let local_column = item % ${N}u;
+      let row = tile_row_origin + rows_at + local_row;
+      let column = tile_column_origin + columns_at + ${columnTile * N}u + local_column;
+      if (row < gemm_rows) {
+        let at = subgroup * ${M * outStride}u + local_row * ${outStride}u + local_column;
+        let values = vec4<f32>(gemm_matrix_out[at], gemm_matrix_out[at + 1u],
+          gemm_matrix_out[at + 2u], gemm_matrix_out[at + 3u]);
+        ${shader.storeVector}
+      }
+    }`;
   return `enable chromium_experimental_subgroup_matrix;
 enable f16;
 ${shader.preamble}
@@ -421,6 +428,7 @@ fn main(
   let gemm_inner = ${shader.inner};
   let gemm_columns = ${shader.columns};
   let lane = local.x;
+  let in_subgroup = lane % ${MATRIX_LANES}u;
   let rows_at = (subgroup / ${columnGroups}u) * ${M}u;
   let columns_at = (subgroup % ${columnGroups}u) * ${groupTiles * N}u;
   let tile_row_origin = group.y * ${GEMM_TILE_ROWS}u;
@@ -451,11 +459,11 @@ ${lines(groupTiles, (c) => `    acc_${c} = subgroupMatrixMultiplyAccumulate(left
     // The next step refills the tiles this multiply just read.
     workgroupBarrier();
   }
-${lines(groupTiles, (c) => `  subgroupMatrixStore(&gemm_matrix_out,
-    rows_at * ${outStride}u + columns_at + ${c * N}u, acc_${c}, false, ${outStride}u);`)}
+${lines(groupTiles, (c) => `  subgroupMatrixStore(&gemm_matrix_out, subgroup * ${M * outStride}u,
+    acc_${c}, false, ${outStride}u);
   workgroupBarrier();
-${drain}
-  workgroupBarrier();
+${drain(c)}
+  workgroupBarrier();`)}
 }`;
 }
 
