@@ -569,6 +569,25 @@ ${[0, 1, 2, 3].map((lane) => `              {
   });
 }
 
+/**
+ * Row length of the staged pair bias, which is the query count rounded up to
+ * four.
+ *
+ * The bias is read a row at a time by the flash kernels, and the matrix one
+ * reads four of it at once — sixteen scalar reads a lane a pass were a quarter
+ * of that kernel, and the count of them is what costs, not the bytes: halving
+ * the bytes it touches changes nothing, and removing the read entirely is
+ * worth 24%. A vector read needs the row to begin on a four-element boundary,
+ * which a query count of 1,650 does not give it. Padding the row to four does,
+ * for three floats a row.
+ */
+export function attentionPairBiasStride(queries: number): number {
+  return (queries + 3) & ~3;
+}
+
+/** The same rounding, in the shaders that index the bias. */
+const PAIR_BIAS_STRIDE = "((p.queries + 3u) & 0xfffffffcu)";
+
 export const ATTENTION_PAIR_BIAS_SHADER = `${COMMON}
 @group(0) @binding(0) var<storage, read> pair: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
@@ -591,7 +610,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     result += pair[(row * p.queries + k) * p.pair_channels + c]
       * weights[p.pair_weight + c * p.heads + head];
   }
-  output[(head * p.queries + p.batch_offset + row) * p.queries + k] = result;
+  output[(head * p.queries + p.batch_offset + row) * ${PAIR_BIAS_STRIDE} + k] = result;
 }`;
 
 export const ATTENTION_FLASH_SHADER = `${COMMON}
@@ -633,7 +652,7 @@ fn main(
     if (lane == 0u) {
       var logit = partial[0] + 1e9 * (mask[mask_index(batch_index, k_index)] - 1.0);
       if (p.has_pair_bias != 0u) {
-        logit += pair_bias[(head * p.queries + q_index) * p.queries + k_index];
+        logit += pair_bias[(head * p.queries + q_index) * ${PAIR_BIAS_STRIDE} + k_index];
       }
       logit = clamp(logit, -1e8, 1e8);
       let new_max = max(running_max, logit);
@@ -740,7 +759,7 @@ ${eachSlot("    ", (slot) => `{
 ${perSlot(slot, "  ", (index) => `score += dot(qv_${slot}_${index}, kv${index});`)}
   var logit = score + masked;
   if (p.has_pair_bias != 0u) {
-    logit += pair_bias[(head * p.queries + select(0u, q_index_${slot}, live_${slot})) * p.queries + k_index];
+    logit += pair_bias[(head * p.queries + select(0u, q_index_${slot}, live_${slot})) * ${PAIR_BIAS_STRIDE} + k_index];
   }
   logit = clamp(logit, -1e8, 1e8);
   let new_max = max(running_max_${slot}, logit);
@@ -825,7 +844,7 @@ fn main(
         }
         var logit = subgroupAdd(product) + 1e9 * (mask[mask_index(batch_index, k_index)] - 1.0);
         if (valid_query && p.has_pair_bias != 0u) {
-          logit += pair_bias[(head * p.queries + q_index) * p.queries + k_index];
+          logit += pair_bias[(head * p.queries + q_index) * ${PAIR_BIAS_STRIDE} + k_index];
         }
         logit = clamp(logit, -1e8, 1e8);
         let new_max = max(running_max, logit);
@@ -940,7 +959,7 @@ fn main(
           var logit = subgroupAdd(select(0.0, product, valid_query))
             + 1e9 * (mask[mask_index(batch_index, k_index)] - 1.0);
           if (valid_query && p.has_pair_bias != 0u) {
-            logit += pair_bias[(head * p.queries + q_index) * p.queries + k_index];
+            logit += pair_bias[(head * p.queries + q_index) * ${PAIR_BIAS_STRIDE} + k_index];
           }
           logit = clamp(logit, -1e8, 1e8);
           let new_max = max(running_max[query_slot], logit);
@@ -1041,7 +1060,7 @@ fn main(
       }
       logit += 1e9 * (mask[mask_index(batch_index, k_index)] - 1.0);
       if (p.has_pair_bias != 0u) {
-        logit += pair_bias[(head * p.queries + q_index) * p.queries + k_index];
+        logit += pair_bias[(head * p.queries + q_index) * ${PAIR_BIAS_STRIDE} + k_index];
       }
       logit = clamp(logit, -1e8, 1e8);
     }

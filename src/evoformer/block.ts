@@ -8,6 +8,7 @@ import {
   ATTENTION_OUTPUT_SHADER,
   ATTENTION_OUTPUT_RESIDUAL_SHADER,
   ATTENTION_PAIR_BIAS_SHADER,
+  attentionPairBiasStride,
   attentionKeyValueStorage,
   attentionQueriesPerThread,
   attentionProjectShader,
@@ -757,7 +758,10 @@ async function encodeAttention(
   };
 
   let normalizedPair: GpuTensor | undefined;
-  const pairBiasElements = options.pairBias === undefined ? 1 : options.heads * options.queries * options.queries;
+  // Four even where there is no bias: the matrix kernel binds it as vectors,
+  // and a binding of one element is under the minimum size for that.
+  const pairBiasElements = options.pairBias === undefined
+    ? 4 : options.heads * options.queries * attentionPairBiasStride(options.queries);
   const pairBias = execution.allocate(`${options.label}.pair-bias`, pairBiasElements);
   if (options.pairBias !== undefined) {
     if (options.pairBias.source === "separate") {

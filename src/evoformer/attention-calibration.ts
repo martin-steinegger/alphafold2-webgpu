@@ -91,7 +91,9 @@ async function measureFlashKernel(device: GPUDevice, headDim: number): Promise<A
     const value = create(rows * channels, storage);
     const gate = create(rows * channels, storage);
     const mask = create(rows, storage | GPUBufferUsage.COPY_DST);
-    const pairBias = create(1, storage);
+    // The probe has no bias, but the matrix kernel binds one as vectors and a
+    // binding of a single element is under the minimum size for that.
+    const pairBias = create(4, storage);
     const output = create(rows * channels, storage);
     const descriptor = {
       activations: new Float32Array(0), mask: new Float32Array(0),

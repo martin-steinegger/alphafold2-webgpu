@@ -199,7 +199,10 @@ struct Parameters {
 @group(0) @binding(2) var<storage, read> value: array<${storedHalf ? "f16" : "vec4<f32>"}>;
 @group(0) @binding(3) var<storage, read> gate: array<vec4<f32>>;
 @group(0) @binding(4) var<storage, read> mask: array<f32>;
-@group(0) @binding(5) var<storage, read> pair_bias: array<f32>;
+// Read four at a time: the count of these reads is what the softmax pays, not
+// the bytes, and the rows are padded to four so that a vector read of one is
+// aligned. See attentionPairBiasStride.
+@group(0) @binding(5) var<storage, read> pair_bias: array<vec4<f32>>;
 @group(0) @binding(6) var<uniform> p: Parameters;
 @group(0) @binding(7) var<storage, read_write> output: array<vec4<f32>>;
 
@@ -330,7 +333,14 @@ ${fetchKeyValue(`key_origin + ${KEY_TILE}u`)}`}
       var next_max = previous_max;
       // Both invariants of the inner loop, hoisted out of it.
       let live_query = global_query < p.queries;
-      let bias_row = (head * p.queries + global_query) * p.queries + key_origin;
+      // A whole number of vectors: the row length is a multiple of four, the
+      // key origin a multiple of the key tile, and the half-row offset even.
+      let bias_row = ((head * p.queries + global_query) * ((p.queries + 3u) & 0xfffffffcu)
+        + key_origin + first) / 4u;
+${lines(KEY_TILE / 8, (v) => `      var bias_${v} = vec4<f32>(0.0);`)}
+      if (p.has_pair_bias != 0u && live_query) {
+${lines(KEY_TILE / 8, (v) => `        bias_${v} = pair_bias[bias_row + ${v}u];`)}
+      }
       let score_row = row * ${SCORE_STRIDE}u;
       // The row's own share of the logits, held between the two sweeps over
       // it. Written back to the staged scores instead, each of the sixteen
@@ -341,9 +351,7 @@ ${lines(KEY_TILE / 2, (j) => `      var held_${j} = 0.0;`)}
 ${lines(KEY_TILE / 2, (j) => `        {
           let column = first + ${j}u;
           var logit = scores[score_row + column] + 1e9 * (mask_tile[column] - 1.0);
-          if (p.has_pair_bias != 0u) {
-            logit += pair_bias[bias_row + column];
-          }
+          logit += bias_${Math.floor(j / 4)}[${j % 4}];
           // Scaled once here so the exponential below is the hardware's exp2.
           held_${j} = clamp(logit, -1e8, 1e8) * 1.44269504088896340736;
           next_max = max(next_max, held_${j});
@@ -354,9 +362,7 @@ ${lines(KEY_TILE / 2, (j) => `        {
           var logit = -1e9;
           if (live_query && key_origin + column < p.queries) {
             logit = scores[score_row + column] + 1e9 * (mask_tile[column] - 1.0);
-            if (p.has_pair_bias != 0u) {
-              logit += pair_bias[bias_row + column];
-            }
+            logit += bias_${Math.floor(j / 4)}[${j % 4}];
             logit = clamp(logit, -1e8, 1e8);
           }
           held_${j} = logit * 1.44269504088896340736;

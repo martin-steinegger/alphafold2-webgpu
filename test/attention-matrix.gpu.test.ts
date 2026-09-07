@@ -17,6 +17,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { create, globals } from "webgpu";
 import {
   createAttentionRegisterFlashShader, selectAttentionFlashKernel, supportsAttentionMatrix,
+  attentionPairBiasStride,
 } from "../src/evoformer/attention.js";
 import { recordSubgroupMatrixConfigs } from "../src/runtime/subgroups.js";
 
@@ -80,7 +81,10 @@ describe.skipIf(!enabled)("flash attention over the matrix units", () => {
       const mask = Float32Array.from({ length: batch * queries },
         // A masked key in every row, so the softmax has to exclude it.
         (_, index) => (index % 17 === 0 ? 0 : 1));
-      const bias = values(HEADS * queries * queries, 0xfedcba9);
+      // Rows padded to four, the way the producer writes them, so that the
+      // matrix kernel's vector read of one lands where the register kernel's
+      // scalar reads do.
+      const bias = values(HEADS * queries * attentionPairBiasStride(queries), 0xfedcba9);
       const parameters = new Uint32Array(20);
       parameters.set([batch, queries, HEADS * HEAD_DIM, HEADS, HEAD_DIM, 0, 1], 0);
       parameters[17] = batch;
