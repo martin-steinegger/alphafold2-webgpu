@@ -57,6 +57,7 @@ import {
 import type { TriangleMultiplicationWeights } from "../triangle/types.js";
 import { packWeights as packTriangleWeights } from "../triangle/weights.js";
 import type { AllocationSnapshot } from "../runtime/allocator.js";
+import { scratchBudget } from "../runtime/scratch-budget.js";
 
 export interface AttentionModuleWeights {
   readonly heads: number;
@@ -712,7 +713,8 @@ async function encodeAttention(
   // Attention is independent across batch entries, so the per-row tensors only
   // ever have to hold one window of them.
   const windowBatch = attentionBatchWindow(options.batch, options.queries, options.channels,
-    Math.min(options.windowBytes ?? ATTENTION_WINDOW_TARGET_BYTES, execution.bindingLimitBytes));
+    Math.min(options.windowBytes ?? scratchBudget(ATTENTION_WINDOW_TARGET_BYTES),
+      execution.bindingLimitBytes));
   const windowElements = windowBatch * options.queries * options.channels;
 
   const normalized = execution.allocate(`${options.label}.normalized`, windowElements);
@@ -761,7 +763,8 @@ async function encodeAttention(
       const channels = options.pairBias.channels;
       const rowElements = options.queries * channels;
       const pairWindowRows = Math.max(1, Math.min(options.queries, Math.floor(
-        Math.min(options.windowBytes ?? ATTENTION_WINDOW_TARGET_BYTES, execution.bindingLimitBytes)
+        Math.min(options.windowBytes ?? scratchBudget(ATTENTION_WINDOW_TARGET_BYTES),
+          execution.bindingLimitBytes)
           / (rowElements * Float32Array.BYTES_PER_ELEMENT),
       )));
       normalizedPair = execution.allocate(`${options.label}.pair-normalized`, pairWindowRows * rowElements);
@@ -971,7 +974,8 @@ async function encodeOuterProductMean(
   const weights = execution.upload("opm.weights", packed.data);
   const params = uniform(execution, "opm.parameters", createOuterProductMeanParameters(descriptor, packed.offsets));
   const normalizeRows = outerProductMeanNormalizeWindow(rows, input.cM,
-    Math.min(input.scratchWindowBytes ?? OUTER_PRODUCT_NORMALIZE_WINDOW_BYTES, execution.bindingLimitBytes));
+    Math.min(input.scratchWindowBytes ?? scratchBudget(OUTER_PRODUCT_NORMALIZE_WINDOW_BYTES),
+      execution.bindingLimitBytes));
   const normalized = execution.allocate("opm.normalized", normalizeRows * input.cM);
   const projectionViews = (tensor: GpuTensor): readonly GpuTensor[] => {
     if (projectionShards.count === 1) return [tensor];
@@ -984,7 +988,7 @@ async function encodeOuterProductMean(
   const left = execution.allocate("opm.left", rows * input.cOuter);
   const right = execution.allocate("opm.right", rows * input.cOuter);
   const rowBlock = outerProductMeanRowBlock(input.length, input.cOuter,
-    Math.min(OUTER_PRODUCT_BLOCK_LIMIT_BYTES, execution.bindingLimitBytes));
+    Math.min(scratchBudget(OUTER_PRODUCT_BLOCK_LIMIT_BYTES), execution.bindingLimitBytes));
   const outer = execution.allocate("opm.outer", rowBlock * input.length * input.cOuter * input.cOuter);
   const pairCount = execution.allocate("opm.pair-count", input.length * input.length);
   const output = residualTarget ?? execution.allocate("opm.output",
@@ -1061,7 +1065,7 @@ const WEBGPU_GUARANTEED_BINDING_BYTES = 128 * 1024 * 1024;
 
 export function triangleBlockRows(
   length: number, cZ: number, triangleHidden: number,
-  budgetBytes: number = TRIANGLE_BLOCK_TARGET_BYTES,
+  budgetBytes: number = scratchBudget(TRIANGLE_BLOCK_TARGET_BYTES),
 ): number {
   if (![length, cZ, triangleHidden, budgetBytes].every((value) => Number.isSafeInteger(value) && value > 0)) {
     throw new RangeError("triangle block dimensions must be positive safe integers");
@@ -1107,7 +1111,8 @@ async function encodeTriangleMultiplication(
   const shape = { length: input.length, cZ: input.cZ, cHidden: input.triangleHidden };
   const packed = packTriangleWeights(weightsValue, "f32");
   const blockRows = triangleBlockRows(input.length, input.cZ, input.triangleHidden,
-    Math.min(input.scratchWindowBytes ?? TRIANGLE_BLOCK_TARGET_BYTES, execution.bindingLimitBytes));
+    Math.min(input.scratchWindowBytes ?? scratchBudget(TRIANGLE_BLOCK_TARGET_BYTES),
+      execution.bindingLimitBytes));
   const wholeStorage = input.triangleWholeStorage ?? "f32";
   const pairStorage = input.pairStorage ?? "f32";
   // A pair past the device's binding limit is bound as several windows of the

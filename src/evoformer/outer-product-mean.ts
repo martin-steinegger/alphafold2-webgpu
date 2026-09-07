@@ -3,6 +3,7 @@ import { pipelineCacheForDevice, type ComputePipelineCache } from "../runtime/pi
 import { type ActivationStorage, storageArray, storedElement } from "../runtime/storage.js";
 import { shardBindings, shardLoader, type ShardLayout } from "../runtime/sharded.js";
 import { createTiledGemmShader, gemmGrid } from "../runtime/gemm.js";
+import { scratchBudget } from "../runtime/scratch-budget.js";
 
 export interface OuterProductMeanWeights {
   readonly layerNormScale: Float32Array;
@@ -375,7 +376,8 @@ export const OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_RESIDUAL_SHADER =
 export const OUTER_PRODUCT_NORMALIZE_WINDOW_BYTES = 8 * 1024 * 1024;
 
 export function outerProductMeanNormalizeWindow(
-  rows: number, cM: number, budgetBytes: number = OUTER_PRODUCT_NORMALIZE_WINDOW_BYTES,
+  rows: number, cM: number,
+  budgetBytes: number = scratchBudget(OUTER_PRODUCT_NORMALIZE_WINDOW_BYTES),
 ): number {
   if (![rows, cM, budgetBytes].every((value) => Number.isSafeInteger(value) && value > 0)) {
     throw new RangeError("outer-product normalize window dimensions must be positive safe integers");
@@ -389,7 +391,8 @@ export function outerProductMeanNormalizeWindow(
 export const OUTER_PRODUCT_BLOCK_LIMIT_BYTES = 16 * 1024 * 1024;
 
 export function outerProductMeanRowBlock(
-  length: number, cOuter: number, budgetBytes: number = OUTER_PRODUCT_BLOCK_LIMIT_BYTES,
+  length: number, cOuter: number,
+  budgetBytes: number = scratchBudget(OUTER_PRODUCT_BLOCK_LIMIT_BYTES),
 ): number {
   if (![length, cOuter, budgetBytes].every((value) => Number.isSafeInteger(value) && value > 0)) {
     throw new RangeError("outer-product block dimensions and budget must be positive safe integers");

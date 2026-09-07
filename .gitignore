@@ -12,3 +12,6 @@ test/fixtures/evoformer/
 
 # A local reproduction spec that has been committed by accident three times.
 test/browser/metal-repro.spec.ts
+
+# Downloaded model bundles, which are release assets rather than sources.
+.models/

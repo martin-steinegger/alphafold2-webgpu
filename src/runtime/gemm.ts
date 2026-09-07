@@ -25,10 +25,63 @@ const GEMM_THREADS = 256;
  */
 const GEMM_WORKGROUP_BYTES = 16384;
 
-/** The matrix shape Apple offers, the region one subgroup owns, and its width. */
-const MATRIX_TILE = 8;
-const MATRIX_REGION = 32;
+/** The region one subgroup owns and its width. */
+export const MATRIX_REGION = 32;
 const MATRIX_LANES = 32;
+
+/**
+ * One hardware matrix configuration: `Accum[M][N] += A[M][K] * B[K][N]`.
+ *
+ * A device advertises the shapes and component types its units actually
+ * implement, and they differ by vendor rather than by preference. Apple offers
+ * f32 at 8x8x8, which is what this kernel was first written against. Nvidia
+ * offers no f32 configuration at all: its units take f16 operands, at 16x16x16
+ * and two narrower shapes, and accumulate into f32. So the shape cannot be a
+ * constant, and a device that reports nothing usable keeps the hand-tiled
+ * kernel as before.
+ *
+ * `resultType` is always f32 here. The units can accumulate in f16 as well and
+ * this deliberately does not: the whole reason the matrix path was exempt from
+ * the half-precision margin is that its reduction stays single precision, and
+ * a contraction over a deep MSA is exactly where an f16 accumulator fails.
+ */
+export interface MatrixUnitShape {
+  readonly componentType: "f32" | "f16";
+  readonly M: number;
+  readonly N: number;
+  readonly K: number;
+}
+
+/**
+ * Sixteen-deep steps staged before the units walk them.
+ *
+ * Each staging costs two barriers whatever its depth, so a deeper one buys
+ * them back and grows only the operands, which are small beside the result.
+ */
+const GEMM_STAGE_STEPS = 1;
+
+/**
+ * Workgroup bytes the f16 projection kernel declares.
+ *
+ * It stages both operands and the result, which is more than the 16 KiB every
+ * WebGPU implementation guarantees. A device that grants only the baseline
+ * cannot run it, and the candidate is withheld rather than left to fail
+ * validation inside the measurement.
+ */
+export function matrixGemmStorageBytes(unit: MatrixUnitShape, tileColumns = GEMM_TILE_COLUMNS): number {
+  if (unit.componentType !== "f16") return 0;
+  const { M, N, K } = unit;
+  const aStride = K + 2;
+  const bStride = tileColumns + 8;
+  const outStride = tileColumns + 1;
+  const reach = (maxOffset: number, stride: number, rows: number): number => maxOffset + stride * rows;
+  return reach((GEMM_TILE_ROWS - M) * aStride, aStride, M) * 2
+    + reach((tileColumns / N - 1) * N, bStride, K) * 2
+    + reach((GEMM_TILE_ROWS - M) * outStride + (tileColumns / N - 1) * N, outStride, M) * 4;
+}
+
+/** Apple's configuration, and what a variant naming no shape means. */
+export const MATRIX_SHAPE_F32_8: MatrixUnitShape = { componentType: "f32", M: 8, N: 8, K: 8 };
 
 /**
  * How the k loop computes, chosen per device rather than written down.
@@ -77,6 +130,15 @@ export interface GemmVariant {
    * the projection time, since the largest single shape is one of them.
    */
   readonly fallback?: "f32" | "f16-mixed" | "f16-chunked";
+  /**
+   * Which hardware configuration `matrix` means on this device.
+   *
+   * Absent is Apple's f32 8x8x8, which is what every existing caller and
+   * every recorded measurement assumed. An f16 configuration computes the
+   * products in half precision, so unlike the f32 one it is not exact and is
+   * held to the half-precision margin rather than the matrix one.
+   */
+  readonly matrix?: MatrixUnitShape;
 }
 
 export const GEMM_VARIANT_F32: GemmVariant = { precision: "f32", inner: GEMM_TILE_INNER };
@@ -223,25 +285,210 @@ export function usesMatrixUnits(shader: TiledGemmShader, variant: GemmVariant): 
  * Below one region's worth of rows there is nowhere to pull back to, and that
  * case is computed without the units at all.
  */
+/**
+ * The projection over f16 matrix units, four subgroups to a workgroup.
+ *
+ * The f32 kernel below addresses the operands where they lie, because Apple's
+ * units take the component type the tensors already are. An f16 unit cannot:
+ * `subgroupMatrixLoad` reinterprets nothing, so the operands have to be f16 in
+ * memory, and a staged tile is the only place they are.
+ *
+ * That staging is what the shape is chosen around. One subgroup owning the
+ * whole 64x128 tile — which is what the f32 kernel does — leaves thirty-two
+ * lanes to stage every tile and issue every multiply, and measured fifteen
+ * times slower than the hand-tiled kernel. Four subgroups stage once for
+ * sixty-four rows and take sixteen rows each, which is the same arrangement
+ * that made the matrix attention kernel win.
+ *
+ * Every staged row is padded to an odd-ish length for the banks: workgroup
+ * memory is thirty-two four-byte banks, and a stride sharing a factor with
+ * thirty-two collapses the lanes of a column read onto a few of them.
+ */
+function createMatrixGemmShaderF16(shader: TiledGemmShader, unit: MatrixUnitShape): string {
+  const { M, N, K } = unit;
+  const tileColumns = shader.tileColumns ?? GEMM_TILE_COLUMNS;
+  const rowGroups = GEMM_TILE_ROWS / M;
+  const columnTiles = tileColumns / N;
+  if (!Number.isInteger(rowGroups) || !Number.isInteger(columnTiles)) {
+    throw new RangeError(`a ${M}x${N} unit does not tile a ${GEMM_TILE_ROWS}x${tileColumns} output`);
+  }
+  // Subgroups are laid out across the columns as well as down the rows, so a
+  // 64x128 tile is carried by 256 lanes rather than 128. The staging is what
+  // wanted them — three thousand operand elements a step is the kernel's cost,
+  // not the multiplies — and it halves the accumulators each subgroup holds.
+  // Two, measured: one leaves 128 lanes staging three thousand elements a
+  // step and costs 0.33 ms where two cost 0.19; four asks for 512 lanes, which
+  // this driver would not run at all.
+  const columnGroups = columnTiles % 2 === 0 ? 2 : 1;
+  const subgroups = rowGroups * columnGroups;
+  const lanes = subgroups * MATRIX_LANES;
+  const groupTiles = columnTiles / columnGroups;
+  const aStride = K + 2;
+  const bStride = tileColumns + 8;
+  const outStride = tileColumns + 1;
+  // A load or store reaches `offset + stride * rows`, not the last element it
+  // touches; an array sized to the latter is out of bounds by the extension's
+  // own rule however valid every index in it is.
+  const reach = (maxOffset: number, stride: number, count: number): number =>
+    maxOffset + stride * count;
+  const aLength = reach((GEMM_TILE_ROWS - M) * aStride, aStride, M);
+  const bLength = reach((columnTiles - 1) * N, bStride, K);
+  const outLength = reach((GEMM_TILE_ROWS - M) * outStride + (columnTiles - 1) * N, outStride, M);
+  const source = shader.sourceArray!;
+  const weight = shader.weightArray!;
+  const base = (operand: GemmOperandArray): string => operand.base ?? "0u";
+  const lines = (count: number, body: (index: number) => string): string =>
+    Array.from({ length: count }, (_, index) => body(index)).join(String.fromCharCode(10));
+  // The whole tile is drained once, by every lane, after each subgroup has
+  // stored its own columns of it.
+  const drain = shader.storeVector === undefined
+    ? `  for (var item = lane; item < ${GEMM_TILE_ROWS * tileColumns}u; item += ${lanes}u) {
+    let local_row = item / ${tileColumns}u;
+    let local_column = item % ${tileColumns}u;
+    let row = tile_row_origin + local_row;
+    let column = tile_column_origin + local_column;
+    if (row < gemm_rows && column < gemm_columns) {
+      let element = gemm_matrix_out[local_row * ${outStride}u + local_column];
+      ${shader.store}
+    }
+  }`
+    : `  for (var item = lane * 4u; item < ${GEMM_TILE_ROWS * tileColumns}u; item += ${lanes * 4}u) {
+    let local_row = item / ${tileColumns}u;
+    let local_column = item % ${tileColumns}u;
+    let row = tile_row_origin + local_row;
+    let column = tile_column_origin + local_column;
+    if (row < gemm_rows) {
+      let at = local_row * ${outStride}u + local_column;
+      let values = vec4<f32>(gemm_matrix_out[at], gemm_matrix_out[at + 1u],
+        gemm_matrix_out[at + 2u], gemm_matrix_out[at + 3u]);
+      ${shader.storeVector}
+    }
+  }`;
+  return `enable chromium_experimental_subgroup_matrix;
+enable f16;
+${shader.preamble}
+
+var<workgroup> gemm_matrix_a: array<f16, ${aLength}>;
+var<workgroup> gemm_matrix_b: array<f16, ${bLength}>;
+var<workgroup> gemm_matrix_out: array<f32, ${outLength}>;
+
+@compute @workgroup_size(${lanes}, 1, 1)
+fn main(
+  @builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>,
+  @builtin(subgroup_id) subgroup: u32,
+) {
+  let gemm_rows = ${shader.rows};
+  let gemm_inner = ${shader.inner};
+  let gemm_columns = ${shader.columns};
+  let lane = local.x;
+  let rows_at = (subgroup / ${columnGroups}u) * ${M}u;
+  let columns_at = (subgroup % ${columnGroups}u) * ${groupTiles * N}u;
+  let tile_row_origin = group.y * ${GEMM_TILE_ROWS}u;
+  let tile_column_origin = group.x * ${tileColumns}u;
+${lines(groupTiles, (c) => `  var acc_${c} = subgroup_matrix_result<f32, ${N}, ${M}>();`)}
+
+  for (var k0 = 0u; k0 < gemm_inner; k0 += ${K}u) {
+    for (var item = lane; item < ${GEMM_TILE_ROWS * K}u; item += ${lanes}u) {
+      let row = item / ${K}u;
+      let step = item % ${K}u;
+      let global_row = tile_row_origin + row;
+      var held = 0.0;
+      if (global_row < gemm_rows && k0 + step < gemm_inner) {
+        held = ${source.array}[${base(source)} + global_row * (${source.stride}) + k0 + step];
+      }
+      gemm_matrix_a[row * ${aStride}u + step] = f16(held);
+    }
+    for (var item = lane; item < ${K * tileColumns}u; item += ${lanes}u) {
+      let step = item / ${tileColumns}u;
+      let column = item % ${tileColumns}u;
+      let global_column = tile_column_origin + column;
+      var held = 0.0;
+      if (k0 + step < gemm_inner && global_column < gemm_columns) {
+        held = ${weight.array}[${base(weight)} + (k0 + step) * (${weight.stride}) + global_column];
+      }
+      gemm_matrix_b[step * ${bStride}u + column] = f16(held);
+    }
+    workgroupBarrier();
+    let left = subgroupMatrixLoad<subgroup_matrix_left<f16, ${K}, ${M}>>(
+      &gemm_matrix_a, rows_at * ${aStride}u, false, ${aStride}u);
+${lines(groupTiles, (c) => `    acc_${c} = subgroupMatrixMultiplyAccumulate(left,
+      subgroupMatrixLoad<subgroup_matrix_right<f16, ${N}, ${K}>>(
+        &gemm_matrix_b, columns_at + ${c * N}u, false, ${bStride}u), acc_${c});`)}
+    // The next step refills the tiles this multiply just read.
+    workgroupBarrier();
+  }
+${lines(groupTiles, (c) => `  subgroupMatrixStore(&gemm_matrix_out,
+    rows_at * ${outStride}u + columns_at + ${c * N}u, acc_${c}, false, ${outStride}u);`)}
+  workgroupBarrier();
+${drain}
+  workgroupBarrier();
+}`;
+}
+
 function createMatrixGemmShader(shader: TiledGemmShader, variant: GemmVariant): string {
-  const size = MATRIX_TILE;
+  const unit = variant.matrix ?? MATRIX_SHAPE_F32_8;
+  const { M, N, K } = unit;
+  const half = unit.componentType === "f16";
   const region = MATRIX_REGION;
-  const tiles = region / size;
+  const rowTiles = region / M;
+  const columnTiles = region / N;
   const tileColumns = shader.tileColumns ?? GEMM_TILE_COLUMNS;
   const rowBlocks = GEMM_TILE_ROWS / region;
   const columnBlocks = tileColumns / region;
   if (!Number.isInteger(rowBlocks) || !Number.isInteger(columnBlocks)) {
     throw new RangeError(`matrix GEMM needs a tile in multiples of ${region}`);
   }
+  if (!Number.isInteger(rowTiles) || !Number.isInteger(columnTiles)) {
+    throw new RangeError(`matrix GEMM needs a unit shape dividing ${region}`);
+  }
   const source = shader.sourceArray!;
   const weight = shader.weightArray!;
   const lines = (count: number, body: (index: number) => string): string =>
     Array.from({ length: count }, (_, index) => body(index)).join("\n");
   const base = (operand: GemmOperandArray): string => operand.base ?? "0u";
+  // Where a tile is read from. With f32 components the units address the
+  // storage buffers directly. With f16 they cannot: `subgroupMatrixLoad`
+  // reinterprets nothing, so the array it reads must already hold the
+  // component type, and the operands here are f32. The tile is therefore
+  // converted once into workgroup storage and loaded from there, which is
+  // also where a staged tile is read more than once — every left tile meets
+  // every right tile — so the conversion is paid once per tile rather than
+  // once per multiply.
+  const leftArray = half ? "gemm_matrix_left" : source.array;
+  const leftOffset = (r: number): string => half
+    ? `${r * M * K}u`
+    : `${base(source)} + (load_origin + ${r * M}u) * (${source.stride}) + k0`;
+  const leftStride = half ? `${K}u` : source.stride;
+  const rightArray = half ? "gemm_matrix_right" : weight.array;
+  const rightOffset = (c: number): string => half
+    ? `${c * N}u`
+    : `${base(weight)} + k0 * (${weight.stride}) + column_origin + ${c * N}u`;
+  const rightStride = half ? `${region}u` : weight.stride;
+  // One lane-strided pass each, so the two staging loops touch consecutive
+  // addresses. A k that runs past the contraction is written as zero rather
+  // than read from the next row, which keeps a shape whose inner dimension is
+  // not a multiple of the unit's K exact instead of merely unstored.
+  const staging = half ? `
+        for (var item = lane; item < ${region * K}u; item += ${MATRIX_LANES}u) {
+          let stage_k = k0 + item % ${K}u;
+          gemm_matrix_left[item] = select(f16(0.0),
+            f16(${source.array}[${base(source)} + (load_origin + item / ${K}u) * (${source.stride}) + stage_k]),
+            stage_k < gemm_inner);
+        }
+        for (var item = lane; item < ${K * region}u; item += ${MATRIX_LANES}u) {
+          let stage_k = k0 + item / ${region}u;
+          gemm_matrix_right[item] = select(f16(0.0),
+            f16(${weight.array}[${base(weight)} + stage_k * (${weight.stride}) + column_origin + item % ${region}u]),
+            stage_k < gemm_inner);
+        }
+        workgroupBarrier();` : "";
   return `enable chromium_experimental_subgroup_matrix;
-${shader.preamble}
+${half ? "enable f16;\n" : ""}${shader.preamble}
 
-var<workgroup> gemm_matrix_stage: array<f32, ${region * region}>;
+var<workgroup> gemm_matrix_stage: array<f32, ${region * region}>;${half ? `
+var<workgroup> gemm_matrix_left: array<f16, ${region * K}>;
+var<workgroup> gemm_matrix_right: array<f16, ${K * region}>;` : ""}
 
 @compute @workgroup_size(${MATRIX_LANES}, 1, 1)
 fn main(
@@ -262,21 +509,23 @@ fn main(
         let column_origin = tile_column_origin + column_block * ${region}u;
         // Pulled back so the last tile still lies inside the source.
         let load_origin = min(row_origin, gemm_rows - ${region}u);
-${lines(tiles, (r) => lines(tiles, (c) =>
-    `        var acc_${r}_${c} = subgroup_matrix_result<f32, ${size}, ${size}>();`))}
-        for (var k0 = 0u; k0 < gemm_inner; k0 += ${size}u) {
-${lines(tiles, (r) => `          let left_${r} = subgroupMatrixLoad<subgroup_matrix_left<f32, ${size}, ${size}>>(
-            &${source.array}, ${base(source)} + (load_origin + ${r * size}u) * (${source.stride}) + k0,
-            false, ${source.stride});`)}
-${lines(tiles, (c) => `          let right_${c} = subgroupMatrixLoad<subgroup_matrix_right<f32, ${size}, ${size}>>(
-            &${weight.array}, ${base(weight)} + k0 * (${weight.stride}) + column_origin + ${c * size}u,
-            false, ${weight.stride});`)}
-${lines(tiles, (r) => lines(tiles, (c) =>
-    `          acc_${r}_${c} = subgroupMatrixMultiplyAccumulate(left_${r}, right_${c}, acc_${r}_${c});`))}
+${lines(rowTiles, (r) => lines(columnTiles, (c) =>
+    `        var acc_${r}_${c} = subgroup_matrix_result<f32, ${N}, ${M}>();`))}
+        for (var k0 = 0u; k0 < gemm_inner; k0 += ${K}u) {${staging}
+${lines(rowTiles, (r) => `          let left_${r} = subgroupMatrixLoad<subgroup_matrix_left<${unit.componentType}, ${K}, ${M}>>(
+            &${leftArray}, ${leftOffset(r)},
+            false, ${leftStride});`)}
+${lines(columnTiles, (c) => `          let right_${c} = subgroupMatrixLoad<subgroup_matrix_right<${unit.componentType}, ${N}, ${K}>>(
+            &${rightArray}, ${rightOffset(c)},
+            false, ${rightStride});`)}
+${lines(rowTiles, (r) => lines(columnTiles, (c) =>
+    `          acc_${r}_${c} = subgroupMatrixMultiplyAccumulate(left_${r}, right_${c}, acc_${r}_${c});`))}${half ? `
+          // The next k step refills the staging tiles this multiply just read.
+          workgroupBarrier();` : ""}
         }
         workgroupBarrier();
-${lines(tiles, (r) => lines(tiles, (c) =>
-    `        subgroupMatrixStore(&gemm_matrix_stage, ${r * size}u * ${region}u + ${c * size}u,
+${lines(rowTiles, (r) => lines(columnTiles, (c) =>
+    `        subgroupMatrixStore(&gemm_matrix_stage, ${r * M}u * ${region}u + ${c * N}u,
           acc_${r}_${c}, false, ${region}u);`))}
         workgroupBarrier();
 ${shader.storeVector === undefined ? `        for (var item = lane; item < ${region * region}u; item += ${MATRIX_LANES}u) {
@@ -343,7 +592,11 @@ ${shader.storeVector === undefined ? `    for (var item = lane; item < ${GEMM_TI
 export function createTiledGemmShader(
   shader: TiledGemmShader, variant: GemmVariant = gemmVariant(),
 ): string {
-  if (usesMatrixUnits(shader, variant)) return createMatrixGemmShader(shader, variant);
+  if (usesMatrixUnits(shader, variant)) {
+    const unit = variant.matrix ?? MATRIX_SHAPE_F32_8;
+    return unit.componentType === "f16"
+      ? createMatrixGemmShaderF16(shader, unit) : createMatrixGemmShader(shader, variant);
+  }
   const tileColumns = shader.tileColumns ?? GEMM_TILE_COLUMNS;
   // A caller that cannot reach the matrix units computes the same thing with
   // the hand-tiled kernel, in whatever precision the device settled on for
@@ -467,4 +720,29 @@ ${shader.storeVector !== undefined ? `      let column = tile_column;
     }
   }`)}
 }`;
+}
+
+/**
+ * The unit shape an attention kernel should use, or nothing.
+ *
+ * Attention needs a square tile: the same M carries the queries through both
+ * multiplies, and N must divide both the staged key tile and the head width.
+ * An f32 configuration would be exact and there is none on the parts that
+ * offer these units at all, so an f16 one with an f32 accumulator is what this
+ * looks for — the accumulator is what keeps the long reduction safe.
+ */
+export function attentionMatrixConfig(
+  device: GPUDevice,
+  configs: readonly { componentType: string; resultComponentType: string;
+    M: number; N: number; K: number }[],
+  queryTile: number,
+): MatrixUnitShape | undefined {
+  if (!device.features.has("shader-f16" as GPUFeatureName)) return undefined;
+  const usable = configs.filter((config) =>
+    config.resultComponentType === "f32" && config.componentType === "f16"
+    && config.M === queryTile && config.N === config.M && config.K === config.M);
+  const chosen = usable[0];
+  return chosen === undefined ? undefined : {
+    componentType: "f16", M: chosen.M, N: chosen.N, K: chosen.K,
+  };
 }

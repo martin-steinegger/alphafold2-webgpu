@@ -2,6 +2,7 @@ import { GpuBufferAllocator, type AllocatedGpuBuffer, type AllocationSnapshot } 
 import { pipelineCacheForDevice, type ComputePipelineCache } from "../runtime/pipeline-cache.js";
 import { type ActivationStorage, storageArray, storedElement } from "../runtime/storage.js";
 import { createTiledGemmShader, GEMM_TILE_COLUMNS, GEMM_TILE_ROWS } from "../runtime/gemm.js";
+import { scratchBudget } from "../runtime/scratch-budget.js";
 
 export interface TransitionWeights {
   readonly layerNormScale: Float32Array;
@@ -66,7 +67,7 @@ export function transitionChunkRows(
     throw new RangeError("transition chunk dimensions and limits must be positive safe integers");
   }
   const rowBytes = Math.max(channels, hiddenChannels) * Float32Array.BYTES_PER_ELEMENT;
-  const budget = Math.min(maxStorageBufferBindingSize, TRANSITION_CHUNK_TARGET_BYTES);
+  const budget = Math.min(maxStorageBufferBindingSize, scratchBudget(TRANSITION_CHUNK_TARGET_BYTES));
   if (rows * rowBytes <= budget) return rows;
   const capacity = Math.floor(budget / rowBytes);
   if (capacity < 1) throw new RangeError("WebGPU storage binding is too small for one transition row");

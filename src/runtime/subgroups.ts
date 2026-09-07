@@ -30,3 +30,33 @@ export function subgroupRange(device: GPUDevice): readonly [number, number] | un
   if (limits.minSubgroupSize === undefined || limits.maxSubgroupSize === undefined) return undefined;
   return [limits.minSubgroupSize, limits.maxSubgroupSize];
 }
+
+/** One entry of the adapter's `subgroupMatrixConfigs`, which the device omits. */
+export interface RecordedMatrixConfig {
+  readonly componentType: string;
+  readonly resultComponentType: string;
+  readonly M: number;
+  readonly N: number;
+  readonly K: number;
+}
+
+const matrixConfigs = new WeakMap<GPUDevice, readonly RecordedMatrixConfig[]>();
+
+/**
+ * Records which matrix shapes the units implement.
+ *
+ * The list is on the adapter and not on the device, and a kernel that wants it
+ * has only the device, so it is stashed here the way the subgroup range above
+ * already is.
+ */
+export function recordSubgroupMatrixConfigs(device: GPUDevice, adapter: GPUAdapter): void {
+  const info = adapter.info as unknown as
+    { subgroupMatrixConfigs?: readonly RecordedMatrixConfig[] } | undefined;
+  const configs = info?.subgroupMatrixConfigs;
+  if (configs !== undefined && configs.length > 0) matrixConfigs.set(device, configs);
+}
+
+/** The recorded shapes, empty on a device that reported none. */
+export function subgroupMatrixConfigs(device: GPUDevice): readonly RecordedMatrixConfig[] {
+  return matrixConfigs.get(device) ?? [];
+}

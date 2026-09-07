@@ -3,9 +3,14 @@ import {
 } from "../runtime/sharded.js";
 import { GpuBufferAllocator, type AllocatedGpuBuffer, type AllocationSnapshot } from "../runtime/allocator.js";
 import { pipelineCacheForDevice, type ComputePipelineCache } from "../runtime/pipeline-cache.js";
-import { subgroupRange } from "../runtime/subgroups.js";
+import { subgroupRange, subgroupMatrixConfigs } from "../runtime/subgroups.js";
+import {
+  attentionMatrixShape, attentionMatrixStorageBytes, createAttentionMatrixFlashShader,
+  ATTENTION_MATRIX_QUERY_TILE,
+} from "./attention-matrix.js";
 import { type ActivationStorage, storageArray, storedElement } from "../runtime/storage.js";
 import { createTiledGemmShader, gemmGrid } from "../runtime/gemm.js";
+import { scratchBudget } from "../runtime/scratch-budget.js";
 
 export interface AttentionWeights {
   readonly queryNormScale: Float32Array;
@@ -55,6 +60,7 @@ export interface AttentionResult {
 }
 
 export type AttentionFlashVariant = "auto" | "portable" | "register" | "register-2q" | "register-4q"
+  | "matrix"
   | "subgroup-4x8"
   | "subgroup-key32"
   | "subgroup-8x16" | "subgroup-8x32" | "subgroup-8x64"
@@ -134,7 +140,7 @@ export const ATTENTION_WINDOW_TARGET_BYTES = 8 * 1024 * 1024;
 
 export function attentionBatchWindow(
   batch: number, queries: number, channels: number,
-  budgetBytes: number = ATTENTION_WINDOW_TARGET_BYTES,
+  budgetBytes: number = scratchBudget(ATTENTION_WINDOW_TARGET_BYTES),
 ): number {
   if (![batch, queries, channels, budgetBytes].every((value) => Number.isSafeInteger(value) && value > 0)) {
     throw new RangeError("attention window dimensions and budget must be positive safe integers");
@@ -1058,11 +1064,39 @@ export function supportsAttentionSubgroup64x64(device: GPUDevice, headDim = 32):
     && device.limits.maxComputeWorkgroupStorageSize >= 16_384;
 }
 
+/**
+ * Whether the hardware matrix units can carry this attention.
+ *
+ * Needs the units themselves, f16 to feed them, a unit shape whose tiles the
+ * kernel is written around, and the workgroup storage its staged tiles take —
+ * which is more than the 16 KiB every implementation guarantees, so a device
+ * that grants only the baseline keeps the kernels it already had.
+ */
+export function supportsAttentionMatrix(device: GPUDevice, headDim = 32): boolean {
+  return device.features.has("chromium-experimental-subgroup-matrix" as GPUFeatureName)
+    && device.features.has("shader-f16" as GPUFeatureName)
+    && device.features.has("subgroups" as GPUFeatureName)
+    && device.limits.maxComputeInvocationsPerWorkgroup >= ATTENTION_MATRIX_QUERY_TILE * 2
+    && device.limits.maxComputeWorkgroupStorageSize >= attentionMatrixStorageBytes(headDim)
+    && attentionMatrixShape(device, headDim, subgroupMatrixConfigs(device)) !== undefined;
+}
+
 export function selectAttentionFlashKernel(
   device: GPUDevice,
   headDim = 32,
   requested: AttentionFlashVariant = "auto",
 ): AttentionFlashKernel {
+  if (requested === "matrix") {
+    const shape = attentionMatrixShape(device, headDim, subgroupMatrixConfigs(device));
+    if (shape === undefined || !supportsAttentionMatrix(device, headDim)) {
+      throw new Error("the matrix attention kernel is unsupported by this device");
+    }
+    return {
+      cacheKey: `attention:flash-matrix-${headDim}`,
+      shader: createAttentionMatrixFlashShader(headDim, shape),
+      queryTile: ATTENTION_MATRIX_QUERY_TILE, variant: requested,
+    };
+  }
   const subgroup = supportsAttentionSubgroups(device, headDim);
   const subgroup64 = supportsAttentionSubgroup64x64(device, headDim);
   const variant = requested === "auto"

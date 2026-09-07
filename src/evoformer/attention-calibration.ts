@@ -1,5 +1,6 @@
 import {
-  createAttentionParameters, selectAttentionFlashKernel, supportsAttentionSubgroups,
+  createAttentionParameters, selectAttentionFlashKernel, supportsAttentionMatrix,
+  supportsAttentionSubgroups,
   type AttentionFlashKernel, type AttentionFlashVariant, type AttentionInput,
 } from "./attention.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
@@ -32,6 +33,11 @@ const calibrations = new WeakMap<GPUDevice, Map<number, Promise<AttentionFlashKe
 export function attentionFlashCandidates(device: GPUDevice, headDim: number): readonly AttentionFlashVariant[] {
   const candidates: AttentionFlashVariant[] = [];
   if (headDim % 4 === 0 && headDim <= 32) candidates.push("register");
+  // The matrix units reduce each query-key dot product in hardware, so unlike
+  // every subgroup variant this one pays no cross-lane traffic for it. It is
+  // measured rather than assumed: it stages its tiles, which the register
+  // kernel does not, and only wins where that trade pays.
+  if (supportsAttentionMatrix(device, headDim)) candidates.push("matrix");
   if (supportsAttentionSubgroups(device, headDim)) {
     candidates.push(selectAttentionFlashKernel(device, headDim, "auto").variant);
   }

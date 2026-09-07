@@ -1,18 +1,25 @@
 import { describe, expect, it } from "vitest";
 import {
-  forceGemmVariant, gemmVariantCandidates, gemmVariantName, SHIPPABLE_GEMM_PRECISIONS,
+  forceGemmVariant, gemmVariantCandidates, gemmVariantName, selectMatrixShape,
+  SHIPPABLE_GEMM_PRECISIONS, type SubgroupMatrixConfig,
 } from "../src/runtime/gemm-selection.js";
 import {
   createTiledGemmShader, GEMM_VARIANT_F32, gemmGrid, gemmVariant, setGemmVariant,
   type GemmVariant,
 } from "../src/runtime/gemm.js";
 
-function fakeDevice(halfPrecision: boolean, matrixUnits = false): GPUDevice {
+function fakeDevice(
+  halfPrecision: boolean, matrixUnits = false,
+  // The f16 projection kernel stages both operands and the result, so a
+  // device that grants only the guaranteed 16 KiB is not offered it.
+  maxComputeWorkgroupStorageSize = 49152,
+): GPUDevice {
   const features = new Set<GPUFeatureName>();
   if (halfPrecision) features.add("shader-f16" as GPUFeatureName);
   if (matrixUnits) features.add("chromium-experimental-subgroup-matrix" as GPUFeatureName);
   return {
     features,
+    limits: { maxComputeWorkgroupStorageSize },
     createBuffer: () => { throw new Error("this test must not allocate"); },
   } as unknown as GPUDevice;
 }
@@ -66,6 +73,70 @@ describe("projection variant selection", () => {
     // And they do not depend on half precision being available.
     expect(gemmVariantCandidates(fakeDevice(false, true))
       .filter((variant) => variant.precision === "matrix")).toHaveLength(1);
+  });
+});
+
+const config = (
+  componentType: string, M: number, N: number, K: number, resultComponentType = "f32",
+): SubgroupMatrixConfig => ({ componentType, resultComponentType, M, N, K });
+
+describe("which hardware matrix configuration is used", () => {
+  it("prefers an exact configuration to a faster inexact one", () => {
+    // Apple reports f32 alongside f16. The f32 units reproduce the reference
+    // to the digit, so a wider f16 shape does not displace them.
+    expect(selectMatrixShape(fakeDevice(true, true),
+      [config("f16", 16, 16, 16), config("f32", 8, 8, 8)]))
+      .toEqual({ componentType: "f32", M: 8, N: 8, K: 8 });
+  });
+
+  it("takes the widest f16 shape when the device offers no f32 one", () => {
+    // Every current Nvidia part. All of them accumulate in f32, so the choice
+    // between them is throughput, and the widest is the most arithmetic per
+    // instruction issued.
+    expect(selectMatrixShape(fakeDevice(true, true),
+      [config("f16", 16, 8, 8), config("f16", 16, 16, 16), config("f16", 16, 8, 16)]))
+      .toEqual({ componentType: "f16", M: 16, N: 16, K: 16 });
+  });
+
+  it("will not use f16 units on a device that cannot compile f16", () => {
+    expect(selectMatrixShape(fakeDevice(false, true), [config("f16", 16, 16, 16)]))
+      .toBeUndefined();
+  });
+
+  it("refuses a configuration the kernel cannot walk or trust", () => {
+    const device = fakeDevice(true, true);
+    // A unit that does not divide the 32x32 region leaves part of it unwritten.
+    expect(selectMatrixShape(device, [config("f16", 12, 12, 16)])).toBeUndefined();
+    // An f16 accumulator is the arrangement that took a deep MSA to NaN.
+    expect(selectMatrixShape(device, [config("f16", 16, 16, 16, "f16")])).toBeUndefined();
+    // Integer units are not a projection kernel.
+    expect(selectMatrixShape(device, [config("u8", 16, 16, 32, "u32")])).toBeUndefined();
+  });
+
+  it("names a configuration apart from Apple's, which keeps its name", () => {
+    // The name still distinguishes a shape the projection kernel does not
+    // currently take, because the attention kernel reaches the same units.
+    expect(gemmVariantName({
+      precision: "matrix", inner: 8, matrix: { componentType: "f16", M: 16, N: 16, K: 16 },
+    })).toBe("matrix-f1616x16x16-64x128");
+    expect(gemmVariantName({
+      precision: "matrix", inner: 8, matrix: { componentType: "f32", M: 8, N: 8, K: 8 },
+    })).toBe("matrix-64x128");
+  });
+
+  it("offers the reported configuration, and none when nothing is reported", () => {
+    const offered = gemmVariantCandidates(fakeDevice(true, true), [config("f16", 16, 16, 16)])
+      .filter((variant) => variant.precision === "matrix");
+    expect(offered).toHaveLength(1);
+    expect(offered[0]?.matrix).toEqual({ componentType: "f16", M: 16, N: 16, K: 16 });
+    // A device whose units advertise nothing this kernel can walk keeps the
+    // hand-tiled kernel rather than being offered a shape it cannot run.
+    expect(gemmVariantCandidates(fakeDevice(true, true), [config("f16", 12, 12, 16)])
+      .some((variant) => variant.precision === "matrix")).toBe(false);
+    // Nor does a device that grants only the workgroup storage every
+    // implementation guarantees, which the staged kernel outgrows.
+    expect(gemmVariantCandidates(fakeDevice(true, true, 16384), [config("f16", 16, 16, 16)])
+      .some((variant) => variant.precision === "matrix")).toBe(false);
   });
 });
 

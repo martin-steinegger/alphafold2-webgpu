@@ -1,6 +1,6 @@
 import {
-  createTiledGemmShader, gemmGrid, GEMM_VARIANT_F32, setGemmVariant,
-  type GemmVariant,
+  createTiledGemmShader, gemmGrid, GEMM_VARIANT_F32, matrixGemmStorageBytes, MATRIX_REGION,
+  MATRIX_SHAPE_F32_8, setGemmVariant, type GemmVariant, type MatrixUnitShape,
 } from "./gemm.js";
 
 /**
@@ -164,15 +164,86 @@ function hasMatrixUnits(device: GPUDevice): boolean {
   return features?.has(MATRIX_FEATURE as GPUFeatureName) === true;
 }
 
+/**
+ * One entry of `GPUAdapterInfo.subgroupMatrixConfigs`.
+ *
+ * Declared structurally because the shipping `@webgpu/types` does not carry
+ * the experimental extension, and because only these five fields are read.
+ */
+export interface SubgroupMatrixConfig {
+  readonly componentType: string;
+  readonly resultComponentType: string;
+  readonly M: number;
+  readonly N: number;
+  readonly K: number;
+}
+
+/**
+ * The configuration this device should run the matrix kernel with, if any.
+ *
+ * Exact before fast: an f32 configuration reproduces the reference to the
+ * digit, so it is taken whenever one exists and no f16 shape is considered.
+ * Only a device that offers none — every current Nvidia part — falls to f16
+ * operands, and then the widest shape wins, being the most arithmetic per
+ * instruction issued.
+ *
+ * The accumulator must be f32 either way. A configuration that can only
+ * accumulate in f16 is not a faster matrix kernel, it is the `f16` precision
+ * this file already refuses to ship, reached by another route.
+ */
+export function selectMatrixShape(
+  device: GPUDevice, configs: readonly SubgroupMatrixConfig[],
+): MatrixUnitShape | undefined {
+  // f32 components only, and not for want of trying an f16 kernel: one was
+  // written, reproduced the reference to 3e-4, and aborted the driver on
+  // dispatch as soon as the contraction ran past five sixteen-deep steps.
+  // Every contraction in this model is far longer than that — the projections
+  // reduce over 256 and the transitions over 512 — and this list is walked by
+  // the calibration probe, so offering the shape here would not merely lose
+  // the measurement, it would take the process down before the model started.
+  // The attention kernel uses the same units without this, which is why it is
+  // reached through `attentionMatrixConfig` and not through here.
+  const usable = configs.filter((config) =>
+    config.resultComponentType === "f32"
+    && (config.componentType === "f32"
+      || (config.componentType === "f16" && hasHalfPrecision(device)))
+    // The kernel walks a 32x32 region with whole units, so both must divide it.
+    && MATRIX_REGION % config.M === 0 && MATRIX_REGION % config.N === 0);
+  // Exact before fast: an f32 configuration reproduces the reference to the
+  // digit, so it wins whenever one exists.
+  const exact = usable.filter((config) => config.componentType === "f32");
+  const preferred = (exact.length > 0 ? exact : usable)
+    .sort((left, right) => right.M * right.N * right.K - left.M * left.N * left.K)[0];
+  return preferred === undefined ? undefined : {
+    componentType: preferred.componentType as "f32" | "f16",
+    M: preferred.M, N: preferred.N, K: preferred.K,
+  };
+}
+
 /** Variants worth measuring against each other on this device. */
-export function gemmVariantCandidates(device: GPUDevice): readonly GemmVariant[] {
+export function gemmVariantCandidates(
+  device: GPUDevice, configs: readonly SubgroupMatrixConfig[] = [],
+): readonly GemmVariant[] {
   const depths = [8, 16] as const;
   const half = hasHalfPrecision(device) && !sawDeviceWithoutHalfPrecision;
   const candidates: GemmVariant[] = [];
   for (const precision of SHIPPABLE_GEMM_PRECISIONS) {
     if (precision === "matrix") {
       // The units fix the contraction step, so there is one of these.
-      if (hasMatrixUnits(device)) candidates.push({ precision, inner: 8 });
+      if (!hasMatrixUnits(device)) continue;
+      // A device that reports no configurations at all is Apple, whose shape
+      // predates the reporting; anything else is taken at its word.
+      const shape = configs.length === 0
+        ? MATRIX_SHAPE_F32_8 : selectMatrixShape(device, configs);
+      // The f16 kernel stages both operands and the result, past the 16 KiB
+      // baseline; a device that grants only that keeps the hand-tiled kernel.
+      // A stub standing in for a device in a test reports no limits at all,
+      // and is read as the baseline rather than as an error, the same way
+      // `hasHalfPrecision` reads a missing feature set.
+      const granted = device.limits?.maxComputeWorkgroupStorageSize ?? 16384;
+      if (shape !== undefined && matrixGemmStorageBytes(shape) <= granted) {
+        candidates.push({ precision, inner: 8, matrix: shape });
+      }
       continue;
     }
     if (precision !== "f32" && !half) continue;
@@ -182,8 +253,13 @@ export function gemmVariantCandidates(device: GPUDevice): readonly GemmVariant[]
 }
 
 export function gemmVariantName(variant: GemmVariant): string {
-  return variant.precision === "matrix"
-    ? "matrix-64x128" : `${variant.precision}-64x128k${variant.inner}`;
+  if (variant.precision !== "matrix") return `${variant.precision}-64x128k${variant.inner}`;
+  const unit = variant.matrix;
+  const apple = unit === undefined || (unit.componentType === "f32"
+    && unit.M === MATRIX_SHAPE_F32_8.M && unit.N === MATRIX_SHAPE_F32_8.N
+    && unit.K === MATRIX_SHAPE_F32_8.K);
+  return apple ? "matrix-64x128"
+    : `matrix-${unit!.componentType}${unit!.M}x${unit!.N}x${unit!.K}-64x128`;
 }
 
 /** A bias-free projection with the shared tiling, for probing one variant. */
@@ -322,36 +398,37 @@ async function measureError(
   }
 }
 
-/** Milliseconds per dispatch of one variant, best of several batches. */
-async function measureTime(
-  device: GPUDevice, variant: GemmVariant, probe: Probe, pipeline: GPUComputePipeline,
+/**
+ * One timed batch of a candidate on one shape, in milliseconds per dispatch.
+ *
+ * A submission costs a millisecond or two to come back and the clock is
+ * coarse, both of which swamp one dispatch of a few hundred microseconds, so a
+ * batch of dispatches is what gets timed.
+ */
+async function timeBatch(
+  device: GPUDevice, variant: GemmVariant, timing: VariantTiming, dispatches: number,
 ): Promise<number> {
-  const group = bindProbe(device, pipeline, probe);
-  const [x, y] = gemmGrid(probe.rows, probe.columns);
-  // A submission costs a millisecond or two to come back and the clock is
-  // coarse, both of which swamp one dispatch of a few hundred microseconds, so
-  // a batch of dispatches is what gets timed.
-  const batch = async (dispatches: number): Promise<number> => {
-    const encoder = device.createCommandEncoder({ label: `gemm-selection.time.${variant.precision}` });
-    const pass = encoder.beginComputePass();
-    pass.setPipeline(pipeline);
-    pass.setBindGroup(0, group);
-    for (let dispatch = 0; dispatch < dispatches; dispatch += 1) pass.dispatchWorkgroups(x, y, 1);
-    pass.end();
-    const started = performance.now();
-    device.queue.submit([encoder.finish()]);
-    await device.queue.onSubmittedWorkDone();
-    return (performance.now() - started) / dispatches;
-  };
-  // The rough pass also warms the pipeline, so its own time is discarded.
-  const rough = await batch(PROBE_ROUGH_DISPATCHES);
-  const dispatches = Math.max(PROBE_ROUGH_DISPATCHES, Math.min(PROBE_MAX_DISPATCHES,
-    Math.ceil(PROBE_BATCH_MILLISECONDS / Math.max(rough, 0.01))));
-  let best = Number.POSITIVE_INFINITY;
-  for (let repeat = 0; repeat < PROBE_REPEATS; repeat += 1) {
-    best = Math.min(best, await batch(dispatches));
-  }
-  return best;
+  const encoder = device.createCommandEncoder({ label: `gemm-selection.time.${variant.precision}` });
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(timing.pipeline);
+  pass.setBindGroup(0, timing.group);
+  const [x, y] = timing.grid;
+  for (let dispatch = 0; dispatch < dispatches; dispatch += 1) pass.dispatchWorkgroups(x, y, 1);
+  pass.end();
+  const started = performance.now();
+  device.queue.submit([encoder.finish()]);
+  await device.queue.onSubmittedWorkDone();
+  return (performance.now() - started) / dispatches;
+}
+
+/** One candidate measured on one shape: what to dispatch and the best seen. */
+interface VariantTiming {
+  readonly pipeline: GPUComputePipeline;
+  readonly group: GPUBindGroup;
+  readonly grid: readonly [number, number];
+  /** Sized so a batch reaches `PROBE_BATCH_MILLISECONDS`, once, up front. */
+  dispatches: number;
+  best: number;
 }
 
 export interface GemmVariantMeasurement {
@@ -372,30 +449,62 @@ export interface GemmVariantMeasurement {
  * the device on f32 for no reason.
  */
 export async function measureGemmVariants(
-  device: GPUDevice,
+  device: GPUDevice, configs: readonly SubgroupMatrixConfig[] = [],
 ): Promise<readonly GemmVariantMeasurement[]> {
   const probes = PROBE_SHAPES.map(
     (shape) => createProbe(device, shape.rows, shape.inner, shape.columns, false),
   );
   try {
-    const measurements: GemmVariantMeasurement[] = [];
-    for (const variant of gemmVariantCandidates(device)) {
+    // Compile and check every candidate first, so the timing loop below holds
+    // nothing but candidates that already reproduced the reference.
+    const entries: { variant: GemmVariant; relativeError: number; timings: VariantTiming[] }[] = [];
+    for (const variant of gemmVariantCandidates(device, configs)) {
       try {
         // One pipeline per candidate, not one per measurement: compiling each
         // shader twice was most of what this probe cost at device creation.
         const pipeline = await pipelineFor(device, variant);
         const relativeError = await measureError(device, variant, pipeline);
-        const perShape: number[] = [];
-        for (const probe of probes) perShape.push(await measureTime(device, variant, probe, pipeline));
-        measurements.push({
-          variant, relativeError, perShape,
-          milliseconds: perShape.reduce((total, value) => total + value, 0),
-        });
+        const timings = probes.map((probe) => ({
+          pipeline, group: bindProbe(device, pipeline, probe),
+          grid: gemmGrid(probe.rows, probe.columns),
+          dispatches: PROBE_ROUGH_DISPATCHES, best: Number.POSITIVE_INFINITY,
+        }));
+        entries.push({ variant, relativeError, timings });
       } catch {
         // Left out of the ranking entirely.
       }
     }
-    return measurements;
+    // Size each batch to reach `PROBE_BATCH_MILLISECONDS`. The rough pass also
+    // warms the pipeline, so its own time is discarded.
+    for (const entry of entries) {
+      for (const timing of entry.timings) {
+        const rough = await timeBatch(device, entry.variant, timing, PROBE_ROUGH_DISPATCHES);
+        timing.dispatches = Math.max(PROBE_ROUGH_DISPATCHES, Math.min(PROBE_MAX_DISPATCHES,
+          Math.ceil(PROBE_BATCH_MILLISECONDS / Math.max(rough, 0.01))));
+      }
+    }
+    // Sweep the candidates round-robin rather than finishing one before
+    // starting the next. Measured the other way each candidate owns a
+    // different window of wall time, so anything that drifts across the sweep
+    // — a clock ramping, a neighbouring process on a shared GPU — lands on
+    // whichever candidates happened to be running and ranks them, not the
+    // kernels. Interleaving gives every candidate the same windows, and the
+    // per-batch minimum then rejects the spikes instead of averaging them in.
+    for (let repeat = 0; repeat < PROBE_REPEATS; repeat += 1) {
+      for (const entry of entries) {
+        for (const timing of entry.timings) {
+          timing.best = Math.min(timing.best,
+            await timeBatch(device, entry.variant, timing, timing.dispatches));
+        }
+      }
+    }
+    return entries.map(({ variant, relativeError, timings }) => {
+      const perShape = timings.map((timing) => timing.best);
+      return {
+        variant, relativeError, perShape,
+        milliseconds: perShape.reduce((total, value) => total + value, 0),
+      };
+    });
   } finally {
     for (const probe of probes) destroyProbe(probe);
   }
@@ -410,7 +519,9 @@ export async function measureGemmVariants(
  * chosen, so an adapter where f16 buys nothing stays exact. Anything that
  * throws leaves the f32 kernel in place.
  */
-export function calibrateGemmVariant(device: GPUDevice): Promise<GemmVariant> {
+export function calibrateGemmVariant(
+  device: GPUDevice, configs: readonly SubgroupMatrixConfig[] = [],
+): Promise<GemmVariant> {
   if (pinnedVariant !== undefined) {
     setGemmVariant(pinnedVariant);
     return Promise.resolve(pinnedVariant);
@@ -420,7 +531,7 @@ export function calibrateGemmVariant(device: GPUDevice): Promise<GemmVariant> {
   const selection = (async (): Promise<GemmVariant> => {
     try {
       if (!hasHalfPrecision(device)) sawDeviceWithoutHalfPrecision = true;
-      const measurements = await measureGemmVariants(device);
+      const measurements = await measureGemmVariants(device, configs);
       const usable = measurements.filter(
         (measurement) => measurement.relativeError <= CHECK_TOLERANCE,
       );
@@ -453,10 +564,16 @@ export function calibrateGemmVariant(device: GPUDevice): Promise<GemmVariant> {
       const bestClassicWide = usable
         .filter((measurement) => measurement.variant.precision !== "matrix")
         .sort((left, right) => wideTime(left) - wideTime(right))[0];
+      // An f16 configuration rounds both operands, so it is held to the
+      // half-precision margin; only an f32 one is exact enough for the
+      // narrower matrix margin this path was given.
+      const matrixMargin = matrix?.variant.matrix?.componentType === "f16"
+        ? HALF_PRECISION_MARGIN : MATRIX_MARGIN;
       const winner: GemmVariant = matrix !== undefined && bestClassicWide !== undefined
-        && wideTime(matrix) * MATRIX_MARGIN < wideTime(bestClassicWide)
+        && wideTime(matrix) * matrixMargin < wideTime(bestClassicWide)
         ? { precision: "matrix", inner: classic.inner, fallback: classic.precision as
-            "f32" | "f16-mixed" | "f16-chunked" }
+            "f32" | "f16-mixed" | "f16-chunked",
+            ...(matrix.variant.matrix === undefined ? {} : { matrix: matrix.variant.matrix }) }
         : classic;
       setGemmVariant(winner);
       return winner;
