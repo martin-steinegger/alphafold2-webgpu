@@ -569,9 +569,22 @@ export function calibrateGemmVariant(
       // narrower matrix margin this path was given.
       const matrixMargin = matrix?.variant.matrix?.componentType === "f16"
         ? HALF_PRECISION_MARGIN : MATRIX_MARGIN;
+      // What a caller that cannot reach the units computes instead. The
+      // half-precision margin keeps a device exact when half precision buys
+      // too little to be worth its rounding — but a run whose units already
+      // take f16 operands has made that trade, and holding the callers that
+      // missed out to single precision only makes them slower for a
+      // consistency the run does not have. So they take the fastest kernel
+      // that reproduced the reference. Measured: the attention projections
+      // fell from the chunked kernel to f32 under a matrix winner and cost
+      // 0.11s of a recycle for it.
+      const matrixIsHalf = matrix?.variant.matrix?.componentType === "f16";
+      const fastestClassic = half !== undefined && half.milliseconds < (exact?.milliseconds ?? Infinity)
+        ? half.variant : classic;
+      const fallback = matrixIsHalf ? fastestClassic : classic;
       const winner: GemmVariant = matrix !== undefined && bestClassicWide !== undefined
         && wideTime(matrix) * matrixMargin < wideTime(bestClassicWide)
-        ? { precision: "matrix", inner: classic.inner, fallback: classic.precision as
+        ? { precision: "matrix", inner: fallback.inner, fallback: fallback.precision as
             "f32" | "f16-mixed" | "f16-chunked",
             ...(matrix.variant.matrix === undefined ? {} : { matrix: matrix.variant.matrix }) }
         : classic;
