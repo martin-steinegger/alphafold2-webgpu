@@ -70,6 +70,104 @@ describe.skipIf(!enabled)("projection over the hardware matrix units", () => {
 
   afterAll(() => { device?.destroy(); });
 
+  // The staged kernel walks an operand along whichever index the caller says
+  // runs contiguously, and both the fetch and the write into workgroup memory
+  // have to agree about it. When they did not, every shape here still passed —
+  // they all use the default layout — and the model came back at 26 pLDDT.
+  for (const layout of [
+    { name: "default layout", source: undefined, weight: undefined },
+    { name: "row-contiguous source", source: "row" as const, weight: undefined },
+    { name: "k-contiguous weight", source: undefined, weight: "k" as const },
+    { name: "both transposed", source: "row" as const, weight: "k" as const },
+  ]) {
+    it(`reproduces a reference projection with a ${layout.name}`, async (context) => {
+      if (device === undefined) {
+        context.skip("this adapter has no usable subgroup matrix configuration");
+        return;
+      }
+      const shape = selectMatrixShape(device, configs);
+      if (shape === undefined) {
+        context.skip("this adapter reports no configuration the kernel can walk");
+        return;
+      }
+      const rows = 130;
+      const inner = 96;
+      const columns = 132;
+      const source = values(rows * inner, 0x2244668);
+      const weights = values(inner * columns, 0x1133557);
+      // The operands are written transposed when the layout says they are, so
+      // the expression the kernel reads matches what the hint claims.
+      const sourceIndex = layout.source === "row" ? "k * 130u + row" : "row * 96u + k";
+      const weightIndex = layout.weight === "k" ? "column * 96u + k" : "k * 132u + column";
+      const code = createTiledGemmShader({
+        preamble: `
+@group(0) @binding(0) var<storage, read> source: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;`,
+        rows: `${rows}u`, inner: `${inner}u`, columns: `${columns}u`,
+        sourceElement: `source[${sourceIndex}]`,
+        weightElement: `weights[${weightIndex}]`,
+        store: `output[row * ${columns}u + column] = element;`,
+        ...(layout.source === undefined ? {} : { sourceContiguous: layout.source }),
+        ...(layout.weight === undefined ? {} : { weightContiguous: layout.weight }),
+      }, { precision: "matrix", inner: 8, matrix: shape });
+
+      const storage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
+      const created: GPUBuffer[] = [];
+      const make = (data: Float32Array, usage: GPUBufferUsageFlags): GPUBuffer => {
+        const buffer = device!.createBuffer({ size: data.byteLength, usage });
+        device!.queue.writeBuffer(buffer, 0, data);
+        created.push(buffer);
+        return buffer;
+      };
+      try {
+        const output = device.createBuffer({ size: rows * columns * 4,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        const readback = device.createBuffer({ size: rows * columns * 4,
+          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+        created.push(output, readback);
+        const bound = [make(source, storage), make(weights, storage), output];
+        device.pushErrorScope("validation");
+        const pipeline = device.createComputePipeline({ layout: "auto",
+          compute: { module: device.createShaderModule({ code }), entryPoint: "main" } });
+        expect(await device.popErrorScope(), "compiles").toBeNull();
+        const encoder = device.createCommandEncoder();
+        const pass = encoder.beginComputePass();
+        pass.setPipeline(pipeline);
+        pass.setBindGroup(0, device.createBindGroup({
+          layout: pipeline.getBindGroupLayout(0),
+          entries: bound.map((buffer, binding) => ({ binding, resource: { buffer } })),
+        }));
+        const [x, y] = gemmGrid(rows, columns);
+        pass.dispatchWorkgroups(x, y, 1);
+        pass.end();
+        encoder.copyBufferToBuffer(output, 0, readback, 0, rows * columns * 4);
+        device.queue.submit([encoder.finish()]);
+        await readback.mapAsync(GPUMapMode.READ);
+        const actual = new Float32Array(readback.getMappedRange().slice(0));
+        readback.unmap();
+        let worst = 0;
+        let scale = 0;
+        for (let row = 0; row < rows; row += 1) {
+          for (let column = 0; column < columns; column += 1) {
+            let total = 0;
+            for (let k = 0; k < inner; k += 1) {
+              const left = layout.source === "row" ? source[k * rows + row]! : source[row * inner + k]!;
+              const right = layout.weight === "k" ? weights[column * inner + k]! : weights[k * columns + column]!;
+              total += left * right;
+            }
+            worst = Math.max(worst, Math.abs(actual[row * columns + column]! - total));
+            scale = Math.max(scale, Math.abs(total));
+          }
+        }
+        expect(scale).toBeGreaterThan(0);
+        expect(worst / scale, `${layout.name} reproduces the reference`).toBeLessThan(4e-3);
+      } finally {
+        for (const buffer of created) buffer.destroy();
+      }
+    }, 60_000);
+  }
+
   it("reproduces a reference projection on the reported configuration", async (context) => {
     if (device === undefined) {
       context.skip("this adapter does not expose the subgroup matrix units");

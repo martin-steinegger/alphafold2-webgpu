@@ -222,6 +222,21 @@ export interface TiledGemmShader {
    */
   readonly sourceArray?: GemmOperandArray;
   readonly weightArray?: GemmOperandArray;
+  /**
+   * Which index of each operand runs contiguously in memory.
+   *
+   * Only the staged kernel reads this, and only to choose which index a lane
+   * varies fastest when it fetches a tile and writes it into workgroup memory.
+   * Getting it wrong costs bandwidth, not correctness — but the fetch and the
+   * write have to agree, and when they did not the prediction came back at 26
+   * pLDDT. The defaults are the common layouts — a source indexed `[row][k]`
+   * and a weight indexed `[k][column]`. The triangle multiplication's incoming
+   * direction has its source the other way round and read as though it did
+   * not, its tile arrived one block row apart per lane and it cost 0.19s to
+   * 0.27s of a recycle.
+   */
+  readonly sourceContiguous?: "k" | "row";
+  readonly weightContiguous?: "column" | "k";
 }
 
 export interface GemmOperandArray {
@@ -371,18 +386,28 @@ function createMatrixGemmShaderF16(shader: TiledGemmShader, unit: MatrixUnitShap
   // `row` and `k` for the source and `k` and `column` for the weight. They are
   // read under an `if` rather than a `select` so an expression is never
   // evaluated for an index outside the operand.
+  const rowFirst = shader.sourceContiguous === "row";
+  // The staged slot is `[row][k]` however the fetch walked it, so the write
+  // index has to be derived the same way the fetch was.
+  const stagedA = (offset: number): string => rowFirst
+    ? `((lane + ${offset}u) % ${GEMM_TILE_ROWS}u) * ${aStride}u + (lane + ${offset}u) / ${GEMM_TILE_ROWS}u`
+    : `((lane + ${offset}u) / ${K}u) * ${aStride}u + (lane + ${offset}u) % ${K}u`;
   const fetchA = (at: string): string => lines(aPerLane, (i) => `  {
     let item = lane + ${i * lanes}u;
-    let row = tile_row_origin + item / ${K}u;
-    let k = ${at} + item % ${K}u;
+    let row = tile_row_origin + item ${rowFirst ? `% ${GEMM_TILE_ROWS}u` : `/ ${K}u`};
+    let k = ${at} + item ${rowFirst ? `/ ${GEMM_TILE_ROWS}u` : `% ${K}u`};
     var held = 0.0;
     if (row < gemm_rows && k < gemm_inner) { held = ${shader.sourceElement}; }
     next_a_${i} = held;
   }`);
+  const kFirst = shader.weightContiguous === "k";
+  const stagedB = (offset: number): string => kFirst
+    ? `((lane + ${offset}u) % ${K}u) * ${bStride}u + (lane + ${offset}u) / ${K}u`
+    : `((lane + ${offset}u) / ${tileColumns}u) * ${bStride}u + (lane + ${offset}u) % ${tileColumns}u`;
   const fetchB = (at: string): string => lines(bPerLane, (i) => `  {
     let item = lane + ${i * lanes}u;
-    let k = ${at} + item / ${tileColumns}u;
-    let column = tile_column_origin + item % ${tileColumns}u;
+    let k = ${at} + item ${kFirst ? `% ${K}u` : `/ ${tileColumns}u`};
+    let column = tile_column_origin + item ${kFirst ? `/ ${K}u` : `% ${tileColumns}u`};
     var held = 0.0;
     if (k < gemm_inner && column < gemm_columns) { held = ${shader.weightElement}; }
     next_b_${i} = held;
@@ -449,10 +474,8 @@ ${lines(bPerLane, (i) => `  var next_b_${i} = 0.0;`)}
 ${fetchA("0u")}
 ${fetchB("0u")}
   for (var k0 = 0u; k0 < gemm_inner; k0 += ${K}u) {
-${lines(aPerLane, (i) => `    gemm_matrix_a[((lane + ${i * lanes}u) / ${K}u) * ${aStride}u`
-    + ` + (lane + ${i * lanes}u) % ${K}u] = f16(next_a_${i});`)}
-${lines(bPerLane, (i) => `    gemm_matrix_b[((lane + ${i * lanes}u) / ${tileColumns}u) * ${bStride}u`
-    + ` + (lane + ${i * lanes}u) % ${tileColumns}u] = f16(next_b_${i});`)}
+${lines(aPerLane, (i) => `    gemm_matrix_a[${stagedA(i * lanes)}] = f16(next_a_${i});`)}
+${lines(bPerLane, (i) => `    gemm_matrix_b[${stagedB(i * lanes)}] = f16(next_b_${i});`)}
     workgroupBarrier();
 ${fetchA(`k0 + ${K}u`)}
 ${fetchB(`k0 + ${K}u`)}

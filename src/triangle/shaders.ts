@@ -309,6 +309,10 @@ ${shardLoader(wholeShards, "whole", packedWhole ? "f16" : "f32")}`,
       ? "blocked[group.z * BLOCK_PAIRS + row * L + k]" : "blocked[group.z * BLOCK_PAIRS + k * block.w + row]",
     weightElement: outgoing
       ? wholeElement("group.z * WHOLE_STRIDE + column * L + k") : wholeElement("group.z * WHOLE_STRIDE + k * L + column"),
+    // Which index of each operand is contiguous, so a staged tile is fetched
+    // along memory rather than across it.
+    sourceContiguous: outgoing ? "k" : "row",
+    weightContiguous: outgoing ? "k" : "column",
     // The block's output entries are enumerated like its operand: by pair row
     // (i, j) outgoing, by (i, block column j) incoming.
     store: outgoing

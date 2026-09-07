@@ -286,6 +286,9 @@ ${shardLoader(shards, "right", "f32")}`,
   columns: "p.length * p.c_outer",
   sourceElement: "left_load(k * p.length * p.c_outer + tile.offset * p.c_outer + row)",
   weightElement: "right_load(k * p.length * p.c_outer + column)",
+  // Both operands are accumulated over the sequences, so the sequence is
+  // their outermost index and the residue runs contiguously.
+  sourceContiguous: "row",
   // One binding covering the whole projection is a plain array, so the matrix
   // units can address it. The left operand is accumulated over the sequences
   // and so is stored with the contraction axis outermost; the right one is
