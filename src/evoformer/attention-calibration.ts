@@ -52,13 +52,19 @@ async function timeFlashKernel(
     layout: pipeline.getBindGroupLayout(0),
     entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer } })),
   });
-  const groupsX = Math.ceil(PROBE_QUERIES / kernel.queryTile);
+  // Dispatched the way the kernel asks. Sent the query blocks where a
+  // batch-first kernel looks for its batch, the probe gives it a quarter of
+  // the work — the blocks past the query count exit at once — and times it as
+  // though it had done all of it.
+  const blocks = Math.ceil(PROBE_QUERIES / kernel.queryTile);
+  const groupsX = kernel.batchFirst === true ? PROBE_BATCH : blocks;
+  const groupsY = kernel.batchFirst === true ? blocks : PROBE_BATCH;
   const dispatch = async (): Promise<number> => {
     const encoder = device.createCommandEncoder({ label: `calibrate.${kernel.variant}` });
     const pass = encoder.beginComputePass();
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, bindGroup);
-    pass.dispatchWorkgroups(groupsX, PROBE_BATCH, heads);
+    pass.dispatchWorkgroups(groupsX, groupsY, heads);
     pass.end();
     const start = performance.now();
     device.queue.submit([encoder.finish()]);
