@@ -22,10 +22,12 @@ import {
 import { recordSubgroupMatrixConfigs } from "../src/runtime/subgroups.js";
 
 const enabled = process.env.AFWEBGPU_GPU_TESTS === "1";
-// Thirty-two is the width of the trunk's heads; eight is the extra-MSA
-// stack's, which the kernel pads up to the unit and so is the case that says
-// the padding carries no channel of its own into the answer.
-const HEAD_DIMS = [32, 8] as const;
+// Thirty-two is the width of the trunk's heads and eight the extra-MSA
+// stack's, which the kernel pads up to the unit: that is the case that says
+// the padding carries no channel of its own into the answer. Sixteen is the
+// width where the padding does nothing and the contraction is a single step,
+// which is neither of the other two.
+const HEAD_DIMS = [32, 16, 8] as const;
 const HEADS = 4;
 
 /** The same deterministic values on every device, so a run is reproducible. */
