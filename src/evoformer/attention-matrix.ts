@@ -26,13 +26,15 @@ import { attentionMatrixConfig, type MatrixUnitShape } from "../runtime/gemm.js"
 /**
  * Subgroups per workgroup, each owning sixteen queries.
  *
- * One subgroup was the obvious first shape and it loses: sixteen queries per
- * workgroup against the register kernel's sixty-four is a quarter of the work
- * per staging and per barrier, and it measured 0.62x. Four subgroups stage the
- * key and value tiles once for sixty-four queries, which is what makes reading
- * a key once for sixteen queries into reading it once for sixty-four.
+ * Two, and the reason is occupancy rather than reuse. Every arrangement of
+ * this kernel ranks by how much workgroup storage it declares, monotonically:
+ * 6.3 KiB reads 1.66x, 10.3 KiB 1.84x, 18.2 KiB 1.77x, 22.5 KiB 1.63x and
+ * 40.4 KiB 1.39x. Wider tiles reuse a staged key across more queries and lose
+ * anyway, because what a multiprocessor can hold matters more here than what a
+ * workgroup can reuse. One subgroup is past the other side of it: too little
+ * work in flight to cover the latency of its own staging.
  */
-const SUBGROUPS = 4;
+const SUBGROUPS = 2;
 /** The M of every tile, fixed by the unit shape the device reports. */
 const UNIT = 16;
 /** Queries one workgroup owns. */
@@ -40,11 +42,12 @@ export const ATTENTION_MATRIX_QUERY_TILE = SUBGROUPS * UNIT;
 /**
  * Keys staged per pass, shared by every subgroup.
  *
- * Each pass costs four barriers whatever its width, so a wider tile buys back
- * barriers and amortises the conversion of the staged tiles. Sixty-four is
- * what fits once the scores and the weighted output share their storage.
+ * One unit wide. A wider pass buys back barriers and amortises the staging,
+ * and measured slower for it at every subgroup count, for the same reason the
+ * subgroup count is small: the storage it takes costs more than the barriers
+ * it saves.
  */
-const KEY_TILE = 32;
+const KEY_TILE = 16;
 const LANES = SUBGROUPS * 32;
 
 /**
