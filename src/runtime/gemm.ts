@@ -781,13 +781,21 @@ fn main(
   let tile_column = column_origin + column_thread * 4u;
 ${lines(rowsPerThread, (row) => `  var ${register}${row} = vec4<${accumulatorScalar}>(0.0);`)}
 
+  // A tile wholly inside the operands needs no test at all, and only the last
+  // tile of a row or a column is not. The condition is uniform across the
+  // workgroup, so the whole of it takes one branch; the contraction is asked
+  // per step, since only its last step is short.
+  let whole_tile = tile_row_origin + ${GEMM_TILE_ROWS}u <= gemm_rows
+    && column_origin + ${tileColumns}u <= gemm_columns;
   for (var k0 = 0u; k0 < gemm_inner; k0 += ${tileInner}u) {
+    let whole_step = whole_tile && k0 + ${tileInner}u <= gemm_inner;
     for (var item = thread; item < ${GEMM_TILE_ROWS * tileInner}u; item += ${GEMM_THREADS}u) {
       let load_row = item / ${tileInner}u;
       let k = k0 + (item % ${tileInner}u);
       let row = group.y * ${GEMM_TILE_ROWS}u + load_row;
       var element = 0.0;
-      if (row < gemm_rows && k < gemm_inner) { element = ${shader.sourceElement}; }
+      if (whole_step) { element = ${shader.sourceElement}; }
+      else if (row < gemm_rows && k < gemm_inner) { element = ${shader.sourceElement}; }
       let slot = (item % ${tileInner}u) * ${GEMM_TILE_ROWS}u + load_row;
       gemm_source[slot] = ${half ? "f16(element)" : "element"};
     }
@@ -795,7 +803,12 @@ ${lines(rowsPerThread, (row) => `  var ${register}${row} = vec4<${accumulatorSca
       let k = k0 + item / ${columnThreads}u;
       let load_column = column_origin + (item % ${columnThreads}u) * 4u;
       var loaded = vec4<f32>(0.0);
-      if (k < gemm_inner) {
+      if (whole_step) {
+${lines(4, (lane) => `        {
+          let column = load_column + ${lane}u;
+          loaded[${lane}u] = ${shader.weightElement};
+        }`)}
+      } else if (k < gemm_inner) {
 ${lines(4, (lane) => `        {
           let column = load_column + ${lane}u;
           if (column < gemm_columns) { loaded[${lane}u] = ${shader.weightElement}; }
