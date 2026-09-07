@@ -65,7 +65,8 @@ describe("projection variant selection", () => {
     expect(gemmVariantCandidates(fakeDevice(true))
       .some((variant) => variant.precision === "matrix")).toBe(false);
     const withUnits = gemmVariantCandidates(fakeDevice(true, true));
-    // The units fix the contraction step at 8, so there is no k depth to try.
+    // This device reports no configuration, so the shape is the f32 one, whose
+    // kernel stages nothing and so has no staged depth to try.
     expect(withUnits.filter((variant) => variant.precision === "matrix")).toHaveLength(1);
     expect(gemmVariantName({ precision: "matrix", inner: 8 })).toBe("matrix-64x128");
     // And they do not depend on half precision being available.
@@ -125,7 +126,9 @@ describe("which hardware matrix configuration is used", () => {
   it("offers the reported configuration, and none when nothing is reported", () => {
     const offered = gemmVariantCandidates(fakeDevice(true, true), [config("f16", 16, 16, 16)])
       .filter((variant) => variant.precision === "matrix");
-    expect(offered).toHaveLength(1);
+    // One per staged depth, both of which this device's storage permits.
+    expect(offered).toHaveLength(2);
+    expect(offered.map((variant) => variant.matrixDepth)).toEqual([1, 2]);
     expect(offered[0]?.matrix).toEqual({ componentType: "f16", M: 16, N: 16, K: 16 });
     // A device whose units advertise nothing this kernel can walk keeps the
     // hand-tiled kernel rather than being offered a shape it cannot run.

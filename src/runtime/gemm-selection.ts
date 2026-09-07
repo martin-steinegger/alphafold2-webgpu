@@ -229,7 +229,6 @@ export function gemmVariantCandidates(
   const candidates: GemmVariant[] = [];
   for (const precision of SHIPPABLE_GEMM_PRECISIONS) {
     if (precision === "matrix") {
-      // The units fix the contraction step, so there is one of these.
       if (!hasMatrixUnits(device)) continue;
       // A device that reports no configurations at all is Apple, whose shape
       // predates the reporting; anything else is taken at its word.
@@ -241,8 +240,18 @@ export function gemmVariantCandidates(
       // and is read as the baseline rather than as an error, the same way
       // `hasHalfPrecision` reads a missing feature set.
       const granted = device.limits?.maxComputeWorkgroupStorageSize ?? 16384;
-      if (shape !== undefined && matrixGemmStorageBytes(shape) <= granted) {
-        candidates.push({ precision, inner: 8, matrix: shape });
+      if (shape === undefined) continue;
+      // One unit of depth a step spends two barriers on as many multiplies as
+      // the tile is wide; two units spend them once for twice as many, and
+      // stage the same operands to do it. Which wins is the device's answer,
+      // so both are offered wherever the storage is granted.
+      // Only the f16 kernel stages the operands at all, so only it has a
+      // depth to stage. The f32 one hands the units a pointer into the
+      // caller's own array and reads a unit's worth at a time.
+      const depths = shape.componentType === "f16" ? [1, 2] : [1];
+      for (const depth of depths) {
+        if (matrixGemmStorageBytes(shape, undefined, depth * shape.K) > granted) continue;
+        candidates.push({ precision, inner: 8, matrix: shape, matrixDepth: depth });
       }
       continue;
     }
@@ -259,7 +268,8 @@ export function gemmVariantName(variant: GemmVariant): string {
     && unit.M === MATRIX_SHAPE_F32_8.M && unit.N === MATRIX_SHAPE_F32_8.N
     && unit.K === MATRIX_SHAPE_F32_8.K);
   return apple ? "matrix-64x128"
-    : `matrix-${unit!.componentType}${unit!.M}x${unit!.N}x${unit!.K}-64x128`;
+    : `matrix-${unit!.componentType}${unit!.M}x${unit!.N}x${unit!.K}-64x128`
+      + ((variant.matrixDepth ?? 1) === 1 ? "" : `d${variant.matrixDepth}`);
 }
 
 /** A bias-free projection with the shared tiling, for probing one variant. */
@@ -584,7 +594,10 @@ export function calibrateGemmVariant(
       const fallback = matrixIsHalf ? fastestClassic : classic;
       const winner: GemmVariant = matrix !== undefined && bestClassicWide !== undefined
         && wideTime(matrix) * matrixMargin < wideTime(bestClassicWide)
-        ? { precision: "matrix", inner: fallback.inner, fallback: fallback.precision as
+        ? { precision: "matrix", inner: fallback.inner,
+          ...(matrix.variant.matrixDepth === undefined
+            ? {} : { matrixDepth: matrix.variant.matrixDepth }),
+          fallback: fallback.precision as
             "f32" | "f16-mixed" | "f16-chunked",
             ...(matrix.variant.matrix === undefined ? {} : { matrix: matrix.variant.matrix }) }
         : classic;

@@ -68,19 +68,21 @@ const GEMM_STAGE_STEPS = 1;
  * cannot run it, and the candidate is withheld rather than left to fail
  * validation inside the measurement.
  */
-export function matrixGemmStorageBytes(unit: MatrixUnitShape, tileColumns = GEMM_TILE_COLUMNS): number {
+export function matrixGemmStorageBytes(
+  unit: MatrixUnitShape, tileColumns = GEMM_TILE_COLUMNS, kStep = unit.K,
+): number {
   if (unit.componentType !== "f16") return 0;
   const { M, N, K } = unit;
   const columnTiles = tileColumns / N;
   const columnGroups = columnTiles % 2 === 0 ? 2 : 1;
   const subgroups = (GEMM_TILE_ROWS / M) * columnGroups;
-  const aStride = K + 2;
+  const aStride = kStep + 2;
   const bStride = tileColumns + 8;
   const outStride = N + 1;
   const reach = (maxOffset: number, stride: number, count: number): number =>
     maxOffset + stride * count;
   return reach((GEMM_TILE_ROWS - M) * aStride, aStride, M) * 2
-    + reach((columnTiles - 1) * N, bStride, K) * 2
+    + reach((columnTiles - 1) * N, bStride, kStep) * 2
     + reach((subgroups - 1) * M * outStride, outStride, M) * 4;
 }
 
@@ -118,11 +120,21 @@ export interface GemmVariant {
    * `matrix` is not half precision at all: it is the hardware matrix units,
    * accumulating in f32, and it is both faster than any of the above and
    * exact. It serves only callers that declared their operands as arrays and
-   * store one element at a time, and `inner` does not apply to it — the units
-   * fix the contraction step at 8.
+   * store one element at a time, and `inner` does not apply to it: the units
+   * fix the depth of a multiply, and `matrixDepth` says how many of those a
+   * step stages at once.
    */
   readonly precision: "f32" | "f16" | "f16-mixed" | "f16-chunked" | "matrix";
   readonly inner: 8 | 16;
+  /**
+   * Unit depths of the contraction one step stages, for the matrix precision.
+   *
+   * One is two barriers for as many multiplies as the tile is wide; two spend
+   * them once for twice as many, and stage the same operands to do it. It
+   * costs workgroup storage, which this kernel ranks by, so the depth is
+   * offered to the calibration rather than written down. Absent means one.
+   */
+  readonly matrixDepth?: number;
   /**
    * What a caller that cannot reach the matrix units computes instead.
    *
@@ -344,8 +356,23 @@ export function usesMatrixUnits(shader: TiledGemmShader, variant: GemmVariant): 
  * memory is thirty-two four-byte banks, and a stride sharing a factor with
  * thirty-two collapses the lanes of a column read onto a few of them.
  */
-function createMatrixGemmShaderF16(shader: TiledGemmShader, unit: MatrixUnitShape): string {
+/**
+ * The projection over the matrix units, staging `kStep` of the contraction.
+ *
+ * One unit of depth a step is two barriers for four multiplies, and the
+ * staging around them is the kernel's cost rather than the multiplies: the
+ * contraction reads 96 GB/s where the card gives 1.8 TB/s, and runs at a
+ * ninth of what the units can do. A deeper step moves the same operands and
+ * spends the barriers once for as many multiplies as it is deep. It costs
+ * workgroup storage, which this kernel ranks by, so which depth wins is
+ * measured per device rather than written down.
+ */
+function createMatrixGemmShaderF16(
+  shader: TiledGemmShader, unit: MatrixUnitShape, kStep = unit.K,
+): string {
   const { M, N, K } = unit;
+  if (kStep % K !== 0) throw new RangeError("the staged depth must be whole units");
+  const steps = kStep / K;
   const tileColumns = shader.tileColumns ?? GEMM_TILE_COLUMNS;
   const rowGroups = GEMM_TILE_ROWS / M;
   const columnTiles = tileColumns / N;
@@ -363,7 +390,7 @@ function createMatrixGemmShaderF16(shader: TiledGemmShader, unit: MatrixUnitShap
   const subgroups = rowGroups * columnGroups;
   const lanes = subgroups * MATRIX_LANES;
   const groupTiles = columnTiles / columnGroups;
-  const aStride = K + 2;
+  const aStride = kStep + 2;
   const bStride = tileColumns + 8;
   const outStride = N + 1;
   // A load or store reaches `offset + stride * rows`, not the last element it
@@ -372,16 +399,16 @@ function createMatrixGemmShaderF16(shader: TiledGemmShader, unit: MatrixUnitShap
   const reach = (maxOffset: number, stride: number, count: number): number =>
     maxOffset + stride * count;
   const aLength = reach((GEMM_TILE_ROWS - M) * aStride, aStride, M);
-  const bLength = reach((columnTiles - 1) * N, bStride, K);
+  const bLength = reach((columnTiles - 1) * N, bStride, kStep);
   const outLength = reach((subgroups - 1) * M * outStride, outStride, M);
   const lines = (count: number, body: (index: number) => string): string =>
     Array.from({ length: count }, (_, index) => body(index)).join(String.fromCharCode(10));
   // Each lane carries a fixed share of both staged tiles between steps.
-  if ((GEMM_TILE_ROWS * K) % lanes !== 0 || (K * tileColumns) % lanes !== 0) {
+  if ((GEMM_TILE_ROWS * kStep) % lanes !== 0 || (kStep * tileColumns) % lanes !== 0) {
     throw new RangeError("the staged tiles must divide evenly among the lanes");
   }
-  const aPerLane = (GEMM_TILE_ROWS * K) / lanes;
-  const bPerLane = (K * tileColumns) / lanes;
+  const aPerLane = (GEMM_TILE_ROWS * kStep) / lanes;
+  const bPerLane = (kStep * tileColumns) / lanes;
   // The operands come from the caller's own element expressions, which name
   // `row` and `k` for the source and `k` and `column` for the weight. They are
   // read under an `if` rather than a `select` so an expression is never
@@ -391,23 +418,23 @@ function createMatrixGemmShaderF16(shader: TiledGemmShader, unit: MatrixUnitShap
   // index has to be derived the same way the fetch was.
   const stagedA = (offset: number): string => rowFirst
     ? `((lane + ${offset}u) % ${GEMM_TILE_ROWS}u) * ${aStride}u + (lane + ${offset}u) / ${GEMM_TILE_ROWS}u`
-    : `((lane + ${offset}u) / ${K}u) * ${aStride}u + (lane + ${offset}u) % ${K}u`;
+    : `((lane + ${offset}u) / ${kStep}u) * ${aStride}u + (lane + ${offset}u) % ${kStep}u`;
   const fetchA = (at: string): string => lines(aPerLane, (i) => `  {
     let item = lane + ${i * lanes}u;
-    let row = tile_row_origin + item ${rowFirst ? `% ${GEMM_TILE_ROWS}u` : `/ ${K}u`};
-    let k = ${at} + item ${rowFirst ? `/ ${GEMM_TILE_ROWS}u` : `% ${K}u`};
+    let row = tile_row_origin + item ${rowFirst ? `% ${GEMM_TILE_ROWS}u` : `/ ${kStep}u`};
+    let k = ${at} + item ${rowFirst ? `/ ${GEMM_TILE_ROWS}u` : `% ${kStep}u`};
     var held = 0.0;
     if (row < gemm_rows && k < gemm_inner) { held = ${shader.sourceElement}; }
     next_a_${i} = held;
   }`);
   const kFirst = shader.weightContiguous === "k";
   const stagedB = (offset: number): string => kFirst
-    ? `((lane + ${offset}u) % ${K}u) * ${bStride}u + (lane + ${offset}u) / ${K}u`
+    ? `((lane + ${offset}u) % ${kStep}u) * ${bStride}u + (lane + ${offset}u) / ${kStep}u`
     : `((lane + ${offset}u) / ${tileColumns}u) * ${bStride}u + (lane + ${offset}u) % ${tileColumns}u`;
   const fetchB = (at: string): string => lines(bPerLane, (i) => `  {
     let item = lane + ${i * lanes}u;
-    let k = ${at} + item ${kFirst ? `% ${K}u` : `/ ${tileColumns}u`};
-    let column = tile_column_origin + item ${kFirst ? `/ ${K}u` : `% ${tileColumns}u`};
+    let k = ${at} + item ${kFirst ? `% ${kStep}u` : `/ ${tileColumns}u`};
+    let column = tile_column_origin + item ${kFirst ? `/ ${kStep}u` : `% ${tileColumns}u`};
     var held = 0.0;
     if (k < gemm_inner && column < gemm_columns) { held = ${shader.weightElement}; }
     next_b_${i} = held;
@@ -473,17 +500,19 @@ ${lines(aPerLane, (i) => `  var next_a_${i} = 0.0;`)}
 ${lines(bPerLane, (i) => `  var next_b_${i} = 0.0;`)}
 ${fetchA("0u")}
 ${fetchB("0u")}
-  for (var k0 = 0u; k0 < gemm_inner; k0 += ${K}u) {
+  for (var k0 = 0u; k0 < gemm_inner; k0 += ${kStep}u) {
 ${lines(aPerLane, (i) => `    gemm_matrix_a[${stagedA(i * lanes)}] = f16(next_a_${i});`)}
 ${lines(bPerLane, (i) => `    gemm_matrix_b[${stagedB(i * lanes)}] = f16(next_b_${i});`)}
     workgroupBarrier();
-${fetchA(`k0 + ${K}u`)}
-${fetchB(`k0 + ${K}u`)}
-    let left = subgroupMatrixLoad<subgroup_matrix_left<f16, ${K}, ${M}>>(
-      &gemm_matrix_a, rows_at * ${aStride}u, false, ${aStride}u);
-${lines(groupTiles, (c) => `    acc_${c} = subgroupMatrixMultiplyAccumulate(left,
-      subgroupMatrixLoad<subgroup_matrix_right<f16, ${N}, ${K}>>(
-        &gemm_matrix_b, columns_at + ${c * N}u, false, ${bStride}u), acc_${c});`)}
+${fetchA(`k0 + ${kStep}u`)}
+${fetchB(`k0 + ${kStep}u`)}
+${lines(steps, (s) => `    {
+      let left = subgroupMatrixLoad<subgroup_matrix_left<f16, ${K}, ${M}>>(
+        &gemm_matrix_a, rows_at * ${aStride}u + ${s * K}u, false, ${aStride}u);
+${lines(groupTiles, (c) => `      acc_${c} = subgroupMatrixMultiplyAccumulate(left,
+        subgroupMatrixLoad<subgroup_matrix_right<f16, ${N}, ${K}>>(
+          &gemm_matrix_b, ${s * K * bStride}u + columns_at + ${c * N}u, false, ${bStride}u), acc_${c});`)}
+    }`)}
     // The next step refills the tiles this multiply just read.
     workgroupBarrier();
   }
@@ -664,7 +693,8 @@ export function createTiledGemmShader(
   if (usesMatrixUnits(shader, variant)) {
     const unit = variant.matrix ?? MATRIX_SHAPE_F32_8;
     return unit.componentType === "f16"
-      ? createMatrixGemmShaderF16(shader, unit) : createMatrixGemmShader(shader, variant);
+      ? createMatrixGemmShaderF16(shader, unit, (variant.matrixDepth ?? 1) * unit.K)
+      : createMatrixGemmShader(shader, variant);
   }
   const tileColumns = shader.tileColumns ?? GEMM_TILE_COLUMNS;
   // A caller that cannot reach the matrix units computes the same thing with
