@@ -338,6 +338,9 @@ export function createOuterProductMeanProjectOutputShader(
     columns: "p.c_z",
     sourceElement: "outer[row * p.c_outer * p.c_outer + k]",
     weightElement: "weights[p.output_weight + k * p.c_z + column]",
+    // Both operands are plain row-major arrays, so the units can address them.
+    sourceArray: { array: "outer", stride: "p.c_outer * p.c_outer" },
+    weightArray: { array: "weights", base: "p.output_weight", stride: "p.c_z" },
     // A packed pair takes the four adjacent columns an invocation holds as two
     // words; the pair channel count is a multiple of four, so the group never
     // runs past the row.

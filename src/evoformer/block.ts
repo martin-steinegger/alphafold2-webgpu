@@ -340,6 +340,11 @@ function globalAttentionQueryShader(): string {
     columns: "p.heads * p.head_dim",
     sourceElement: "means[row * p.channels + k]",
     weightElement: "weights[p.query_weight + k * p.heads * p.head_dim + column]",
+    // Both operands are plain row-major arrays, so the units can address them.
+    sourceArray: { array: "means", stride: "p.channels" },
+    weightArray: {
+      array: "weights", base: "p.query_weight", stride: "p.heads * p.head_dim",
+    },
     store: `query[row * p.heads * p.head_dim + column] = element * inverseSqrt(f32(p.head_dim));`,
   });
 }
