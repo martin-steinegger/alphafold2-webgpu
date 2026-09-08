@@ -551,17 +551,17 @@ ${fetchA(`k0 + ${kStep}u`, false)}
 ${fetchB(`k0 + ${kStep}u`, false)}
     }
 ${lines(steps, (s) => `    {
-      let left = subgroupMatrixLoad<subgroup_matrix_left<f16, ${K}, ${M}>>(
-        &gemm_matrix_a, rows_at * ${aStride}u + ${s * K}u, false, ${aStride}u);
+      let left = subgroupMatrixLoad<subgroup_matrix_left<f16, ${K}, ${M}>, row_major>(
+        &gemm_matrix_a, rows_at * ${aStride}u + ${s * K}u, ${aStride}u);
 ${lines(groupTiles, (c) => `      acc_${c} = subgroupMatrixMultiplyAccumulate(left,
-        subgroupMatrixLoad<subgroup_matrix_right<f16, ${N}, ${K}>>(
-          &gemm_matrix_b, ${s * K * bStride}u + columns_at + ${c * N}u, false, ${bStride}u), acc_${c});`)}
+        subgroupMatrixLoad<subgroup_matrix_right<f16, ${N}, ${K}>, row_major>(
+          &gemm_matrix_b, ${s * K * bStride}u + columns_at + ${c * N}u, ${bStride}u), acc_${c});`)}
     }`)}
     // The next step refills the tiles this multiply just read.
     workgroupBarrier();
   }
-${lines(groupTiles, (c) => `  subgroupMatrixStore(&gemm_matrix_out, subgroup * ${M * outStride}u,
-    acc_${c}, false, ${outStride}u);
+${lines(groupTiles, (c) => `  subgroupMatrixStore<row_major>(&gemm_matrix_out, subgroup * ${M * outStride}u,
+    acc_${c}, ${outStride}u);
   workgroupBarrier();
 ${drain(c)}
   workgroupBarrier();`)}
@@ -653,12 +653,12 @@ ${tileOrigins(tileColumns)}
 ${lines(rowTiles, (r) => lines(columnTiles, (c) =>
     `        var acc_${r}_${c} = subgroup_matrix_result<f32, ${N}, ${M}>();`))}
         for (var k0 = 0u; k0 < gemm_inner; k0 += ${K}u) {${staging}
-${lines(rowTiles, (r) => `          let left_${r} = subgroupMatrixLoad<subgroup_matrix_left<${unit.componentType}, ${K}, ${M}>>(
+${lines(rowTiles, (r) => `          let left_${r} = subgroupMatrixLoad<subgroup_matrix_left<${unit.componentType}, ${K}, ${M}>, row_major>(
             &${leftArray}, ${leftOffset(r)},
-            false, ${leftStride});`)}
-${lines(columnTiles, (c) => `          let right_${c} = subgroupMatrixLoad<subgroup_matrix_right<${unit.componentType}, ${N}, ${K}>>(
+            ${leftStride});`)}
+${lines(columnTiles, (c) => `          let right_${c} = subgroupMatrixLoad<subgroup_matrix_right<${unit.componentType}, ${N}, ${K}>, row_major>(
             &${rightArray}, ${rightOffset(c)},
-            false, ${rightStride});`)}
+            ${rightStride});`)}
 ${lines(rowTiles, (r) => lines(columnTiles, (c) =>
     `          acc_${r}_${c} = subgroupMatrixMultiplyAccumulate(left_${r}, right_${c}, acc_${r}_${c});`))}${half ? `
           // The next k step refills the staging tiles this multiply just read.
@@ -666,8 +666,8 @@ ${lines(rowTiles, (r) => lines(columnTiles, (c) =>
         }
         workgroupBarrier();
 ${lines(rowTiles, (r) => lines(columnTiles, (c) =>
-    `        subgroupMatrixStore(&gemm_matrix_stage, ${r * M}u * ${region}u + ${c * N}u,
-          acc_${r}_${c}, false, ${region}u);`))}
+    `        subgroupMatrixStore<row_major>(&gemm_matrix_stage, ${r * M}u * ${region}u + ${c * N}u,
+          acc_${r}_${c}, ${region}u);`))}
         workgroupBarrier();
 ${shader.storeVector === undefined ? `        for (var item = lane; item < ${region * region}u; item += ${MATRIX_LANES}u) {
           let row = row_origin + item / ${region}u;

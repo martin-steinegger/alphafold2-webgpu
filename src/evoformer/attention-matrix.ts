@@ -324,18 +324,18 @@ ${fetchKeyValue(`key_origin + ${KEY_TILE}u`)}`}
     for (var tile = 0u; tile < ${keyTiles}u; tile += 1u) {
       var product = subgroup_matrix_result<f32, ${N}, ${M}>();
       for (var step = 0u; step < ${contractions}u; step += 1u) {
-        let left = subgroupMatrixLoad<subgroup_matrix_left<f16, ${K}, ${M}>>(
-          &queries_tile, rows_at * ${TILE_STRIDE}u + step * ${K}u, false, ${TILE_STRIDE}u);
+        let left = subgroupMatrixLoad<subgroup_matrix_left<f16, ${K}, ${M}>, row_major>(
+          &queries_tile, rows_at * ${TILE_STRIDE}u + step * ${K}u, ${TILE_STRIDE}u);
         let right = ${storedHalf
-          ? `subgroupMatrixLoad<subgroup_matrix_right<f16, ${N}, ${K}>>(&key,
+          ? `subgroupMatrixLoad<subgroup_matrix_right<f16, ${N}, ${K}>, col_major>(&key,
           ((batch_index * p.queries + key_origin + tile * ${N}u) * p.heads + head) * ${headDim}u
-            + step * ${K}u, true, p.heads * ${headDim}u)`
-          : `subgroupMatrixLoad<subgroup_matrix_right<f16, ${N}, ${K}>>(
-          &keys_tile, tile * ${N} * ${TILE_STRIDE}u + step * ${K}u, true, ${TILE_STRIDE}u)`};
+            + step * ${K}u, p.heads * ${headDim}u)`
+          : `subgroupMatrixLoad<subgroup_matrix_right<f16, ${N}, ${K}>, col_major>(
+          &keys_tile, tile * ${N} * ${TILE_STRIDE}u + step * ${K}u, ${TILE_STRIDE}u)`};
         product = subgroupMatrixMultiplyAccumulate(left, right, product);
       }
-      subgroupMatrixStore(&scores, rows_at * ${SCORE_STRIDE}u + tile * ${N}u,
-        product, false, ${SCORE_STRIDE}u);
+      subgroupMatrixStore<row_major>(&scores, rows_at * ${SCORE_STRIDE}u + tile * ${N}u,
+        product, ${SCORE_STRIDE}u);
     }
     for (var column = lane; column < ${KEY_TILE}u; column += ${LANES}u) {
       let global_key = key_origin + column;
@@ -418,19 +418,19 @@ ${lines(KEY_TILE / 2, (j) => `      {
     for (var channel = 0u; channel < ${channelTiles}u; channel += 1u) {
       var product = subgroup_matrix_result<f32, ${N}, ${M}>();
       for (var tile = 0u; tile < ${keyTiles}u; tile += 1u) {
-        let left = subgroupMatrixLoad<subgroup_matrix_left<f16, ${K}, ${M}>>(
+        let left = subgroupMatrixLoad<subgroup_matrix_left<f16, ${K}, ${M}>, row_major>(
           &probabilities, rows_at * ${PROBABILITY_STRIDE}u + tile * ${K}u,
-          false, ${PROBABILITY_STRIDE}u);
+          ${PROBABILITY_STRIDE}u);
         let right = ${storedHalf
-          ? `subgroupMatrixLoad<subgroup_matrix_right<f16, ${N}, ${K}>>(&value,
+          ? `subgroupMatrixLoad<subgroup_matrix_right<f16, ${N}, ${K}>, row_major>(&value,
           ((batch_index * p.queries + key_origin + tile * ${K}u) * p.heads + head) * ${headDim}u
-            + channel * ${N}u, false, p.heads * ${headDim}u)`
-          : `subgroupMatrixLoad<subgroup_matrix_right<f16, ${N}, ${K}>>(
-          &values_tile, tile * ${K} * ${TILE_STRIDE}u + channel * ${N}u, false, ${TILE_STRIDE}u)`};
+            + channel * ${N}u, p.heads * ${headDim}u)`
+          : `subgroupMatrixLoad<subgroup_matrix_right<f16, ${N}, ${K}>, row_major>(
+          &values_tile, tile * ${K} * ${TILE_STRIDE}u + channel * ${N}u, ${TILE_STRIDE}u)`};
         product = subgroupMatrixMultiplyAccumulate(left, right, product);
       }
-      subgroupMatrixStore(&scores, rows_at * ${WEIGHTED_STRIDE}u + channel * ${N}u,
-        product, false, ${WEIGHTED_STRIDE}u);
+      subgroupMatrixStore<row_major>(&scores, rows_at * ${WEIGHTED_STRIDE}u + channel * ${N}u,
+        product, ${WEIGHTED_STRIDE}u);
     }
     workgroupBarrier();
 ${lines(outPerLane, (j) => `    {
