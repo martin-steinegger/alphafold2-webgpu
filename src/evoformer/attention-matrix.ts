@@ -211,7 +211,7 @@ struct Parameters {
   query_weight: u32, key_weight: u32, value_weight: u32,
   gating_weight: u32, gating_bias: u32, output_weight: u32,
   output_bias: u32, pair_weight: u32, pair_channels: u32,
-  batch_offset: u32, batch_total: u32, padding: vec2<u32>,
+  batch_offset: u32, batch_total: u32, bias_stride: u32, padding: u32,
 };
 @group(0) @binding(0) var<storage, read> query: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read> key: array<${storedHalf ? "f16" : "vec4<f32>"}>;
@@ -354,7 +354,7 @@ ${fetchKeyValue(`key_origin + ${KEY_TILE}u`)}`}
       let live_query = global_query < p.queries;
       // A whole number of vectors: the row length is a multiple of four, the
       // key origin a multiple of the key tile, and the half-row offset even.
-      let bias_row = ((head * p.queries + global_query) * ((p.queries + 3u) & 0xfffffffcu)
+      let bias_row = ((head * p.queries + global_query) * p.bias_stride
         + key_origin + first) / 4u;
 ${lines(KEY_TILE / 8, (v) => `      var bias_${v} = vec4<f32>(0.0);`)}
       if (p.has_pair_bias != 0u && live_query) {

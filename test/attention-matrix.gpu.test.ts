@@ -94,6 +94,7 @@ describe.skipIf(!enabled)("flash attention over the matrix units", () => {
       const parameters = new Uint32Array(20);
       parameters.set([batch, queries, HEADS * HEAD_DIM, HEADS, HEAD_DIM, 0, 1], 0);
       parameters[17] = batch;
+      parameters[18] = attentionPairBiasStride(queries);
 
       const storage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
       const created: GPUBuffer[] = [];

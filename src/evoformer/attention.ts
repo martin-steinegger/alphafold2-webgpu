@@ -199,7 +199,7 @@ export function createAttentionParameters(
     offsets[2]!, offsets[3]!, offsets[4]!, offsets[5]!, offsets[6]!, offsets[7]!, offsets[8]!,
     input.pairBias === undefined ? 0 : offsets[pairProjectionIndex]!,
     input.pairBias?.source === "separate" ? input.pairBias.channels : input.channels,
-    batchWindow.offset, input.batch, 0, 0,
+    batchWindow.offset, input.batch, attentionPairBiasStride(input.queryLength), 0,
   ]);
 }
 
@@ -271,7 +271,7 @@ function normalizeShader(storage: ActivationStorage, shards: ShardLayout, inPlac
 struct NormParameters {
   rows: u32, channels: u32, scale: u32, offset: u32,
   transpose: u32, batch: u32, queries: u32, epsilon: f32,
-  batch_offset: u32, batch_total: u32, padding: vec2<u32>,
+  batch_offset: u32, batch_total: u32, bias_stride: u32, padding: u32,
 };
 const GRID_WIDTH: u32 = 32768u;
 ${shardBindings(shards, "source", storage, 0, inPlace)}
@@ -344,7 +344,7 @@ export function createAttentionStatisticsShader(
 struct NormParameters {
   rows: u32, channels: u32, scale: u32, offset: u32,
   transpose: u32, batch: u32, queries: u32, epsilon: f32,
-  batch_offset: u32, batch_total: u32, padding: vec2<u32>,
+  batch_offset: u32, batch_total: u32, bias_stride: u32, padding: u32,
 };
 const GRID_WIDTH: u32 = 32768u;
 ${shardBindings(shards, "source", storage, 0, false)}
@@ -404,7 +404,7 @@ struct Parameters {
   query_weight: u32, key_weight: u32, value_weight: u32,
   gating_weight: u32, gating_bias: u32, output_weight: u32,
   output_bias: u32, pair_weight: u32, pair_channels: u32,
-  batch_offset: u32, batch_total: u32, padding: vec2<u32>,
+  batch_offset: u32, batch_total: u32, bias_stride: u32, padding: u32,
 };
 const GRID_WIDTH: u32 = 32768u;
 `;
@@ -586,7 +586,7 @@ export function attentionPairBiasStride(queries: number): number {
 }
 
 /** The same rounding, in the shaders that index the bias. */
-const PAIR_BIAS_STRIDE = "((p.queries + 3u) & 0xfffffffcu)";
+const PAIR_BIAS_STRIDE = "p.bias_stride";
 
 /**
  * The pair projection that becomes the attention bias, for a fixed head count.
