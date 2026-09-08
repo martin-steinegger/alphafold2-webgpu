@@ -1,6 +1,6 @@
 import type { Precision, TriangleShape } from "./types.js";
 import type { WeightOffsets } from "./weights.js";
-import { createTiledGemmShader, GEMM_TILE_ROWS } from "../runtime/gemm.js";
+import { createTiledGemmShader, GEMM_TILE_COLUMNS, GEMM_TILE_ROWS } from "../runtime/gemm.js";
 import { type ActivationStorage, storageArray, storedElement } from "../runtime/storage.js";
 import {
   planShards, shardBindings, shardLoader, shardStorer, shardWordLoader, type ShardLayout,
@@ -54,10 +54,19 @@ export type TriangleWholeStorage = "f32" | "f16";
  * commented on.
  */
 const ROWS_THE_EPILOGUE_IS_WRITTEN_FOR = 64;
-if (GEMM_TILE_ROWS !== ROWS_THE_EPILOGUE_IS_WRITTEN_FOR) {
+/**
+ * Tile columns it is written for, for the same reason.
+ *
+ * It splits the tile into two halves of sixteen column threads and stages
+ * thirty-two channels of each, which follows from 128 columns over four-wide
+ * invocations. A 256-column tile silently returned 70 pLDDT for it.
+ */
+const COLUMNS_THE_EPILOGUE_IS_WRITTEN_FOR = 128;
+if (GEMM_TILE_ROWS !== ROWS_THE_EPILOGUE_IS_WRITTEN_FOR
+  || GEMM_TILE_COLUMNS !== COLUMNS_THE_EPILOGUE_IS_WRITTEN_FOR) {
   throw new RangeError(`the triangle projection epilogue is written for a `
-    + `${ROWS_THE_EPILOGUE_IS_WRITTEN_FOR}-row GEMM tile, and this build tiles `
-    + `${GEMM_TILE_ROWS} rows`);
+    + `${ROWS_THE_EPILOGUE_IS_WRITTEN_FOR}x${COLUMNS_THE_EPILOGUE_IS_WRITTEN_FOR} GEMM tile, `
+    + `and this build tiles ${GEMM_TILE_ROWS}x${GEMM_TILE_COLUMNS}`);
 }
 
 const declaration = (precision: Precision): string => precision === "f16" ? "enable f16;\n" : "";
