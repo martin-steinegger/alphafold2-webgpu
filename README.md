@@ -262,12 +262,14 @@ npm run qualify:hardware
 A native run reaches the GPU through `webgpu`'s `create`, which takes Dawn's
 toggles, so it chooses things a browser does not. `dawnInstanceFlags` in
 `src/runtime/dawn.ts` is the single place that names them, and every shipped
-entry point calls it. Two of them are not optional: without
-`vulkan_enable_f16_on_nvidia` Dawn does not expose `shader-f16` on NVIDIA, and
-without `allow_unsafe_apis` it hides the experimental matrix-unit extension, so
-an instance built without them silently measures an adapter with neither
-half-precision projections nor matrix units. A tool that builds its own instance
-and forgets these will report the model as much slower than it is.
+entry point calls it. Two of them are not optional, and they do different jobs.
+`vulkan_enable_f16_on_nvidia` is what its name says: an instance with no toggles
+reports `shader-f16=false` on a Blackwell and `true` on an RDNA 3.5 part, which
+exposes half precision by default. `allow_unsafe_apis` gates the experimental
+matrix-unit extension on every vendor, so a bare instance reports no matrix
+configurations at all on either. A tool that builds its own instance and forgets
+these measures an adapter without the units, and on NVIDIA without half
+precision either, and reports the model as much slower than it is.
 
 `dawnInstanceFlags({ unclamped: true })` additionally drops Tint's bounds clamp,
 worth 11% of a recycle. It is off by default because it is a promise rather than

@@ -13,11 +13,14 @@
 /** Toggles every native entry point wants. */
 const REQUIRED = [
   // Nvidia's Vulkan driver reports f16 support that Dawn does not expose
-  // without this. Without it there is no `shader-f16`, so no half-precision
-  // projection and no matrix units.
+  // without this, and without `shader-f16` there is no half-precision
+  // projection and no f16 matrix configuration to select. It is Nvidia-only in
+  // effect as well as in name: an instance with no toggles at all reports
+  // `shader-f16` false on a Blackwell and true on an RDNA 3.5 part.
   "vulkan_enable_f16_on_nvidia",
   // `chromium-experimental-subgroup-matrix` is an experimental feature, and
-  // Dawn hides experimental features behind this.
+  // Dawn hides experimental features behind this. On every vendor: a bare
+  // instance reports no matrix configurations on either of the two above.
   "allow_unsafe_apis",
 ] as const;
 
