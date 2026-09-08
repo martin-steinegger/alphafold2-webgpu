@@ -56,8 +56,9 @@ const shape = {
   recycles: features.length,
 };
 const gpu = create(dawnInstanceFlags({
-  // AFWEBGPU_UNCLAMPED=1 drops the bounds clamp; see `dawnInstanceFlags`.
-  unclamped: process.env.AFWEBGPU_UNCLAMPED === "1",
+  // Qualification checks numbers against reference tensors, so it keeps the
+  // clamp the platform promises rather than the fastest arrangement.
+  unclamped: false,
 }));
 const compactPoolMibValue = process.env.AFWEBGPU_COMPACT_POOL_MIB;
 const compactPoolMib = compactPoolMibValue === undefined ? undefined : Number(compactPoolMibValue);

@@ -8,8 +8,6 @@
 import { EXACT_STORAGE } from "../src/model/monomer.js";
 import { readFileSync, writeFileSync } from "node:fs";
 import { create, globals } from "webgpu";
-import { dawnInstanceFlags, fitScratchBudgetScale } from "../src/runtime/dawn.js";
-import { nativeMemoryBudgetBytes } from "./native-device.js";
 import { AlphaFoldMonomerGpu } from "../src/model/monomer.js";
 import { parseA3m } from "../src/input/a3m.js";
 import { makeA3mFeatures, type RecycleFeatureSource } from "../src/input/a3m-features.js";
@@ -19,6 +17,13 @@ import { predictionToPdb } from "../web/prediction-results.js";
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
 import { planMonomerDevice, requestAlphaFoldDevice } from "../src/runtime/device.js";
+import { calibrateGemmVariant, gemmVariantName } from "../src/runtime/gemm-selection.js";
+import { forceGemmVariant } from "../src/runtime/gemm-selection.js";
+import { presetAttentionFlashKernel } from "../src/evoformer/attention-calibration.js";
+import {
+  forceAttentionKeyValueStorage, forceAttentionQueriesPerThread,
+  type AttentionFlashVariant, type AttentionKeyValueStorage,
+} from "../src/evoformer/attention.js";
 Object.assign(globalThis, globals);
 const file = process.argv[2];
 if (file === undefined) throw new Error("usage: predict-a3m.ts <file.a3m> [msaRows] [extraRows] [recycles]");
@@ -59,11 +64,13 @@ if (templatePath !== undefined && templatePath !== "") {
     identity: Number((prepared.alignment.identity * 100).toFixed(1)),
   };
 }
-const gpu = create(dawnInstanceFlags({
-  // Native, so the bounds clamp goes: the kernels do not rely on it, and it is
-  // worth 11% of a recycle. See `dawnInstanceFlags`.
-  unclamped: true,
-}));
+// AFWEBGPU_DAWN_FEATURES passes Dawn toggles (shader-f16 on Nvidia Vulkan).
+const dawnFeatures = process.env.AFWEBGPU_DAWN_FEATURES;
+const dawnDisabled = process.env.AFWEBGPU_DAWN_DISABLE;
+const gpu = create([
+  ...(dawnFeatures === undefined || dawnFeatures === "" ? [] : [`enable-dawn-features=${dawnFeatures}`]),
+  ...(dawnDisabled === undefined || dawnDisabled === "" ? [] : [`disable-dawn-features=${dawnDisabled}`]),
+]);
 const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
 if (adapter === null) throw new Error("no WebGPU adapter");
 const clustered = Math.min(msaRows, depth);
@@ -71,29 +78,91 @@ const extra = Math.max(1, Math.min(extraRows, Math.max(0, depth - clustered)));
 // The model stores its activations packed. AFWEBGPU_EXACT=1 selects the f32
 // storages the differential tests use, for comparison.
 const memoryOptions = process.env.AFWEBGPU_EXACT === "1" ? { ...EXACT_STORAGE } : {};
-const baseMemoryOptions = templateReport === undefined
-  ? memoryOptions : { ...memoryOptions, template: true };
-// The scratch windows are sized to the memory this host actually has rather
-// than to the browser's conservative default, which costs a 1,650-residue
-// dimer a third of its speed. WebGPU cannot say how much that is, so it is
-// asked for out of band and each scale is costed against it.
-const memoryBudget = nativeMemoryBudgetBytes();
-const scratchBudgetScale = memoryBudget === undefined ? 1 : fitScratchBudgetScale(
-  (scale) => planMonomerDevice(adapter, length, clustered, extra, undefined, false,
-    { ...baseMemoryOptions, scratchBudgetScale: scale }).memory.estimatedPeakBytes,
-  memoryBudget);
+// AFWEBGPU_SCRATCH_SCALE widens the bounded scratch windows for a run that
+// owns a large accelerator rather than a browser's share of one.
+const scratchBudgetScale = Number(process.env.AFWEBGPU_SCRATCH_SCALE ?? "1");
 const plan = planMonomerDevice(adapter, length, clustered, extra, undefined, false,
-  { ...baseMemoryOptions, scratchBudgetScale });
-console.error(`device memory budget ${memoryBudget === undefined ? "unknown"
-  : `${(memoryBudget / 1024 ** 3).toFixed(1)} GiB`}, scratch budget ${scratchBudgetScale}x`);
+  { ...(templateReport === undefined ? memoryOptions : { ...memoryOptions, template: true }),
+    scratchBudgetScale });
+// AFWEBGPU_GEMM pins the projection variant, so a comparison of anything else
+// is not moved by the calibration picking differently between runs.
+const gemmPin = process.env.AFWEBGPU_GEMM;
+if (gemmPin === "f16-chunked") forceGemmVariant({ precision: "f16-chunked", inner: 8 });
+if (gemmPin === "f32") forceGemmVariant({ precision: "f32", inner: 8 });
 const device = await requestAlphaFoldDevice(adapter, plan.requirements);
+console.error(`f16=${adapter.features.has("shader-f16")} scratch=${scratchBudgetScale}x`
+  + ` gemm=${gemmVariantName(await calibrateGemmVariant(device))}`);
+// AFWEBGPU_ATTENTION pins the flash kernel; AFWEBGPU_KV its key/value width.
+const attentionVariant = process.env.AFWEBGPU_ATTENTION;
+if (attentionVariant !== undefined && attentionVariant !== "") {
+  for (const headDim of [8, 16, 32, 64]) {
+    try { presetAttentionFlashKernel(device, headDim, attentionVariant as AttentionFlashVariant); }
+    catch { /* no such kernel at this head width */ }
+  }
+}
+// AFWEBGPU_SLOTS pins queries per invocation, which the probe measures on a
+// synthetic shape rather than on the ones the model runs.
+const slotsEnv = process.env.AFWEBGPU_SLOTS;
+if (slotsEnv !== undefined && slotsEnv !== "") forceAttentionQueriesPerThread(Number(slotsEnv));
+for (const headDim of [8, 32]) {
+  try {
+    const chosen = await (await import("../src/evoformer/attention-calibration.js"))
+      .calibrateAttentionFlashKernel(device, headDim);
+    console.error(`flash kernel headDim=${headDim}: ${chosen.variant}`);
+  } catch (error) { console.error(`flash headDim=${headDim}: ${(error as Error).message}`); }
+}
+if (process.env.AFWEBGPU_GEMM_TABLE === "1") {
+  const { measureGemmVariants } = await import("../src/runtime/gemm-selection.js");
+  const { subgroupMatrixConfigs } = await import("../src/runtime/subgroups.js");
+  const measured = await measureGemmVariants(device, subgroupMatrixConfigs(device));
+  for (const entry of [...measured].sort((a, b) => a.milliseconds - b.milliseconds)) {
+    console.error(`  ${gemmVariantName(entry.variant).padEnd(28)} `
+      + `${entry.milliseconds.toFixed(3).padStart(8)} ms  `
+      + `perShape [${entry.perShape.map((value) => value.toFixed(3)).join(", ")}]  `
+      + `relErr ${entry.relativeError.toExponential(2)}`);
+  }
+}
+const kvWidth = process.env.AFWEBGPU_KV;
+if (kvWidth !== undefined && kvWidth !== "") {
+  forceAttentionKeyValueStorage(kvWidth as AttentionKeyValueStorage);
+}
 try {
+  const profiling = process.env.AFWEBGPU_PROFILE === "1"
+    ? { profile: true, profileRecycle: recycles - 1 } : {};
   const prediction = await new AlphaFoldMonomerGpu(device, {
-    ...memoryOptions,
+    ...memoryOptions, ...profiling,
   }).predict(features, {
     embedding, template, extraStack, mainStack, structure,
     lddt: confidence.lddt, pae: confidence.pae, geometry,
-  }, await model.tensor("confidencePaeBreaks"));
+  }, await model.tensor("confidencePaeBreaks"), (summary, recycle) => {
+    // Per recycle, because the first absorbs the clock ramp and the pipeline
+    // compiles; only the later ones are the steady state worth comparing.
+    console.error(`recycle=${recycle} ${(summary.elapsedMilliseconds / 1000).toFixed(2)} s`);
+  });
+  const profile = (prediction.final as unknown as { gpuProfile?: Record<string, {
+    block: number; method: string; wallMilliseconds: number;
+    entries: readonly { label: string; nanoseconds: number }[];
+  }> }).gpuProfile;
+  if (profile !== undefined) {
+    for (const [name, count] of [["extraMsa", extraStack.length],
+      ["mainEvoformer", mainStack.length]] as const) {
+      const block = profile[name]!;
+      const gpuMs = block.entries.reduce((sum, e) => sum + e.nanoseconds, 0) / 1e6;
+      console.error(`\n== ${name} block ${block.block} (${block.method}) ==`);
+      console.error(`dispatches=${block.entries.length} gpu=${gpuMs.toFixed(3)}ms `
+        + `wall=${block.wallMilliseconds.toFixed(3)}ms  stack=${(gpuMs * count / 1000).toFixed(2)}s`);
+      const byLabel = new Map<string, { total: number; count: number }>();
+      for (const entry of block.entries) {
+        const key = entry.label.replace(/[.-]?\d+$/, "");
+        const current = byLabel.get(key) ?? { total: 0, count: 0 };
+        byLabel.set(key, { total: current.total + entry.nanoseconds, count: current.count + 1 });
+      }
+      for (const [label, value] of [...byLabel].sort((a, b) => b[1].total - a[1].total).slice(0, 18)) {
+        console.error(`  ${(value.total / 1e6).toFixed(3)}ms x${value.count}  ${label}`
+          + `  (stack ${(value.total * count / 1e9).toFixed(2)}s)`);
+      }
+    }
+  }
   // AFWEBGPU_PDB=<file> writes the structure, for comparing against a template.
   const pdbPath = process.env.AFWEBGPU_PDB;
   if (pdbPath !== undefined && pdbPath !== "") {

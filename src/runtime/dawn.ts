@@ -34,13 +34,42 @@ const REQUIRED = [
  *
  * It is off by default because it is a promise, not a setting. Dropping the
  * clamp makes any access outside an array undefined rather than clamped, so it
- * is only sound while no kernel relies on the clamp. None of them do — the
- * loads that used to sit inside a `select`, which evaluates both of its arms,
- * are under an `if` now, and the pair bias carries a row of slack for the
+ * is only sound while no kernel relies on the clamp. None of them do — a
+ * guarded load sits under an `if` rather than inside a `select`, which
+ * evaluates both of its arms, and the pair bias carries a row of slack for the
  * vector read at its end — but that is a property of the shaders that has to
  * be kept true, not one the platform enforces.
  */
 const UNCLAMPED = "disable_robustness";
+
+/**
+ * Scratch budget scales worth trying, widest first.
+ *
+ * The dial saturates: a 1,650-residue dimer reads 27.3 s a recycle at one,
+ * 20.7 s at sixteen and 20.4 s at thirty-two, for another 950 MiB. Sixteen is
+ * where it stops paying, so nothing above it is offered.
+ */
+export const SCRATCH_BUDGET_SCALES: readonly number[] = [16, 8, 4, 2, 1];
+
+/**
+ * The widest scratch budget whose estimated peak fits `budgetBytes`.
+ *
+ * WebGPU does not report how much memory a device has — `adapter.info` carries
+ * no heaps, and `maxBufferSize` is the API's theoretical maximum rather than
+ * the card's — so the budget comes from the caller, who knows. What does not
+ * need guessing is the scale: the planner already estimates a prediction's
+ * peak, so each scale is costed and the widest affordable one is taken.
+ */
+export function fitScratchBudgetScale(
+  estimatePeakBytes: (scale: number) => number,
+  budgetBytes: number,
+  scales: readonly number[] = SCRATCH_BUDGET_SCALES,
+): number {
+  for (const scale of scales) {
+    if (estimatePeakBytes(scale) <= budgetBytes) return scale;
+  }
+  return scales[scales.length - 1] ?? 1;
+}
 
 export interface DawnInstanceOptions {
   /** Drop the bounds clamp. See `UNCLAMPED`; measure before trusting it. */

@@ -53,8 +53,9 @@ const features = makeA3mFeatures(a3m, featureTables, {
 });
 
 const gpu = create(dawnInstanceFlags({
-  // AFWEBGPU_UNCLAMPED=1 drops the bounds clamp; see `dawnInstanceFlags`.
-  unclamped: process.env.AFWEBGPU_UNCLAMPED === "1",
+  // Native, so the bounds clamp goes: the kernels do not rely on it, and it is
+  // worth 11% of a recycle. See `dawnInstanceFlags`.
+  unclamped: true,
 }));
 const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
 if (adapter === null) throw new Error("no WebGPU adapter");

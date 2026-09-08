@@ -117,8 +117,9 @@ const references = await Promise.all(referencePaths.map(async (path) => {
 
 Object.assign(globalThis, globals);
 const adapter = await create(dawnInstanceFlags({
-  // AFWEBGPU_UNCLAMPED=1 drops the bounds clamp; see `dawnInstanceFlags`.
-  unclamped: process.env.AFWEBGPU_UNCLAMPED === "1",
+  // Qualification checks numbers against reference tensors, so it keeps the
+  // clamp the platform promises rather than the fastest arrangement.
+  unclamped: false,
 })).requestAdapter();
 if (adapter === null) throw new Error("no WebGPU adapter");
 const device = await adapter.requestDevice();
