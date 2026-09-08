@@ -6,7 +6,7 @@
  */
 import { create, globals } from "webgpu";
 import { dawnInstanceFlags, fitScratchBudgetScale } from "../src/runtime/dawn.js";
-import { nativeMemoryBudgetBytes } from "./native-device.js";
+import { nativeMemoryBudgetBytes, selectGpu } from "./native-device.js";
 import { AlphaFoldMultimerGpu } from "../src/model/multimer.js";
 import { EXACT_STORAGE } from "../src/model/monomer.js";
 import {
@@ -31,6 +31,10 @@ const [embedding, multimerTemplate, extraStack, mainStack, structure, confidence
     model.mainStackWeights(), model.multimerStructureWeights(), model.confidenceWeights(), model.geometryTables(),
     model.queryOnlyFeatureTables(), model.tensor("confidencePaeBreaks"),
   ]);
+// Chosen before the instance exists, because the Vulkan loader reads the
+// selection when it makes one. Honours CUDA_VISIBLE_DEVICES; see `selectGpu`.
+const selectedGpu = selectGpu();
+if (selectedGpu !== undefined) console.error(`pinned to ${selectedGpu}`);
 const gpu = create(dawnInstanceFlags({
   // Native, so the bounds clamp goes: the kernels do not rely on it, and it is
   // worth 11% of a recycle. See `dawnInstanceFlags`.

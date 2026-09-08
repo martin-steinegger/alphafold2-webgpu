@@ -9,24 +9,89 @@
 import { execFileSync } from "node:child_process";
 
 /**
- * Total memory of the smallest visible GPU, or undefined when nothing answers.
+ * Points the Vulkan loader at one GPU, by index, before an instance exists.
  *
- * The smallest, because WebGPU does not say which adapter Dawn picked and this
- * cannot ask: `create(["adapter=<name>"])` matches a substring of the device
- * name and takes the first match, which on a host of identical cards is always
- * the first one. Sizing to the smallest is the answer that is right whichever
- * it chose.
+ * WebGPU cannot choose a device: `requestAdapter` takes a power preference and
+ * nothing else, and dawn.node's `adapter=<name>` matches a substring of the
+ * device name and takes the first hit — which on a host of identical cards is
+ * always the first one. Every adapter here reports the same vendor,
+ * architecture, device and description, so there is nothing to match on.
+ *
+ * Mesa's device-select layer can, and it is already installed wherever Mesa is:
+ * it is a GLOBAL implicit layer, so it sits above every driver including
+ * Nvidia's own, and `DRI_PRIME` names a card by its PCI address rather than by
+ * a name that repeats. The loader reads the variable when the instance is
+ * made, so setting it here works as long as it happens before `create`.
+ *
+ * Returns the tag it set, or undefined when the host cannot say where the card
+ * is, in which case the caller gets whichever device the loader prefers.
+ */
+export function selectGpu(index = cudaVisibleDeviceIndex()): string | undefined {
+  if (index === undefined) return undefined;
+  if (!Number.isSafeInteger(index) || index < 0) {
+    throw new RangeError(`a GPU index must be a non-negative integer, not ${index}`);
+  }
+  const bus = queryGpu(["--query-gpu=pci.bus_id", "--format=csv,noheader", "-i", String(index)]);
+  if (bus === undefined) return undefined;
+  // nvidia-smi writes 00000000:95:00.0; the layer wants pci-0000_95_00_0.
+  const match = /^([0-9a-f]+):([0-9a-f]+):([0-9a-f]+)\.([0-9a-f]+)$/.exec(bus.trim().toLowerCase());
+  if (match === null) return undefined;
+  const domain = Number.parseInt(match[1]!, 16).toString(16).padStart(4, "0");
+  const tag = `pci-${domain}_${match[2]}_${match[3]}_${match[4]}`;
+  process.env.DRI_PRIME = tag;
+  selected = index;
+  return tag;
+}
+
+/** The index `selectGpu` chose, so the memory probe can ask about that card. */
+let selected: number | undefined;
+
+/**
+ * The card `CUDA_VISIBLE_DEVICES` names, which is what people reach for.
+ *
+ * Nothing here uses CUDA, but that variable is how a GPU gets chosen on a
+ * shared host and it costs nothing to honour. The first entry wins, since this
+ * runs on one card. A plain number is an index as `nvidia-smi` counts them; a
+ * `GPU-...` UUID is resolved to one, and is the form to prefer, because CUDA
+ * numbers devices fastest-first unless `CUDA_DEVICE_ORDER=PCI_BUS_ID` says
+ * otherwise while `nvidia-smi` always counts by bus.
+ */
+function cudaVisibleDeviceIndex(): number | undefined {
+  const value = process.env.CUDA_VISIBLE_DEVICES?.split(",")[0]?.trim();
+  if (value === undefined || value === "") return undefined;
+  if (/^\d+$/.test(value)) return Number(value);
+  const listed = queryGpu(["--query-gpu=index,uuid", "--format=csv,noheader"]);
+  if (listed === undefined) return undefined;
+  for (const line of listed.split("\n")) {
+    const [index, uuid] = line.split(",").map((part) => part.trim());
+    if (uuid !== undefined && uuid === value) return Number(index);
+  }
+  return undefined;
+}
+
+function queryGpu(args: readonly string[]): string | undefined {
+  try {
+    return execFileSync("nvidia-smi", [...args],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5_000 });
+  } catch { return undefined; }
+}
+
+/**
+ * Total memory of the selected GPU, or of the smallest visible one.
+ *
+ * Once `selectGpu` has chosen, this asks about that card. Without a choice it
+ * takes the smallest visible one, because nothing says which the loader
+ * preferred and the smallest is the answer that is right whichever it was.
  */
 export function detectDeviceMemoryBytes(): number | undefined {
-  try {
-    const out = execFileSync("nvidia-smi",
-      ["--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5_000 });
+    const out = queryGpu(selected === undefined
+      ? ["--query-gpu=memory.total", "--format=csv,noheader,nounits"]
+      : ["--query-gpu=memory.total", "--format=csv,noheader,nounits", "-i", String(selected)]);
+    if (out === undefined) return undefined;
     const sizes = out.split("\n").map((line) => Number(line.trim()))
       .filter((value) => Number.isFinite(value) && value > 0);
     if (sizes.length === 0) return undefined;
     return Math.min(...sizes) * 1024 * 1024;
-  } catch { return undefined; }
 }
 
 /**
