@@ -7,8 +7,7 @@
  * the card's. A browser has to plan without it. A native host does not.
  */
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
-import { globSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { totalmem } from "node:os";
 
 /**
@@ -111,15 +110,39 @@ export function detectDeviceMemoryBytes(): number | undefined {
  * memory is the smaller of the two.
  */
 function amdDeviceMemoryBytes(): number | undefined {
+  const heap = amdVramHeapBytes();
+  return heap === undefined ? undefined : Math.min(heap, totalmem());
+}
+
+function amdVramHeapBytes(): number | undefined {
+  let cards: readonly string[];
+  // Read rather than globbed: every entry on the way to the file is a symlink
+  // into the PCI tree, which a glob will not walk through.
+  try { cards = readdirSync("/sys/class/drm"); } catch { return undefined; }
   let smallest: number | undefined;
-  for (const path of globSync("/sys/class/drm/card*/device/mem_info_vram_total")) {
+  for (const card of cards) {
+    if (!/^card\d+$/.test(card)) continue;
     try {
-      const bytes = Number(readFileSync(path, "utf8").trim());
+      const bytes = Number(
+        readFileSync(`/sys/class/drm/${card}/device/mem_info_vram_total`, "utf8").trim(),
+      );
       if (!Number.isFinite(bytes) || bytes <= 0) continue;
       if (smallest === undefined || bytes < smallest) smallest = bytes;
     } catch { /* a card that will not say is one this cannot plan against */ }
   }
-  return smallest === undefined ? undefined : Math.min(smallest, totalmem());
+  return smallest;
+}
+
+/**
+ * Whether the card's memory is the host's memory.
+ *
+ * An integrated part reports a heap larger than the machine holds, because
+ * that heap is carved out of system memory on demand. Nothing else does, so
+ * the comparison identifies one without asking the driver what it is.
+ */
+function sharesHostMemory(): boolean {
+  const heap = amdVramHeapBytes();
+  return heap !== undefined && heap > totalmem();
 }
 
 /**
@@ -130,6 +153,14 @@ function amdDeviceMemoryBytes(): number | undefined {
  * the caller keeps the browser's own conservative budget.
  */
 export function nativeMemoryBudgetBytes(): number | undefined {
+  // A card that shares the host's memory is not one to spend it on. The wider
+  // scratch windows buy their speed by keeping more of a pass resident, which
+  // pays where board memory is separate and fast, and does not where it is the
+  // same DRAM the passes already stream through: measured on a Strix Halo at
+  // 1.60 s a recycle on the browser's own budget against 2.07 s at four times
+  // it and 1.94 s at sixteen. So the host reports what it has and declines to
+  // plan against it.
+  if (sharesHostMemory()) return undefined;
   const total = detectDeviceMemoryBytes();
   return total === undefined ? undefined : Math.floor(total * 2 / 3);
 }
