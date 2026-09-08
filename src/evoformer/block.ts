@@ -761,8 +761,12 @@ async function encodeAttention(
   let normalizedPair: GpuTensor | undefined;
   // Four even where there is no bias: the matrix kernel binds it as vectors,
   // and a binding of one element is under the minimum size for that.
+  // One row past what the bias holds. The matrix kernel reads it four at a
+  // time, and the last vector of the last row reaches past the end of the last
+  // key tile. The values are discarded, but the read should land inside the
+  // tensor rather than rely on a clamp a device may be asked to drop.
   const pairBiasElements = options.pairBias === undefined
-    ? 4 : options.heads * options.queries * attentionPairBiasStride(options.queries);
+    ? 4 : (options.heads * options.queries + 1) * attentionPairBiasStride(options.queries);
   const pairBias = execution.allocate(`${options.label}.pair-bias`, pairBiasElements);
   if (options.pairBias !== undefined) {
     if (options.pairBias.source === "separate") {

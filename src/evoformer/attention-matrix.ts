@@ -187,11 +187,17 @@ export function createAttentionMatrixFlashShader(
   const fetchKeyValue = (at: string): string => lines(keyPerLane, (i) => `  {
     let item = lane + ${i * LANES}u;
     let global_key = ${at} + item / ${headDim / 4}u;
-    let live = global_key < p.queries;
     let at_index = ((batch_index * p.queries + global_key) * p.heads + head)
       * ${headDim / 4}u + item % ${headDim / 4}u;
-    next_k_${i} = select(vec4<f32>(0.0), key[at_index], live);
-    next_v_${i} = select(vec4<f32>(0.0), value[at_index], live);
+    // Under an if rather than a select, which evaluates both of its arms and so
+    // reads the tensor past its end for a key that does not exist. WebGPU
+    // clamps that read, but a device may be asked not to.
+    next_k_${i} = vec4<f32>(0.0);
+    next_v_${i} = vec4<f32>(0.0);
+    if (global_key < p.queries) {
+      next_k_${i} = key[at_index];
+      next_v_${i} = value[at_index];
+    }
   }`);
   const queriesLength = reach((rows - M) * TILE_STRIDE, TILE_STRIDE, M);
   const keysLength = reach((keyTiles - 1) * N * TILE_STRIDE, TILE_STRIDE, N);
@@ -333,8 +339,9 @@ ${fetchKeyValue(`key_origin + ${KEY_TILE}u`)}`}
     }
     for (var column = lane; column < ${KEY_TILE}u; column += ${LANES}u) {
       let global_key = key_origin + column;
-      mask_tile[column] = select(0.0, mask[mask_index(batch_index, global_key)],
-        global_key < p.queries);
+      var held_mask = 0.0;
+      if (global_key < p.queries) { held_mask = mask[mask_index(batch_index, global_key)]; }
+      mask_tile[column] = held_mask;
     }
     workgroupBarrier();
 

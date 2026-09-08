@@ -664,7 +664,9 @@ fn main(
   var running_sum = 0.0;
   for (var k_index = 0u; k_index < p.queries; k_index += 1u) {
     let k_base = ((batch_index * p.queries + k_index) * p.heads + head) * p.head_dim;
-    partial[lane] = select(0.0, query[q_base + lane] * key[k_base + lane], lane < p.head_dim);
+    var product = 0.0;
+    if (lane < p.head_dim) { product = query[q_base + lane] * key[k_base + lane]; }
+    partial[lane] = product;
     workgroupBarrier();
     for (var stride = 16u; stride > 0u; stride /= 2u) {
       if (lane < stride) { partial[lane] += partial[lane + stride]; }
