@@ -24,6 +24,7 @@ import {
 import { attentionFlashKernelForShape } from "./attention-calibration.js";
 import { calibrateAttentionShape } from "../runtime/attention-queries.js";
 import { createTiledGemmShader, GEMM_TILE_ROWS, gemmGrid } from "../runtime/gemm.js";
+import { rowNormalizeLayout } from "../runtime/reduction.js";
 import { releaseScratch } from "./execution-scratch.js";
 import {
   createOuterProductMeanNormalizeShader,
@@ -530,9 +531,11 @@ async function encodeTransition(
     rows, channels, hiddenChannels, execution.transitionBufferLimit,
     execution.device.limits.minStorageBufferOffsetAlignment,
   );
-  const shaders = createTransitionShaders(descriptor, packed.offsets, storage);
+  const layout = rowNormalizeLayout(execution.device);
+  const shaders = createTransitionShaders(descriptor, packed.offsets, storage, layout);
   const [normalize, linear, linearResidual] = await Promise.all([
-    execution.pipelines.get(`block:transition:normalize:${storage}`, shaders[0]!),
+    execution.pipelines.get(
+      `block:transition:normalize:${storage}:${layout.rowsPerWorkgroup}`, shaders[0]!),
     execution.pipelines.get("block:transition:linear", shaders[1]!),
     execution.pipelines.get(`block:transition:linear-residual:${storage}`, shaders[2]!),
   ]);
@@ -549,7 +552,7 @@ async function encodeTransition(
     ]));
     const normalized = execution.allocate(`${label}.normalized`, rows * channels);
     const hidden = execution.allocate(`${label}.hidden`, rows * hiddenChannels);
-    const normalizeGrid = execution.linearGrid(rows, 1);
+    const normalizeGrid = execution.linearGrid(rows, layout.rowsPerWorkgroup);
     execution.dispatch(encoder, normalize, [source, weights, normalizeParams, normalized],
       normalizeGrid[0], normalizeGrid[1], 1, `${label}.normalize`);
     execution.dispatch(encoder, linear, [normalized, weights, firstParams, hidden],
@@ -584,7 +587,7 @@ async function encodeTransition(
       storageWords(rowOffset * channels, storage), storageWords(count * channels, storage));
     const normalizedChunk = execution.view(normalized, 0, count * channels);
     const hiddenChunk = execution.view(hidden, 0, count * hiddenChannels);
-    const normalizeGrid = execution.linearGrid(count, 1);
+    const normalizeGrid = execution.linearGrid(count, layout.rowsPerWorkgroup);
     execution.dispatch(encoder, normalize, [sourceChunk, weights, normalizeParams, normalizedChunk],
       normalizeGrid[0], normalizeGrid[1], 1, `${label}.normalize-${rowOffset}`);
     execution.dispatch(encoder, linear, [normalizedChunk, weights, firstParams, hiddenChunk],
@@ -693,10 +696,11 @@ async function encodeAttention(
       + `${execution.device.limits.maxStorageBuffersPerShaderStage}. Its `
       + `${(execution.bindingLimitBytes / 1024 ** 2).toFixed(0)} MiB binding limit is what forces the windows.`);
   }
-  const shardKey = `${storage}:${sourceShards.count}`;
+  const normalizeLayout = rowNormalizeLayout(execution.device);
+  const shardKey = `${storage}:${sourceShards.count}:${normalizeLayout.rowsPerWorkgroup}`;
   const [normalize, project, pairProject, flash, outputProject, pairNormalize] = await Promise.all([
     execution.pipelines.get(`block:attention:normalize:${shardKey}`,
-      createAttentionNormalizeShader(storage, sourceShards)),
+      createAttentionNormalizeShader(storage, sourceShards, normalizeLayout)),
     execution.pipelines.get(`block:attention:project:${keyValueStorage}`,
       attentionProjectShader(keyValueStorage)),
     execution.pipelines.get(`block:attention:pair-bias:h${options.heads}`,
@@ -709,8 +713,10 @@ async function encodeAttention(
     ),
     // The pair bias source has its own storage, which need not match the
     // attention source's: MSA row attention reads a pair, not an MSA.
-    execution.pipelines.get(`block:attention:normalize:${options.pairStorage ?? "f32"}`,
-      createAttentionNormalizeShader(options.pairStorage ?? "f32")),
+    execution.pipelines.get(
+      `block:attention:normalize:${options.pairStorage ?? "f32"}:${normalizeLayout.rowsPerWorkgroup}`,
+      createAttentionNormalizeShader(
+        options.pairStorage ?? "f32", undefined, rowNormalizeLayout(execution.device))),
   ]);
   const wholeRows = options.batch * options.queries;
   const weights = execution.upload(`${options.label}.weights`, packed.data);
@@ -752,7 +758,7 @@ async function encodeAttention(
   const normalizeWindow = (window: (typeof windowParameters)[number]): GpuTensor => {
     const rows = window.count * options.queries;
     const target = execution.view(normalized, 0, rows * options.channels);
-    const grid = execution.linearGrid(rows, 1);
+    const grid = execution.linearGrid(rows, normalizeLayout.rowsPerWorkgroup);
     execution.dispatch(encoder, normalize, [...sourceViews, weights, window.norm, target],
       grid[0], grid[1], 1, `${options.label}.normalize-${window.offset}`);
     return target;
@@ -790,7 +796,7 @@ async function encodeAttention(
             rows, channels, packed.offsets[9]!, packed.offsets[10]!, false, 1, rows, 1e-5,
           ));
         const target = execution.view(normalizedPair, 0, rows * channels);
-        const pairGrid = execution.linearGrid(rows, 1);
+        const pairGrid = execution.linearGrid(rows, normalizeLayout.rowsPerWorkgroup);
         const pairStorage = options.pairStorage ?? "f32";
         execution.dispatch(encoder, pairNormalize, [
           execution.view(options.pairSource, storageWords(offset * rowElements, pairStorage),
@@ -893,10 +899,12 @@ async function encodeGlobalAttention(
       + `alignment, past this device's limit of `
       + `${execution.device.limits.maxStorageBuffersPerShaderStage}. Fewer extra MSA rows will run.`);
   }
+  const statisticsLayout = rowNormalizeLayout(execution.device);
   const [statisticsPipeline, kvPipeline, columnMeanPipeline, queryPipeline, flashPipeline, outputPipeline]
     = await Promise.all([
-    execution.pipelines.get(`block:attention:statistics:${key}`,
-      createAttentionStatisticsShader(storage, shards)),
+    execution.pipelines.get(
+      `block:attention:statistics:${key}:${statisticsLayout.rowsPerWorkgroup}`,
+      createAttentionStatisticsShader(storage, shards, statisticsLayout)),
     execution.pipelines.get(`block:global-attention:kv:${key}`, createGlobalAttentionKvShader(storage, shards)),
     execution.pipelines.get(`block:global-attention:column-mean:${key}`,
       createGlobalAttentionColumnMeanShader(storage, shards)),
@@ -928,7 +936,8 @@ async function encodeGlobalAttention(
   const query = execution.allocate(`${label}.query`, shape.length * w.heads * headDim);
   const attended = execution.allocate(`${label}.attended`, shape.length * w.heads * headDim);
   const output = residualTarget ?? execution.allocate(`${label}.output`, shape.sequences * shape.length * shape.cM);
-  let grid = execution.linearGrid(shape.length * shape.sequences, 1);
+  let grid = execution.linearGrid(
+    shape.length * shape.sequences, statisticsLayout.rowsPerWorkgroup);
   execution.dispatch(encoder, statisticsPipeline, [...sourceViews, normParameters, statistics],
     grid[0], grid[1], 1, `${label}.statistics`);
   grid = execution.linearGrid(shape.length * shape.sequences * headDim);
@@ -976,8 +985,10 @@ async function encodeOuterProductMean(
   // Both projections carry every sequence, so a deep alignment at a long
   // length puts them past one binding; the contraction reads them as windows.
   const projectionShards = planShards(rows * input.cOuter, input.cOuter, execution.bindingLimitBytes);
+  const opmLayout = rowNormalizeLayout(execution.device);
   const [normalize, project, contractPipeline, pairCountPipeline, projectOutputPipeline] = await Promise.all([
-    execution.pipelines.get(`block:opm:normalize:${storage}`, createOuterProductMeanNormalizeShader(storage)),
+    execution.pipelines.get(`block:opm:normalize:${storage}:${opmLayout.rowsPerWorkgroup}`,
+      createOuterProductMeanNormalizeShader(storage, opmLayout)),
     execution.pipelines.get("block:opm:project", OUTER_PRODUCT_MEAN_PROJECT_SHADER),
     execution.pipelines.get(`block:opm:contract:${projectionShards.count}`,
       createOuterProductMeanContractShader(projectionShards)),
@@ -1025,7 +1036,7 @@ async function encodeOuterProductMean(
     const normalizedWindow = execution.view(normalized, 0, count * input.cM);
     const leftWindow = execution.view(left, offset * input.cOuter, count * input.cOuter);
     const rightWindow = execution.view(right, offset * input.cOuter, count * input.cOuter);
-    let windowGrid = execution.linearGrid(count, 1);
+    let windowGrid = execution.linearGrid(count, opmLayout.rowsPerWorkgroup);
     execution.dispatch(encoder, normalize, [msaWindow, weights, params, normalizedWindow],
       windowGrid[0], windowGrid[1], 1, `opm.normalize-${offset}`);
     windowGrid = execution.linearGrid(count * input.cOuter);

@@ -1,6 +1,7 @@
 import { GpuBufferAllocator, type AllocatedGpuBuffer, type AllocationSnapshot } from "../runtime/allocator.js";
 import { pipelineCacheForDevice, type ComputePipelineCache } from "../runtime/pipeline-cache.js";
 import { type ActivationStorage, storageArray, storedElement } from "../runtime/storage.js";
+import { rowNormalizeLayout, type RowNormalizeLayout } from "../runtime/reduction.js";
 import { shardBindings, shardLoader, type ShardLayout } from "../runtime/sharded.js";
 import { createTiledGemmShader, gemmGrid } from "../runtime/gemm.js";
 import { scratchBudget } from "../runtime/scratch-budget.js";
@@ -109,46 +110,43 @@ struct Parameters {
 const GRID_WIDTH: u32 = 32768u;
 `;
 
-export function createOuterProductMeanNormalizeShader(storage: ActivationStorage = "f32"): string {
-  return `${COMMON}
+export function createOuterProductMeanNormalizeShader(
+  storage: ActivationStorage = "f32",
+  layout: RowNormalizeLayout = rowNormalizeLayout(undefined),
+): string {
+  return `${layout.enables}${COMMON}
 @group(0) @binding(0) var<storage, read> source: array<${storageArray(storage)}>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> p: Parameters;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
-var<workgroup> partial: array<f32, 64>;
-var<workgroup> row_mean: array<f32, 1>;
+${layout.declarations}
 
-@compute @workgroup_size(64)
-fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) group: vec3<u32>) {
+${layout.attributes}
+fn main(@builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>${layout.builtins}) {
   let rows = p.sequences * p.length;
-  let row = group.x + group.y * GRID_WIDTH;
-  if (row >= rows) { return; }
-  let base = row * p.c_m;
+${layout.open("rows")}
+  let base = norm_row * p.c_m;
   var sum = 0.0;
-  for (var c = local.x; c < p.c_m; c += 64u) { sum += ${storedElement(storage, "source", "base + c")}; }
-  partial[local.x] = sum;
-  workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride /= 2u) {
-    if (local.x < stride) { partial[local.x] += partial[local.x + stride]; }
-    workgroupBarrier();
+  for (var c = norm_lane; c < p.c_m; c += norm_stride) {
+    sum += ${storedElement(storage, "source", "base + c")};
   }
-  if (local.x == 0u) { row_mean[0] = partial[0] / f32(p.c_m); }
-  workgroupBarrier();
+${layout.sum("sum", "row_total")}
+  let row_mean = row_total / f32(p.c_m);
   var squared = 0.0;
-  for (var c = local.x; c < p.c_m; c += 64u) {
-    let centered = ${storedElement(storage, "source", "base + c")} - row_mean[0];
+  for (var c = norm_lane; c < p.c_m; c += norm_stride) {
+    let centered = ${storedElement(storage, "source", "base + c")} - row_mean;
     squared += centered * centered;
   }
-  partial[local.x] = squared;
-  workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride /= 2u) {
-    if (local.x < stride) { partial[local.x] += partial[local.x + stride]; }
-    workgroupBarrier();
-  }
-  let inverse_std = inverseSqrt(partial[0] / f32(p.c_m) + p.layer_norm_epsilon);
-  for (var c = local.x; c < p.c_m; c += 64u) {
-    output[base + c] = (${storedElement(storage, "source", "base + c")} - row_mean[0]) * inverse_std
-      * weights[p.layer_norm_scale + c] + weights[p.layer_norm_offset + c];
+${layout.sum("squared", "squared_total")}
+  let inverse_std = inverseSqrt(squared_total / f32(p.c_m) + p.layer_norm_epsilon);
+  // A workgroup covering rows past the end still reduces, over row zero, so
+  // only the store is withheld.
+  if (norm_live) {
+    for (var c = norm_lane; c < p.c_m; c += norm_stride) {
+      output[base + c] = (${storedElement(storage, "source", "base + c")} - row_mean) * inverse_std
+        * weights[p.layer_norm_scale + c] + weights[p.layer_norm_offset + c];
+    }
   }
 }`;
 }

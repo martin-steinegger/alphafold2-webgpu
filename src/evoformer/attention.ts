@@ -4,6 +4,7 @@ import {
 import { GpuBufferAllocator, type AllocatedGpuBuffer, type AllocationSnapshot } from "../runtime/allocator.js";
 import { pipelineCacheForDevice, type ComputePipelineCache } from "../runtime/pipeline-cache.js";
 import { subgroupRange, subgroupMatrixConfigs, supportsSubgroupSize } from "../runtime/subgroups.js";
+import { rowNormalizeLayout, type RowNormalizeLayout } from "../runtime/reduction.js";
 import {
   ATTENTION_MATRIX_SUBGROUP_SIZE,
   attentionMatrixShape, attentionMatrixStorageBytes, createAttentionMatrixFlashShader,
@@ -230,8 +231,9 @@ const WHOLE_SHARD: ShardLayout = { count: 1, shardElements: Number.MAX_SAFE_INTE
 
 export function createAttentionNormalizeShader(
   storage: ActivationStorage = "f32", shards: ShardLayout = WHOLE_SHARD,
+  layout: RowNormalizeLayout = rowNormalizeLayout(undefined),
 ): string {
-  return normalizeShader(storage, shards, false);
+  return normalizeShader(storage, shards, false, layout);
 }
 
 /**
@@ -244,31 +246,40 @@ export function createAttentionNormalizeShader(
  */
 export function createAttentionNormalizeInPlaceShader(
   storage: ActivationStorage = "f32", shards: ShardLayout = WHOLE_SHARD,
+  layout: RowNormalizeLayout = rowNormalizeLayout(undefined),
 ): string {
-  return normalizeShader(storage, shards, true);
+  return normalizeShader(storage, shards, true, layout);
 }
 
-function normalizeShader(storage: ActivationStorage, shards: ShardLayout, inPlace: boolean): string {
+function normalizeShader(
+  storage: ActivationStorage, shards: ShardLayout, inPlace: boolean,
+  layout: RowNormalizeLayout,
+): string {
   const normalized = (channel: string) =>
-    `(source_load(input_base + ${channel}) - row_mean[0]) * inverse_std
+    `(source_load(input_base + ${channel}) - row_mean) * inverse_std
       * weights[p.scale + ${channel}] + weights[p.offset + ${channel}]`;
   // Packed in place, an invocation owns whole words rather than single
   // channels: two invocations sharing a word would otherwise race to write it.
-  const store = !inPlace
-    ? `  for (var c = local.x; c < p.channels; c += 64u) {
-    output[output_base + c] = ${normalized("c")};
-  }`
+  const stored = !inPlace
+    ? `    for (var c = norm_lane; c < p.channels; c += norm_stride) {
+      output[output_base + c] = ${normalized("c")};
+    }`
     : storage === "f32"
-      ? `  for (var c = local.x; c < p.channels; c += 64u) {
-    source_store(output_base + c, ${normalized("c")});
-  }`
-      : `  for (var word = local.x; word < p.channels / 2u; word += 64u) {
-    let c = word * 2u;
-    let low = ${normalized("c")};
-    let high = ${normalized("c + 1u")};
-    source_store((output_base + c) >> 1u, pack2x16float(vec2<f32>(low, high)));
+      ? `    for (var c = norm_lane; c < p.channels; c += norm_stride) {
+      source_store(output_base + c, ${normalized("c")});
+    }`
+      : `    for (var word = norm_lane; word < p.channels / 2u; word += norm_stride) {
+      let c = word * 2u;
+      let low = ${normalized("c")};
+      let high = ${normalized("c + 1u")};
+      source_store((output_base + c) >> 1u, pack2x16float(vec2<f32>(low, high)));
+    }`;
+  // A workgroup covering rows past the end still reduces, over row zero, so
+  // only the store is withheld.
+  const store = `  if (norm_live) {
+${stored}
   }`;
-  return `
+  return `${layout.enables}
 struct NormParameters {
   rows: u32, channels: u32, scale: u32, offset: u32,
   transpose: u32, batch: u32, queries: u32, epsilon: f32,
@@ -281,8 +292,7 @@ ${shardBindings(shards, "source", storage, 0, inPlace)}
 ${inPlace ? "" : `@group(0) @binding(${shards.count + 2}) var<storage, read_write> output: array<f32>;`}
 ${shardLoader(shards, "source", storage)}
 ${inPlace ? shardStorer(shards, "source", storage) : ""}
-var<workgroup> partial: array<f32, 64>;
-var<workgroup> row_mean: array<f32, 1>;
+${layout.declarations}
 
 // Rows are numbered within this batch window; the source holds the whole batch.
 fn source_row(row: u32) -> u32 {
@@ -292,34 +302,23 @@ fn source_row(row: u32) -> u32 {
   return q * p.batch_total + b;
 }
 
-@compute @workgroup_size(64)
-fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) group: vec3<u32>) {
-  let row = group.x + group.y * GRID_WIDTH;
-  if (row >= p.rows) { return; }
-  let input_base = source_row(row) * p.channels;
-  let output_base = ${inPlace ? "input_base" : "row * p.channels"};
+${layout.attributes}
+fn main(@builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>${layout.builtins}) {
+${layout.open("p.rows")}
+  let input_base = source_row(norm_row) * p.channels;
+  let output_base = ${inPlace ? "input_base" : "norm_row * p.channels"};
   var sum = 0.0;
-  for (var c = local.x; c < p.channels; c += 64u) { sum += source_load(input_base + c); }
-  partial[local.x] = sum;
-  workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride /= 2u) {
-    if (local.x < stride) { partial[local.x] += partial[local.x + stride]; }
-    workgroupBarrier();
-  }
-  if (local.x == 0u) { row_mean[0] = partial[0] / f32(p.channels); }
-  workgroupBarrier();
+  for (var c = norm_lane; c < p.channels; c += norm_stride) { sum += source_load(input_base + c); }
+${layout.sum("sum", "row_total")}
+  let row_mean = row_total / f32(p.channels);
   var squared = 0.0;
-  for (var c = local.x; c < p.channels; c += 64u) {
-    let centered = source_load(input_base + c) - row_mean[0];
+  for (var c = norm_lane; c < p.channels; c += norm_stride) {
+    let centered = source_load(input_base + c) - row_mean;
     squared += centered * centered;
   }
-  partial[local.x] = squared;
-  workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride /= 2u) {
-    if (local.x < stride) { partial[local.x] += partial[local.x + stride]; }
-    workgroupBarrier();
-  }
-  let inverse_std = inverseSqrt(partial[0] / f32(p.channels) + p.epsilon);
+${layout.sum("squared", "squared_total")}
+  let inverse_std = inverseSqrt(squared_total / f32(p.channels) + p.epsilon);
 ${store}
 }`;
 }
@@ -340,8 +339,9 @@ export const ATTENTION_NORMALIZE_IN_PLACE_SHADER = createAttentionNormalizeInPla
  */
 export function createAttentionStatisticsShader(
   storage: ActivationStorage = "f32", shards: ShardLayout = WHOLE_SHARD,
+  layout: RowNormalizeLayout = rowNormalizeLayout(undefined),
 ): string {
-  return `
+  return `${layout.enables}
 struct NormParameters {
   rows: u32, channels: u32, scale: u32, offset: u32,
   transpose: u32, batch: u32, queries: u32, epsilon: f32,
@@ -352,8 +352,7 @@ ${shardBindings(shards, "source", storage, 0, false)}
 @group(0) @binding(${shards.count}) var<uniform> p: NormParameters;
 @group(0) @binding(${shards.count + 1}) var<storage, read_write> statistics: array<f32>;
 ${shardLoader(shards, "source", storage)}
-var<workgroup> partial: array<f32, 64>;
-var<workgroup> row_mean: array<f32, 1>;
+${layout.declarations}
 
 fn source_row(row: u32) -> u32 {
   let b = p.batch_offset + row / p.queries;
@@ -362,36 +361,26 @@ fn source_row(row: u32) -> u32 {
   return q * p.batch_total + b;
 }
 
-@compute @workgroup_size(64)
-fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) group: vec3<u32>) {
-  let row = group.x + group.y * GRID_WIDTH;
-  if (row >= p.rows) { return; }
-  let input_row = source_row(row);
+${layout.attributes}
+fn main(@builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>${layout.builtins}) {
+${layout.open("p.rows")}
+  let input_row = source_row(norm_row);
   let input_base = input_row * p.channels;
   var sum = 0.0;
-  for (var c = local.x; c < p.channels; c += 64u) { sum += source_load(input_base + c); }
-  partial[local.x] = sum;
-  workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride /= 2u) {
-    if (local.x < stride) { partial[local.x] += partial[local.x + stride]; }
-    workgroupBarrier();
-  }
-  if (local.x == 0u) { row_mean[0] = partial[0] / f32(p.channels); }
-  workgroupBarrier();
+  for (var c = norm_lane; c < p.channels; c += norm_stride) { sum += source_load(input_base + c); }
+${layout.sum("sum", "row_total")}
+  let row_mean = row_total / f32(p.channels);
   var squared = 0.0;
-  for (var c = local.x; c < p.channels; c += 64u) {
-    let centered = source_load(input_base + c) - row_mean[0];
+  for (var c = norm_lane; c < p.channels; c += norm_stride) {
+    let centered = source_load(input_base + c) - row_mean;
     squared += centered * centered;
   }
-  partial[local.x] = squared;
-  workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride /= 2u) {
-    if (local.x < stride) { partial[local.x] += partial[local.x + stride]; }
-    workgroupBarrier();
-  }
-  if (local.x == 0u) {
-    statistics[2u * input_row] = row_mean[0];
-    statistics[2u * input_row + 1u] = inverseSqrt(partial[0] / f32(p.channels) + p.epsilon);
+${layout.sum("squared", "squared_total")}
+  // One lane of the row writes the pair the consumers read.
+  if (norm_live && norm_lane == 0u) {
+    statistics[2u * input_row] = row_mean;
+    statistics[2u * input_row + 1u] = inverseSqrt(squared_total / f32(p.channels) + p.epsilon);
   }
 }`;
 }
