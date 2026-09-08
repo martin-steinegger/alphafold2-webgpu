@@ -1,7 +1,8 @@
 import {
-  createTiledGemmShader, gemmGrid, GEMM_VARIANT_F32, matrixGemmStorageBytes, MATRIX_REGION,
-  MATRIX_SHAPE_F32_8, setGemmVariant, type GemmVariant, type MatrixUnitShape,
+  createTiledGemmShader, gemmGrid, GEMM_VARIANT_F32, MATRIX_LANES, matrixGemmStorageBytes,
+  MATRIX_REGION, MATRIX_SHAPE_F32_8, setGemmVariant, type GemmVariant, type MatrixUnitShape,
 } from "./gemm.js";
+import { supportsSubgroupSize } from "./subgroups.js";
 
 /**
  * Which arithmetic and which k depth the dense projections use on this device.
@@ -161,7 +162,12 @@ const MATRIX_FEATURE = "chromium-experimental-subgroup-matrix";
 
 function hasMatrixUnits(device: GPUDevice): boolean {
   const features: GPUSupportedFeatures | undefined = device.features;
-  return features?.has(MATRIX_FEATURE as GPUFeatureName) === true;
+  // The kernel lays one tile across one subgroup and indexes `lane % 32`, and
+  // says so with `@subgroup_size`. A device that cannot be held to that width
+  // is not offered the units. A stub in a test carries no features at all.
+  return features?.has(MATRIX_FEATURE as GPUFeatureName) === true
+    && (features.has("subgroups" as GPUFeatureName) !== true
+      || supportsSubgroupSize(device, MATRIX_LANES));
 }
 
 /**

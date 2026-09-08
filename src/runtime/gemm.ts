@@ -40,7 +40,8 @@ const GEMM_WORKGROUP_BYTES = 16384;
 
 /** The region one subgroup owns and its width. */
 export const MATRIX_REGION = 32;
-const MATRIX_LANES = 32;
+/** Lanes a subgroup. Every index and tile placement in the kernels assumes it. */
+export const MATRIX_LANES = 32;
 
 /**
  * One hardware matrix configuration: `Accum[M][N] += A[M][K] * B[K][N]`.

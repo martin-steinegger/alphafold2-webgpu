@@ -3,8 +3,9 @@ import {
 } from "../runtime/sharded.js";
 import { GpuBufferAllocator, type AllocatedGpuBuffer, type AllocationSnapshot } from "../runtime/allocator.js";
 import { pipelineCacheForDevice, type ComputePipelineCache } from "../runtime/pipeline-cache.js";
-import { subgroupRange, subgroupMatrixConfigs } from "../runtime/subgroups.js";
+import { subgroupRange, subgroupMatrixConfigs, supportsSubgroupSize } from "../runtime/subgroups.js";
 import {
+  ATTENTION_MATRIX_SUBGROUP_SIZE,
   attentionMatrixShape, attentionMatrixStorageBytes, createAttentionMatrixFlashShader,
   ATTENTION_MATRIX_QUERY_TILE,
 } from "./attention-matrix.js";
@@ -1131,7 +1132,7 @@ export function supportsAttentionSubgroup64x64(device: GPUDevice, headDim = 32):
 export function supportsAttentionMatrix(device: GPUDevice, headDim = 32): boolean {
   return device.features.has("chromium-experimental-subgroup-matrix" as GPUFeatureName)
     && device.features.has("shader-f16" as GPUFeatureName)
-    && device.features.has("subgroups" as GPUFeatureName)
+    && supportsSubgroupSize(device, ATTENTION_MATRIX_SUBGROUP_SIZE)
     && device.limits.maxComputeInvocationsPerWorkgroup >= ATTENTION_MATRIX_QUERY_TILE * 2
     && device.limits.maxComputeWorkgroupStorageSize >= attentionMatrixStorageBytes(headDim)
     && attentionMatrixShape(device, headDim, subgroupMatrixConfigs(device)) !== undefined;

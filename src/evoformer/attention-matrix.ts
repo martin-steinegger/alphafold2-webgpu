@@ -39,6 +39,9 @@ import { attentionMatrixConfig, type MatrixUnitShape } from "../runtime/gemm.js"
  * 51.0 ms at two, 54.1 ms at four and 62.9 ms at eight. A standalone
  * dispatch ranks them the other way round, and is the wrong instrument here.
  */
+/** Lanes a subgroup, which every index and shuffle in this kernel assumes. */
+export const ATTENTION_MATRIX_SUBGROUP_SIZE = 32;
+
 const SUBGROUPS = 2;
 /** The M of every tile, fixed by the unit shape the device reports. */
 const UNIT = 16;

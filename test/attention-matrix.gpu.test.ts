@@ -19,7 +19,7 @@ import {
   createAttentionRegisterFlashShader, selectAttentionFlashKernel, supportsAttentionMatrix,
   attentionPairBiasStride,
 } from "../src/evoformer/attention.js";
-import { recordSubgroupMatrixConfigs } from "../src/runtime/subgroups.js";
+import { recordSubgroupRange, recordSubgroupMatrixConfigs } from "../src/runtime/subgroups.js";
 
 const enabled = process.env.AFWEBGPU_GPU_TESTS === "1";
 // Thirty-two is the width of the trunk's heads and eight the extra-MSA
@@ -68,6 +68,7 @@ describe.skipIf(!enabled)("flash attention over the matrix units", () => {
         maxBufferSize: adapter.limits.maxBufferSize,
       },
     });
+    recordSubgroupRange(candidate, adapter);
     recordSubgroupMatrixConfigs(candidate, adapter);
     device = supportsAttentionMatrix(candidate, 32) ? candidate : undefined;
   });
