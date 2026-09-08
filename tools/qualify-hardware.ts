@@ -1,6 +1,7 @@
 import { CLUSTERED_MSA_CHANNELS, compactClusteredMsaFeatures } from "../src/input/msa-features.js";
 import { arch, platform, release } from "node:os";
 import { create, globals } from "webgpu";
+import { dawnInstanceFlags } from "../src/runtime/dawn.js";
 import { AlphaFoldMonomerGpu, type MonomerModelWeights, type MonomerRecycleFeatures } from "../src/model/monomer.js";
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
@@ -54,7 +55,10 @@ const shape = {
   extraSequences: features[0]!.extraSequences,
   recycles: features.length,
 };
-const gpu = create([]);
+const gpu = create(dawnInstanceFlags({
+  // AFWEBGPU_UNCLAMPED=1 drops the bounds clamp; see `dawnInstanceFlags`.
+  unclamped: process.env.AFWEBGPU_UNCLAMPED === "1",
+}));
 const compactPoolMibValue = process.env.AFWEBGPU_COMPACT_POOL_MIB;
 const compactPoolMib = compactPoolMibValue === undefined ? undefined : Number(compactPoolMibValue);
 if (compactPoolMib !== undefined && (!Number.isSafeInteger(compactPoolMib) || compactPoolMib < 0)) {

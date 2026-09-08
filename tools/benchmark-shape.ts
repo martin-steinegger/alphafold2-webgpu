@@ -10,6 +10,7 @@
  */
 import { EXACT_STORAGE } from "../src/model/monomer.js";
 import { create, globals } from "webgpu";
+import { dawnInstanceFlags } from "../src/runtime/dawn.js";
 import { AlphaFoldMonomerGpu } from "../src/model/monomer.js";
 import { makeA3mFeatures } from "../src/input/a3m-features.js";
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
@@ -51,7 +52,10 @@ const features = makeA3mFeatures(a3m, featureTables, {
   recycles: recycles - 1, maxMsaSequences: msaRows, maxExtraSequences: extraRows, randomSeed: 0,
 });
 
-const gpu = create([]);
+const gpu = create(dawnInstanceFlags({
+  // AFWEBGPU_UNCLAMPED=1 drops the bounds clamp; see `dawnInstanceFlags`.
+  unclamped: process.env.AFWEBGPU_UNCLAMPED === "1",
+}));
 const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
 if (adapter === null) throw new Error("no WebGPU adapter");
 // The model stores its activations packed. AFWEBGPU_EXACT=1 selects the f32

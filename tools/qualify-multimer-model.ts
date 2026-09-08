@@ -1,6 +1,7 @@
 import { EXACT_STORAGE } from "../src/model/monomer.js";
 import { CLUSTERED_MSA_CHANNELS, compactClusteredMsaFeatures } from "../src/input/msa-features.js";
 import { create, globals } from "webgpu";
+import { dawnInstanceFlags } from "../src/runtime/dawn.js";
 import { AlphaFoldMultimerGpu, type MultimerModelWeights } from "../src/model/multimer.js";
 import type { MultimerRecycleFeatures } from "../src/input/multimer-features.js";
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
@@ -115,7 +116,10 @@ const references = await Promise.all(referencePaths.map(async (path) => {
 }));
 
 Object.assign(globalThis, globals);
-const adapter = await create([]).requestAdapter();
+const adapter = await create(dawnInstanceFlags({
+  // AFWEBGPU_UNCLAMPED=1 drops the bounds clamp; see `dawnInstanceFlags`.
+  unclamped: process.env.AFWEBGPU_UNCLAMPED === "1",
+})).requestAdapter();
 if (adapter === null) throw new Error("no WebGPU adapter");
 const device = await adapter.requestDevice();
 try {

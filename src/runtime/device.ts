@@ -408,11 +408,17 @@ export async function requestAlphaFoldDevice(
   // costs nothing and never fails; a device that grants only the baseline
   // simply will not offer that kernel to the measurement.
   const maxComputeWorkgroupStorageSize = adapter.limits.maxComputeWorkgroupStorageSize;
+  // A device grants 256 invocations a workgroup unless asked for more, where
+  // the adapter here offers 1,024. No kernel wants more than 256 today, and
+  // the matrix kernels check the granted figure before they offer themselves,
+  // so this only widens what a future tiling may ask for.
+  const maxComputeInvocationsPerWorkgroup = adapter.limits.maxComputeInvocationsPerWorkgroup;
+  const maxComputeWorkgroupSizeX = adapter.limits.maxComputeWorkgroupSizeX;
   const device = await adapter.requestDevice({
     requiredFeatures,
     requiredLimits: {
       maxBufferSize, maxStorageBufferBindingSize, maxStorageBuffersPerShaderStage,
-      maxComputeWorkgroupStorageSize,
+      maxComputeWorkgroupStorageSize, maxComputeInvocationsPerWorkgroup, maxComputeWorkgroupSizeX,
     },
   });
   recordSubgroupRange(device, adapter);

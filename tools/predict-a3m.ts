@@ -8,6 +8,7 @@
 import { EXACT_STORAGE } from "../src/model/monomer.js";
 import { readFileSync, writeFileSync } from "node:fs";
 import { create, globals } from "webgpu";
+import { dawnInstanceFlags } from "../src/runtime/dawn.js";
 import { AlphaFoldMonomerGpu } from "../src/model/monomer.js";
 import { parseA3m } from "../src/input/a3m.js";
 import { makeA3mFeatures, type RecycleFeatureSource } from "../src/input/a3m-features.js";
@@ -57,7 +58,10 @@ if (templatePath !== undefined && templatePath !== "") {
     identity: Number((prepared.alignment.identity * 100).toFixed(1)),
   };
 }
-const gpu = create([]);
+const gpu = create(dawnInstanceFlags({
+  // AFWEBGPU_UNCLAMPED=1 drops the bounds clamp; see `dawnInstanceFlags`.
+  unclamped: process.env.AFWEBGPU_UNCLAMPED === "1",
+}));
 const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
 if (adapter === null) throw new Error("no WebGPU adapter");
 const clustered = Math.min(msaRows, depth);

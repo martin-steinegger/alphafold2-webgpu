@@ -7,12 +7,16 @@
  * kernel currently in production.
  */
 import { create, globals } from "webgpu";
+import { dawnInstanceFlags } from "../src/runtime/dawn.js";
 import { requestAlphaFoldDevice } from "../src/runtime/device.js";
 import { CANDIDATES, SHAPES } from "./gemm-candidates.js";
 
 Object.assign(globalThis, globals);
 
-const gpu = create([]);
+const gpu = create(dawnInstanceFlags({
+  // AFWEBGPU_UNCLAMPED=1 drops the bounds clamp; see `dawnInstanceFlags`.
+  unclamped: process.env.AFWEBGPU_UNCLAMPED === "1",
+}));
 const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
 if (adapter === null) throw new Error("no WebGPU adapter is available");
 const device = await requestAlphaFoldDevice(adapter);

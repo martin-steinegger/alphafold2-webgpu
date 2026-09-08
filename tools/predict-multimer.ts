@@ -5,6 +5,7 @@
  * Usage: tsx tools/predict-multimer.ts <manifest.json> <CHAIN_A:CHAIN_B[:...]> [recycles]
  */
 import { create, globals } from "webgpu";
+import { dawnInstanceFlags } from "../src/runtime/dawn.js";
 import { AlphaFoldMultimerGpu } from "../src/model/multimer.js";
 import { EXACT_STORAGE } from "../src/model/monomer.js";
 import {
@@ -29,7 +30,10 @@ const [embedding, multimerTemplate, extraStack, mainStack, structure, confidence
     model.mainStackWeights(), model.multimerStructureWeights(), model.confidenceWeights(), model.geometryTables(),
     model.queryOnlyFeatureTables(), model.tensor("confidencePaeBreaks"),
   ]);
-const gpu = create([]);
+const gpu = create(dawnInstanceFlags({
+  // AFWEBGPU_UNCLAMPED=1 drops the bounds clamp; see `dawnInstanceFlags`.
+  unclamped: process.env.AFWEBGPU_UNCLAMPED === "1",
+}));
 const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
 if (adapter === null) throw new Error("no WebGPU adapter");
 const plan = planMonomerDevice(adapter, length, 1, 1, undefined, false,
