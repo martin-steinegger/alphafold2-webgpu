@@ -7,6 +7,9 @@
  * the card's. A browser has to plan without it. A native host does not.
  */
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { globSync } from "node:fs";
+import { totalmem } from "node:os";
 
 /**
  * Points the Vulkan loader at one GPU, by index, before an instance exists.
@@ -87,11 +90,36 @@ export function detectDeviceMemoryBytes(): number | undefined {
     const out = queryGpu(selected === undefined
       ? ["--query-gpu=memory.total", "--format=csv,noheader,nounits"]
       : ["--query-gpu=memory.total", "--format=csv,noheader,nounits", "-i", String(selected)]);
-    if (out === undefined) return undefined;
+    if (out === undefined) return amdDeviceMemoryBytes();
     const sizes = out.split("\n").map((line) => Number(line.trim()))
       .filter((value) => Number.isFinite(value) && value > 0);
-    if (sizes.length === 0) return undefined;
+    if (sizes.length === 0) return amdDeviceMemoryBytes();
     return Math.min(...sizes) * 1024 * 1024;
+}
+
+/**
+ * The same figure for an AMD card, which has no `nvidia-smi` to ask.
+ *
+ * The kernel reports it per card in sysfs, so nothing has to be installed and
+ * `rocm-smi` need not be present. The smallest is taken for the reason above:
+ * without a choice, nothing says which card the loader preferred.
+ *
+ * An integrated part reports a heap it does not have — the Strix Halo here
+ * says 96 GiB on a host holding 32 GiB, because that heap is carved out of
+ * system memory on demand — so the host's own memory caps it. That keeps the
+ * budget honest on an APU and changes nothing on a discrete card, whose board
+ * memory is the smaller of the two.
+ */
+function amdDeviceMemoryBytes(): number | undefined {
+  let smallest: number | undefined;
+  for (const path of globSync("/sys/class/drm/card*/device/mem_info_vram_total")) {
+    try {
+      const bytes = Number(readFileSync(path, "utf8").trim());
+      if (!Number.isFinite(bytes) || bytes <= 0) continue;
+      if (smallest === undefined || bytes < smallest) smallest = bytes;
+    } catch { /* a card that will not say is one this cannot plan against */ }
+  }
+  return smallest === undefined ? undefined : Math.min(smallest, totalmem());
 }
 
 /**

@@ -26,6 +26,20 @@ import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 const PROBE_BATCH = 16;
 const PROBE_QUERIES = 256;
 const PROBE_REPEATS = 3;
+/**
+ * A batch long enough that the queue round trip is not what is measured.
+ *
+ * One dispatch of this probe runs in about a tenth of a millisecond, and a
+ * wall clock around a submit and its completion cannot see that: on a card
+ * another process is saturating, a single dispatch of the same kernel reads
+ * anywhere between 0.15 ms and 2.4 ms, which ranks the quiet slots rather than
+ * the kernels. Batching many dispatches into one command buffer and dividing
+ * puts the kernel back in charge of the number. `measureGemmVariants` is sized
+ * the same way and for the same reason.
+ */
+const PROBE_BATCH_MILLISECONDS = 12;
+const PROBE_ROUGH_DISPATCHES = 4;
+const PROBE_MAX_DISPATCHES = 2000;
 
 const calibrations = new WeakMap<GPUDevice, Map<number, Promise<AttentionFlashKernel>>>();
 
@@ -44,9 +58,18 @@ export function attentionFlashCandidates(device: GPUDevice, headDim: number): re
   return [...new Set(candidates)];
 }
 
-async function timeFlashKernel(
+/** One candidate, ready to dispatch, so the sweep below can interleave them. */
+interface FlashTiming {
+  readonly kernel: AttentionFlashKernel;
+  readonly dispatch: (dispatches: number) => Promise<number>;
+  /** Sized so one batch reaches `PROBE_BATCH_MILLISECONDS`, once, up front. */
+  dispatches: number;
+  best: number;
+}
+
+async function prepareFlashKernel(
   device: GPUDevice, kernel: AttentionFlashKernel, buffers: readonly GPUBuffer[], heads: number,
-): Promise<number> {
+): Promise<FlashTiming> {
   const pipeline = await pipelineCacheForDevice(device).get(kernel.cacheKey, kernel.shader);
   const bindGroup = device.createBindGroup({
     layout: pipeline.getBindGroupLayout(0),
@@ -59,22 +82,23 @@ async function timeFlashKernel(
   const blocks = Math.ceil(PROBE_QUERIES / kernel.queryTile);
   const groupsX = kernel.batchFirst === true ? PROBE_BATCH : blocks;
   const groupsY = kernel.batchFirst === true ? blocks : PROBE_BATCH;
-  const dispatch = async (): Promise<number> => {
+  const dispatch = async (dispatches: number): Promise<number> => {
     const encoder = device.createCommandEncoder({ label: `calibrate.${kernel.variant}` });
     const pass = encoder.beginComputePass();
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, bindGroup);
-    pass.dispatchWorkgroups(groupsX, groupsY, heads);
+    for (let index = 0; index < dispatches; index += 1) {
+      pass.dispatchWorkgroups(groupsX, groupsY, heads);
+    }
     pass.end();
     const start = performance.now();
     device.queue.submit([encoder.finish()]);
     await device.queue.onSubmittedWorkDone();
-    return performance.now() - start;
+    return (performance.now() - start) / dispatches;
   };
-  await dispatch();
-  let best = Number.POSITIVE_INFINITY;
-  for (let repeat = 0; repeat < PROBE_REPEATS; repeat += 1) best = Math.min(best, await dispatch());
-  return best;
+  return {
+    kernel, dispatch, dispatches: PROBE_ROUGH_DISPATCHES, best: Number.POSITIVE_INFINITY,
+  };
 }
 
 async function measureFlashKernel(device: GPUDevice, headDim: number): Promise<AttentionFlashKernel> {
@@ -117,12 +141,32 @@ async function measureFlashKernel(device: GPUDevice, headDim: number): Promise<A
     device.queue.writeBuffer(mask, 0, new Float32Array(rows).fill(1));
 
     const bound = [query, key, value, gate, mask, pairBias, parameters, output];
-    let best: { kernel: AttentionFlashKernel; milliseconds: number } | undefined;
+    const timings: FlashTiming[] = [];
     for (const variant of candidates) {
-      const kernel = selectAttentionFlashKernel(device, headDim, variant);
-      const milliseconds = await timeFlashKernel(device, kernel, bound, heads);
-      if (best === undefined || milliseconds < best.milliseconds) best = { kernel, milliseconds };
+      timings.push(await prepareFlashKernel(
+        device, selectAttentionFlashKernel(device, headDim, variant), bound, heads,
+      ));
     }
+    // Warm every candidate before any of them is timed, then sweep them
+    // round-robin rather than finishing one before starting the next. Swept
+    // the other way each candidate owns a different window of wall time, so a
+    // clock ramping across the sweep ranks the windows and not the kernels: on
+    // a Strix Halo the same two kernels at headDim 8 read 0.298 against 0.212
+    // ms in one order and 0.220 against 0.257 in the other.
+    // `measureGemmVariants` is swept the same way.
+    // The rough pass warms the pipeline as well as sizing the batch, so its
+    // own time is discarded.
+    for (const timing of timings) {
+      const rough = await timing.dispatch(PROBE_ROUGH_DISPATCHES);
+      timing.dispatches = Math.max(PROBE_ROUGH_DISPATCHES, Math.min(PROBE_MAX_DISPATCHES,
+        Math.ceil(PROBE_BATCH_MILLISECONDS / Math.max(rough, 0.01))));
+    }
+    for (let repeat = 0; repeat < PROBE_REPEATS; repeat += 1) {
+      for (const timing of timings) {
+        timing.best = Math.min(timing.best, await timing.dispatch(timing.dispatches));
+      }
+    }
+    const best = [...timings].sort((left, right) => left.best - right.best)[0];
     return best?.kernel ?? fallback;
   } catch {
     return fallback;
