@@ -279,6 +279,11 @@ ${shardBindings(shards, "right", "f32", shards.count, false)}
 @group(0) @binding(${2 * shards.count}) var<uniform> p: Parameters;
 @group(0) @binding(${2 * shards.count + 1}) var<uniform> tile: TileParameters;
 @group(0) @binding(${2 * shards.count + 2}) var<storage, read_write> outer: array<f32>;
+// Divided here rather than after the output projection below, which reads this
+// tensor as an operand. A sum over every extra sequence grows with the depth of
+// the alignment and leaves the range of an f16 operand at about 2,650 of them;
+// the mean is of order one whatever the depth.
+@group(0) @binding(${2 * shards.count + 3}) var<storage, read> pair_count: array<f32>;
 ${shardLoader(shards, "left", "f32")}
 ${shardLoader(shards, "right", "f32")}`,
   rows: "tile.count * p.c_outer",
@@ -305,7 +310,9 @@ ${shardLoader(shards, "right", "f32")}`,
           let outer_left = row % p.c_outer;
           let j = column / p.c_outer;
           let outer_right = column % p.c_outer;
-          outer[((block_i * p.length + j) * p.c_outer + outer_left) * p.c_outer + outer_right] = element;`,
+          let pair = (tile.offset + block_i) * p.length + j;
+          outer[((block_i * p.length + j) * p.c_outer + outer_left) * p.c_outer + outer_right]
+            = element / (p.normalization_epsilon + pair_count[pair]);`,
   });
 }
 
@@ -353,7 +360,7 @@ export function createOuterProductMeanProjectOutputShader(
       let local = row;
       let biases = vec4<f32>(weights[p.output_bias + column], weights[p.output_bias + column + 1u],
         weights[p.output_bias + column + 2u], weights[p.output_bias + column + 3u]);
-      var stored = (values + biases) * scale;
+      var stored = values + biases * scale;
       let word = (local * p.c_z + column) >> 1u;
       ${residual ? "stored += vec4<f32>(unpack2x16float(output[word]), unpack2x16float(output[word + 1u]));" : ""}
       output[word] = pack2x16float(stored.xy);
@@ -361,9 +368,9 @@ export function createOuterProductMeanProjectOutputShader(
       store: "",
     } : {
       store: `let pair = tile.offset * p.length + row;
-          let projected = element + weights[p.output_bias + column];
+          let scale = 1.0 / (p.normalization_epsilon + pair_count[pair]);
           output[row * p.c_z + column] ${residual ? "+=" : "="}
-            projected / (p.normalization_epsilon + pair_count[pair]);`,
+            element + weights[p.output_bias + column] * scale;`,
     }),
   });
 }

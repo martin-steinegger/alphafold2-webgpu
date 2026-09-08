@@ -1039,7 +1039,7 @@ async function encodeOuterProductMean(
     const tile = uniform(execution, `opm.block-${offset}`, new Uint32Array([offset, count, 0, 0]));
     const contractGrid = gemmGrid(count * input.cOuter, input.length * input.cOuter);
     execution.dispatch(encoder, contractPipeline,
-      [...projectionViews(left), ...projectionViews(right), params, tile, outer],
+      [...projectionViews(left), ...projectionViews(right), params, tile, outer, pairCount],
       contractGrid[0], contractGrid[1], 1, "opm.contract");
     const projectOutputGrid = gemmGrid(count * input.length, input.cZ);
     // The block writes its own pair rows, so it binds only those.
