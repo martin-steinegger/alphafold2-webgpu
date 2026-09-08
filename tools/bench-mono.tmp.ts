@@ -8,6 +8,7 @@
 import { EXACT_STORAGE } from "../src/model/monomer.js";
 import { readFileSync, writeFileSync } from "node:fs";
 import { create, globals } from "webgpu";
+import { dawnInstanceFlags } from "../src/runtime/dawn.js";
 import { AlphaFoldMonomerGpu } from "../src/model/monomer.js";
 import { parseA3m } from "../src/input/a3m.js";
 import { makeA3mFeatures, type RecycleFeatureSource } from "../src/input/a3m-features.js";
@@ -64,13 +65,10 @@ if (templatePath !== undefined && templatePath !== "") {
     identity: Number((prepared.alignment.identity * 100).toFixed(1)),
   };
 }
-// AFWEBGPU_DAWN_FEATURES passes Dawn toggles (shader-f16 on Nvidia Vulkan).
-const dawnFeatures = process.env.AFWEBGPU_DAWN_FEATURES;
-const dawnDisabled = process.env.AFWEBGPU_DAWN_DISABLE;
-const gpu = create([
-  ...(dawnFeatures === undefined || dawnFeatures === "" ? [] : [`enable-dawn-features=${dawnFeatures}`]),
-  ...(dawnDisabled === undefined || dawnDisabled === "" ? [] : [`disable-dawn-features=${dawnDisabled}`]),
-]);
+// The same native flags every shipped node entry point sets: without them the
+// adapter reports no matrix units at all and the probe silently measures a
+// device that has them.
+const gpu = create(dawnInstanceFlags({ unclamped: true }));
 const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
 if (adapter === null) throw new Error("no WebGPU adapter");
 const clustered = Math.min(msaRows, depth);

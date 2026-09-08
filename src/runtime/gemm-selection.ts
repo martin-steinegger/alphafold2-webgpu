@@ -576,7 +576,14 @@ export function calibrateGemmVariant(
       // simply make the matrix kernel look slower than everything.
       const wideTime = (measurement: GemmVariantMeasurement): number =>
         measurement.perShape[0] ?? Number.POSITIVE_INFINITY;
-      const matrix = usable.find((measurement) => measurement.variant.precision === "matrix");
+      // The fastest of them, not the first: a shape is offered at more than
+      // one staged k depth, and which depth wins is the device's answer. On a
+      // Strix Halo the deeper tile runs the wide probe in 0.218 ms against
+      // 0.274, so which of them the margin below is applied to decides whether
+      // the units are reached at all.
+      const matrix = usable
+        .filter((measurement) => measurement.variant.precision === "matrix")
+        .sort((left, right) => wideTime(left) - wideTime(right))[0];
       const bestClassicWide = usable
         .filter((measurement) => measurement.variant.precision !== "matrix")
         .sort((left, right) => wideTime(left) - wideTime(right))[0];
