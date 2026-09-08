@@ -14,6 +14,19 @@
  * 16 KiB every WebGPU implementation guarantees.
  */
 
+/**
+ * Workgroups one dispatch dimension may hold, which every WebGPU device grants
+ * and none here grants more of.
+ *
+ * The row tiles of a tall contraction outgrow it: the extra-MSA global
+ * attention projects `sequences * length` rows, which at 800 residues passes it
+ * at 5,242 extra sequences, and at the multimer's 1,152 at 3,640 residues. It
+ * announced itself as a validation error rather than a wrong answer, but it
+ * stopped the prediction. `gemmGrid` folds the excess into the column
+ * dimension and the kernels take it apart again.
+ */
+export const GEMM_GRID_LIMIT = 65_535;
+
 export const GEMM_TILE_ROWS = 64;
 export const GEMM_TILE_COLUMNS = 128;
 const GEMM_TILE_INNER = 8;
@@ -284,8 +297,24 @@ export function gemmGrid(
   if (![rows, columns].every((value) => Number.isSafeInteger(value) && value > 0)) {
     throw new RangeError("GEMM dispatch dimensions must be positive safe integers");
   }
-  return [Math.ceil(columns / tileColumns), Math.ceil(rows / GEMM_TILE_ROWS)];
+  const columnTiles = Math.ceil(columns / tileColumns);
+  const rowTiles = Math.ceil(rows / GEMM_TILE_ROWS);
+  const folds = Math.ceil(rowTiles / GEMM_GRID_LIMIT);
+  return [columnTiles * folds, Math.min(rowTiles, GEMM_GRID_LIMIT)];
 }
+
+/**
+ * Where a workgroup's output tile begins.
+ *
+ * With one fold this is `group.x` across the columns and `group.y` down the
+ * rows, as it reads. With more, the folds ride in the high part of `group.x`,
+ * which costs a division of a value the whole workgroup shares.
+ */
+const tileOrigins = (tileColumns: number): string => `  let gemm_column_tiles =
+    (gemm_columns + ${tileColumns - 1}u) / ${tileColumns}u;
+  let tile_column_origin = (group.x % gemm_column_tiles) * ${tileColumns}u;
+  let tile_row_origin = (group.y + (group.x / gemm_column_tiles) * ${GEMM_GRID_LIMIT}u)
+    * ${GEMM_TILE_ROWS}u;`;
 
 /** Whether this shader and this variant can use the hardware matrix units. */
 export function usesMatrixUnits(shader: TiledGemmShader, variant: GemmVariant): boolean {
@@ -491,8 +520,7 @@ fn main(
   let in_subgroup = lane % ${MATRIX_LANES}u;
   let rows_at = (subgroup / ${columnGroups}u) * ${M}u;
   let columns_at = (subgroup % ${columnGroups}u) * ${groupTiles * N}u;
-  let tile_row_origin = group.y * ${GEMM_TILE_ROWS}u;
-  let tile_column_origin = group.x * ${tileColumns}u;
+${tileOrigins(tileColumns)}
 ${lines(groupTiles, (c) => `  var acc_${c} = subgroup_matrix_result<f32, ${N}, ${M}>();`)}
 
   // Software pipelined: the operands for the next step are fetched into
@@ -613,8 +641,7 @@ fn main(
   let gemm_inner = ${shader.inner};
   let gemm_columns = ${shader.columns};
   let lane = local.x;
-  let tile_row_origin = group.y * ${GEMM_TILE_ROWS}u;
-  let tile_column_origin = group.x * ${tileColumns}u;
+${tileOrigins(tileColumns)}
   // Uniform: every invocation of the workgroup takes the same branch.
   if (gemm_rows >= ${region}u) {
     for (var row_block = 0u; row_block < ${rowBlocks}u; row_block += 1u) {
@@ -775,9 +802,9 @@ fn main(
   let thread = local.x;
   let column_thread = thread % ${columnThreads}u;
   let row_thread = thread / ${columnThreads}u;
-  let tile_row_origin = group.y * ${GEMM_TILE_ROWS}u;
+${tileOrigins(tileColumns)}
   let row_origin = tile_row_origin + row_thread * ${rowsPerThread}u;
-  let column_origin = group.x * ${tileColumns}u;
+  let column_origin = tile_column_origin;
   let tile_column = column_origin + column_thread * 4u;
 ${lines(rowsPerThread, (row) => `  var ${register}${row} = vec4<${accumulatorScalar}>(0.0);`)}
 

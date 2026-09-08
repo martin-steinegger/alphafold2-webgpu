@@ -231,10 +231,25 @@ describe("the matrix units and what they can serve", () => {
     // gemmGrid does not know which shader is asking, so a matrix kernel on a
     // different tile would hand the wrong grid to any caller that opted out.
     const shader = createTiledGemmShader({ ...spec, ...arrays }, matrix);
-    expect(shader).toContain("group.y * 64u");
-    expect(shader).toContain("group.x * 128u");
+    expect(shader).toContain("(gemm_columns + 127u) / 128u");
+    expect(shader).toContain("* 64u");
     expect(gemmGrid(64, 128)).toEqual([1, 1]);
     expect(gemmGrid(65, 129)).toEqual([2, 2]);
+  });
+
+  it("folds the row tiles a dispatch dimension cannot hold into the columns", () => {
+    // One dimension holds 65,535 workgroups. The extra-MSA global attention
+    // projects `sequences * length` rows, which passes that at 5,242 extra
+    // sequences of an 800-residue chain, and the dispatch was refused.
+    const rows = 65_536 * 64;
+    const [x, y] = gemmGrid(rows, 128);
+    expect(y).toBeLessThanOrEqual(65_535);
+    expect(x).toBeLessThanOrEqual(65_535);
+    // Two folds of one column tile, covering every row tile between them.
+    expect(x * y).toBeGreaterThanOrEqual(rows / 64);
+    expect([x, y]).toEqual([2, 65_535]);
+    // A shape that fits takes one fold, and the grid is what it always was.
+    expect(gemmGrid(65_535 * 64, 256)).toEqual([2, 65_535]);
   });
 });
 
