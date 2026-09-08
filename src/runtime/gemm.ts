@@ -502,13 +502,16 @@ function createMatrixGemmShaderF16(
     }`;
   return `enable chromium_experimental_subgroup_matrix;
 enable f16;
+enable subgroups;
+enable subgroup_size_control;
 ${shader.preamble}
 
 var<workgroup> gemm_matrix_a: array<f16, ${aLength}>;
 var<workgroup> gemm_matrix_b: array<f16, ${bLength}>;
 var<workgroup> gemm_matrix_out: array<f32, ${outLength}>;
 
-@compute @workgroup_size(${lanes}, 1, 1)
+// Pinned: one tile sits on one subgroup and every index counts on its width.
+@compute @workgroup_size(${lanes}, 1, 1) @subgroup_size(${MATRIX_LANES})
 fn main(
   @builtin(local_invocation_id) local: vec3<u32>,
   @builtin(workgroup_id) group: vec3<u32>,
@@ -627,13 +630,16 @@ function createMatrixGemmShader(shader: TiledGemmShader, variant: GemmVariant): 
         }
         workgroupBarrier();` : "";
   return `enable chromium_experimental_subgroup_matrix;
+enable subgroups;
+enable subgroup_size_control;
 ${half ? "enable f16;\n" : ""}${shader.preamble}
 
 var<workgroup> gemm_matrix_stage: array<f32, ${region * region}>;${half ? `
 var<workgroup> gemm_matrix_left: array<f16, ${region * K}>;
 var<workgroup> gemm_matrix_right: array<f16, ${K * region}>;` : ""}
 
-@compute @workgroup_size(${MATRIX_LANES}, 1, 1)
+// Pinned, for the same reason as the half-precision kernel above.
+@compute @workgroup_size(${MATRIX_LANES}, 1, 1) @subgroup_size(${MATRIX_LANES})
 fn main(
   @builtin(local_invocation_id) local: vec3<u32>,
   @builtin(workgroup_id) group: vec3<u32>,

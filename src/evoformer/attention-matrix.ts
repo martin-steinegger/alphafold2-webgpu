@@ -41,6 +41,7 @@ import { attentionMatrixConfig, type MatrixUnitShape } from "../runtime/gemm.js"
  */
 /** Lanes a subgroup, which every index and shuffle in this kernel assumes. */
 export const ATTENTION_MATRIX_SUBGROUP_SIZE = 32;
+const MATRIX_LANES = ATTENTION_MATRIX_SUBGROUP_SIZE;
 
 const SUBGROUPS = 2;
 /** The M of every tile, fixed by the unit shape the device reports. */
@@ -214,6 +215,7 @@ export function createAttentionMatrixFlashShader(
   return `enable chromium_experimental_subgroup_matrix;
 enable f16;
 enable subgroups;
+enable subgroup_size_control;
 struct Parameters {
   batch: u32, queries: u32, channels: u32, heads: u32,
   head_dim: u32, transpose: u32, has_pair_bias: u32,
@@ -255,7 +257,8 @@ var<workgroup> rescale: array<f32, ${ATTENTION_MATRIX_QUERY_TILE}>;
 // per row: sixty-four times more often than it changes. Staged once per pass.
 var<workgroup> mask_tile: array<f32, ${KEY_TILE}>;
 
-@compute @workgroup_size(${LANES}, 1, 1)
+// Pinned, because every index here counts on thirty-two lanes a subgroup.
+@compute @workgroup_size(${LANES}, 1, 1) @subgroup_size(${MATRIX_LANES})
 fn main(
   @builtin(local_invocation_id) local: vec3<u32>,
   @builtin(workgroup_id) group: vec3<u32>,

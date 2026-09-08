@@ -15,6 +15,7 @@
  */
 import { beforeAll, describe, expect, it } from "vitest";
 import { create, globals } from "webgpu";
+import { dawnInstanceFlags } from "../src/runtime/dawn.js";
 import {
   createAttentionRegisterFlashShader, selectAttentionFlashKernel, supportsAttentionMatrix,
   attentionPairBiasStride,
@@ -47,11 +48,14 @@ describe.skipIf(!enabled)("flash attention over the matrix units", () => {
 
   beforeAll(async () => {
     Object.assign(globalThis, globals);
+    // The same flags the model asks for. Built from the environment instead,
+    // this suite skipped every case on any host where the caller had not set
+    // the variable, and reported the skips as passes: the extension is
+    // experimental, so Dawn hides it without `allow_unsafe_apis`.
     const adapterName = process.env.AFWEBGPU_ADAPTER;
-    const toggles = process.env.AFWEBGPU_DAWN_FEATURES;
     gpu = create([
       ...(adapterName === undefined ? [] : [`adapter=${adapterName}`]),
-      ...(toggles === undefined || toggles === "" ? [] : [`enable-dawn-features=${toggles}`]),
+      ...dawnInstanceFlags(),
     ]);
     const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
     if (adapter === null) throw new Error("no WebGPU adapter is available");

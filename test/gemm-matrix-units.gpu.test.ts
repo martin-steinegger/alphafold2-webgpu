@@ -15,6 +15,7 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { create, globals } from "webgpu";
+import { dawnInstanceFlags } from "../src/runtime/dawn.js";
 import { createTiledGemmShader, gemmGrid } from "../src/runtime/gemm.js";
 import {
   gemmVariantName, selectMatrixShape, type SubgroupMatrixConfig,
@@ -41,15 +42,21 @@ describe.skipIf(!enabled)("projection over the hardware matrix units", () => {
 
   beforeAll(async () => {
     Object.assign(globalThis, globals);
+    // The same flags the model asks for. Built from the environment instead,
+    // this suite skipped every case on any host where the caller had not set
+    // the variable, and reported the skips as passes: the extension is
+    // experimental, so Dawn hides it without `allow_unsafe_apis`.
     const adapterName = process.env.AFWEBGPU_ADAPTER;
-    const toggles = process.env.AFWEBGPU_DAWN_FEATURES;
     gpu = create([
       ...(adapterName === undefined ? [] : [`adapter=${adapterName}`]),
-      ...(toggles === undefined || toggles === "" ? [] : [`enable-dawn-features=${toggles}`]),
+      ...dawnInstanceFlags(),
     ]);
     const adapter = await gpu!.requestAdapter({ powerPreference: "high-performance" });
     if (adapter === null) throw new Error("no WebGPU adapter is available");
-    const wanted = ["chromium-experimental-subgroup-matrix", "subgroups", "shader-f16"] as const;
+    // The kernels pin their subgroup width, so the feature that lets them is
+    // not optional for this suite.
+    const wanted = ["chromium-experimental-subgroup-matrix", "subgroups",
+      "subgroup-size-control", "shader-f16"] as const;
     const requiredFeatures = wanted.filter(
       (feature) => adapter.features.has(feature as GPUFeatureName),
     ) as GPUFeatureName[];
