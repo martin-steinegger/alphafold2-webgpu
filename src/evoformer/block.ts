@@ -23,7 +23,7 @@ import {
 } from "./attention.js";
 import { attentionFlashKernelForShape } from "./attention-calibration.js";
 import { calibrateAttentionShape } from "../runtime/attention-queries.js";
-import { createTiledGemmShader, GEMM_TILE_ROWS, gemmGrid } from "../runtime/gemm.js";
+import { createTiledGemmShader, GEMM_TILE_COLUMNS, GEMM_TILE_ROWS, gemmGrid } from "../runtime/gemm.js";
 import { rowNormalizeLayout } from "../runtime/reduction.js";
 import { releaseScratch } from "./execution-scratch.js";
 import {
@@ -701,8 +701,9 @@ async function encodeAttention(
   const [normalize, project, pairProject, flash, outputProject, pairNormalize] = await Promise.all([
     execution.pipelines.get(`block:attention:normalize:${shardKey}`,
       createAttentionNormalizeShader(storage, sourceShards, normalizeLayout)),
-    execution.pipelines.get(`block:attention:project:${keyValueStorage}`,
-      attentionProjectShader(keyValueStorage)),
+    execution.pipelines.get(
+      `block:attention:project:${keyValueStorage}:${options.channels >= GEMM_TILE_COLUMNS}`,
+      attentionProjectShader(keyValueStorage, options.channels >= GEMM_TILE_COLUMNS)),
     execution.pipelines.get(`block:attention:pair-bias:h${options.heads}`,
       createAttentionPairBiasShader(options.heads)),
     execution.pipelines.get(

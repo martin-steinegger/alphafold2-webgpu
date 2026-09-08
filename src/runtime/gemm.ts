@@ -206,6 +206,13 @@ export interface TiledGemmShader {
   readonly sourceElement: string;
   /** Expression producing one W element, with `k` and `column` in scope. */
   readonly weightElement: string;
+  /**
+   * `sourceElement` and `weightElement` may use `column_origin`, the first
+   * column of the tile being staged, which both kernels define. Arithmetic
+   * that depends only on the tile belongs there: written against `column` it
+   * is recomputed for every element staged, and a division by a uniform cannot
+   * be strength-reduced.
+   */
   /** Statements storing one result, with `row`, `column` and `element` in scope. */
   readonly store: string;
   /**
@@ -467,7 +474,11 @@ function createMatrixGemmShaderF16(
   const fetchB = (at: string, whole: boolean): string => lines(bPerLane, (i) => `  {
     let item = lane + ${i * lanes}u;
     let k = ${at} + item ${kFirst ? `% ${kStep}u` : `/ ${tileColumns}u`};
-    let column = tile_column_origin + item ${kFirst ? `/ ${kStep}u` : `% ${tileColumns}u`};
+    // Both kernels offer the tile's first column under this name, so a weight
+    // expression can put its loop-invariant arithmetic on the tile rather than
+    // on the element and have it hoisted out of the staging loop.
+    let column_origin = tile_column_origin;
+    let column = column_origin + item ${kFirst ? `/ ${kStep}u` : `% ${tileColumns}u`};
     ${whole ? `next_b_${i} = ${shader.weightElement};` : `var held = 0.0;
     if (k < gemm_inner && column < gemm_columns) { held = ${shader.weightElement}; }
     next_b_${i} = held;`}

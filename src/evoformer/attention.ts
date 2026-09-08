@@ -11,7 +11,7 @@ import {
   ATTENTION_MATRIX_QUERY_TILE,
 } from "./attention-matrix.js";
 import { type ActivationStorage, storageArray, storedElement } from "../runtime/storage.js";
-import { createTiledGemmShader, gemmGrid } from "../runtime/gemm.js";
+import { createTiledGemmShader, gemmGrid, GEMM_TILE_COLUMNS } from "../runtime/gemm.js";
 import { scratchBudget } from "../runtime/scratch-budget.js";
 
 export interface AttentionWeights {
@@ -485,6 +485,14 @@ export function attentionQueriesPerThread(preferred: number): number {
 
 export function attentionProjectShader(
   keyValueStorage: AttentionKeyValueStorage = "f32",
+  /**
+   * Whether one projection is at least a column tile wide, which lets the
+   * weight address put its matrix index on the tile instead of the element.
+   * The main stack projects 256 channels a matrix and qualifies; the extra
+   * stack projects 64, so a 128-wide tile spans two of its matrices and the
+   * index has to be computed per element there.
+   */
+  tileWideProjection = false,
 ): string {
   // The projection stores what the flash kernel reads: keys packed only when
   // the keys are packed, values whenever either half-precision mode is on.
@@ -514,7 +522,21 @@ fn projection_weight_offset(matrix: u32) -> u32 {
     inner: "p.channels",
     columns: "4u * p.heads * p.head_dim",
     sourceElement: "source[row * p.channels + k]",
-    weightElement: `weights[projection_weight_offset(column / (p.heads * p.head_dim))
+    // The matrix index is loop-invariant across a tile whenever one projection
+    // is at least as wide as the tile, so it goes on `column_origin` and the
+    // compiler lifts it out of the weight staging loop. Written against
+    // `column` it is recomputed for every element staged, and neither division
+    // can be strength-reduced because the divisor is a uniform: measured 3.685
+    // ms to 3.085 on the row projection and 3.313 to 2.710 on the column one.
+    //
+    // Where a tile can span two matrices the index has to be per element.
+    // Getting that wrong is quiet -- it moved the 825-residue prediction from
+    // 86.76 pLDDT to 87.33 rather than failing anything.
+    weightElement: tileWideProjection
+      ? `weights[projection_weight_offset(column_origin / (p.heads * p.head_dim))
+        + k * p.heads * p.head_dim
+        + column - (column_origin / (p.heads * p.head_dim)) * (p.heads * p.head_dim)]`
+      : `weights[projection_weight_offset(column / (p.heads * p.head_dim))
         + k * p.heads * p.head_dim + column % (p.heads * p.head_dim)]`,
     store: `let projected = p.heads * p.head_dim;
           let matrix = column / projected;
@@ -1264,12 +1286,14 @@ export class AttentionGpu {
   async run(input: AttentionInput): Promise<AttentionResult> {
     validate(input);
     const packed = packAttentionWeights(input);
+    const wideProjection = input.channels >= GEMM_TILE_COLUMNS;
     const flashKernel = selectAttentionFlashKernel(
       this.device, input.channels / input.heads, this.options.flashVariant ?? "auto",
     );
     const [normalize, project, pairProject, flash, outputProject] = await Promise.all([
       this.pipelines.get("attention:normalize", ATTENTION_NORMALIZE_SHADER),
-      this.pipelines.get("attention:project", attentionProjectShader()),
+      this.pipelines.get(`attention:project:${wideProjection}`,
+        attentionProjectShader("f32", wideProjection)),
       this.pipelines.get(`attention:pair-bias:h${input.heads}`,
         createAttentionPairBiasShader(input.heads)),
       this.pipelines.get(flashKernel.cacheKey, flashKernel.shader),
