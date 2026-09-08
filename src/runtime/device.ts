@@ -3,13 +3,16 @@ import { COMPACT_GPU_POOL_BYTES } from "./allocator.js";
 import {
   OUTER_PRODUCT_BLOCK_LIMIT_BYTES, outerProductMeanNormalizeWindow, outerProductMeanRowBlock,
 } from "../evoformer/outer-product-mean.js";
-import { ATTENTION_WINDOW_TARGET_BYTES, attentionBatchWindow } from "../evoformer/attention.js";
+import {
+  ATTENTION_WINDOW_TARGET_BYTES, attentionBatchWindow, attentionPairBiasStride,
+} from "../evoformer/attention.js";
 import { triangleBlockRows } from "../evoformer/block.js";
 import type { TriangleWholeStorage } from "../triangle/shaders.js";
 import type { ActivationStorage } from "./storage.js";
 import { TRANSITION_CHUNK_TARGET_BYTES, transitionChunkRows } from "../evoformer/transition.js";
-import { calibrateGemmVariant } from "./gemm-selection.js";
-import { recordSubgroupRange } from "./subgroups.js";
+import { calibrateGemmVariant, type SubgroupMatrixConfig } from "./gemm-selection.js";
+import { recordSubgroupRange, recordSubgroupMatrixConfigs } from "./subgroups.js";
+import { scratchBudget, setScratchBudgetScale } from "./scratch-budget.js";
 
 const WEBGPU_BASE_MAX_BUFFER_SIZE = 256 * 1024 * 1024;
 const WEBGPU_BASE_MAX_STORAGE_BINDING_SIZE = 128 * 1024 * 1024;
@@ -71,6 +74,15 @@ export interface MonomerMemoryOptions {
    */
   readonly multimer?: boolean;
   readonly templateRows?: number;
+  /**
+   * How much larger the bounded scratch windows may be than the browser's.
+   *
+   * One, the default, keeps the budgets every shipped adapter was tuned for.
+   * A caller that knows it owns a large accelerator raises it and trades
+   * memory for far fewer dispatches; `src/runtime/scratch-budget.ts` says why
+   * this cannot be derived from the adapter.
+   */
+  readonly scratchBudgetScale?: number;
   /**
    * A monomer folding against a custom template.
    *
@@ -137,7 +149,8 @@ export function estimateMonomerMemory(
   const attentionScratch = (batch: number, queries: number, channels: number, tensors: number): number =>
     attentionBatchWindow(batch, queries, channels) * queries * channels * bytes * tensors;
   const transitionScratch = (rows: number, channels: number, hidden: number): number => {
-    const chunk = transitionChunkRows(rows, channels, hidden, TRANSITION_CHUNK_TARGET_BYTES);
+    const chunk = transitionChunkRows(rows, channels, hidden,
+      scratchBudget(TRANSITION_CHUNK_TARGET_BYTES));
     return chunk * (channels + hidden) * bytes;
   };
   const outerProductScratch = (sequences: number, channels: number, outer: number): number =>
@@ -149,8 +162,10 @@ export function estimateMonomerMemory(
   const triangleBlock = triangleBlockRows(length, 128, 128) * length * 128 * bytes;
 
   // Attention over the pair adds a bias of one value per head and query pair,
-  // built from the pair one row window at a time.
-  const pairBias = 8 * length * length * bytes + Math.min(pair, ATTENTION_WINDOW_TARGET_BYTES);
+  // built from the pair one row window at a time. Its rows are padded to four,
+  // so the flash kernels can read four of one at once.
+  const pairBias = 8 * length * attentionPairBiasStride(length) * bytes
+    + Math.min(pair, scratchBudget(ATTENTION_WINDOW_TARGET_BYTES));
   const operatorScratch = Math.max(
     // Row and column attention over the clustered and extra alignments: the
     // normalized input, query, key, value and gate, one batch window each.
@@ -289,7 +304,7 @@ export function monomerDeviceRequirements(
     options.multimer === true ? length * length * 64 * bytes : 0,
     options.template === true ? length * length * 64 * pairBytes : 0,
     options.multimer === true ? length * length * 128 * pairBytes : 0,
-    OUTER_PRODUCT_BLOCK_LIMIT_BYTES,
+    scratchBudget(OUTER_PRODUCT_BLOCK_LIMIT_BYTES),
   );
   if (!Number.isSafeInteger(largestTensor)) throw new RangeError("monomer tensor size exceeds JavaScript precision");
   return {
@@ -312,6 +327,9 @@ export function planMonomerDevice(
     && (!Number.isSafeInteger(memoryBudgetBytes) || memoryBudgetBytes <= 0)) {
     throw new RangeError("memory budget must be a positive safe integer");
   }
+  // Installed before anything is estimated, because the same budgets decide
+  // both what this plan says the run needs and what the run then allocates.
+  if (options.scratchBudgetScale !== undefined) setScratchBudgetScale(options.scratchBudgetScale);
   const compact = monomerDeviceRequirements(length, msaSequences, extraSequences, options);
   const bytes = Float32Array.BYTES_PER_ELEMENT;
   const largestFullTransition = Math.max(
@@ -385,13 +403,37 @@ export async function requestAlphaFoldDevice(
   // more of them per stage reaches longer sequences. The adapter's own figure
   // costs nothing to ask for.
   const maxStorageBuffersPerShaderStage = adapter.limits.maxStorageBuffersPerShaderStage;
+  // The matrix attention kernel stages its tiles in workgroup memory and wants
+  // more than the 16 KiB baseline. Asking for what the adapter already offers
+  // costs nothing and never fails; a device that grants only the baseline
+  // simply will not offer that kernel to the measurement.
+  const maxComputeWorkgroupStorageSize = adapter.limits.maxComputeWorkgroupStorageSize;
+  // A device grants 256 invocations a workgroup unless asked for more, where
+  // the adapter here offers 1,024. No kernel wants more than 256 today, and
+  // the matrix kernels check the granted figure before they offer themselves,
+  // so this only widens what a future tiling may ask for.
+  const maxComputeInvocationsPerWorkgroup = adapter.limits.maxComputeInvocationsPerWorkgroup;
+  const maxComputeWorkgroupSizeX = adapter.limits.maxComputeWorkgroupSizeX;
   const device = await adapter.requestDevice({
     requiredFeatures,
-    requiredLimits: { maxBufferSize, maxStorageBufferBindingSize, maxStorageBuffersPerShaderStage },
+    requiredLimits: {
+      maxBufferSize, maxStorageBufferBindingSize, maxStorageBuffersPerShaderStage,
+      maxComputeWorkgroupStorageSize, maxComputeInvocationsPerWorkgroup, maxComputeWorkgroupSizeX,
+    },
   });
   recordSubgroupRange(device, adapter);
+  recordSubgroupMatrixConfigs(device, adapter);
+  // Which matrix configurations the units implement is reported on the
+  // adapter and not on the device, so it is read here and handed down rather
+  // than looked up where it is used. An implementation that reports none
+  // leaves the selection exactly as it was.
+  // `info` itself is optional: it postdates the adapters this runs on, and a
+  // stub standing in for one in a test does not carry it either.
+  const subgroupMatrixConfigs = ((adapter.info as unknown as {
+    subgroupMatrixConfigs?: readonly SubgroupMatrixConfig[];
+  } | undefined)?.subgroupMatrixConfigs) ?? [];
   // Before the caller can hold the device, and so before any projection
   // shader exists, settle which arithmetic and k depth the shared GEMM uses.
-  await calibrateGemmVariant(device);
+  await calibrateGemmVariant(device, subgroupMatrixConfigs);
   return device;
 }

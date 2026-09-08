@@ -1,6 +1,7 @@
 /** Reports per-dispatch GPU timestamps for one extra-MSA and one main Evoformer block. */
 import { CLUSTERED_MSA_CHANNELS, compactClusteredMsaFeatures } from "../src/input/msa-features.js";
 import { create, globals } from "webgpu";
+import { dawnInstanceFlags } from "../src/runtime/dawn.js";
 import { AlphaFoldMonomerGpu, type MonomerRecycleFeatures } from "../src/model/monomer.js";
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
@@ -40,7 +41,11 @@ const [embedding, template, extraStack, mainStack, structure, confidence, geomet
   model.embeddingWeights(), model.templateWeights(), model.extraStackWeights(), model.mainStackWeights(),
   model.structureWeights(), model.confidenceWeights(), model.geometryTables(),
 ]);
-const gpu = create([]);
+const gpu = create(dawnInstanceFlags({
+  // Native, so the bounds clamp goes: the kernels do not rely on it, and it is
+  // worth 11% of a recycle. See `dawnInstanceFlags`.
+  unclamped: true,
+}));
 const adapter = await gpu.requestAdapter();
 if (adapter === null) throw new Error("no WebGPU adapter");
 const device = await requestAlphaFoldDevice(adapter);

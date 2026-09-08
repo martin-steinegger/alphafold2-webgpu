@@ -30,3 +30,51 @@ export function subgroupRange(device: GPUDevice): readonly [number, number] | un
   if (limits.minSubgroupSize === undefined || limits.maxSubgroupSize === undefined) return undefined;
   return [limits.minSubgroupSize, limits.maxSubgroupSize];
 }
+
+/**
+ * Whether this device can be pinned to subgroups of `size`.
+ *
+ * The matrix kernels are written for thirty-two lanes a subgroup: they index
+ * `lane % 32`, pair two lanes to a row through `subgroupShuffleXor`, and lay
+ * one matrix tile across exactly one subgroup. They declare `@subgroup_size`
+ * to hold the driver to it, which needs the feature; and a device may expose
+ * the feature while advertising a range that does not contain thirty-two —
+ * SwiftShader fixes it at [4, 4] — in which case the kernels are simply not
+ * for that device.
+ */
+export function supportsSubgroupSize(device: GPUDevice, size: number): boolean {
+  if (!device.features.has("subgroups" as GPUFeatureName)
+    || !device.features.has("subgroup-size-control" as GPUFeatureName)) return false;
+  const range = subgroupRange(device);
+  return range !== undefined && range[0] <= size && size <= range[1];
+}
+
+/** One entry of the adapter's `subgroupMatrixConfigs`, which the device omits. */
+export interface RecordedMatrixConfig {
+  readonly componentType: string;
+  readonly resultComponentType: string;
+  readonly M: number;
+  readonly N: number;
+  readonly K: number;
+}
+
+const matrixConfigs = new WeakMap<GPUDevice, readonly RecordedMatrixConfig[]>();
+
+/**
+ * Records which matrix shapes the units implement.
+ *
+ * The list is on the adapter and not on the device, and a kernel that wants it
+ * has only the device, so it is stashed here the way the subgroup range above
+ * already is.
+ */
+export function recordSubgroupMatrixConfigs(device: GPUDevice, adapter: GPUAdapter): void {
+  const info = adapter.info as unknown as
+    { subgroupMatrixConfigs?: readonly RecordedMatrixConfig[] } | undefined;
+  const configs = info?.subgroupMatrixConfigs;
+  if (configs !== undefined && configs.length > 0) matrixConfigs.set(device, configs);
+}
+
+/** The recorded shapes, empty on a device that reported none. */
+export function subgroupMatrixConfigs(device: GPUDevice): readonly RecordedMatrixConfig[] {
+  return matrixConfigs.get(device) ?? [];
+}

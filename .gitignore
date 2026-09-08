@@ -12,3 +12,10 @@ test/fixtures/evoformer/
 
 # A local reproduction spec that has been committed by accident three times.
 test/browser/metal-repro.spec.ts
+
+# Scratch harnesses. They pin a variant or print a table for one
+# investigation and are not maintained against the code they import.
+tools/*.tmp.ts
+
+# Downloaded model bundles, which are release assets rather than sources.
+.models/

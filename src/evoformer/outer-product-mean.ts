@@ -1,8 +1,10 @@
 import { GpuBufferAllocator, type AllocatedGpuBuffer, type AllocationSnapshot } from "../runtime/allocator.js";
 import { pipelineCacheForDevice, type ComputePipelineCache } from "../runtime/pipeline-cache.js";
 import { type ActivationStorage, storageArray, storedElement } from "../runtime/storage.js";
+import { rowNormalizeLayout, type RowNormalizeLayout } from "../runtime/reduction.js";
 import { shardBindings, shardLoader, type ShardLayout } from "../runtime/sharded.js";
 import { createTiledGemmShader, gemmGrid } from "../runtime/gemm.js";
+import { scratchBudget } from "../runtime/scratch-budget.js";
 
 export interface OuterProductMeanWeights {
   readonly layerNormScale: Float32Array;
@@ -108,46 +110,43 @@ struct Parameters {
 const GRID_WIDTH: u32 = 32768u;
 `;
 
-export function createOuterProductMeanNormalizeShader(storage: ActivationStorage = "f32"): string {
-  return `${COMMON}
+export function createOuterProductMeanNormalizeShader(
+  storage: ActivationStorage = "f32",
+  layout: RowNormalizeLayout = rowNormalizeLayout(undefined),
+): string {
+  return `${layout.enables}${COMMON}
 @group(0) @binding(0) var<storage, read> source: array<${storageArray(storage)}>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> p: Parameters;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
-var<workgroup> partial: array<f32, 64>;
-var<workgroup> row_mean: array<f32, 1>;
+${layout.declarations}
 
-@compute @workgroup_size(64)
-fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) group: vec3<u32>) {
+${layout.attributes}
+fn main(@builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>${layout.builtins}) {
   let rows = p.sequences * p.length;
-  let row = group.x + group.y * GRID_WIDTH;
-  if (row >= rows) { return; }
-  let base = row * p.c_m;
+${layout.open("rows")}
+  let base = norm_row * p.c_m;
   var sum = 0.0;
-  for (var c = local.x; c < p.c_m; c += 64u) { sum += ${storedElement(storage, "source", "base + c")}; }
-  partial[local.x] = sum;
-  workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride /= 2u) {
-    if (local.x < stride) { partial[local.x] += partial[local.x + stride]; }
-    workgroupBarrier();
+  for (var c = norm_lane; c < p.c_m; c += norm_stride) {
+    sum += ${storedElement(storage, "source", "base + c")};
   }
-  if (local.x == 0u) { row_mean[0] = partial[0] / f32(p.c_m); }
-  workgroupBarrier();
+${layout.sum("sum", "row_total")}
+  let row_mean = row_total / f32(p.c_m);
   var squared = 0.0;
-  for (var c = local.x; c < p.c_m; c += 64u) {
-    let centered = ${storedElement(storage, "source", "base + c")} - row_mean[0];
+  for (var c = norm_lane; c < p.c_m; c += norm_stride) {
+    let centered = ${storedElement(storage, "source", "base + c")} - row_mean;
     squared += centered * centered;
   }
-  partial[local.x] = squared;
-  workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride /= 2u) {
-    if (local.x < stride) { partial[local.x] += partial[local.x + stride]; }
-    workgroupBarrier();
-  }
-  let inverse_std = inverseSqrt(partial[0] / f32(p.c_m) + p.layer_norm_epsilon);
-  for (var c = local.x; c < p.c_m; c += 64u) {
-    output[base + c] = (${storedElement(storage, "source", "base + c")} - row_mean[0]) * inverse_std
-      * weights[p.layer_norm_scale + c] + weights[p.layer_norm_offset + c];
+${layout.sum("squared", "squared_total")}
+  let inverse_std = inverseSqrt(squared_total / f32(p.c_m) + p.layer_norm_epsilon);
+  // A workgroup covering rows past the end still reduces, over row zero, so
+  // only the store is withheld.
+  if (norm_live) {
+    for (var c = norm_lane; c < p.c_m; c += norm_stride) {
+      output[base + c] = (${storedElement(storage, "source", "base + c")} - row_mean) * inverse_std
+        * weights[p.layer_norm_scale + c] + weights[p.layer_norm_offset + c];
+    }
   }
 }`;
 }
@@ -278,6 +277,11 @@ ${shardBindings(shards, "right", "f32", shards.count, false)}
 @group(0) @binding(${2 * shards.count}) var<uniform> p: Parameters;
 @group(0) @binding(${2 * shards.count + 1}) var<uniform> tile: TileParameters;
 @group(0) @binding(${2 * shards.count + 2}) var<storage, read_write> outer: array<f32>;
+// Divided here rather than after the output projection below, which reads this
+// tensor as an operand. A sum over every extra sequence grows with the depth of
+// the alignment and leaves the range of an f16 operand at about 2,650 of them;
+// the mean is of order one whatever the depth.
+@group(0) @binding(${2 * shards.count + 3}) var<storage, read> pair_count: array<f32>;
 ${shardLoader(shards, "left", "f32")}
 ${shardLoader(shards, "right", "f32")}`,
   rows: "tile.count * p.c_outer",
@@ -285,11 +289,28 @@ ${shardLoader(shards, "right", "f32")}`,
   columns: "p.length * p.c_outer",
   sourceElement: "left_load(k * p.length * p.c_outer + tile.offset * p.c_outer + row)",
   weightElement: "right_load(k * p.length * p.c_outer + column)",
+  // Both operands are accumulated over the sequences, so the sequence is
+  // their outermost index and the residue runs contiguously.
+  sourceContiguous: "row",
+  // One binding covering the whole projection is a plain array, so the matrix
+  // units can address it. The left operand is accumulated over the sequences
+  // and so is stored with the contraction axis outermost; the right one is
+  // already row-major in it. A sharded projection keeps the expressions,
+  // whose loader chooses a binding per element.
+  ...(shards.count === 1 ? {
+    sourceArray: {
+      array: "left_0", base: "tile.offset * p.c_outer",
+      stride: "p.length * p.c_outer", columnMajor: true,
+    },
+    weightArray: { array: "right_0", stride: "p.length * p.c_outer" },
+  } : {}),
   store: `let block_i = row / p.c_outer;
           let outer_left = row % p.c_outer;
           let j = column / p.c_outer;
           let outer_right = column % p.c_outer;
-          outer[((block_i * p.length + j) * p.c_outer + outer_left) * p.c_outer + outer_right] = element;`,
+          let pair = (tile.offset + block_i) * p.length + j;
+          outer[((block_i * p.length + j) * p.c_outer + outer_left) * p.c_outer + outer_right]
+            = element / (p.normalization_epsilon + pair_count[pair]);`,
   });
 }
 
@@ -325,6 +346,9 @@ export function createOuterProductMeanProjectOutputShader(
     columns: "p.c_z",
     sourceElement: "outer[row * p.c_outer * p.c_outer + k]",
     weightElement: "weights[p.output_weight + k * p.c_z + column]",
+    // Both operands are plain row-major arrays, so the units can address them.
+    sourceArray: { array: "outer", stride: "p.c_outer * p.c_outer" },
+    weightArray: { array: "weights", base: "p.output_weight", stride: "p.c_z" },
     // A packed pair takes the four adjacent columns an invocation holds as two
     // words; the pair channel count is a multiple of four, so the group never
     // runs past the row.
@@ -334,7 +358,7 @@ export function createOuterProductMeanProjectOutputShader(
       let local = row;
       let biases = vec4<f32>(weights[p.output_bias + column], weights[p.output_bias + column + 1u],
         weights[p.output_bias + column + 2u], weights[p.output_bias + column + 3u]);
-      var stored = (values + biases) * scale;
+      var stored = values + biases * scale;
       let word = (local * p.c_z + column) >> 1u;
       ${residual ? "stored += vec4<f32>(unpack2x16float(output[word]), unpack2x16float(output[word + 1u]));" : ""}
       output[word] = pack2x16float(stored.xy);
@@ -342,9 +366,9 @@ export function createOuterProductMeanProjectOutputShader(
       store: "",
     } : {
       store: `let pair = tile.offset * p.length + row;
-          let projected = element + weights[p.output_bias + column];
+          let scale = 1.0 / (p.normalization_epsilon + pair_count[pair]);
           output[row * p.c_z + column] ${residual ? "+=" : "="}
-            projected / (p.normalization_epsilon + pair_count[pair]);`,
+            element + weights[p.output_bias + column] * scale;`,
     }),
   });
 }
@@ -375,7 +399,8 @@ export const OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_RESIDUAL_SHADER =
 export const OUTER_PRODUCT_NORMALIZE_WINDOW_BYTES = 8 * 1024 * 1024;
 
 export function outerProductMeanNormalizeWindow(
-  rows: number, cM: number, budgetBytes: number = OUTER_PRODUCT_NORMALIZE_WINDOW_BYTES,
+  rows: number, cM: number,
+  budgetBytes: number = scratchBudget(OUTER_PRODUCT_NORMALIZE_WINDOW_BYTES),
 ): number {
   if (![rows, cM, budgetBytes].every((value) => Number.isSafeInteger(value) && value > 0)) {
     throw new RangeError("outer-product normalize window dimensions must be positive safe integers");
@@ -389,7 +414,8 @@ export function outerProductMeanNormalizeWindow(
 export const OUTER_PRODUCT_BLOCK_LIMIT_BYTES = 16 * 1024 * 1024;
 
 export function outerProductMeanRowBlock(
-  length: number, cOuter: number, budgetBytes: number = OUTER_PRODUCT_BLOCK_LIMIT_BYTES,
+  length: number, cOuter: number,
+  budgetBytes: number = scratchBudget(OUTER_PRODUCT_BLOCK_LIMIT_BYTES),
 ): number {
   if (![length, cOuter, budgetBytes].every((value) => Number.isSafeInteger(value) && value > 0)) {
     throw new RangeError("outer-product block dimensions and budget must be positive safe integers");

@@ -7,7 +7,8 @@ import {
   createAttentionStatisticsShader,
   ATTENTION_OUTPUT_SHADER,
   ATTENTION_OUTPUT_RESIDUAL_SHADER,
-  ATTENTION_PAIR_BIAS_SHADER,
+  createAttentionPairBiasShader,
+  attentionPairBiasStride,
   attentionKeyValueStorage,
   attentionQueriesPerThread,
   attentionProjectShader,
@@ -23,6 +24,7 @@ import {
 import { attentionFlashKernelForShape } from "./attention-calibration.js";
 import { calibrateAttentionShape } from "../runtime/attention-queries.js";
 import { createTiledGemmShader, GEMM_TILE_ROWS, gemmGrid } from "../runtime/gemm.js";
+import { rowNormalizeLayout } from "../runtime/reduction.js";
 import { releaseScratch } from "./execution-scratch.js";
 import {
   createOuterProductMeanNormalizeShader,
@@ -57,6 +59,7 @@ import {
 import type { TriangleMultiplicationWeights } from "../triangle/types.js";
 import { packWeights as packTriangleWeights } from "../triangle/weights.js";
 import type { AllocationSnapshot } from "../runtime/allocator.js";
+import { scratchBudget } from "../runtime/scratch-budget.js";
 
 export interface AttentionModuleWeights {
   readonly heads: number;
@@ -339,6 +342,11 @@ function globalAttentionQueryShader(): string {
     columns: "p.heads * p.head_dim",
     sourceElement: "means[row * p.channels + k]",
     weightElement: "weights[p.query_weight + k * p.heads * p.head_dim + column]",
+    // Both operands are plain row-major arrays, so the units can address them.
+    sourceArray: { array: "means", stride: "p.channels" },
+    weightArray: {
+      array: "weights", base: "p.query_weight", stride: "p.heads * p.head_dim",
+    },
     store: `query[row * p.heads * p.head_dim + column] = element * inverseSqrt(f32(p.head_dim));`,
   });
 }
@@ -523,9 +531,11 @@ async function encodeTransition(
     rows, channels, hiddenChannels, execution.transitionBufferLimit,
     execution.device.limits.minStorageBufferOffsetAlignment,
   );
-  const shaders = createTransitionShaders(descriptor, packed.offsets, storage);
+  const layout = rowNormalizeLayout(execution.device);
+  const shaders = createTransitionShaders(descriptor, packed.offsets, storage, layout);
   const [normalize, linear, linearResidual] = await Promise.all([
-    execution.pipelines.get(`block:transition:normalize:${storage}`, shaders[0]!),
+    execution.pipelines.get(
+      `block:transition:normalize:${storage}:${layout.rowsPerWorkgroup}`, shaders[0]!),
     execution.pipelines.get("block:transition:linear", shaders[1]!),
     execution.pipelines.get(`block:transition:linear-residual:${storage}`, shaders[2]!),
   ]);
@@ -542,7 +552,7 @@ async function encodeTransition(
     ]));
     const normalized = execution.allocate(`${label}.normalized`, rows * channels);
     const hidden = execution.allocate(`${label}.hidden`, rows * hiddenChannels);
-    const normalizeGrid = execution.linearGrid(rows, 1);
+    const normalizeGrid = execution.linearGrid(rows, layout.rowsPerWorkgroup);
     execution.dispatch(encoder, normalize, [source, weights, normalizeParams, normalized],
       normalizeGrid[0], normalizeGrid[1], 1, `${label}.normalize`);
     execution.dispatch(encoder, linear, [normalized, weights, firstParams, hidden],
@@ -577,7 +587,7 @@ async function encodeTransition(
       storageWords(rowOffset * channels, storage), storageWords(count * channels, storage));
     const normalizedChunk = execution.view(normalized, 0, count * channels);
     const hiddenChunk = execution.view(hidden, 0, count * hiddenChannels);
-    const normalizeGrid = execution.linearGrid(count, 1);
+    const normalizeGrid = execution.linearGrid(count, layout.rowsPerWorkgroup);
     execution.dispatch(encoder, normalize, [sourceChunk, weights, normalizeParams, normalizedChunk],
       normalizeGrid[0], normalizeGrid[1], 1, `${label}.normalize-${rowOffset}`);
     execution.dispatch(encoder, linear, [normalizedChunk, weights, firstParams, hiddenChunk],
@@ -686,13 +696,15 @@ async function encodeAttention(
       + `${execution.device.limits.maxStorageBuffersPerShaderStage}. Its `
       + `${(execution.bindingLimitBytes / 1024 ** 2).toFixed(0)} MiB binding limit is what forces the windows.`);
   }
-  const shardKey = `${storage}:${sourceShards.count}`;
+  const normalizeLayout = rowNormalizeLayout(execution.device);
+  const shardKey = `${storage}:${sourceShards.count}:${normalizeLayout.rowsPerWorkgroup}`;
   const [normalize, project, pairProject, flash, outputProject, pairNormalize] = await Promise.all([
     execution.pipelines.get(`block:attention:normalize:${shardKey}`,
-      createAttentionNormalizeShader(storage, sourceShards)),
+      createAttentionNormalizeShader(storage, sourceShards, normalizeLayout)),
     execution.pipelines.get(`block:attention:project:${keyValueStorage}`,
       attentionProjectShader(keyValueStorage)),
-    execution.pipelines.get("block:attention:pair-bias", ATTENTION_PAIR_BIAS_SHADER),
+    execution.pipelines.get(`block:attention:pair-bias:h${options.heads}`,
+      createAttentionPairBiasShader(options.heads)),
     execution.pipelines.get(
       `block:${flashKernel.cacheKey}:kv-${keyValueStorage}:q${slots}`, flashShader),
     execution.pipelines.get(
@@ -701,8 +713,10 @@ async function encodeAttention(
     ),
     // The pair bias source has its own storage, which need not match the
     // attention source's: MSA row attention reads a pair, not an MSA.
-    execution.pipelines.get(`block:attention:normalize:${options.pairStorage ?? "f32"}`,
-      createAttentionNormalizeShader(options.pairStorage ?? "f32")),
+    execution.pipelines.get(
+      `block:attention:normalize:${options.pairStorage ?? "f32"}:${normalizeLayout.rowsPerWorkgroup}`,
+      createAttentionNormalizeShader(
+        options.pairStorage ?? "f32", undefined, rowNormalizeLayout(execution.device))),
   ]);
   const wholeRows = options.batch * options.queries;
   const weights = execution.upload(`${options.label}.weights`, packed.data);
@@ -712,7 +726,8 @@ async function encodeAttention(
   // Attention is independent across batch entries, so the per-row tensors only
   // ever have to hold one window of them.
   const windowBatch = attentionBatchWindow(options.batch, options.queries, options.channels,
-    Math.min(options.windowBytes ?? ATTENTION_WINDOW_TARGET_BYTES, execution.bindingLimitBytes));
+    Math.min(options.windowBytes ?? scratchBudget(ATTENTION_WINDOW_TARGET_BYTES),
+      execution.bindingLimitBytes));
   const windowElements = windowBatch * options.queries * options.channels;
 
   const normalized = execution.allocate(`${options.label}.normalized`, windowElements);
@@ -743,14 +758,21 @@ async function encodeAttention(
   const normalizeWindow = (window: (typeof windowParameters)[number]): GpuTensor => {
     const rows = window.count * options.queries;
     const target = execution.view(normalized, 0, rows * options.channels);
-    const grid = execution.linearGrid(rows, 1);
+    const grid = execution.linearGrid(rows, normalizeLayout.rowsPerWorkgroup);
     execution.dispatch(encoder, normalize, [...sourceViews, weights, window.norm, target],
       grid[0], grid[1], 1, `${options.label}.normalize-${window.offset}`);
     return target;
   };
 
   let normalizedPair: GpuTensor | undefined;
-  const pairBiasElements = options.pairBias === undefined ? 1 : options.heads * options.queries * options.queries;
+  // Four even where there is no bias: the matrix kernel binds it as vectors,
+  // and a binding of one element is under the minimum size for that.
+  // One row past what the bias holds. The matrix kernel reads it four at a
+  // time, and the last vector of the last row reaches past the end of the last
+  // key tile. The values are discarded, but the read should land inside the
+  // tensor rather than rely on a clamp a device may be asked to drop.
+  const pairBiasElements = options.pairBias === undefined
+    ? 4 : (options.heads * options.queries + 1) * attentionPairBiasStride(options.queries);
   const pairBias = execution.allocate(`${options.label}.pair-bias`, pairBiasElements);
   if (options.pairBias !== undefined) {
     if (options.pairBias.source === "separate") {
@@ -761,7 +783,8 @@ async function encodeAttention(
       const channels = options.pairBias.channels;
       const rowElements = options.queries * channels;
       const pairWindowRows = Math.max(1, Math.min(options.queries, Math.floor(
-        Math.min(options.windowBytes ?? ATTENTION_WINDOW_TARGET_BYTES, execution.bindingLimitBytes)
+        Math.min(options.windowBytes ?? scratchBudget(ATTENTION_WINDOW_TARGET_BYTES),
+          execution.bindingLimitBytes)
           / (rowElements * Float32Array.BYTES_PER_ELEMENT),
       )));
       normalizedPair = execution.allocate(`${options.label}.pair-normalized`, pairWindowRows * rowElements);
@@ -773,7 +796,7 @@ async function encodeAttention(
             rows, channels, packed.offsets[9]!, packed.offsets[10]!, false, 1, rows, 1e-5,
           ));
         const target = execution.view(normalizedPair, 0, rows * channels);
-        const pairGrid = execution.linearGrid(rows, 1);
+        const pairGrid = execution.linearGrid(rows, normalizeLayout.rowsPerWorkgroup);
         const pairStorage = options.pairStorage ?? "f32";
         execution.dispatch(encoder, pairNormalize, [
           execution.view(options.pairSource, storageWords(offset * rowElements, pairStorage),
@@ -782,7 +805,7 @@ async function encodeAttention(
         ], pairGrid[0], pairGrid[1], 1, `${options.label}.pair-normalize-${offset}`);
         const params = uniform(execution, `${options.label}.pair-parameters-${offset}`,
           createAttentionParameters(descriptor, packed.offsets, { offset, count }));
-        const grid = execution.linearGrid(options.heads * rows);
+        const grid = execution.linearGrid(rows);
         execution.dispatch(encoder, pairProject, [target, weights, params, pairBias],
           grid[0], grid[1], 1, `${options.label}.pair-bias-${offset}`);
       }
@@ -794,7 +817,7 @@ async function encodeAttention(
       // pair-shaped tensor held across the operation.
       for (const window of windowParameters) {
         const source = normalizeWindow(window);
-        const grid = execution.linearGrid(options.heads * window.count * options.queries);
+        const grid = execution.linearGrid(window.count * options.queries);
         execution.dispatch(encoder, pairProject, [source, weights, window.attention, pairBias],
           grid[0], grid[1], 1, `${options.label}.pair-bias-${window.offset}`);
       }
@@ -826,9 +849,11 @@ async function encodeAttention(
     const projectGrid = gemmGrid(rows, 4 * options.channels);
     execution.dispatch(encoder, project, [windowNormalized, weights, params, query, key, value, gate],
       projectGrid[0], projectGrid[1], 1, `${options.label}.project-${offset}`);
+    const flashBlocks = Math.ceil(options.queries / flashQueryTile);
     execution.dispatch(encoder, flash, [query, key, value, gate, options.mask, pairBias, params, weighted],
-      Math.ceil(options.queries / flashQueryTile), count, options.heads,
-      `${options.label}.flash-${offset}`);
+      flashKernel.batchFirst === true ? count : flashBlocks,
+      flashKernel.batchFirst === true ? flashBlocks : count,
+      options.heads, `${options.label}.flash-${offset}`);
     const outputGrid = gemmGrid(rows, options.channels);
     execution.dispatch(encoder, outputProject, [weighted, weights, params, ...outputViews],
       outputGrid[0], outputGrid[1], 1, `${options.label}.output-${offset}`);
@@ -874,10 +899,12 @@ async function encodeGlobalAttention(
       + `alignment, past this device's limit of `
       + `${execution.device.limits.maxStorageBuffersPerShaderStage}. Fewer extra MSA rows will run.`);
   }
+  const statisticsLayout = rowNormalizeLayout(execution.device);
   const [statisticsPipeline, kvPipeline, columnMeanPipeline, queryPipeline, flashPipeline, outputPipeline]
     = await Promise.all([
-    execution.pipelines.get(`block:attention:statistics:${key}`,
-      createAttentionStatisticsShader(storage, shards)),
+    execution.pipelines.get(
+      `block:attention:statistics:${key}:${statisticsLayout.rowsPerWorkgroup}`,
+      createAttentionStatisticsShader(storage, shards, statisticsLayout)),
     execution.pipelines.get(`block:global-attention:kv:${key}`, createGlobalAttentionKvShader(storage, shards)),
     execution.pipelines.get(`block:global-attention:column-mean:${key}`,
       createGlobalAttentionColumnMeanShader(storage, shards)),
@@ -909,7 +936,8 @@ async function encodeGlobalAttention(
   const query = execution.allocate(`${label}.query`, shape.length * w.heads * headDim);
   const attended = execution.allocate(`${label}.attended`, shape.length * w.heads * headDim);
   const output = residualTarget ?? execution.allocate(`${label}.output`, shape.sequences * shape.length * shape.cM);
-  let grid = execution.linearGrid(shape.length * shape.sequences, 1);
+  let grid = execution.linearGrid(
+    shape.length * shape.sequences, statisticsLayout.rowsPerWorkgroup);
   execution.dispatch(encoder, statisticsPipeline, [...sourceViews, normParameters, statistics],
     grid[0], grid[1], 1, `${label}.statistics`);
   grid = execution.linearGrid(shape.length * shape.sequences * headDim);
@@ -957,8 +985,10 @@ async function encodeOuterProductMean(
   // Both projections carry every sequence, so a deep alignment at a long
   // length puts them past one binding; the contraction reads them as windows.
   const projectionShards = planShards(rows * input.cOuter, input.cOuter, execution.bindingLimitBytes);
+  const opmLayout = rowNormalizeLayout(execution.device);
   const [normalize, project, contractPipeline, pairCountPipeline, projectOutputPipeline] = await Promise.all([
-    execution.pipelines.get(`block:opm:normalize:${storage}`, createOuterProductMeanNormalizeShader(storage)),
+    execution.pipelines.get(`block:opm:normalize:${storage}:${opmLayout.rowsPerWorkgroup}`,
+      createOuterProductMeanNormalizeShader(storage, opmLayout)),
     execution.pipelines.get("block:opm:project", OUTER_PRODUCT_MEAN_PROJECT_SHADER),
     execution.pipelines.get(`block:opm:contract:${projectionShards.count}`,
       createOuterProductMeanContractShader(projectionShards)),
@@ -971,7 +1001,8 @@ async function encodeOuterProductMean(
   const weights = execution.upload("opm.weights", packed.data);
   const params = uniform(execution, "opm.parameters", createOuterProductMeanParameters(descriptor, packed.offsets));
   const normalizeRows = outerProductMeanNormalizeWindow(rows, input.cM,
-    Math.min(input.scratchWindowBytes ?? OUTER_PRODUCT_NORMALIZE_WINDOW_BYTES, execution.bindingLimitBytes));
+    Math.min(input.scratchWindowBytes ?? scratchBudget(OUTER_PRODUCT_NORMALIZE_WINDOW_BYTES),
+      execution.bindingLimitBytes));
   const normalized = execution.allocate("opm.normalized", normalizeRows * input.cM);
   const projectionViews = (tensor: GpuTensor): readonly GpuTensor[] => {
     if (projectionShards.count === 1) return [tensor];
@@ -984,7 +1015,7 @@ async function encodeOuterProductMean(
   const left = execution.allocate("opm.left", rows * input.cOuter);
   const right = execution.allocate("opm.right", rows * input.cOuter);
   const rowBlock = outerProductMeanRowBlock(input.length, input.cOuter,
-    Math.min(OUTER_PRODUCT_BLOCK_LIMIT_BYTES, execution.bindingLimitBytes));
+    Math.min(scratchBudget(OUTER_PRODUCT_BLOCK_LIMIT_BYTES), execution.bindingLimitBytes));
   const outer = execution.allocate("opm.outer", rowBlock * input.length * input.cOuter * input.cOuter);
   const pairCount = execution.allocate("opm.pair-count", input.length * input.length);
   const output = residualTarget ?? execution.allocate("opm.output",
@@ -1005,7 +1036,7 @@ async function encodeOuterProductMean(
     const normalizedWindow = execution.view(normalized, 0, count * input.cM);
     const leftWindow = execution.view(left, offset * input.cOuter, count * input.cOuter);
     const rightWindow = execution.view(right, offset * input.cOuter, count * input.cOuter);
-    let windowGrid = execution.linearGrid(count, 1);
+    let windowGrid = execution.linearGrid(count, opmLayout.rowsPerWorkgroup);
     execution.dispatch(encoder, normalize, [msaWindow, weights, params, normalizedWindow],
       windowGrid[0], windowGrid[1], 1, `opm.normalize-${offset}`);
     windowGrid = execution.linearGrid(count * input.cOuter);
@@ -1023,7 +1054,7 @@ async function encodeOuterProductMean(
     const tile = uniform(execution, `opm.block-${offset}`, new Uint32Array([offset, count, 0, 0]));
     const contractGrid = gemmGrid(count * input.cOuter, input.length * input.cOuter);
     execution.dispatch(encoder, contractPipeline,
-      [...projectionViews(left), ...projectionViews(right), params, tile, outer],
+      [...projectionViews(left), ...projectionViews(right), params, tile, outer, pairCount],
       contractGrid[0], contractGrid[1], 1, "opm.contract");
     const projectOutputGrid = gemmGrid(count * input.length, input.cZ);
     // The block writes its own pair rows, so it binds only those.
@@ -1061,7 +1092,7 @@ const WEBGPU_GUARANTEED_BINDING_BYTES = 128 * 1024 * 1024;
 
 export function triangleBlockRows(
   length: number, cZ: number, triangleHidden: number,
-  budgetBytes: number = TRIANGLE_BLOCK_TARGET_BYTES,
+  budgetBytes: number = scratchBudget(TRIANGLE_BLOCK_TARGET_BYTES),
 ): number {
   if (![length, cZ, triangleHidden, budgetBytes].every((value) => Number.isSafeInteger(value) && value > 0)) {
     throw new RangeError("triangle block dimensions must be positive safe integers");
@@ -1107,7 +1138,8 @@ async function encodeTriangleMultiplication(
   const shape = { length: input.length, cZ: input.cZ, cHidden: input.triangleHidden };
   const packed = packTriangleWeights(weightsValue, "f32");
   const blockRows = triangleBlockRows(input.length, input.cZ, input.triangleHidden,
-    Math.min(input.scratchWindowBytes ?? TRIANGLE_BLOCK_TARGET_BYTES, execution.bindingLimitBytes));
+    Math.min(input.scratchWindowBytes ?? scratchBudget(TRIANGLE_BLOCK_TARGET_BYTES),
+      execution.bindingLimitBytes));
   const wholeStorage = input.triangleWholeStorage ?? "f32";
   const pairStorage = input.pairStorage ?? "f32";
   // A pair past the device's binding limit is bound as several windows of the

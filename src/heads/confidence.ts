@@ -8,6 +8,7 @@ import {
   GpuBufferAllocator, type AllocatedGpuBuffer, type AllocationSnapshot,
 } from "../runtime/allocator.js";
 import { pipelineCacheForDevice, type ComputePipelineCache } from "../runtime/pipeline-cache.js";
+import { scratchBudget } from "../runtime/scratch-budget.js";
 
 export interface PredictedLddtWeights {
   readonly normScale: Float32Array;
@@ -394,7 +395,7 @@ export class ConfidenceHeadsGpu {
     options: ReducedConfidenceOptions = {},
   ): Promise<ReducedConfidenceResult> {
     return this.#run(structureRepresentation, pairRepresentation, length, lddtWeights, paeWeights,
-      breaks, options.pairBuffer, options.maxPaeLogitsBytes ?? PAE_LOGITS_WINDOW_BYTES,
+      breaks, options.pairBuffer, options.maxPaeLogitsBytes ?? scratchBudget(PAE_LOGITS_WINDOW_BYTES),
       options.pairStorage ?? "f32",
     ) as Promise<ReducedConfidenceResult>;
   }

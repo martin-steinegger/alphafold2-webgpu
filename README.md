@@ -111,7 +111,7 @@ The browser must download model parameters and compile many GPU pipelines. Model
 
 ### How are the model weights stored?
 
-The loader accepts float32, float16, and mixed q8 bundles; neural-network arithmetic remains float32 after one-time decoding. Monomer model 1 is 355.3 MiB in float32 and 97.3 MiB in the qualified mixed-q8 form. Multimer model 1 is 355.5 MiB in float32 and 181.6 MiB in the qualified mixed-f16 form; its structure tensors remain float32. Multimer q8 failed the fixed paired-MSA pLDDT envelope and is not a release format. Every published shard has a declared SHA-256 digest, and the loader verifies it before use or persistent caching. The official parameters remain under DeepMind's CC BY 4.0 weights license, which is copied into each exported bundle.
+The loader accepts float32, float16, and mixed q8 bundles, and decodes every one of them to float32 tensors before inference. Which arithmetic the projections then run in is measured per device rather than fixed; see [How are activations stored?](#how-are-activations-stored) below. Monomer model 1 is 355.3 MiB in float32 and 97.3 MiB in the qualified mixed-q8 form. Multimer model 1 is 355.5 MiB in float32 and 181.6 MiB in the qualified mixed-f16 form; its structure tensors remain float32. Multimer q8 failed the fixed paired-MSA pLDDT envelope and is not a release format. Every published shard has a declared SHA-256 digest, and the loader verifies it before use or persistent caching. The official parameters remain under DeepMind's CC BY 4.0 weights license, which is copied into each exported bundle.
 
 ### What is the maximum sequence length?
 
@@ -119,7 +119,35 @@ There is no single portable limit. Available GPU memory, WebGPU buffer limits, M
 
 ### How are activations stored?
 
-Weights are decoded once to float32 and every operation computes in float32. The activations the trunk carries between operations, the MSA, the pair, and the triangle multiplication's whole projection, are stored as half precision packed two to a 32-bit word, which needs no device feature. That is the only storage the model has: there is no exact mode to choose, and Multimer uses the same one. It halves the memory a prediction needs and, on real alignments of 164 to 396 residues, returned mean pLDDT and pTM identical to the float32 storage to two decimals; on a complex with a live ColabFold alignment, pLDDT 91.58 against 91.56 and ipTM 0.836 against 0.836. The float32 storage remains in the code as `EXACT_STORAGE` so the kernels can be compared against AlphaFold's own float32 tensors.
+Weights are decoded once to float32. The activations the trunk carries between operations, the MSA, the pair, and the triangle multiplication's whole projection, are stored as half precision packed two to a 32-bit word, which needs no device feature. That is the only storage the model has: there is no exact mode to choose, and Multimer uses the same one. It halves the memory a prediction needs and, on real alignments of 164 to 396 residues, returned mean pLDDT and pTM identical to the float32 storage to two decimals; on a complex with a live ColabFold alignment, pLDDT 91.58 against 91.56 and ipTM 0.836 against 0.836. The float32 storage remains in the code as `EXACT_STORAGE` so the kernels can be compared against AlphaFold's own float32 tensors.
+
+### What arithmetic do the projections run in?
+
+Whichever the device is fastest at and still reproduces the reference, decided
+by measurement rather than by assumption. One hand-tiled GEMM serves every dense
+projection in the model, and at device creation each arrangement it can be built
+in is compiled, checked against a reference result, and only then timed:
+float32, two half-precision arrangements that accumulate in float32, and, where
+the adapter offers `chromium-experimental-subgroup-matrix` alongside `subgroups`
+and `subgroup-size-control` with 32 lanes to a subgroup, a kernel that hands the
+contraction to the hardware matrix units. Half precision has to beat float32 by
+a margin to be chosen, so an adapter where it buys nothing stays exact. The
+flash-attention kernel is chosen the same way, between a register-resident, a
+subgroup and a matrix-unit kernel.
+
+Accumulating a whole contraction in half precision is deliberately not offered.
+It is the fastest arrangement of all and it is not safe: it overflows on a deep
+MSA, which took a 508-row acceptance prediction from 96.80 pLDDT to 69.94 and
+its pTM to NaN. No runtime probe rediscovers that, because it only appears at a
+depth a cheap probe does not reach, so the exclusion is recorded in the source
+instead of being left to a measurement.
+
+What this is worth depends on the part. On an L40S the matrix kernel runs the
+projection probe in 0.048 ms against 0.143 ms for the hand-tiled half-precision
+one, and the whole recycle falls from 0.86 s to 0.70 s. On a Strix Halo, whose
+units are the same shape but far fewer, it is 0.218 ms against 0.265 ms. On both
+the matrix kernel is also the more accurate one, at 2.1e-4 relative error
+against 5.8e-4.
 
 ### How long a sequence can it fold?
 
@@ -169,9 +197,28 @@ The literal 8,076-row `test.a3m`, independently parsed and clustered in TypeScri
 
 ## Performance
 
-Development-host timings on an NVIDIA GB10 were 9.75 and 9.76 seconds for four A3M passes with 508 clustered and 1,024 extra rows when the optional key-parallel subgroup fast path was available. The original correctness-first scheduler took approximately 95 seconds.
+Steady-state seconds a recycle, measured through `tools/predict-a3m.ts` on a
+59-residue query with 128 clustered and 256 extra rows:
 
-Run `npm run bench:a3m-model` to reproduce the full-model measurement. These values are engineering measurements from one adapter and software configuration, not cross-device performance claims. Compare warm medians on the same machine before and after an optimization.
+| Adapter | Projection kernel chosen | Flash kernel chosen | Seconds a recycle |
+| --- | --- | --- | --- |
+| NVIDIA L40S (Ada) | matrix, f16 16x16x16 | matrix | 0.70 |
+| AMD Strix Halo (gfx1151, RDNA 3.5) | matrix, f16 16x16x16 | register | 1.72 |
+
+Both figures are the second recycle, not the first: the first compiles every
+pipeline and runs on a GPU still ramping its clocks. The same L40S measured 0.86
+s a recycle through an older `webgpu` binding that reports no
+`subgroup-size-control`, where the matrix kernels are refused and the hand-tiled
+half-precision one serves instead, which is the closest thing here to a
+before-and-after on one machine. The Strix Halo figure is a 200-residue query,
+so it is not comparable to the L40S row.
+
+Run `npm run bench:a3m-model` to reproduce the full-model measurement. These
+values are engineering measurements from particular adapters and software
+configurations, not cross-device performance claims. Compare warm medians on the
+same machine before and after an optimization, and on a shared host pin an idle
+GPU first: measuring against a card another process is saturating changes which
+kernel wins, not just how fast it is.
 
 To force the bounded transition path for portability testing, run:
 
@@ -210,6 +257,40 @@ npm run bench:a3m-model
 npm run qualify:hardware
 ```
 
+### Running on Node
+
+A native run reaches the GPU through `webgpu`'s `create`, which takes Dawn's
+toggles, so it chooses things a browser does not. `dawnInstanceFlags` in
+`src/runtime/dawn.ts` is the single place that names them, and every shipped
+entry point calls it. Two of them are not optional, and they do different jobs.
+`vulkan_enable_f16_on_nvidia` is what its name says: an instance with no toggles
+reports `shader-f16=false` on a Blackwell and `true` on an RDNA 3.5 part, which
+exposes half precision by default. `allow_unsafe_apis` gates the experimental
+matrix-unit extension on every vendor, so a bare instance reports no matrix
+configurations at all on either. A tool that builds its own instance and forgets
+these measures an adapter without the units, and on NVIDIA without half
+precision either, and reports the model as much slower than it is.
+
+`dawnInstanceFlags({ unclamped: true })` additionally drops Tint's bounds clamp,
+worth 11% of a recycle. It is off by default because it is a promise rather than
+a setting: no kernel may rely on the clamp, which is a property of the shaders
+that has to be kept true.
+
+Two further things a native host knows and a browser does not, both in
+`tools/native-device.ts`:
+
+- **Which GPU.** WebGPU cannot choose one, so `selectGpu` sets `DRI_PRIME` to a
+  card's PCI address before the instance exists, which Mesa's device-select
+  layer honours above every driver including NVIDIA's. It reads
+  `CUDA_VISIBLE_DEVICES` — nothing here uses CUDA, but that is how a GPU gets
+  chosen on a shared host — accepting either an index or a `GPU-…` UUID, and
+  takes an explicit index as a parameter.
+- **How much memory it has.** `nativeMemoryBudgetBytes` asks `nvidia-smi`, or
+  sysfs on AMD, and the widest scratch budget that fits is used instead of the
+  browser's conservative default. It declines to widen anything on an adapter
+  whose memory is the host's, where the wider windows measured slower rather
+  than faster.
+
 GPU tests use Dawn's native Node WebGPU implementation. The suite includes operator-level official AlphaFold differential tests, complete block and stack tests, four-recycle single-sequence inference, four-recycle A3M inference, and a literal raw-A3M acceptance test.
 
 The full-model hardware qualification runs both automatic and compact memory paths, checks all recycle confidence values against the official reference, and emits a machine-readable adapter/timing/memory report. See [hardware qualification](docs/HARDWARE_QUALIFICATION.md).
@@ -224,7 +305,7 @@ Small reference fixtures required by the default tests are committed. Full Evofo
 
 Implemented components include input and recycling embeddings, mock-template pair embedding for model 1, MSA row and column attention, extra-MSA global column attention, transitions, OuterProductMean, both triangle multiplication directions, both triangle attention orientations, invariant point attention, backbone updates, sidechain torsions, atom14/atom37 geometry, pLDDT, PAE, and pTM.
 
-Attention uses online softmax and never materializes attention-logit cubes. When `subgroups` and `subgroup-size-control` are available, eight 32-lane subgroups process eight queries while sharing a 32-key K/V tile. Other devices, including Chrome-on-Metal, use a register-resident kernel in which one invocation owns a complete 8- or 32-channel head and requires no workgroup barriers in the key loop. The original portable workgroup kernel remains selectable as an independent differential baseline.
+Attention uses online softmax and never materializes attention-logit cubes. Where the adapter offers the subgroup matrix units, a kernel reduces each query-key dot product in hardware and stages its tiles in workgroup memory. When `subgroups` and `subgroup-size-control` are available without the units, eight 32-lane subgroups process eight queries while sharing a 32-key K/V tile. Other devices, including Chrome-on-Metal, use a register-resident kernel in which one invocation owns a complete 8- or 32-channel head and requires no workgroup barriers in the key loop. Which of these runs is measured per device and per head width, not inferred from the feature list: the matrix kernel wins on both NVIDIA parts measured here and loses to the register kernel on a Strix Halo. The original portable workgroup kernel remains selectable as an independent differential baseline.
 
 QKV and gate projections use register-blocked 16x16 tiles, attention output uses 16x32 tiles, and transition GEMMs use 16x64 tiles. Triangle multiplication uses cooperative 16x16 joint tiles for split A/B projection, gates, output projection, and output gate. Its contraction intermediates are channel-major so each hidden-channel slice is contiguous, and it never materializes an `O(L³)` tensor. For deep, short MSAs, OuterProductMean uses AlphaFold2's canonical outer-first contraction; a bounded path is available when the temporary would exceed 64 MiB.
 
@@ -359,7 +440,7 @@ site-size ceiling before upload.
 
 ## Current scope
 
-- Monomer `model_1_ptm` and no-template `model_1_multimer_v3` are supported with fixed model channel sizes. Monomer accepts float32 and qualified mixed block-int8 storage; Multimer accepts float32 and the qualified mixed-f16 bundle. Neural-network arithmetic remains float32 after one-time weight decoding.
+- Monomer `model_1_ptm` and no-template `model_1_multimer_v3` are supported with fixed model channel sizes. Monomer accepts float32 and qualified mixed block-int8 storage; Multimer accepts float32 and the qualified mixed-f16 bundle. Weights decode to float32 once; which arithmetic the projections and attention then run in is measured per device, never accumulating a contraction in half precision.
 - Multimer A3M sampling, masking, and clustering reproduce the JAX/ColabFold `process_features` keys and ordering. The monomer A3M path uses a deterministic application PRNG and remains distribution-equivalent rather than reproducing TensorFlow's private RNG stream.
 - ColabFold paired/unpaired Multimer MSA preprocessing and serialized complex A3M upload are supported. Searched/custom Multimer templates, models 2–5, sub-eight-bit weight formats, and result relaxation are not supported; ColabFold's learned no-search mock-template path is included.
 - Pair state remains GPU-resident through structure, confidence, and recycle boundaries. The PAE confidence head uses a fixed 16 MiB logits window and GPU-side expectation reduction instead of materializing and reading back the full `L² × 64` tensor. Renewed Apple-GPU profiling after these kernel rewrites remains release work.

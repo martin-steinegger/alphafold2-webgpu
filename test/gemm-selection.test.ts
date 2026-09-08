@@ -1,18 +1,23 @@
 import { describe, expect, it } from "vitest";
 import {
-  forceGemmVariant, gemmVariantCandidates, gemmVariantName, SHIPPABLE_GEMM_PRECISIONS,
+  forceGemmVariant, gemmVariantCandidates, gemmVariantName, selectMatrixShape,
+  SHIPPABLE_GEMM_PRECISIONS, type SubgroupMatrixConfig,
 } from "../src/runtime/gemm-selection.js";
 import {
   createTiledGemmShader, GEMM_VARIANT_F32, gemmGrid, gemmVariant, setGemmVariant,
   type GemmVariant,
 } from "../src/runtime/gemm.js";
 
-function fakeDevice(halfPrecision: boolean, matrixUnits = false): GPUDevice {
+function fakeDevice(
+  halfPrecision: boolean, matrixUnits = false,
+  maxComputeWorkgroupStorageSize = 49152,
+): GPUDevice {
   const features = new Set<GPUFeatureName>();
   if (halfPrecision) features.add("shader-f16" as GPUFeatureName);
   if (matrixUnits) features.add("chromium-experimental-subgroup-matrix" as GPUFeatureName);
   return {
     features,
+    limits: { maxComputeWorkgroupStorageSize },
     createBuffer: () => { throw new Error("this test must not allocate"); },
   } as unknown as GPUDevice;
 }
@@ -60,12 +65,82 @@ describe("projection variant selection", () => {
     expect(gemmVariantCandidates(fakeDevice(true))
       .some((variant) => variant.precision === "matrix")).toBe(false);
     const withUnits = gemmVariantCandidates(fakeDevice(true, true));
-    // The units fix the contraction step at 8, so there is no k depth to try.
+    // This device reports no configuration, so the shape is the f32 one, whose
+    // kernel stages nothing and so has no staged depth to try.
     expect(withUnits.filter((variant) => variant.precision === "matrix")).toHaveLength(1);
     expect(gemmVariantName({ precision: "matrix", inner: 8 })).toBe("matrix-64x128");
     // And they do not depend on half precision being available.
     expect(gemmVariantCandidates(fakeDevice(false, true))
       .filter((variant) => variant.precision === "matrix")).toHaveLength(1);
+  });
+});
+
+const config = (
+  componentType: string, M: number, N: number, K: number, resultComponentType = "f32",
+): SubgroupMatrixConfig => ({ componentType, resultComponentType, M, N, K });
+
+describe("which hardware matrix configuration is used", () => {
+  it("prefers an exact configuration to a faster inexact one", () => {
+    // Apple reports f32 alongside f16. The f32 units reproduce the reference
+    // to the digit, so a wider f16 shape does not displace them.
+    expect(selectMatrixShape(fakeDevice(true, true),
+      [config("f16", 16, 16, 16), config("f32", 8, 8, 8)]))
+      .toEqual({ componentType: "f32", M: 8, N: 8, K: 8 });
+  });
+
+  it("takes the widest f16 shape when the device offers no f32 one", () => {
+    // Every current Nvidia part. All of them accumulate in f32, so the choice
+    // between them is throughput, and the widest is the most arithmetic per
+    // instruction issued.
+    expect(selectMatrixShape(fakeDevice(true, true),
+      [config("f16", 16, 8, 8), config("f16", 16, 16, 16), config("f16", 16, 8, 16)]))
+      .toEqual({ componentType: "f16", M: 16, N: 16, K: 16 });
+  });
+
+  it("will not use f16 units on a device that cannot compile f16", () => {
+    expect(selectMatrixShape(fakeDevice(false, true), [config("f16", 16, 16, 16)]))
+      .toBeUndefined();
+  });
+
+  it("refuses a configuration the kernel cannot walk or trust", () => {
+    const device = fakeDevice(true, true);
+    // A unit that does not divide the 32x32 region leaves part of it unwritten.
+    expect(selectMatrixShape(device, [config("f16", 12, 12, 16)])).toBeUndefined();
+    // An f16 accumulator is the arrangement that took a deep MSA to NaN.
+    expect(selectMatrixShape(device, [config("f16", 16, 16, 16, "f16")])).toBeUndefined();
+    // Integer units are not a projection kernel.
+    expect(selectMatrixShape(device, [config("u8", 16, 16, 32, "u32")])).toBeUndefined();
+  });
+
+  it("names a configuration apart from Apple's, which keeps its name", () => {
+    // The name still distinguishes a shape the projection kernel does not
+    // currently take, because the attention kernel reaches the same units.
+    expect(gemmVariantName({
+      precision: "matrix", inner: 8, matrix: { componentType: "f16", M: 16, N: 16, K: 16 },
+    })).toBe("matrix-f1616x16x16-64x128");
+    expect(gemmVariantName({
+      precision: "matrix", inner: 8, matrix: { componentType: "f32", M: 8, N: 8, K: 8 },
+    })).toBe("matrix-64x128");
+  });
+
+  it("offers the reported configuration, and none when nothing is reported", () => {
+    const offered = gemmVariantCandidates(fakeDevice(true, true), [config("f16", 16, 16, 16)])
+      .filter((variant) => variant.precision === "matrix");
+    // One per staged depth, both of which this device's storage permits.
+    expect(offered).toHaveLength(2);
+    expect(offered.map((variant) => variant.matrixDepth)).toEqual([1, 2]);
+    expect(offered[0]?.matrix).toEqual({ componentType: "f16", M: 16, N: 16, K: 16 });
+    // A device whose units advertise nothing this kernel can walk keeps the
+    // hand-tiled kernel rather than being offered a shape it cannot run.
+    expect(gemmVariantCandidates(fakeDevice(true, true), [config("f16", 12, 12, 16)])
+      .some((variant) => variant.precision === "matrix")).toBe(false);
+    // The staged kernel fits the storage every implementation guarantees, so
+    // a device is not asked for more than that to be offered it.
+    expect(gemmVariantCandidates(fakeDevice(true, true, 16384), [config("f16", 16, 16, 16)])
+      .some((variant) => variant.precision === "matrix")).toBe(true);
+    // One that grants less than it declares still keeps the hand-tiled kernel.
+    expect(gemmVariantCandidates(fakeDevice(true, true, 8192), [config("f16", 16, 16, 16)])
+      .some((variant) => variant.precision === "matrix")).toBe(false);
   });
 });
 
@@ -156,10 +231,25 @@ describe("the matrix units and what they can serve", () => {
     // gemmGrid does not know which shader is asking, so a matrix kernel on a
     // different tile would hand the wrong grid to any caller that opted out.
     const shader = createTiledGemmShader({ ...spec, ...arrays }, matrix);
-    expect(shader).toContain("group.y * 64u");
-    expect(shader).toContain("group.x * 128u");
+    expect(shader).toContain("(gemm_columns + 127u) / 128u");
+    expect(shader).toContain("* 64u");
     expect(gemmGrid(64, 128)).toEqual([1, 1]);
     expect(gemmGrid(65, 129)).toEqual([2, 2]);
+  });
+
+  it("folds the row tiles a dispatch dimension cannot hold into the columns", () => {
+    // One dimension holds 65,535 workgroups. The extra-MSA global attention
+    // projects `sequences * length` rows, which passes that at 5,242 extra
+    // sequences of an 800-residue chain, and the dispatch was refused.
+    const rows = 65_536 * 64;
+    const [x, y] = gemmGrid(rows, 128);
+    expect(y).toBeLessThanOrEqual(65_535);
+    expect(x).toBeLessThanOrEqual(65_535);
+    // Two folds of one column tile, covering every row tile between them.
+    expect(x * y).toBeGreaterThanOrEqual(rows / 64);
+    expect([x, y]).toEqual([2, 65_535]);
+    // A shape that fits takes one fold, and the grid is what it always was.
+    expect(gemmGrid(65_535 * 64, 256)).toEqual([2, 65_535]);
   });
 });
 

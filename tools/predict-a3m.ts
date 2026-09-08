@@ -8,6 +8,8 @@
 import { EXACT_STORAGE } from "../src/model/monomer.js";
 import { readFileSync, writeFileSync } from "node:fs";
 import { create, globals } from "webgpu";
+import { dawnInstanceFlags, fitScratchBudgetScale } from "../src/runtime/dawn.js";
+import { nativeMemoryBudgetBytes, selectGpu } from "./native-device.js";
 import { AlphaFoldMonomerGpu } from "../src/model/monomer.js";
 import { parseA3m } from "../src/input/a3m.js";
 import { makeA3mFeatures, type RecycleFeatureSource } from "../src/input/a3m-features.js";
@@ -57,7 +59,15 @@ if (templatePath !== undefined && templatePath !== "") {
     identity: Number((prepared.alignment.identity * 100).toFixed(1)),
   };
 }
-const gpu = create([]);
+// Chosen before the instance exists, because the Vulkan loader reads the
+// selection when it makes one. Honours CUDA_VISIBLE_DEVICES; see `selectGpu`.
+const selectedGpu = selectGpu();
+if (selectedGpu !== undefined) console.error(`pinned to ${selectedGpu}`);
+const gpu = create(dawnInstanceFlags({
+  // Native, so the bounds clamp goes: the kernels do not rely on it, and it is
+  // worth 11% of a recycle. See `dawnInstanceFlags`.
+  unclamped: true,
+}));
 const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
 if (adapter === null) throw new Error("no WebGPU adapter");
 const clustered = Math.min(msaRows, depth);
@@ -65,8 +75,21 @@ const extra = Math.max(1, Math.min(extraRows, Math.max(0, depth - clustered)));
 // The model stores its activations packed. AFWEBGPU_EXACT=1 selects the f32
 // storages the differential tests use, for comparison.
 const memoryOptions = process.env.AFWEBGPU_EXACT === "1" ? { ...EXACT_STORAGE } : {};
+const baseMemoryOptions = templateReport === undefined
+  ? memoryOptions : { ...memoryOptions, template: true };
+// The scratch windows are sized to the memory this host actually has rather
+// than to the browser's conservative default, which costs a 1,650-residue
+// dimer a third of its speed. WebGPU cannot say how much that is, so it is
+// asked for out of band and each scale is costed against it.
+const memoryBudget = nativeMemoryBudgetBytes();
+const scratchBudgetScale = memoryBudget === undefined ? 1 : fitScratchBudgetScale(
+  (scale) => planMonomerDevice(adapter, length, clustered, extra, undefined, false,
+    { ...baseMemoryOptions, scratchBudgetScale: scale }).memory.estimatedPeakBytes,
+  memoryBudget);
 const plan = planMonomerDevice(adapter, length, clustered, extra, undefined, false,
-  templateReport === undefined ? memoryOptions : { ...memoryOptions, template: true });
+  { ...baseMemoryOptions, scratchBudgetScale });
+console.error(`device memory budget ${memoryBudget === undefined ? "unknown"
+  : `${(memoryBudget / 1024 ** 3).toFixed(1)} GiB`}, scratch budget ${scratchBudgetScale}x`);
 const device = await requestAlphaFoldDevice(adapter, plan.requirements);
 try {
   const prediction = await new AlphaFoldMonomerGpu(device, {

@@ -2,6 +2,8 @@ import { GpuBufferAllocator, type AllocatedGpuBuffer, type AllocationSnapshot } 
 import { pipelineCacheForDevice, type ComputePipelineCache } from "../runtime/pipeline-cache.js";
 import { type ActivationStorage, storageArray, storedElement } from "../runtime/storage.js";
 import { createTiledGemmShader, GEMM_TILE_COLUMNS, GEMM_TILE_ROWS } from "../runtime/gemm.js";
+import { scratchBudget } from "../runtime/scratch-budget.js";
+import { rowNormalizeLayout, type RowNormalizeLayout } from "../runtime/reduction.js";
 
 export interface TransitionWeights {
   readonly layerNormScale: Float32Array;
@@ -66,7 +68,7 @@ export function transitionChunkRows(
     throw new RangeError("transition chunk dimensions and limits must be positive safe integers");
   }
   const rowBytes = Math.max(channels, hiddenChannels) * Float32Array.BYTES_PER_ELEMENT;
-  const budget = Math.min(maxStorageBufferBindingSize, TRANSITION_CHUNK_TARGET_BYTES);
+  const budget = Math.min(maxStorageBufferBindingSize, scratchBudget(TRANSITION_CHUNK_TARGET_BYTES));
   if (rows * rowBytes <= budget) return rows;
   const capacity = Math.floor(budget / rowBytes);
   if (capacity < 1) throw new RangeError("WebGPU storage binding is too small for one transition row");
@@ -173,10 +175,11 @@ export function packTransitionWeights(input: TransitionInput): { data: Float32Ar
 
 export function createTransitionShaders(
   input: TransitionInput, offsets: readonly number[], storage: ActivationStorage = "f32",
+  layout: RowNormalizeLayout = rowNormalizeLayout(undefined),
 ): readonly string[] {
   void input;
   void offsets;
-  const normalize = `
+  const normalize = `${layout.enables}
 struct NormalizeParameters {
   rows: u32,
   channels: u32,
@@ -192,45 +195,36 @@ const GRID_WIDTH: u32 = 32768u;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> parameters: NormalizeParameters;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
-var<workgroup> partial: array<f32, 64>;
-var<workgroup> row_mean: array<f32, 1>;
+${layout.declarations}
 
-@compute @workgroup_size(64)
+${layout.attributes}
 fn main(
   @builtin(local_invocation_id) local: vec3<u32>,
-  @builtin(workgroup_id) group: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>${layout.builtins},
 ) {
-  let row = group.x + group.y * GRID_WIDTH;
-  if (row >= parameters.rows) { return; }
-  let base = row * parameters.channels;
+${layout.open("parameters.rows")}
+  let base = norm_row * parameters.channels;
   var sum = 0.0;
-  for (var c = local.x; c < parameters.channels; c += 64u) {
+  for (var c = norm_lane; c < parameters.channels; c += norm_stride) {
     sum += ${storedElement(storage, "source", "base + c")};
   }
-  partial[local.x] = sum;
-  workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride /= 2u) {
-    if (local.x < stride) { partial[local.x] += partial[local.x + stride]; }
-    workgroupBarrier();
-  }
-  if (local.x == 0u) { row_mean[0] = partial[0] / f32(parameters.channels); }
-  workgroupBarrier();
+${layout.sum("sum", "row_total")}
+  let row_mean = row_total / f32(parameters.channels);
 
   var sum_squared = 0.0;
-  for (var c = local.x; c < parameters.channels; c += 64u) {
-    let centered = ${storedElement(storage, "source", "base + c")} - row_mean[0];
+  for (var c = norm_lane; c < parameters.channels; c += norm_stride) {
+    let centered = ${storedElement(storage, "source", "base + c")} - row_mean;
     sum_squared += centered * centered;
   }
-  partial[local.x] = sum_squared;
-  workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride /= 2u) {
-    if (local.x < stride) { partial[local.x] += partial[local.x + stride]; }
-    workgroupBarrier();
-  }
-  let inverse_std = inverseSqrt(partial[0] / f32(parameters.channels) + parameters.epsilon);
-  for (var c = local.x; c < parameters.channels; c += 64u) {
-    output[base + c] = (${storedElement(storage, "source", "base + c")} - row_mean[0]) * inverse_std
-      * weights[parameters.scale_offset + c] + weights[parameters.offset_offset + c];
+${layout.sum("sum_squared", "squared_total")}
+  let inverse_std = inverseSqrt(squared_total / f32(parameters.channels) + parameters.epsilon);
+  // A workgroup covering rows past the end still reduces, over row zero, so
+  // only the store is withheld.
+  if (norm_live) {
+    for (var c = norm_lane; c < parameters.channels; c += norm_stride) {
+      output[base + c] = (${storedElement(storage, "source", "base + c")} - row_mean) * inverse_std
+        * weights[parameters.scale_offset + c] + weights[parameters.offset_offset + c];
+    }
   }
 }`;
   return [normalize, createLinearShader(false), createLinearShader(true, storage)];

@@ -3,9 +3,16 @@ import {
 } from "../runtime/sharded.js";
 import { GpuBufferAllocator, type AllocatedGpuBuffer, type AllocationSnapshot } from "../runtime/allocator.js";
 import { pipelineCacheForDevice, type ComputePipelineCache } from "../runtime/pipeline-cache.js";
-import { subgroupRange } from "../runtime/subgroups.js";
+import { subgroupRange, subgroupMatrixConfigs, supportsSubgroupSize } from "../runtime/subgroups.js";
+import { rowNormalizeLayout, type RowNormalizeLayout } from "../runtime/reduction.js";
+import {
+  ATTENTION_MATRIX_SUBGROUP_SIZE,
+  attentionMatrixShape, attentionMatrixStorageBytes, createAttentionMatrixFlashShader,
+  ATTENTION_MATRIX_QUERY_TILE,
+} from "./attention-matrix.js";
 import { type ActivationStorage, storageArray, storedElement } from "../runtime/storage.js";
 import { createTiledGemmShader, gemmGrid } from "../runtime/gemm.js";
+import { scratchBudget } from "../runtime/scratch-budget.js";
 
 export interface AttentionWeights {
   readonly queryNormScale: Float32Array;
@@ -55,6 +62,7 @@ export interface AttentionResult {
 }
 
 export type AttentionFlashVariant = "auto" | "portable" | "register" | "register-2q" | "register-4q"
+  | "matrix"
   | "subgroup-4x8"
   | "subgroup-key32"
   | "subgroup-8x16" | "subgroup-8x32" | "subgroup-8x64"
@@ -70,6 +78,20 @@ export interface AttentionFlashKernel {
   readonly shader: string;
   readonly queryTile: number;
   readonly variant: Exclude<AttentionFlashVariant, "auto">;
+  /**
+   * Whether the batch is the fastest-varying dispatch dimension.
+   *
+   * The pair bias does not depend on the batch: every row of the alignment,
+   * or every row of the pair in a triangle update, reads the same
+   * `bias[head][query][key]`. Dispatched with the query block varying fastest,
+   * neighbouring workgroups want different blocks of it and each one's read
+   * misses; dispatched with the batch varying fastest they want the same
+   * block, and all but the first of them find it in cache. At 1,650 residues
+   * the bias is 43 MiB and triangle attention reads it once per batch row,
+   * which is what made that kernel 3.1 TFLOP/s there against 23.9 on a shape
+   * whose bias stays resident.
+   */
+  readonly batchFirst?: boolean;
 }
 
 const GRID_WIDTH = 32_768;
@@ -134,7 +156,7 @@ export const ATTENTION_WINDOW_TARGET_BYTES = 8 * 1024 * 1024;
 
 export function attentionBatchWindow(
   batch: number, queries: number, channels: number,
-  budgetBytes: number = ATTENTION_WINDOW_TARGET_BYTES,
+  budgetBytes: number = scratchBudget(ATTENTION_WINDOW_TARGET_BYTES),
 ): number {
   if (![batch, queries, channels, budgetBytes].every((value) => Number.isSafeInteger(value) && value > 0)) {
     throw new RangeError("attention window dimensions and budget must be positive safe integers");
@@ -179,7 +201,7 @@ export function createAttentionParameters(
     offsets[2]!, offsets[3]!, offsets[4]!, offsets[5]!, offsets[6]!, offsets[7]!, offsets[8]!,
     input.pairBias === undefined ? 0 : offsets[pairProjectionIndex]!,
     input.pairBias?.source === "separate" ? input.pairBias.channels : input.channels,
-    batchWindow.offset, input.batch, 0, 0,
+    batchWindow.offset, input.batch, attentionPairBiasStride(input.queryLength), 0,
   ]);
 }
 
@@ -209,8 +231,9 @@ const WHOLE_SHARD: ShardLayout = { count: 1, shardElements: Number.MAX_SAFE_INTE
 
 export function createAttentionNormalizeShader(
   storage: ActivationStorage = "f32", shards: ShardLayout = WHOLE_SHARD,
+  layout: RowNormalizeLayout = rowNormalizeLayout(undefined),
 ): string {
-  return normalizeShader(storage, shards, false);
+  return normalizeShader(storage, shards, false, layout);
 }
 
 /**
@@ -223,35 +246,44 @@ export function createAttentionNormalizeShader(
  */
 export function createAttentionNormalizeInPlaceShader(
   storage: ActivationStorage = "f32", shards: ShardLayout = WHOLE_SHARD,
+  layout: RowNormalizeLayout = rowNormalizeLayout(undefined),
 ): string {
-  return normalizeShader(storage, shards, true);
+  return normalizeShader(storage, shards, true, layout);
 }
 
-function normalizeShader(storage: ActivationStorage, shards: ShardLayout, inPlace: boolean): string {
+function normalizeShader(
+  storage: ActivationStorage, shards: ShardLayout, inPlace: boolean,
+  layout: RowNormalizeLayout,
+): string {
   const normalized = (channel: string) =>
-    `(source_load(input_base + ${channel}) - row_mean[0]) * inverse_std
+    `(source_load(input_base + ${channel}) - row_mean) * inverse_std
       * weights[p.scale + ${channel}] + weights[p.offset + ${channel}]`;
   // Packed in place, an invocation owns whole words rather than single
   // channels: two invocations sharing a word would otherwise race to write it.
-  const store = !inPlace
-    ? `  for (var c = local.x; c < p.channels; c += 64u) {
-    output[output_base + c] = ${normalized("c")};
-  }`
+  const stored = !inPlace
+    ? `    for (var c = norm_lane; c < p.channels; c += norm_stride) {
+      output[output_base + c] = ${normalized("c")};
+    }`
     : storage === "f32"
-      ? `  for (var c = local.x; c < p.channels; c += 64u) {
-    source_store(output_base + c, ${normalized("c")});
-  }`
-      : `  for (var word = local.x; word < p.channels / 2u; word += 64u) {
-    let c = word * 2u;
-    let low = ${normalized("c")};
-    let high = ${normalized("c + 1u")};
-    source_store((output_base + c) >> 1u, pack2x16float(vec2<f32>(low, high)));
+      ? `    for (var c = norm_lane; c < p.channels; c += norm_stride) {
+      source_store(output_base + c, ${normalized("c")});
+    }`
+      : `    for (var word = norm_lane; word < p.channels / 2u; word += norm_stride) {
+      let c = word * 2u;
+      let low = ${normalized("c")};
+      let high = ${normalized("c + 1u")};
+      source_store((output_base + c) >> 1u, pack2x16float(vec2<f32>(low, high)));
+    }`;
+  // A workgroup covering rows past the end still reduces, over row zero, so
+  // only the store is withheld.
+  const store = `  if (norm_live) {
+${stored}
   }`;
-  return `
+  return `${layout.enables}
 struct NormParameters {
   rows: u32, channels: u32, scale: u32, offset: u32,
   transpose: u32, batch: u32, queries: u32, epsilon: f32,
-  batch_offset: u32, batch_total: u32, padding: vec2<u32>,
+  batch_offset: u32, batch_total: u32, bias_stride: u32, padding: u32,
 };
 const GRID_WIDTH: u32 = 32768u;
 ${shardBindings(shards, "source", storage, 0, inPlace)}
@@ -260,8 +292,7 @@ ${shardBindings(shards, "source", storage, 0, inPlace)}
 ${inPlace ? "" : `@group(0) @binding(${shards.count + 2}) var<storage, read_write> output: array<f32>;`}
 ${shardLoader(shards, "source", storage)}
 ${inPlace ? shardStorer(shards, "source", storage) : ""}
-var<workgroup> partial: array<f32, 64>;
-var<workgroup> row_mean: array<f32, 1>;
+${layout.declarations}
 
 // Rows are numbered within this batch window; the source holds the whole batch.
 fn source_row(row: u32) -> u32 {
@@ -271,34 +302,23 @@ fn source_row(row: u32) -> u32 {
   return q * p.batch_total + b;
 }
 
-@compute @workgroup_size(64)
-fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) group: vec3<u32>) {
-  let row = group.x + group.y * GRID_WIDTH;
-  if (row >= p.rows) { return; }
-  let input_base = source_row(row) * p.channels;
-  let output_base = ${inPlace ? "input_base" : "row * p.channels"};
+${layout.attributes}
+fn main(@builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>${layout.builtins}) {
+${layout.open("p.rows")}
+  let input_base = source_row(norm_row) * p.channels;
+  let output_base = ${inPlace ? "input_base" : "norm_row * p.channels"};
   var sum = 0.0;
-  for (var c = local.x; c < p.channels; c += 64u) { sum += source_load(input_base + c); }
-  partial[local.x] = sum;
-  workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride /= 2u) {
-    if (local.x < stride) { partial[local.x] += partial[local.x + stride]; }
-    workgroupBarrier();
-  }
-  if (local.x == 0u) { row_mean[0] = partial[0] / f32(p.channels); }
-  workgroupBarrier();
+  for (var c = norm_lane; c < p.channels; c += norm_stride) { sum += source_load(input_base + c); }
+${layout.sum("sum", "row_total")}
+  let row_mean = row_total / f32(p.channels);
   var squared = 0.0;
-  for (var c = local.x; c < p.channels; c += 64u) {
-    let centered = source_load(input_base + c) - row_mean[0];
+  for (var c = norm_lane; c < p.channels; c += norm_stride) {
+    let centered = source_load(input_base + c) - row_mean;
     squared += centered * centered;
   }
-  partial[local.x] = squared;
-  workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride /= 2u) {
-    if (local.x < stride) { partial[local.x] += partial[local.x + stride]; }
-    workgroupBarrier();
-  }
-  let inverse_std = inverseSqrt(partial[0] / f32(p.channels) + p.epsilon);
+${layout.sum("squared", "squared_total")}
+  let inverse_std = inverseSqrt(squared_total / f32(p.channels) + p.epsilon);
 ${store}
 }`;
 }
@@ -319,20 +339,20 @@ export const ATTENTION_NORMALIZE_IN_PLACE_SHADER = createAttentionNormalizeInPla
  */
 export function createAttentionStatisticsShader(
   storage: ActivationStorage = "f32", shards: ShardLayout = WHOLE_SHARD,
+  layout: RowNormalizeLayout = rowNormalizeLayout(undefined),
 ): string {
-  return `
+  return `${layout.enables}
 struct NormParameters {
   rows: u32, channels: u32, scale: u32, offset: u32,
   transpose: u32, batch: u32, queries: u32, epsilon: f32,
-  batch_offset: u32, batch_total: u32, padding: vec2<u32>,
+  batch_offset: u32, batch_total: u32, bias_stride: u32, padding: u32,
 };
 const GRID_WIDTH: u32 = 32768u;
 ${shardBindings(shards, "source", storage, 0, false)}
 @group(0) @binding(${shards.count}) var<uniform> p: NormParameters;
 @group(0) @binding(${shards.count + 1}) var<storage, read_write> statistics: array<f32>;
 ${shardLoader(shards, "source", storage)}
-var<workgroup> partial: array<f32, 64>;
-var<workgroup> row_mean: array<f32, 1>;
+${layout.declarations}
 
 fn source_row(row: u32) -> u32 {
   let b = p.batch_offset + row / p.queries;
@@ -341,36 +361,26 @@ fn source_row(row: u32) -> u32 {
   return q * p.batch_total + b;
 }
 
-@compute @workgroup_size(64)
-fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) group: vec3<u32>) {
-  let row = group.x + group.y * GRID_WIDTH;
-  if (row >= p.rows) { return; }
-  let input_row = source_row(row);
+${layout.attributes}
+fn main(@builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>${layout.builtins}) {
+${layout.open("p.rows")}
+  let input_row = source_row(norm_row);
   let input_base = input_row * p.channels;
   var sum = 0.0;
-  for (var c = local.x; c < p.channels; c += 64u) { sum += source_load(input_base + c); }
-  partial[local.x] = sum;
-  workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride /= 2u) {
-    if (local.x < stride) { partial[local.x] += partial[local.x + stride]; }
-    workgroupBarrier();
-  }
-  if (local.x == 0u) { row_mean[0] = partial[0] / f32(p.channels); }
-  workgroupBarrier();
+  for (var c = norm_lane; c < p.channels; c += norm_stride) { sum += source_load(input_base + c); }
+${layout.sum("sum", "row_total")}
+  let row_mean = row_total / f32(p.channels);
   var squared = 0.0;
-  for (var c = local.x; c < p.channels; c += 64u) {
-    let centered = source_load(input_base + c) - row_mean[0];
+  for (var c = norm_lane; c < p.channels; c += norm_stride) {
+    let centered = source_load(input_base + c) - row_mean;
     squared += centered * centered;
   }
-  partial[local.x] = squared;
-  workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride /= 2u) {
-    if (local.x < stride) { partial[local.x] += partial[local.x + stride]; }
-    workgroupBarrier();
-  }
-  if (local.x == 0u) {
-    statistics[2u * input_row] = row_mean[0];
-    statistics[2u * input_row + 1u] = inverseSqrt(partial[0] / f32(p.channels) + p.epsilon);
+${layout.sum("squared", "squared_total")}
+  // One lane of the row writes the pair the consumers read.
+  if (norm_live && norm_lane == 0u) {
+    statistics[2u * input_row] = row_mean;
+    statistics[2u * input_row + 1u] = inverseSqrt(squared_total / f32(p.channels) + p.epsilon);
   }
 }`;
 }
@@ -384,7 +394,7 @@ struct Parameters {
   query_weight: u32, key_weight: u32, value_weight: u32,
   gating_weight: u32, gating_bias: u32, output_weight: u32,
   output_bias: u32, pair_weight: u32, pair_channels: u32,
-  batch_offset: u32, batch_total: u32, padding: vec2<u32>,
+  batch_offset: u32, batch_total: u32, bias_stride: u32, padding: u32,
 };
 const GRID_WIDTH: u32 = 32768u;
 `;
@@ -549,7 +559,43 @@ ${[0, 1, 2, 3].map((lane) => `              {
   });
 }
 
-export const ATTENTION_PAIR_BIAS_SHADER = `${COMMON}
+/**
+ * Row length of the staged pair bias, which is the query count rounded up to
+ * four.
+ *
+ * The bias is read a row at a time by the flash kernels, and the matrix one
+ * reads four of it at once — sixteen scalar reads a lane a pass were a quarter
+ * of that kernel, and the count of them is what costs, not the bytes: halving
+ * the bytes it touches changes nothing, and removing the read entirely is
+ * worth 24%. A vector read needs the row to begin on a four-element boundary,
+ * which a query count of 1,650 does not give it. Padding the row to four does,
+ * for three floats a row.
+ */
+export function attentionPairBiasStride(queries: number): number {
+  return (queries + 3) & ~3;
+}
+
+/** The same rounding, in the shaders that index the bias. */
+const PAIR_BIAS_STRIDE = "p.bias_stride";
+
+/**
+ * The pair projection that becomes the attention bias, for a fixed head count.
+ *
+ * One invocation carries one residue pair and all of its heads. Carrying one
+ * head each, every head read the pair's whole channel row again: at 1,650
+ * residues that is the 1.4 GB pair tensor read four times over for triangle
+ * attention and eight for MSA row attention, and the kernel ran at the card's
+ * bandwidth for it. The heads share the row instead, and the weights they
+ * want for a channel sit next to each other.
+ *
+ * `heads` fixes how many accumulators the loop carries, so it is compiled per
+ * head count; `p.heads` still gives the weight stride, and the two are the
+ * same number by construction.
+ */
+export function createAttentionPairBiasShader(heads: number): string {
+  const each = (body: (head: number) => string): string =>
+    Array.from({ length: heads }, (_, head) => body(head)).join(String.fromCharCode(10));
+  return `${COMMON}
 @group(0) @binding(0) var<storage, read> pair: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> p: Parameters;
@@ -562,17 +608,21 @@ export const ATTENTION_PAIR_BIAS_SHADER = `${COMMON}
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let index = id.x + id.y * GRID_WIDTH * 64u;
-  if (index >= p.heads * p.batch * p.queries) { return; }
+  if (index >= p.batch * p.queries) { return; }
   let k = index % p.queries;
-  let row = (index / p.queries) % p.batch;
-  let head = index / (p.queries * p.batch);
-  var result = 0.0;
+  let row = index / p.queries;
+${each((head) => `  var total_${head} = 0.0;`)}
+  let source = (row * p.queries + k) * p.pair_channels;
   for (var c = 0u; c < p.pair_channels; c += 1u) {
-    result += pair[(row * p.queries + k) * p.pair_channels + c]
-      * weights[p.pair_weight + c * p.heads + head];
+    let held = pair[source + c];
+    let at = p.pair_weight + c * p.heads;
+${each((head) => `    total_${head} += held * weights[at + ${head}u];`)}
   }
-  output[(head * p.queries + p.batch_offset + row) * p.queries + k] = result;
+  let stride = ${PAIR_BIAS_STRIDE};
+  let at_row = (p.batch_offset + row) * stride + k;
+${each((head) => `  output[${head}u * p.queries * stride + at_row] = total_${head};`)}
 }`;
+}
 
 export const ATTENTION_FLASH_SHADER = `${COMMON}
 @group(0) @binding(0) var<storage, read> query: array<f32>;
@@ -604,7 +654,9 @@ fn main(
   var running_sum = 0.0;
   for (var k_index = 0u; k_index < p.queries; k_index += 1u) {
     let k_base = ((batch_index * p.queries + k_index) * p.heads + head) * p.head_dim;
-    partial[lane] = select(0.0, query[q_base + lane] * key[k_base + lane], lane < p.head_dim);
+    var product = 0.0;
+    if (lane < p.head_dim) { product = query[q_base + lane] * key[k_base + lane]; }
+    partial[lane] = product;
     workgroupBarrier();
     for (var stride = 16u; stride > 0u; stride /= 2u) {
       if (lane < stride) { partial[lane] += partial[lane + stride]; }
@@ -613,7 +665,7 @@ fn main(
     if (lane == 0u) {
       var logit = partial[0] + 1e9 * (mask[mask_index(batch_index, k_index)] - 1.0);
       if (p.has_pair_bias != 0u) {
-        logit += pair_bias[(head * p.queries + q_index) * p.queries + k_index];
+        logit += pair_bias[(head * p.queries + q_index) * ${PAIR_BIAS_STRIDE} + k_index];
       }
       logit = clamp(logit, -1e8, 1e8);
       let new_max = max(running_max, logit);
@@ -720,7 +772,7 @@ ${eachSlot("    ", (slot) => `{
 ${perSlot(slot, "  ", (index) => `score += dot(qv_${slot}_${index}, kv${index});`)}
   var logit = score + masked;
   if (p.has_pair_bias != 0u) {
-    logit += pair_bias[(head * p.queries + select(0u, q_index_${slot}, live_${slot})) * p.queries + k_index];
+    logit += pair_bias[(head * p.queries + select(0u, q_index_${slot}, live_${slot})) * ${PAIR_BIAS_STRIDE} + k_index];
   }
   logit = clamp(logit, -1e8, 1e8);
   let new_max = max(running_max_${slot}, logit);
@@ -805,7 +857,7 @@ fn main(
         }
         var logit = subgroupAdd(product) + 1e9 * (mask[mask_index(batch_index, k_index)] - 1.0);
         if (valid_query && p.has_pair_bias != 0u) {
-          logit += pair_bias[(head * p.queries + q_index) * p.queries + k_index];
+          logit += pair_bias[(head * p.queries + q_index) * ${PAIR_BIAS_STRIDE} + k_index];
         }
         logit = clamp(logit, -1e8, 1e8);
         let new_max = max(running_max, logit);
@@ -920,7 +972,7 @@ fn main(
           var logit = subgroupAdd(select(0.0, product, valid_query))
             + 1e9 * (mask[mask_index(batch_index, k_index)] - 1.0);
           if (valid_query && p.has_pair_bias != 0u) {
-            logit += pair_bias[(head * p.queries + q_index) * p.queries + k_index];
+            logit += pair_bias[(head * p.queries + q_index) * ${PAIR_BIAS_STRIDE} + k_index];
           }
           logit = clamp(logit, -1e8, 1e8);
           let new_max = max(running_max[query_slot], logit);
@@ -1021,7 +1073,7 @@ fn main(
       }
       logit += 1e9 * (mask[mask_index(batch_index, k_index)] - 1.0);
       if (p.has_pair_bias != 0u) {
-        logit += pair_bias[(head * p.queries + q_index) * p.queries + k_index];
+        logit += pair_bias[(head * p.queries + q_index) * ${PAIR_BIAS_STRIDE} + k_index];
       }
       logit = clamp(logit, -1e8, 1e8);
     }
@@ -1058,11 +1110,39 @@ export function supportsAttentionSubgroup64x64(device: GPUDevice, headDim = 32):
     && device.limits.maxComputeWorkgroupStorageSize >= 16_384;
 }
 
+/**
+ * Whether the hardware matrix units can carry this attention.
+ *
+ * Needs the units themselves, f16 to feed them, a unit shape whose tiles the
+ * kernel is written around, and the workgroup storage its staged tiles take —
+ * which is more than the 16 KiB every implementation guarantees, so a device
+ * that grants only the baseline keeps the kernels it already had.
+ */
+export function supportsAttentionMatrix(device: GPUDevice, headDim = 32): boolean {
+  return device.features.has("chromium-experimental-subgroup-matrix" as GPUFeatureName)
+    && device.features.has("shader-f16" as GPUFeatureName)
+    && supportsSubgroupSize(device, ATTENTION_MATRIX_SUBGROUP_SIZE)
+    && device.limits.maxComputeInvocationsPerWorkgroup >= ATTENTION_MATRIX_QUERY_TILE * 2
+    && device.limits.maxComputeWorkgroupStorageSize >= attentionMatrixStorageBytes(headDim)
+    && attentionMatrixShape(device, headDim, subgroupMatrixConfigs(device)) !== undefined;
+}
+
 export function selectAttentionFlashKernel(
   device: GPUDevice,
   headDim = 32,
   requested: AttentionFlashVariant = "auto",
 ): AttentionFlashKernel {
+  if (requested === "matrix") {
+    const shape = attentionMatrixShape(device, headDim, subgroupMatrixConfigs(device));
+    if (shape === undefined || !supportsAttentionMatrix(device, headDim)) {
+      throw new Error("the matrix attention kernel is unsupported by this device");
+    }
+    return {
+      cacheKey: `attention:flash-matrix-${headDim}`,
+      shader: createAttentionMatrixFlashShader(headDim, shape),
+      queryTile: ATTENTION_MATRIX_QUERY_TILE, variant: requested, batchFirst: true,
+    };
+  }
   const subgroup = supportsAttentionSubgroups(device, headDim);
   const subgroup64 = supportsAttentionSubgroup64x64(device, headDim);
   const variant = requested === "auto"
@@ -1190,7 +1270,8 @@ export class AttentionGpu {
     const [normalize, project, pairProject, flash, outputProject] = await Promise.all([
       this.pipelines.get("attention:normalize", ATTENTION_NORMALIZE_SHADER),
       this.pipelines.get("attention:project", attentionProjectShader()),
-      this.pipelines.get("attention:pair-bias", ATTENTION_PAIR_BIAS_SHADER),
+      this.pipelines.get(`attention:pair-bias:h${input.heads}`,
+        createAttentionPairBiasShader(input.heads)),
       this.pipelines.get(flashKernel.cacheKey, flashKernel.shader),
       this.pipelines.get("attention:output", ATTENTION_OUTPUT_SHADER),
     ]);
@@ -1273,7 +1354,7 @@ export class AttentionGpu {
           grid[0], grid[1]);
       }
       if (input.pairBias !== undefined) {
-        const pairGrid = linearGrid(input.heads * biasRows * input.queryLength);
+        const pairGrid = linearGrid(biasRows * input.queryLength);
         pass(pairProject, [pairNormalized.buffer, weights.buffer, biasParams.buffer, pairBias.buffer],
           pairGrid[0], pairGrid[1]);
       }

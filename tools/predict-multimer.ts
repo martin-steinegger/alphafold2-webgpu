@@ -5,6 +5,8 @@
  * Usage: tsx tools/predict-multimer.ts <manifest.json> <CHAIN_A:CHAIN_B[:...]> [recycles]
  */
 import { create, globals } from "webgpu";
+import { dawnInstanceFlags, fitScratchBudgetScale } from "../src/runtime/dawn.js";
+import { nativeMemoryBudgetBytes, selectGpu } from "./native-device.js";
 import { AlphaFoldMultimerGpu } from "../src/model/multimer.js";
 import { EXACT_STORAGE } from "../src/model/monomer.js";
 import {
@@ -29,12 +31,30 @@ const [embedding, multimerTemplate, extraStack, mainStack, structure, confidence
     model.mainStackWeights(), model.multimerStructureWeights(), model.confidenceWeights(), model.geometryTables(),
     model.queryOnlyFeatureTables(), model.tensor("confidencePaeBreaks"),
   ]);
-const gpu = create([]);
+// Chosen before the instance exists, because the Vulkan loader reads the
+// selection when it makes one. Honours CUDA_VISIBLE_DEVICES; see `selectGpu`.
+const selectedGpu = selectGpu();
+if (selectedGpu !== undefined) console.error(`pinned to ${selectedGpu}`);
+const gpu = create(dawnInstanceFlags({
+  // Native, so the bounds clamp goes: the kernels do not rely on it, and it is
+  // worth 11% of a recycle. See `dawnInstanceFlags`.
+  unclamped: true,
+}));
 const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
 if (adapter === null) throw new Error("no WebGPU adapter");
+const baseMemoryOptions = { multimer: true, templateRows: multimerTemplate.templateRows,
+  ...(process.env.AFWEBGPU_EXACT === "1" ? EXACT_STORAGE : {}) };
+// Sized to this host's memory rather than the browser's default; see
+// `fitScratchBudgetScale`.
+const memoryBudget = nativeMemoryBudgetBytes();
+const scratchBudgetScale = memoryBudget === undefined ? 1 : fitScratchBudgetScale(
+  (scale) => planMonomerDevice(adapter, length, 1, 1, undefined, false,
+    { ...baseMemoryOptions, scratchBudgetScale: scale }).memory.estimatedPeakBytes,
+  memoryBudget);
 const plan = planMonomerDevice(adapter, length, 1, 1, undefined, false,
-  { multimer: true, templateRows: multimerTemplate.templateRows,
-    ...(process.env.AFWEBGPU_EXACT === "1" ? EXACT_STORAGE : {}) });
+  { ...baseMemoryOptions, scratchBudgetScale });
+console.error(`device memory budget ${memoryBudget === undefined ? "unknown"
+  : `${(memoryBudget / 1024 ** 3).toFixed(1)} GiB`}, scratch budget ${scratchBudgetScale}x`);
 console.error(`chains ${chains.map((chain) => chain.length).join("+")} = ${length} residues; estimated peak `
   + `${(plan.memory.estimatedPeakBytes / 1024 ** 2).toFixed(0)} MiB`);
 const device = await requestAlphaFoldDevice(adapter, plan.requirements);

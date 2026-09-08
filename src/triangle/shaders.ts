@@ -1,6 +1,6 @@
 import type { Precision, TriangleShape } from "./types.js";
 import type { WeightOffsets } from "./weights.js";
-import { createTiledGemmShader } from "../runtime/gemm.js";
+import { createTiledGemmShader, GEMM_TILE_COLUMNS, GEMM_TILE_ROWS } from "../runtime/gemm.js";
 import { type ActivationStorage, storageArray, storedElement } from "../runtime/storage.js";
 import {
   planShards, shardBindings, shardLoader, shardStorer, shardWordLoader, type ShardLayout,
@@ -42,6 +42,32 @@ export type TriangleDirection = "outgoing" | "incoming";
  * about three significant digits, so it is not exact.
  */
 export type TriangleWholeStorage = "f32" | "f16";
+
+/**
+ * Tile rows the projection epilogue below is written for.
+ *
+ * It names eight accumulators an invocation and stages its transpose 64 rows
+ * wide, both of which follow from a 64-row tile rather than being read off it.
+ * A different tile row count leaves it addressing the wrong accumulators and
+ * the wrong slots, and nothing says so: the model still runs, and comes back
+ * at 70 pLDDT where it gave 88. So the coupling is checked rather than
+ * commented on.
+ */
+const ROWS_THE_EPILOGUE_IS_WRITTEN_FOR = 64;
+/**
+ * Tile columns it is written for, for the same reason.
+ *
+ * It splits the tile into two halves of sixteen column threads and stages
+ * thirty-two channels of each, which follows from 128 columns over four-wide
+ * invocations. A 256-column tile silently returned 70 pLDDT for it.
+ */
+const COLUMNS_THE_EPILOGUE_IS_WRITTEN_FOR = 128;
+if (GEMM_TILE_ROWS !== ROWS_THE_EPILOGUE_IS_WRITTEN_FOR
+  || GEMM_TILE_COLUMNS !== COLUMNS_THE_EPILOGUE_IS_WRITTEN_FOR) {
+  throw new RangeError(`the triangle projection epilogue is written for a `
+    + `${ROWS_THE_EPILOGUE_IS_WRITTEN_FOR}x${COLUMNS_THE_EPILOGUE_IS_WRITTEN_FOR} GEMM tile, `
+    + `and this build tiles ${GEMM_TILE_ROWS}x${GEMM_TILE_COLUMNS}`);
+}
 
 const declaration = (precision: Precision): string => precision === "f16" ? "enable f16;\n" : "";
 const scalar = (precision: Precision): "f16" | "f32" => precision;
@@ -244,7 +270,7 @@ fn normalized_input(pair_row: u32, k: u32) -> f32 {
       // transpose instead, thirty-two channels at a time so the staging stays
       // inside the portable workgroup storage, and the tile is then written out
       // with adjacent lanes on adjacent pair rows.
-      stageElements: 32 * 64,
+      stageElements: 32 * ROWS_THE_EPILOGUE_IS_WRITTEN_FOR,
       epilogue: `
   for (var half = 0u; half < 2u; half += 1u) {
     if (column_thread >= half * 16u && column_thread < half * 16u + 16u) {
@@ -309,6 +335,10 @@ ${shardLoader(wholeShards, "whole", packedWhole ? "f16" : "f32")}`,
       ? "blocked[group.z * BLOCK_PAIRS + row * L + k]" : "blocked[group.z * BLOCK_PAIRS + k * block.w + row]",
     weightElement: outgoing
       ? wholeElement("group.z * WHOLE_STRIDE + column * L + k") : wholeElement("group.z * WHOLE_STRIDE + k * L + column"),
+    // Which index of each operand is contiguous, so a staged tile is fetched
+    // along memory rather than across it.
+    sourceContiguous: outgoing ? "k" : "row",
+    weightContiguous: outgoing ? "k" : "column",
     // The block's output entries are enumerated like its operand: by pair row
     // (i, j) outgoing, by (i, block column j) incoming.
     store: outgoing
