@@ -700,23 +700,23 @@ async function encodeAttention(
   const shardKey = `${storage}:${sourceShards.count}:${normalizeLayout.rowsPerWorkgroup}`;
   const [normalize, project, pairProject, flash, outputProject, pairNormalize] = await Promise.all([
     execution.pipelines.get(`block:attention:normalize:${shardKey}`,
-      createAttentionNormalizeShader(storage, sourceShards, normalizeLayout)),
+      () => createAttentionNormalizeShader(storage, sourceShards, normalizeLayout)),
     execution.pipelines.get(
       `block:attention:project:${keyValueStorage}:${options.channels >= GEMM_TILE_COLUMNS}`,
       attentionProjectShader(keyValueStorage, options.channels >= GEMM_TILE_COLUMNS)),
     execution.pipelines.get(`block:attention:pair-bias:h${options.heads}`,
-      createAttentionPairBiasShader(options.heads)),
+      () => createAttentionPairBiasShader(options.heads)),
     execution.pipelines.get(
       `block:${flashKernel.cacheKey}:kv-${keyValueStorage}:q${slots}`, flashShader),
     execution.pipelines.get(
       `block:attention:output${options.residualTarget === undefined ? "" : "-residual"}:${shardKey}`,
-      createAttentionOutputShader(options.residualTarget !== undefined, storage, sourceShards),
+      () => createAttentionOutputShader(options.residualTarget !== undefined, storage, sourceShards),
     ),
     // The pair bias source has its own storage, which need not match the
     // attention source's: MSA row attention reads a pair, not an MSA.
     execution.pipelines.get(
       `block:attention:normalize:${options.pairStorage ?? "f32"}:${normalizeLayout.rowsPerWorkgroup}`,
-      createAttentionNormalizeShader(
+      () => createAttentionNormalizeShader(
         options.pairStorage ?? "f32", undefined, rowNormalizeLayout(execution.device))),
   ]);
   const wholeRows = options.batch * options.queries;
@@ -905,15 +905,15 @@ async function encodeGlobalAttention(
     = await Promise.all([
     execution.pipelines.get(
       `block:attention:statistics:${key}:${statisticsLayout.rowsPerWorkgroup}`,
-      createAttentionStatisticsShader(storage, shards, statisticsLayout)),
-    execution.pipelines.get(`block:global-attention:kv:${key}`, createGlobalAttentionKvShader(storage, shards)),
+      () => createAttentionStatisticsShader(storage, shards, statisticsLayout)),
+    execution.pipelines.get(`block:global-attention:kv:${key}`, () => createGlobalAttentionKvShader(storage, shards)),
     execution.pipelines.get(`block:global-attention:column-mean:${key}`,
-      createGlobalAttentionColumnMeanShader(storage, shards)),
+      () => createGlobalAttentionColumnMeanShader(storage, shards)),
     execution.pipelines.get("block:global-attention:query", globalAttentionQueryShader()),
     execution.pipelines.get("block:global-attention:flash", GLOBAL_ATTENTION_FLASH_SHADER),
     execution.pipelines.get(
       `block:global-attention:output${residualTarget === undefined ? "" : "-residual"}:${key}`,
-      createGlobalAttentionOutputShader(residualTarget !== undefined, storage, shards),
+      () => createGlobalAttentionOutputShader(residualTarget !== undefined, storage, shards),
     ),
   ]);
   const shardsOf = (tensor: GpuTensor): readonly GpuTensor[] => {
@@ -989,14 +989,14 @@ async function encodeOuterProductMean(
   const opmLayout = rowNormalizeLayout(execution.device);
   const [normalize, project, contractPipeline, pairCountPipeline, projectOutputPipeline] = await Promise.all([
     execution.pipelines.get(`block:opm:normalize:${storage}:${opmLayout.rowsPerWorkgroup}`,
-      createOuterProductMeanNormalizeShader(storage, opmLayout)),
+      () => createOuterProductMeanNormalizeShader(storage, opmLayout)),
     execution.pipelines.get("block:opm:project", OUTER_PRODUCT_MEAN_PROJECT_SHADER),
     execution.pipelines.get(`block:opm:contract:${projectionShards.count}`,
-      createOuterProductMeanContractShader(projectionShards)),
+      () => createOuterProductMeanContractShader(projectionShards)),
     execution.pipelines.get("block:opm:pair-count", OUTER_PRODUCT_MEAN_PAIR_COUNT_SHADER),
     execution.pipelines.get(
       `block:opm:project-output${residualTarget === undefined ? "" : "-residual"}:${input.pairStorage ?? "f32"}`,
-      createOuterProductMeanProjectOutputShader(residualTarget !== undefined, input.pairStorage ?? "f32"),
+      () => createOuterProductMeanProjectOutputShader(residualTarget !== undefined, input.pairStorage ?? "f32"),
     ),
   ]);
   const weights = execution.upload("opm.weights", packed.data);
