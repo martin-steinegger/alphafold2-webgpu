@@ -1126,18 +1126,49 @@ export function triangleBlockRows(
   return tiled < length && (length % 2 === 1) ? Math.max(2, tiled - (tiled % 2)) : tiled;
 }
 
-async function encodeTriangleMultiplication(
+/**
+ * Sources generated once for a configuration, and weights packed once for a
+ * block, rather than both again on every block of every recycle.
+ *
+ * A fold spends real time here: 316 calls costing 479 ms, against a recycle of
+ * 1037 ms at 256 residues, which is about a seventh of the fold's host time.
+ * Neither result depends on anything that changes between those calls. The
+ * sources are a function of the shape and the storage choices, which the
+ * pipeline key already names in full, so the key serves as the cache key. The
+ * packing is a function of the weights, which are the same objects every
+ * recycle, so it is held against their identity and released with them.
+ *
+ * Holding the packings is a second copy of those weights, 41.8 MB, and buys
+ * 7.5%. Do not extend it to the attention, transition and outer-product
+ * packers: those would hold 321 MB between them to save about 260 ms a
+ * recycle, which a port that runs in a browser should not spend.
+ */
+const TRIANGLE_SHADERS = new Map<string, ReturnType<typeof createTriangleShaders>>();
+const TRIANGLE_PACKED = new WeakMap<
+  TriangleMultiplicationWeights, ReturnType<typeof packTriangleWeights>>();
+
+/**
+ * Everything the triangle multiplication settles before it encodes anything:
+ * its shapes, its windows, and the key and source of every pipeline it needs.
+ *
+ * Split out so that warming the cache and running the kernel cannot disagree
+ * about a key. A warm naming a pipeline differently would compile a second
+ * copy and leave the real one to be compiled on the critical path after all,
+ * which is the failure this shape exists to make impossible.
+ */
+function triangleSetup(
   execution: WebGpuExecution,
-  encoderValue: GPUCommandEncoder,
-  pair: GpuTensor,
-  pairMask: GpuTensor,
   input: EvoformerShape,
   weightsValue: TriangleMultiplicationWeights,
   direction: TriangleDirection,
-  residualTarget?: GpuTensor,
-): Promise<GpuTensor> {
+  residual: boolean,
+) {
   const shape = { length: input.length, cZ: input.cZ, cHidden: input.triangleHidden };
-  const packed = packTriangleWeights(weightsValue, "f32");
+  let packed = TRIANGLE_PACKED.get(weightsValue);
+  if (packed === undefined) {
+    packed = packTriangleWeights(weightsValue, "f32");
+    TRIANGLE_PACKED.set(weightsValue, packed);
+  }
   const blockRows = triangleBlockRows(input.length, input.cZ, input.triangleHidden,
     Math.min(input.scratchWindowBytes ?? scratchBudget(TRIANGLE_BLOCK_TARGET_BYTES),
       execution.bindingLimitBytes));
@@ -1165,24 +1196,57 @@ async function encodeTriangleMultiplication(
       + `Its ${(execution.bindingLimitBytes / 1024 ** 2).toFixed(0)} MiB binding limit is what forces the `
       + "windows: a shorter sequence, or a device that binds more of a buffer at once, will run.");
   }
-  const shaders = createTriangleShaders(shape, "f32", packed.offsets, 1e-5, direction, blockRows, wholeStorage,
-    pairStorage, residualTarget !== undefined, pairShards, wholeShards);
   const pipelineKey = `block:triangle:${direction}:${input.length}:${input.cZ}`
     + `:${input.triangleHidden}:${blockRows}:${wholeStorage}:${pairStorage}:${pairShards.count}`
     + `:${wholeShards.count}`;
-  const [inputStatistics, projectGate, projectBlockOperand, projectWholeOperand, contract, hiddenStatistics, projectOutput]
-    = await Promise.all([
-    execution.pipelines.get(`${pipelineKey}:input-statistics`, shaders.inputStatistics),
-    execution.pipelines.get(`${pipelineKey}:project-gate`, shaders.projectGate),
-    execution.pipelines.get(`${pipelineKey}:project-block-operand`, shaders.projectBlockOperand),
-    execution.pipelines.get(`${pipelineKey}:project-whole-operand`, shaders.projectWholeOperand),
-    execution.pipelines.get(`${pipelineKey}:contract`, shaders.contract),
-    execution.pipelines.get(`${pipelineKey}:hidden-statistics`, shaders.hiddenStatistics),
-    execution.pipelines.get(
-      `${pipelineKey}:project-output${residualTarget === undefined ? "" : "-residual"}`,
-      shaders.projectOutput,
-    ),
-  ]);
+  // The offsets belong to the packing, so they join the key: a bundle packed
+  // differently must not be handed another one's sources.
+  const shaderKey = `${pipelineKey}:${residual}:${JSON.stringify(packed.offsets)}`;
+  let shaders = TRIANGLE_SHADERS.get(shaderKey);
+  if (shaders === undefined) {
+    shaders = createTriangleShaders(shape, "f32", packed.offsets, 1e-5, direction, blockRows,
+      wholeStorage, pairStorage, residual, pairShards, wholeShards);
+    TRIANGLE_SHADERS.set(shaderKey, shaders);
+  }
+  const requests: readonly (readonly [string, string])[] = [
+    [`${pipelineKey}:input-statistics`, shaders.inputStatistics],
+    [`${pipelineKey}:project-gate`, shaders.projectGate],
+    [`${pipelineKey}:project-block-operand`, shaders.projectBlockOperand],
+    [`${pipelineKey}:project-whole-operand`, shaders.projectWholeOperand],
+    [`${pipelineKey}:contract`, shaders.contract],
+    [`${pipelineKey}:hidden-statistics`, shaders.hiddenStatistics],
+    [`${pipelineKey}:project-output${residual ? "-residual" : ""}`, shaders.projectOutput],
+  ];
+  return {
+    packed, blockRows, wholeStorage, pairStorage, pairShards, wholeShards,
+    wholeStride, requests,
+  };
+}
+
+async function encodeTriangleMultiplication(
+  execution: WebGpuExecution,
+  encoderValue: GPUCommandEncoder,
+  pair: GpuTensor,
+  pairMask: GpuTensor,
+  input: EvoformerShape,
+  weightsValue: TriangleMultiplicationWeights,
+  direction: TriangleDirection,
+  residualTarget?: GpuTensor,
+): Promise<GpuTensor> {
+  const {
+    packed, blockRows, wholeStorage, pairStorage, pairShards, wholeShards, wholeStride, requests,
+  } = triangleSetup(execution, input, weightsValue, direction, residualTarget !== undefined);
+  // Indexed rather than destructured: `requests` is the one place the order is
+  // written down, and a tuple type restated here would be a second one.
+  const built = await Promise.all(
+    requests.map(([key, code]) => execution.pipelines.get(key, code)));
+  const inputStatistics = built[0]!;
+  const projectGate = built[1]!;
+  const projectBlockOperand = built[2]!;
+  const projectWholeOperand = built[3]!;
+  const contract = built[4]!;
+  const hiddenStatistics = built[5]!;
+  const projectOutput = built[6]!;
   const pairs = input.length * input.length;
   const views = (tensor: GpuTensor, layout: ShardLayout, storage: ActivationStorage): readonly GpuTensor[] => {
     if (layout.count === 1) return [tensor];
