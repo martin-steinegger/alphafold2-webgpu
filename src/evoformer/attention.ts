@@ -819,9 +819,7 @@ ${perSlot(slot, "  ", (index) => `output[q_base_${slot} + ${index}u] = (acc_${sl
 
 // Fast path for devices that guarantee one 32-lane subgroup. All lanes keep
 // identical online-softmax state, eliminating workgroup barriers in the key loop.
-export const ATTENTION_SUBGROUP_FLASH_SHADER = `enable subgroups;
-enable subgroup_size_control;
-${COMMON}
+const attentionSubgroupFlashShader = (enables: string, width: string): string => `${enables}${COMMON}
 @group(0) @binding(0) var<storage, read> query: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read> key: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read> value: array<vec4<f32>>;
@@ -835,11 +833,16 @@ var<workgroup> value_tile: array<vec4<f32>, 64>;
 
 ${MASK_INDEX}
 
-@compute @workgroup_size(32, 4, 1) @subgroup_size(32)
+// One dimension, not two. The invocation is unpacked back into a row and a
+// lane below, which is exactly what local_invocation_id would have carried:
+// naga refuses a subgroup builtin beside a multi-dimensional workgroup, and
+// the two forms are the same threads in the same order.
+@compute @workgroup_size(128)${width}
 fn main(
-  @builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(local_invocation_index) invocation: u32,
   @builtin(workgroup_id) group: vec3<u32>,
 ) {
+  let local = vec3<u32>(invocation % 32u, invocation / 32u, 0u);
   let q_index = group.x * 4u + local.y;
   let batch_index = group.y;
   let head = group.z;
@@ -906,16 +909,11 @@ fn main(
 }`;
 
 export function supportsAttentionSubgroups(device: GPUDevice, headDim = 32): boolean {
-  // subgroup-size-control only permits selecting a width inside the device's
-  // advertised range. SwiftShader, for example, exposes the feature while
-  // fixing the range to [4, 4], so feature detection alone is insufficient.
-  const range = subgroupRange(device);
-  return headDim === 32
-    && device.features.has("subgroups")
-    && device.features.has("subgroup-size-control")
-    && range !== undefined
-    && range[0] <= 32
-    && range[1] >= 32;
+  // The kernels lay one query row across a 32-lane subgroup. Whether this
+  // device can be held to that width is supportsSubgroupSize's question, and
+  // it is not the same as having the feature: SwiftShader exposes
+  // subgroup-size-control while fixing the range to [4, 4].
+  return headDim === 32 && supportsSubgroupSize(device, 32);
 }
 
 /**
@@ -927,11 +925,10 @@ export function supportsAttentionSubgroups(device: GPUDevice, headDim = 32): boo
  * into the value accumulator. The 64x64 specialization is the closest Pallas
  * analogue; smaller query tiles trade data reuse for more parallelism.
  */
-function createAttentionSubgroupTiledShader(queryTile: 8 | 16 | 32 | 64, keyTile: 16 | 32 | 64): string {
+function createAttentionSubgroupTiledShader(queryTile: 8 | 16 | 32 | 64, keyTile: 16 | 32 | 64,
+  enables: string, width: string): string {
   const querySlots = queryTile / 8;
-  return `enable subgroups;
-enable subgroup_size_control;
-${COMMON}
+  return `${enables}${COMMON}
 @group(0) @binding(0) var<storage, read> query: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read> key: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read> value: array<vec4<f32>>;
@@ -945,12 +942,17 @@ var<workgroup> value_tile: array<vec4<f32>, ${keyTile * 8}>;
 
 ${MASK_INDEX}
 
-@compute @workgroup_size(32, 8, 1) @subgroup_size(32)
+// One dimension, not two. The invocation is unpacked back into a row and a
+// lane below, which is exactly what local_invocation_id would have carried:
+// naga refuses a subgroup builtin beside a multi-dimensional workgroup, and
+// the two forms are the same threads in the same order.
+@compute @workgroup_size(256)${width}
 fn main(
-  @builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(local_invocation_index) invocation: u32,
   @builtin(workgroup_id) group: vec3<u32>,
   @builtin(subgroup_invocation_id) subgroup_lane: u32,
 ) {
+  let local = vec3<u32>(invocation % 32u, invocation / 32u, 0u);
   let batch_index = group.y;
   let head = group.z;
   let vector_index = subgroup_lane / 4u;
@@ -1028,12 +1030,6 @@ fn main(
 }`;
 }
 
-export const ATTENTION_SUBGROUP_8X16_SHADER = createAttentionSubgroupTiledShader(8, 16);
-export const ATTENTION_SUBGROUP_8X32_SHADER = createAttentionSubgroupTiledShader(8, 32);
-export const ATTENTION_SUBGROUP_8X64_SHADER = createAttentionSubgroupTiledShader(8, 64);
-export const ATTENTION_SUBGROUP_16X64_SHADER = createAttentionSubgroupTiledShader(16, 64);
-export const ATTENTION_SUBGROUP_32X64_SHADER = createAttentionSubgroupTiledShader(32, 64);
-export const ATTENTION_SUBGROUP_64X64_SHADER = createAttentionSubgroupTiledShader(64, 64);
 
 /**
  * Key-parallel flash attention for a 32-channel head.
@@ -1042,9 +1038,7 @@ export const ATTENTION_SUBGROUP_64X64_SHADER = createAttentionSubgroupTiledShade
  * parallel, reduce the tile softmax, and then shuffle those probabilities
  * across lanes while each lane accumulates one value/output channel.
  */
-export const ATTENTION_SUBGROUP_KEY32_SHADER = `enable subgroups;
-enable subgroup_size_control;
-${COMMON}
+const attentionSubgroupKey32Shader = (enables: string, width: string): string => `${enables}${COMMON}
 @group(0) @binding(0) var<storage, read> query: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read> key: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read> value: array<vec4<f32>>;
@@ -1058,12 +1052,17 @@ var<workgroup> value_tile: array<vec4<f32>, 256>;
 
 ${MASK_INDEX}
 
-@compute @workgroup_size(32, 8, 1) @subgroup_size(32)
+// One dimension, not two. The invocation is unpacked back into a row and a
+// lane below, which is exactly what local_invocation_id would have carried:
+// naga refuses a subgroup builtin beside a multi-dimensional workgroup, and
+// the two forms are the same threads in the same order.
+@compute @workgroup_size(256)${width}
 fn main(
-  @builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(local_invocation_index) invocation: u32,
   @builtin(workgroup_id) group: vec3<u32>,
   @builtin(subgroup_invocation_id) subgroup_lane: u32,
 ) {
+  let local = vec3<u32>(invocation % 32u, invocation / 32u, 0u);
   let q_index = group.x * 8u + local.y;
   let batch_index = group.y;
   let head = group.z;
@@ -1146,12 +1145,44 @@ export function supportsAttentionSubgroup64x64(device: GPUDevice, headDim = 32):
  * that grants only the baseline keeps the kernels it already had.
  */
 export function supportsAttentionMatrix(device: GPUDevice, headDim = 32): boolean {
-  return device.features.has("chromium-experimental-subgroup-matrix" as GPUFeatureName)
+  return dialect(device).matrix !== undefined
     && device.features.has("shader-f16" as GPUFeatureName)
     && supportsSubgroupSize(device, ATTENTION_MATRIX_SUBGROUP_SIZE)
     && device.limits.maxComputeInvocationsPerWorkgroup >= ATTENTION_MATRIX_QUERY_TILE * 2
     && device.limits.maxComputeWorkgroupStorageSize >= attentionMatrixStorageBytes(headDim)
     && attentionMatrixShape(device, headDim, subgroupMatrixConfigs(device)) !== undefined;
+}
+
+/** The tiled subgroup kernels, by the variant that names each. */
+const TILED_SUBGROUP_SHAPES: Readonly<Record<string,
+  { queryTile: 8 | 16 | 32 | 64; keyTile: 16 | 32 | 64 }>> = {
+  "subgroup-8x16": { queryTile: 8, keyTile: 16 },
+  "subgroup-8x32": { queryTile: 8, keyTile: 32 },
+  "subgroup-8x64": { queryTile: 8, keyTile: 64 },
+  "subgroup-16x64": { queryTile: 16, keyTile: 64 },
+  "subgroup-32x64": { queryTile: 32, keyTile: 64 },
+  "subgroup-64x64": { queryTile: 64, keyTile: 64 },
+};
+
+const subgroupSources = new Map<string, string>();
+
+/**
+ * One subgroup kernel in this device's spelling, built once a spelling.
+ *
+ * Only the directives and the entry point's width attribute differ between
+ * implementations, and generating a source is measurable host cost, so each
+ * built source is kept rather than rebuilt per pipeline.
+ */
+function subgroupSource(name: string, device: GPUDevice,
+  build: (enables: string, width: string) => string): string {
+  const spelling = dialect(device);
+  const width = spelling.subgroupSize(ATTENTION_MATRIX_SUBGROUP_SIZE);
+  const key = `${name}|${spelling.subgroupEnable}|${width}`;
+  const held = subgroupSources.get(key);
+  if (held !== undefined) return held;
+  const built = build(spelling.subgroupEnable, width);
+  subgroupSources.set(key, built);
+  return built;
 }
 
 export function selectAttentionFlashKernel(
@@ -1183,32 +1214,24 @@ export function selectAttentionFlashKernel(
   }
   if (variant === "subgroup-key32") {
     return {
-      cacheKey: "attention:flash-subgroup-key32", shader: ATTENTION_SUBGROUP_KEY32_SHADER,
+      cacheKey: "attention:flash-subgroup-key32",
+      shader: subgroupSource("key32", device, attentionSubgroupKey32Shader),
       queryTile: 8, variant,
     };
   }
-  const tiled = variant === "subgroup-8x16"
-    ? { queryTile: 8, shader: ATTENTION_SUBGROUP_8X16_SHADER }
-    : variant === "subgroup-8x32"
-      ? { queryTile: 8, shader: ATTENTION_SUBGROUP_8X32_SHADER }
-      : variant === "subgroup-8x64"
-        ? { queryTile: 8, shader: ATTENTION_SUBGROUP_8X64_SHADER }
-        : variant === "subgroup-16x64"
-          ? { queryTile: 16, shader: ATTENTION_SUBGROUP_16X64_SHADER }
-          : variant === "subgroup-32x64"
-            ? { queryTile: 32, shader: ATTENTION_SUBGROUP_32X64_SHADER }
-            : variant === "subgroup-64x64"
-              ? { queryTile: 64, shader: ATTENTION_SUBGROUP_64X64_SHADER }
-              : undefined;
+  const tiled = TILED_SUBGROUP_SHAPES[variant];
   if (tiled !== undefined) {
     return {
-      cacheKey: `attention:flash-${variant}`, shader: tiled.shader,
+      cacheKey: `attention:flash-${variant}`,
+      shader: subgroupSource(variant, device, (enables, width) =>
+        createAttentionSubgroupTiledShader(tiled.queryTile, tiled.keyTile, enables, width)),
       queryTile: tiled.queryTile, variant,
     };
   }
   if (variant === "subgroup-4x8") {
     return {
-      cacheKey: "attention:flash-subgroup4x8", shader: ATTENTION_SUBGROUP_FLASH_SHADER,
+      cacheKey: "attention:flash-subgroup4x8",
+      shader: subgroupSource("4x8", device, attentionSubgroupFlashShader),
       queryTile: 4, variant,
     };
   }

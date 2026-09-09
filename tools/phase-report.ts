@@ -18,6 +18,7 @@ import { iterateA3mFeatures } from "../src/input/a3m-features.js";
 import { nativeMemoryBudgetBytes, selectGpu, useFileCalibrationStore } from "./native-device.js";
 import { parseA3m } from "../src/input/a3m.js";
 import { planMonomerDevice, requestAlphaFoldDevice } from "../src/runtime/device.js";
+import { requestWgpuAdapter } from "../src/runtime/wgpu/adapter.js";
 import {
   PhaseLedger, endPhase, formatPhaseReport, markPhase, setPhaseLedger,
 } from "../src/runtime/phase-ledger.js";
@@ -59,9 +60,16 @@ const [embedding, template, extraStack, mainStack, structure, confidence, geomet
   ]);
 
 markPhase("create instance");
-const gpu = create(dawnInstanceFlags({ unclamped: true }));
+// AFWEBGPU_BACKEND=wgpu profiles the same fold over the wgpu addon. The
+// instance is held rather than left as a temporary: dawn.node pumps its event
+// loop from this object, and one that becomes collectable takes the device
+// with it part way through the fold.
+const gpu = process.env.AFWEBGPU_BACKEND === "wgpu"
+  ? undefined : create(dawnInstanceFlags({ unclamped: true }));
 markPhase("request adapter");
-const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
+const adapter = gpu === undefined
+  ? requestWgpuAdapter()
+  : await gpu.requestAdapter({ powerPreference: "high-performance" });
 if (adapter === null) throw new Error("no WebGPU adapter");
 markPhase("plan device");
 const clustered = Math.max(1, Math.min(msaRows, depth));

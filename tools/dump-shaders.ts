@@ -33,6 +33,29 @@ const gemm = await import("../src/runtime/gemm.js");
 const transition = await import("../src/evoformer/transition.js");
 const opm = await import("../src/evoformer/outer-product-mean.js");
 const { subgroupMatrixConfigs } = await import("../src/runtime/subgroups.js");
+const triangle = await import("../src/triangle/shaders.js");
+const { ORDER } = await import("../src/triangle/weights.js");
+
+/**
+ * The triangle multiplication, which is the trunk's largest kernel and was
+ * missing from this dump entirely.
+ *
+ * Its shape is the one a fold builds: 128 channels either side, blocked, with
+ * the whole projection packed. The weight offsets only name constants in the
+ * source, so zeroes serve.
+ */
+function emitTriangle(prefix: string, spelling?: import("../src/runtime/dialect.js").MatrixSpelling): void {
+  const shape = { length: 256, cZ: 128, cHidden: 128 };
+  const offsets = Object.fromEntries(ORDER.map((name) => [name, 0])) as never;
+  for (const direction of ["outgoing", "incoming"] as const) {
+    const shaders = triangle.createTriangleShaders(shape, "f16", offsets, 1e-5, direction,
+      64, "f16", "f32", false, undefined, undefined, spelling);
+    for (const [name, code] of Object.entries(shaders)) {
+      emit(`${prefix}-triangle-${direction}-${name.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}`,
+        code);
+    }
+  }
+}
 
 const GEMM_PROBE = {
   preamble: `@group(0) @binding(0) var<storage, read> a: array<f32>;
@@ -73,6 +96,7 @@ function emitMatrix(prefix: string, reductionDevice: GPUDevice): void {
   emit(`${prefix}-attention-project-f16`, attention.attentionProjectShader("f16"));
   emit(`${prefix}-attention-project-wide`, attention.attentionProjectShader("f32", true));
   emit(`${prefix}-transition-linear`, transition.createLinearShader(false));
+  emitTriangle(prefix, dialect(device).matrix);
   const matrix = { precision: "matrix", inner: 8 } as const;
   // The recorded list is untyped strings; the builders want the narrowed shape.
   for (const raw of subgroupMatrixConfigs(device)) {
@@ -106,8 +130,8 @@ emitMatrix("dawn", device);
 // What wgpu looks like: subgroups without the directive and without
 // subgroup-size-control, so the reduction takes its workgroup path.
 const wgpuLike = { features: new Set(["subgroups", "shader-f16"]) } as unknown as GPUDevice;
-presetDialect(wgpuLike, { subgroupEnable: "", matrix: WGPU_MATRIX });
-presetDialect(device, { subgroupEnable: "", matrix: WGPU_MATRIX });
+presetDialect(wgpuLike, { subgroupEnable: "", subgroupSize: () => "", matrix: WGPU_MATRIX });
+presetDialect(device, { subgroupEnable: "", subgroupSize: () => "", matrix: WGPU_MATRIX });
 emitMatrix("wgpu", wgpuLike);
 presetDialect(device, settled);
 

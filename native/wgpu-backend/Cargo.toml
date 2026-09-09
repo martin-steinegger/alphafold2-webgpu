@@ -1,0 +1,27 @@
+[package]
+name = "afwebgpu-wgpu"
+version = "0.1.0"
+edition = "2021"
+# wgpu 30 resolves a version-4 lock file, which cargo below 1.78 refuses to
+# parse. Naming the minimum turns that into a message saying which tool is old.
+rust-version = "1.78"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# The fork seam: AFWEBGPU_WGPU_PATH in build.sh points cargo at a checkout.
+# Not an exact pin, because cargo refuses to patch a dependency whose version
+# the patch does not satisfy, and a fork's tree is whatever version it says it
+# is. Cargo.lock holds the exact release used when no path is given.
+wgpu = { version = "30", default-features = false, features = ["wgsl", "vulkan", "metal", "dx12"] }
+pollster = "0.4"
+napi = { version = "2", default-features = false, features = ["napi4"] }
+napi-derive = "2"
+
+[build-dependencies]
+napi-build = "2"
+
+[profile.release]
+lto = true
+codegen-units = 1

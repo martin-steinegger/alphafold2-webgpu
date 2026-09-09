@@ -1,4 +1,7 @@
 import { create, globals } from "webgpu";
+import { dawnInstanceFlags } from "../src/runtime/dawn.js";
+import { requestAlphaFoldDevice } from "../src/runtime/device.js";
+import { requestWgpuAdapter } from "../src/runtime/wgpu/adapter.js";
 import { createDeterministicTriangleInput } from "../src/testing/deterministic-input.js";
 import { TriangleMultiplicationOutgoingGpu } from "../src/triangle/webgpu.js";
 import type { Precision } from "../src/triangle/types.js";
@@ -12,6 +15,10 @@ const lengths = option("lengths", "128,256,512").split(",").map(Number);
 const cZ = Number(option("cz", "128"));
 const cHidden = Number(option("hidden", "128"));
 const precision = option("precision", "f16") as Precision;
+// One run a length includes compiling that length's pipelines, which is tens
+// of milliseconds against a kernel of tens more. Best of several, after a
+// discarded first, times the kernel.
+const repeats = Number(option("repeats", "4"));
 if (!lengths.every((length) => Number.isSafeInteger(length) && length > 0)) {
   throw new Error("--lengths must be a comma-separated list of positive integers");
 }
@@ -19,23 +26,40 @@ if (precision !== "f16" && precision !== "f32") throw new Error("--precision mus
 
 Object.assign(globalThis, globals);
 const requestedAdapter = option("adapter", "");
-const gpu = create(requestedAdapter === "" ? [] : [`adapter=${requestedAdapter}`]);
-const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
+// dawnInstanceFlags, not a bare instance: without its toggles the adapter
+// reports no matrix units and every number here is off the wrong kernel.
+// AFWEBGPU_BACKEND=wgpu measures the same kernels through the wgpu addon.
+const gpu = process.env.AFWEBGPU_BACKEND === "wgpu" ? undefined
+  : create(dawnInstanceFlags({ unclamped: true,
+    ...(requestedAdapter === "" ? {} : { adapter: requestedAdapter }) }));
+const adapter = gpu === undefined
+  ? requestWgpuAdapter()
+  : await gpu.requestAdapter({ powerPreference: "high-performance" });
 if (adapter === null) throw new Error("no WebGPU adapter is available");
 const adapterName = adapter.info.description || adapter.info.device || adapter.info.vendor || "unknown";
 console.log(`adapter=${adapterName}`);
 if (precision === "f16" && !adapter.features.has("shader-f16")) {
   throw new Error("the selected adapter does not expose shader-f16; retry with --precision=f32");
 }
-const requiredFeatures: GPUFeatureName[] = precision === "f16" ? ["shader-f16"] : [];
-const device = await adapter.requestDevice({ requiredFeatures });
+// The whole adapter's feature set and workgroup limits, because the matrix
+// kernels are gated on both and this is measuring which kernel wins. The
+// buffer limit is asked for from the largest pair this run will build.
+const largest = Math.max(...lengths) ** 2 * cZ * 4;
+const device = await requestAlphaFoldDevice(adapter,
+  { maxBufferSize: largest, maxStorageBufferBindingSize: largest });
 const runner = new TriangleMultiplicationOutgoingGpu(device);
 
 console.log(`precision=${precision} c_z=${cZ} c_hidden=${cHidden}`);
-console.log("L\ttime_ms\tpeak_gpu_mib");
+console.log("L\tbest_ms\tpeak_gpu_mib");
 for (const length of lengths) {
   const input = createDeterministicTriangleInput({ length, cZ, cHidden }, 1000 + length);
-  const result = await runner.run(input, { precision });
-  console.log(`${length}\t${result.elapsedMilliseconds.toFixed(3)}\t${(result.memory.peakBytes / 2 ** 20).toFixed(2)}`);
+  let best = Number.POSITIVE_INFINITY;
+  let peakBytes = 0;
+  for (let round = 0; round <= repeats; round += 1) {
+    const result = await runner.run(input, { precision });
+    if (round > 0) best = Math.min(best, result.elapsedMilliseconds);
+    peakBytes = Math.max(peakBytes, result.memory.peakBytes);
+  }
+  console.log(`${length}\t${best.toFixed(3)}\t${(peakBytes / 2 ** 20).toFixed(2)}`);
 }
 device.destroy();

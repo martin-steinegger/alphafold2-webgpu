@@ -36,7 +36,7 @@
  * accurate, which is not a trade this model makes.
  */
 import { supportsSubgroupSize } from "./subgroups.js";
-import { dialect } from "./dialect.js";
+import { dialect, type Dialect } from "./dialect.js";
 
 /** Rows one workgroup covers where a subgroup can own one, and its width. */
 const SUBGROUP_ROWS = 8;
@@ -72,13 +72,13 @@ export interface RowNormalizeLayout {
 }
 
 /** One row a subgroup, eight subgroups a workgroup. */
-function subgroupRows(subgroupEnable: string): RowNormalizeLayout {
+function subgroupRows(spelling: Dialect): RowNormalizeLayout {
   return {
     rowsPerWorkgroup: SUBGROUP_ROWS,
-    enables: `${subgroupEnable}enable subgroup_size_control;\n`,
+    enables: spelling.subgroupEnable,
     declarations: "",
     attributes: `@compute @workgroup_size(${SUBGROUP_ROWS_WORKGROUP})`
-      + ` @subgroup_size(${SUBGROUP_LANES})`,
+      + spelling.subgroupSize(SUBGROUP_LANES),
     builtins: ", @builtin(subgroup_invocation_id) norm_lane: u32",
     open: (rows: string): string => `
   let norm_index = (group.x + group.y * GRID_WIDTH) * ${SUBGROUP_ROWS}u
@@ -159,9 +159,9 @@ function treeWorkgroup(): RowNormalizeLayout {
  */
 export function rowNormalizeLayout(device: GPUDevice | undefined): RowNormalizeLayout {
   if (device?.features?.has("subgroups" as GPUFeatureName) !== true) return treeWorkgroup();
-  const { subgroupEnable } = dialect(device);
+  const spelling = dialect(device);
   return supportsSubgroupSize(device, SUBGROUP_LANES)
-    ? subgroupRows(subgroupEnable) : subgroupWorkgroup(subgroupEnable);
+    ? subgroupRows(spelling) : subgroupWorkgroup(spelling.subgroupEnable);
 }
 
 /** Rows one workgroup of this layout covers, for sizing a dispatch grid. */

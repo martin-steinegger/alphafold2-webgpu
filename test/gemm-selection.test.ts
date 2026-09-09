@@ -7,7 +7,7 @@ import {
   createTiledGemmShader, GEMM_VARIANT_F32, gemmGrid, gemmVariant, setGemmVariant,
   type GemmVariant,
 } from "../src/runtime/gemm.js";
-import { DAWN_MATRIX } from "../src/runtime/dialect.js";
+import { DAWN_MATRIX, presetDialect } from "../src/runtime/dialect.js";
 
 function fakeDevice(
   halfPrecision: boolean, matrixUnits = false,
@@ -15,12 +15,18 @@ function fakeDevice(
 ): GPUDevice {
   const features = new Set<GPUFeatureName>();
   if (halfPrecision) features.add("shader-f16" as GPUFeatureName);
-  if (matrixUnits) features.add("chromium-experimental-subgroup-matrix" as GPUFeatureName);
-  return {
+  const device = {
     features,
     limits: { maxComputeWorkgroupStorageSize },
     createBuffer: () => { throw new Error("this test must not allocate"); },
   } as unknown as GPUDevice;
+  // Whether the units are reachable is what calibration settles, not a feature
+  // name: each implementation spells that feature differently.
+  presetDialect(device, {
+    subgroupEnable: "", subgroupSize: () => "",
+    matrix: matrixUnits ? DAWN_MATRIX : undefined,
+  });
+  return device;
 }
 
 const spec = {

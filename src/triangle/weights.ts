@@ -1,7 +1,7 @@
 import { float32ToFloat16Array } from "../runtime/float16.js";
 import type { Precision, TriangleMultiplicationWeights, TriangleShape } from "./types.js";
 
-const ORDER = [
+export const ORDER = [
   "layerNormInWeight", "layerNormInBias",
   "linearAPWeight", "linearAPBias", "linearAGWeight", "linearAGBias",
   "linearBPWeight", "linearBPBias", "linearBGWeight", "linearBGBias",

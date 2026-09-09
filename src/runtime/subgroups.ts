@@ -26,8 +26,11 @@ export function recordSubgroupRange(device: GPUDevice, adapter: GPUAdapter): voi
 export function subgroupRange(device: GPUDevice): readonly [number, number] | undefined {
   const recorded = subgroupRanges.get(device);
   if (recorded !== undefined) return recorded;
-  const limits = device.limits as SubgroupDeviceLimits;
-  if (limits.minSubgroupSize === undefined || limits.maxSubgroupSize === undefined) return undefined;
+  // A stub standing in for a device in a test carries no limits at all.
+  const limits = device.limits as SubgroupDeviceLimits | undefined;
+  if (limits?.minSubgroupSize === undefined || limits.maxSubgroupSize === undefined) {
+    return undefined;
+  }
   return [limits.minSubgroupSize, limits.maxSubgroupSize];
 }
 
@@ -41,12 +44,20 @@ export function subgroupRange(device: GPUDevice): readonly [number, number] | un
  * the feature while advertising a range that does not contain thirty-two —
  * SwiftShader fixes it at [4, 4] — in which case the kernels are simply not
  * for that device.
+ *
+ * A device whose advertised range is the single value asked for needs no
+ * attribute and so no feature: there is no other width for the driver to
+ * choose. That is the wgpu case, which implements the subgroup builtins and
+ * has no counterpart to subgroup-size-control, and it is why the width is read
+ * before the feature rather than after it.
  */
 export function supportsSubgroupSize(device: GPUDevice, size: number): boolean {
-  if (!device.features.has("subgroups" as GPUFeatureName)
-    || !device.features.has("subgroup-size-control" as GPUFeatureName)) return false;
+  if (!device.features.has("subgroups" as GPUFeatureName)) return false;
   const range = subgroupRange(device);
-  return range !== undefined && range[0] <= size && size <= range[1];
+  if (range === undefined) return false;
+  if (range[0] === size && range[1] === size) return true;
+  return device.features.has("subgroup-size-control" as GPUFeatureName)
+    && range[0] <= size && size <= range[1];
 }
 
 /** One entry of the adapter's subgroupMatrixConfigs, which the device omits. */

@@ -17,13 +17,28 @@ function stubDevice(accepts: (code: string) => boolean, features: string[]): GPU
 const dawnLike = (code: string): boolean => !code.includes("wgpu_cooperative_matrix");
 const wgpuLike = (code: string): boolean =>
   !code.includes("enable subgroups;") && !code.includes("chromium_experimental");
+// naga with the subgroups directive patched in: it takes that one, and still
+// has no counterpart to subgroup-size-control or to the width attribute.
+const patchedNagaLike = (code: string): boolean =>
+  !code.includes("subgroup_size_control") && !code.includes("@subgroup_size")
+  && !code.includes("chromium_experimental");
 
 describe("the shader dialect", () => {
-  it("takes the subgroup directive Dawn wants and leaves it off for naga", async () => {
-    expect((await calibrateDialect(stubDevice(dawnLike, ["subgroups"]))).subgroupEnable)
-      .toBe("enable subgroups;\n");
-    expect((await calibrateDialect(stubDevice(wgpuLike, ["subgroups"]))).subgroupEnable).toBe("");
+  it("takes the subgroup directives Dawn wants and leaves them off for naga", async () => {
+    const dawn = await calibrateDialect(stubDevice(dawnLike, ["subgroups"]));
+    expect(dawn.subgroupEnable).toBe("enable subgroups;\nenable subgroup_size_control;\n");
+    expect(dawn.subgroupSize(32)).toBe(" @subgroup_size(32)");
+    const wgpu = await calibrateDialect(stubDevice(wgpuLike, ["subgroups"]));
+    expect(wgpu.subgroupEnable).toBe("");
+    expect(wgpu.subgroupSize(32)).toBe("");
   });
+
+  it("takes the directive without the width attribute where only that is implemented",
+    async () => {
+      const patched = await calibrateDialect(stubDevice(patchedNagaLike, ["subgroups"]));
+      expect(patched.subgroupEnable).toBe("enable subgroups;\n");
+      expect(patched.subgroupSize(32)).toBe("");
+    });
 
   it("asks for no directive on a device without subgroups", async () => {
     expect((await calibrateDialect(stubDevice(dawnLike, []))).subgroupEnable).toBe("");
@@ -42,13 +57,16 @@ describe("the shader dialect", () => {
     await calibrateDialect(withMatrix);
     await calibrateDialect(without);
     expect(dialect(withMatrix).matrix).toBe(DAWN_MATRIX);
-    expect(dialect(withMatrix).subgroupEnable).toBe("enable subgroups;\n");
+    expect(dialect(withMatrix).subgroupEnable)
+      .toBe("enable subgroups;\nenable subgroup_size_control;\n");
     expect(dialect(without).matrix).toBeUndefined();
     expect(dialect(without).subgroupEnable).toBe("");
   });
 
   it("gives the directive-free form for a device it never saw", () => {
-    expect(dialect(undefined)).toEqual({ subgroupEnable: "", matrix: undefined });
+    expect(dialect(undefined).subgroupEnable).toBe("");
+    expect(dialect(undefined).subgroupSize(32)).toBe("");
+    expect(dialect(undefined).matrix).toBeUndefined();
   });
 
   it("refuses the matrix half where there is none", async () => {
@@ -59,7 +77,7 @@ describe("the shader dialect", () => {
 
   it("takes a forced dialect, for a test that wants one deliberately", () => {
     const device = stubDevice(dawnLike, []);
-    presetDialect(device, { subgroupEnable: "", matrix: WGPU_MATRIX });
+    presetDialect(device, { subgroupEnable: "", subgroupSize: () => "", matrix: WGPU_MATRIX });
     expect(matrixSpelling(device)).toBe(WGPU_MATRIX);
   });
 

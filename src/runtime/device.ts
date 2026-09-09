@@ -372,8 +372,12 @@ export async function requestAlphaFoldDevice(
   // below and keeps f32 unless one of them wins. The matrix extension is
   // experimental and Chromium-only, which is exactly why it is asked for
   // rather than depended on.
+  // Both names for the matrix units, because each implementation has its own
+  // and the list is filtered by what this adapter reports. Asking for a name
+  // the adapter does not use costs nothing; not asking for the one it does
+  // costs the units, and with them every kernel gated on the dialect probe.
   const optional = ["subgroups", "subgroup-size-control", "timestamp-query", "shader-f16",
-    "chromium-experimental-subgroup-matrix"] as const;
+    "chromium-experimental-subgroup-matrix", "wgpu-cooperative-matrix"] as const;
   const requiredFeatures = optional.filter(
     (feature) => adapter.features.has(feature as GPUFeatureName),
   ) as GPUFeatureName[];

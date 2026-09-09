@@ -19,6 +19,7 @@ import { predictionToPdb } from "../web/prediction-results.js";
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
 import { planMonomerDevice, requestAlphaFoldDevice } from "../src/runtime/device.js";
+import { requestWgpuAdapter } from "../src/runtime/wgpu/adapter.js";
 Object.assign(globalThis, globals);
 const file = process.argv[2];
 if (file === undefined) throw new Error("usage: predict-a3m.ts <file.a3m> [msaRows] [extraRows] [recycles]");
@@ -64,12 +65,17 @@ if (templatePath !== undefined && templatePath !== "") {
 // selection when it makes one. Honours CUDA_VISIBLE_DEVICES; see selectGpu.
 const selectedGpu = selectGpu();
 if (selectedGpu !== undefined) console.error(`pinned to ${selectedGpu}`);
-const gpu = create(dawnInstanceFlags({
-  // Native, so the bounds clamp goes: the kernels do not rely on it, and it is
-  // worth 11% of a recycle. See dawnInstanceFlags.
-  unclamped: true,
-}));
-const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
+// AFWEBGPU_BACKEND=wgpu folds over the wgpu addon instead of Dawn. Both are
+// asked for without the bounds clamp: the kernels do not rely on it, and it is
+// worth 11% of a recycle. See dawnInstanceFlags.
+// The instance is held, not left as a temporary: dawn.node pumps its event
+// loop from this object, and one that becomes collectable takes the device
+// with it part way through the fold.
+const gpu = process.env.AFWEBGPU_BACKEND === "wgpu"
+  ? undefined : create(dawnInstanceFlags({ unclamped: true }));
+const adapter = gpu === undefined
+  ? requestWgpuAdapter()
+  : await gpu.requestAdapter({ powerPreference: "high-performance" });
 if (adapter === null) throw new Error("no WebGPU adapter");
 const clustered = Math.min(msaRows, depth);
 const extra = Math.max(1, Math.min(extraRows, Math.max(0, depth - clustered)));

@@ -19,3 +19,5 @@ tools/*.tmp.ts
 
 # Downloaded model bundles, which are release assets rather than sources.
 .models/
+afwebgpu-wgpu.node
+native/wgpu-backend/target/

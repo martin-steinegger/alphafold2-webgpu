@@ -54,11 +54,35 @@ export interface MatrixSpelling {
 }
 
 export interface Dialect {
-  /** "enable subgroups;", or empty where the builtins need no directive. */
+  /** Every subgroup directive, or empty where the builtins need none. */
   readonly subgroupEnable: string;
+  /**
+   * The entry point's width attribute, or empty where there is none.
+   *
+   * A kernel written for a fixed width states it here where it can. Where it
+   * cannot, the selection gates have already refused the kernel unless the
+   * device advertises that width and no other. See supportsSubgroupSize.
+   */
+  subgroupSize(lanes: number): string;
   /** Undefined on a device reporting no matrix units. */
   readonly matrix: MatrixSpelling | undefined;
 }
+
+/**
+ * The subgroup halves an implementation may accept, widest first.
+ *
+ * Dawn takes both directives and holds the driver to the width; naga
+ * implements the builtins, has no counterpart to subgroup-size-control, and
+ * once patched takes the plain directive.
+ */
+const SUBGROUP_HALVES: readonly Omit<Dialect, "matrix">[] = [
+  {
+    subgroupEnable: "enable subgroups;\nenable subgroup_size_control;\n",
+    subgroupSize: (lanes) => ` @subgroup_size(${lanes})`,
+  },
+  { subgroupEnable: "enable subgroups;\n", subgroupSize: () => "" },
+  { subgroupEnable: "", subgroupSize: () => "" },
+];
 
 export const DAWN_MATRIX: MatrixSpelling = {
   prelude: "enable chromium_experimental_subgroup_matrix;\n"
@@ -115,7 +139,9 @@ function coopMat(type: string, columns: number, rows: number, role: string): str
   return `coop_mat${columns}x${rows}<${type}, ${role}>`;
 }
 
-const DIRECTIVE_FREE: Dialect = { subgroupEnable: "", matrix: undefined };
+const DIRECTIVE_FREE: Dialect = {
+  subgroupEnable: "", subgroupSize: () => "", matrix: undefined,
+};
 const settled = new WeakMap<GPUDevice, Dialect>();
 
 /**
@@ -126,10 +152,14 @@ const settled = new WeakMap<GPUDevice, Dialect>();
  * undefined matrix half.
  */
 export async function calibrateDialect(device: GPUDevice): Promise<Dialect> {
-  const subgroupEnable = device.features.has("subgroups")
-    ? await firstAccepted(device, ["enable subgroups;\n", ""]) : "";
+  const subgroups = device.features.has("subgroups")
+    ? await firstAccepted(device) : DIRECTIVE_FREE;
   const matrix = await settleMatrix(device);
-  const answer: Dialect = { subgroupEnable, matrix };
+  const answer: Dialect = {
+    subgroupEnable: subgroups.subgroupEnable,
+    subgroupSize: subgroups.subgroupSize,
+    matrix,
+  };
   settled.set(device, answer);
   if (matrix !== undefined) lastMatrix = matrix;
   return answer;
@@ -189,15 +219,18 @@ async function settleMatrix(device: GPUDevice): Promise<MatrixSpelling | undefin
   return undefined;
 }
 
-async function firstAccepted(device: GPUDevice, candidates: readonly string[]): Promise<string> {
-  for (const directive of candidates) {
-    // A builtin as well as the directive, since an implementation that ignores
-    // an unknown directive would otherwise accept every candidate.
-    const source = `${directive}@compute @workgroup_size(64)\n`
+async function firstAccepted(device: GPUDevice): Promise<Omit<Dialect, "matrix">> {
+  for (const half of SUBGROUP_HALVES) {
+    // The builtin and the attribute as well as the directives, since an
+    // implementation that ignores an unknown directive would otherwise accept
+    // every candidate, and one that takes the directive may still reject the
+    // attribute.
+    const source = `${half.subgroupEnable}@compute @workgroup_size(32)`
+      + `${half.subgroupSize(32)}\n`
       + "fn main(@builtin(subgroup_size) width: u32) { _ = width; }\n";
-    if (await compiles(device, source)) return directive;
+    if (await compiles(device, source)) return half;
   }
-  return "";
+  return DIRECTIVE_FREE;
 }
 
 async function compiles(device: GPUDevice, code: string): Promise<boolean> {
