@@ -1,4 +1,6 @@
-import { assignNearestCentres } from "./msa-clustering-webgpu.js";
+import {
+  assignNearestCentres, nearestCentreSets, tieSetWords,
+} from "./msa-clustering-webgpu.js";
 import { CLUSTERED_MSA_CHANNELS, MSA_CODE_NONE } from "./msa-features.js";
 import { parseA3m } from "./a3m.js";
 import {
@@ -38,6 +40,12 @@ export function recycleFeatureSource<T>(
   return { length, [Symbol.asyncIterator]: iterator };
 }
 
+function bitCount(word: number): number {
+  let bits = word - ((word >>> 1) & 0x55555555);
+  bits = (bits & 0x33333333) + ((bits >>> 2) & 0x33333333);
+  return Math.imul((bits + (bits >>> 4)) & 0x0f0f0f0f, 0x01010101) >>> 24;
+}
+
 function generator(seed: number): () => number {
   let state = seed >>> 0;
   return () => { state = (state + 0x6d2b79f5) >>> 0; let value = state;
@@ -60,6 +68,7 @@ function gumbel(key: JaxKey, indices: readonly number[]): number {
 }
 
 function makeColabFoldMultimerFeatures(
+  device: GPUDevice,
   alignment: ReturnType<typeof parseA3m>,
   encodedInput: Uint8Array,
   tables: QueryOnlyFeatureTables,
@@ -103,14 +112,16 @@ function makeColabFoldMultimerFeatures(
     let rootKey: JaxKey = [0, (options.randomSeed ?? 0) >>> 0];
     for (let recycle = 0; recycle <= recycles; recycle += 1) {
     const keys = multimerMsaKeys(rootKey); rootKey = keys.nextRoot;
+    // The noise is a per-row constant, so drawing it once a row rather than
+    // once a comparison is the same order for a twentieth of the draws.
+    const noise = Float64Array.from({ length: depth },
+      (_, row) => jaxPaddingConsistentUniform(keys.sample, [row]));
     const order = Array.from({ length: depth }, (_, row) => row);
     order.sort((left, right) => {
       const leftBias = left === 0 ? 1 : 0; const rightBias = right === 0 ? 1 : 0;
       if (leftBias !== rightBias) return rightBias - leftBias;
       if (rowMask[left] !== rowMask[right]) return rowMask[right]! - rowMask[left]!;
-      const leftNoise = jaxPaddingConsistentUniform(keys.sample, [left]);
-      const rightNoise = jaxPaddingConsistentUniform(keys.sample, [right]);
-      return rightNoise - leftNoise;
+      return noise[right]! - noise[left]!;
     });
     const centers = order.slice(0, Math.min(maxMsa, depth));
     const extras = order.slice(centers.length);
@@ -150,28 +161,42 @@ function makeColabFoldMultimerFeatures(
       }
       deletionSums[slot] = deletionMatrix[centers[center]! * length + residue]!;
     }
-    for (const extraRow of extras) {
-      if (rowMask[extraRow] === 0) continue;
-      let bestAgreement = -1; const nearest: number[] = [];
-      for (let center = 0; center < centers.length; center += 1) {
-        if (rowMask[centers[center]!] === 0) continue;
-        let agreement = 0;
-        for (let residue = 0; residue < length; residue += 1) {
-          const code = centerCodes[center * length + residue]!;
-          if (code <= 20 && code === encoded[extraRow * length + residue]!) agreement += 1;
-        }
-        if (agreement > bestAgreement) { bestAgreement = agreement; nearest.length = 0; nearest.push(center); }
-        else if (agreement === bestAgreement) nearest.push(center);
+    // A masked row takes no part in the search, so the padding a block adds is
+    // never gathered and never costs the kernel anything.
+    const active = extras.filter((row) => rowMask[row] !== 0);
+    const extraCodes = new Uint8Array(active.length * length);
+    for (let index = 0; index < active.length; index += 1) {
+      extraCodes.set(
+        encoded.subarray(active[index]! * length, (active[index]! + 1) * length), index * length);
+    }
+    const words = tieSetWords(centers.length);
+    const sets = await nearestCentreSets(
+      device, centerCodes, centers.length, extraCodes, active.length, length,
+      Uint8Array.from(centers, (row) => rowMask[row]!));
+    for (let index = 0; index < active.length; index += 1) {
+      const extraRow = active[index]!;
+      // Multimer keeps every centre tied at the best agreement and splits the
+      // row's weight between them, so the whole set is read, not one winner.
+      let tied = 0;
+      for (let word = 0; word < words; word += 1) {
+        tied += bitCount(sets[index * words + word]!);
       }
-      if (nearest.length === 0) continue;
-      const assignment = length / nearest.length;
-      for (const center of nearest) for (let residue = 0; residue < length; residue += 1) {
-        const slot = center * length + residue;
-        counts[slot] = counts[slot]! + assignment;
-        const profileSlot = slot * CLUSTERED_MSA_CHANNELS + 3 + encoded[extraRow * length + residue]!;
-        msaFeatures[profileSlot] = msaFeatures[profileSlot]! + assignment;
-        deletionSums[slot] = deletionSums[slot]!
-          + assignment * deletionMatrix[extraRow * length + residue]!;
+      if (tied === 0) continue;
+      const assignment = length / tied;
+      for (let word = 0; word < words; word += 1) {
+        let bits = sets[index * words + word]!;
+        while (bits !== 0) {
+          const center = word * 32 + 31 - Math.clz32(bits & -bits);
+          bits &= bits - 1;
+          for (let residue = 0; residue < length; residue += 1) {
+            const slot = center * length + residue;
+            counts[slot] = counts[slot]! + assignment;
+            const profileSlot = slot * CLUSTERED_MSA_CHANNELS + 3 + encoded[extraRow * length + residue]!;
+            msaFeatures[profileSlot] = msaFeatures[profileSlot]! + assignment;
+            deletionSums[slot] = deletionSums[slot]!
+              + assignment * deletionMatrix[extraRow * length + residue]!;
+          }
+        }
       }
     }
 
@@ -237,7 +262,7 @@ export function iterateA3mFeatures(
     encoded[row * length + residue] = symbol === "-" ? 21 : (INDEX.get(symbol) ?? 20);
   }
   if (options.colabFoldMultimerProcess === true) {
-    return makeColabFoldMultimerFeatures(alignment, encoded, tables, options);
+    return makeColabFoldMultimerFeatures(device, alignment, encoded, tables, options);
   }
   const base = makeQueryOnlyFeatures(alignment.query, tables, { recycles: 0, maskedMsaCodes: [
     Float32Array.from(encoded.subarray(0, length)),
