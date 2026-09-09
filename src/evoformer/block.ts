@@ -58,6 +58,7 @@ import {
 } from "../runtime/storage.js";
 import type { TriangleMultiplicationWeights } from "../triangle/types.js";
 import { packWeights as packTriangleWeights } from "../triangle/weights.js";
+import { triangleOverrides } from "../triangle/shaders.js";
 import type { AllocationSnapshot } from "../runtime/allocator.js";
 import { scratchBudget } from "../runtime/scratch-budget.js";
 
@@ -1201,13 +1202,20 @@ function triangleSetup(
     + `:${wholeShards.count}`;
   // The offsets belong to the packing, so they join the key: a bundle packed
   // differently must not be handed another one's sources.
-  const shaderKey = `${pipelineKey}:${residual}:${JSON.stringify(packed.offsets)}`;
+  // Length and blockRows are overrides now, so they name a pipeline but not a
+  // source; the shader key keeps only what the source really varies with.
+  const shaderKey = `${direction}:${input.cZ}:${input.triangleHidden}:${wholeStorage}`
+    + `:${pairStorage}:${pairShards.count}:${wholeShards.count}:${residual}`
+    + `:${JSON.stringify(packed.offsets)}`;
   let shaders = TRIANGLE_SHADERS.get(shaderKey);
   if (shaders === undefined) {
     shaders = createTriangleShaders(shape, "f32", packed.offsets, 1e-5, direction, blockRows,
       wholeStorage, pairStorage, residual, pairShards, wholeShards);
     TRIANGLE_SHADERS.set(shaderKey, shaders);
   }
+  // The sources no longer carry the length, so the shader cache key must not
+  // either, or every length would still build its own copy of them.
+  const overrides = triangleOverrides(shape, blockRows);
   const requests: readonly (readonly [string, string])[] = [
     [`${pipelineKey}:input-statistics`, shaders.inputStatistics],
     [`${pipelineKey}:project-gate`, shaders.projectGate],
@@ -1219,7 +1227,7 @@ function triangleSetup(
   ];
   return {
     packed, blockRows, wholeStorage, pairStorage, pairShards, wholeShards,
-    wholeStride, requests,
+    wholeStride, requests, overrides,
   };
 }
 
@@ -1235,11 +1243,12 @@ async function encodeTriangleMultiplication(
 ): Promise<GpuTensor> {
   const {
     packed, blockRows, wholeStorage, pairStorage, pairShards, wholeShards, wholeStride, requests,
+    overrides,
   } = triangleSetup(execution, input, weightsValue, direction, residualTarget !== undefined);
   // Indexed rather than destructured: `requests` is the one place the order is
   // written down, and a tuple type restated here would be a second one.
   const built = await Promise.all(
-    requests.map(([key, code]) => execution.pipelines.get(key, code)));
+    requests.map(([key, code]) => execution.pipelines.get(key, code, "main", overrides)));
   const inputStatistics = built[0]!;
   const projectGate = built[1]!;
   const projectBlockOperand = built[2]!;

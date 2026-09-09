@@ -78,24 +78,40 @@ const read = (precision: Precision, expression: string): string =>
  * @param blockRows Rows of the blocked residue axis one step covers. PAIRS
  * stays the whole pair count; BLOCK_PAIRS is one step's worth.
  */
+/**
+ * The length-dependent constants, supplied when a pipeline is created.
+ *
+ * They are overrides rather than literals so that one shader module serves
+ * every sequence length: without this each length compiled its own copy of all
+ * seven triangle kernels, 14 modules at about 16 ms each. They still fold --
+ * `L` is the k bound of the contraction's loop and a runtime bound there
+ * measured 4.7x, while an override measured 0.129 ms against a literal's 0.129
+ * on that kernel.
+ */
+export function triangleOverrides(
+  shape: TriangleShape, blockRows = shape.length,
+): Record<string, number> {
+  const pairs = shape.length * shape.length;
+  return { L: shape.length, WHOLE_STRIDE: pairs + (pairs % 2), BLOCK_ROWS: blockRows };
+}
+
 function prelude(
   shape: TriangleShape, precision: Precision, offsets: WeightOffsets, epsilon: number,
-  blockRows = shape.length,
 ): string {
   const offsetConstants = Object.entries(offsets)
     .map(([name, offset]) => `const W_${name.toUpperCase()}: u32 = ${offset}u;`)
     .join("\n");
-  const pairs = shape.length * shape.length;
   return `${declaration(precision)}
-const L: u32 = ${shape.length}u;
+// Length-dependent, and supplied at pipeline creation. See triangleOverrides.
+override L: u32 = 1u;
 const CZ: u32 = ${shape.cZ}u;
 const CH: u32 = ${shape.cHidden}u;
-const PAIRS: u32 = L * L;
+override PAIRS: u32 = L * L;
 // Channel stride of the whole projection, padded so a packed pair of values
 // never spans two channels.
-const WHOLE_STRIDE: u32 = ${pairs + (pairs % 2)}u;
-const BLOCK_ROWS: u32 = ${blockRows}u;
-const BLOCK_PAIRS: u32 = BLOCK_ROWS * L;
+override WHOLE_STRIDE: u32 = 1u;
+override BLOCK_ROWS: u32 = 1u;
+override BLOCK_PAIRS: u32 = BLOCK_ROWS * L;
 const LINEAR_GRID_WIDTH: u32 = 32768u;
 const EPSILON: f32 = ${epsilon.toPrecision(9)};
 ${offsetConstants}
@@ -127,7 +143,7 @@ export function createTriangleShaders(
   if (pairStorage === "f16" && precision !== "f32") {
     throw new RangeError("a packed pair needs f32 weight precision: both would claim the same halves of a word");
   }
-  const common = prelude(shape, precision, offsets, epsilon, blockRows);
+  const common = prelude(shape, precision, offsets, epsilon);
   const t = scalar(precision);
   // The pair may be stored packed, whatever precision the weights are in, and
   // it may be too large for one binding, in which case it arrives as several.

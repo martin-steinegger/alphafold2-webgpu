@@ -1,5 +1,7 @@
 export class ComputePipelineCache {
   readonly device: GPUDevice;
+  /** Modules by source, so an override-only difference costs no compile. */
+  readonly #modules = new Map<string, GPUShaderModule>();
   readonly #pipelines = new Map<string, {
     readonly code: string;
     readonly entryPoint: string;
@@ -26,7 +28,15 @@ export class ComputePipelineCache {
    * check for the saving, so give a key that names everything the source
    * depends on.
    */
-  get(key: string, code: string | (() => string), entryPoint = "main"): Promise<GPUComputePipeline> {
+  /**
+   * `constants` are WGSL `override` values. A module is cached by its source,
+   * so kernels differing only in an override share one and each length costs a
+   * pipeline rather than a compile.
+   */
+  get(
+    key: string, code: string | (() => string), entryPoint = "main",
+    constants?: Record<string, number>,
+  ): Promise<GPUComputePipeline> {
     const cached = this.#pipelines.get(key);
     if (cached !== undefined) {
       if (typeof code === "string"
@@ -36,14 +46,16 @@ export class ComputePipelineCache {
       return cached.pipeline;
     }
     const source = typeof code === "string" ? code : code();
+    let module = this.#modules.get(source);
+    if (module === undefined) {
+      module = this.device.createShaderModule({ label: `${key}.wgsl`, code: source });
+      this.#modules.set(source, module);
+    }
     const pipeline = this.device.createComputePipelineAsync({
-        label: key,
-        layout: "auto",
-        compute: {
-          module: this.device.createShaderModule({ label: `${key}.wgsl`, code: source }),
-          entryPoint,
-        },
-      });
+      label: key,
+      layout: "auto",
+      compute: { module, entryPoint, ...(constants === undefined ? {} : { constants }) },
+    });
     this.#pipelines.set(key, { code: source, entryPoint, pipeline });
     return pipeline;
   }
