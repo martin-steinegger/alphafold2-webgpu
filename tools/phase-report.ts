@@ -85,7 +85,7 @@ let prediction!: Awaited<ReturnType<typeof monomer.predict>>;
 for (let fold = 0; fold < repeats; fold += 1) {
   const start = performance.now();
   prediction = await monomer.predict(
-    iterateA3mFeatures(device, a3m, featureTables, {
+    iterateA3mFeatures(device, alignment, featureTables, {
       recycles: recycles - 1, maxMsaSequences: msaRows, maxExtraSequences: extraRows, randomSeed: 0,
     }),
     { embedding, template, extraStack, mainStack, structure,

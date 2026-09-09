@@ -3,7 +3,7 @@ import {
 } from "./msa-clustering-webgpu.js";
 import { CLUSTERED_MSA_CHANNELS, MSA_CODE_NONE } from "./msa-features.js";
 import { endPhase, markPhase, timedSync } from "../runtime/phase-ledger.js";
-import { parseA3m } from "./a3m.js";
+import { parseA3m, type A3mAlignment } from "./a3m.js";
 import {
   jaxPaddingConsistentUniform, multimerMsaKeys, type JaxKey,
 } from "./jax-prng.js";
@@ -252,7 +252,7 @@ function makeColabFoldMultimerFeatures(
 
 /** Lazily preprocess A3M text, retaining at most one recycle's large feature tensors. */
 export function iterateA3mFeatures(
-  device: GPUDevice, a3mText: string, tables: QueryOnlyFeatureTables,
+  device: GPUDevice, a3mText: string | A3mAlignment, tables: QueryOnlyFeatureTables,
   options: A3mFeatureOptions = {},
 ): RecycleFeatureSource<MonomerRecycleFeatures> {
   // Parsing and encoding the alignment happens once, before any recycle, so it
@@ -262,10 +262,13 @@ export function iterateA3mFeatures(
 }
 
 function buildA3mFeatureSource(
-  device: GPUDevice, a3mText: string, tables: QueryOnlyFeatureTables,
+  device: GPUDevice, a3mText: string | A3mAlignment, tables: QueryOnlyFeatureTables,
   options: A3mFeatureOptions,
 ): RecycleFeatureSource<MonomerRecycleFeatures> {
-  const alignment = parseA3m(a3mText);
+  // A caller that already parsed the alignment to size the device passes it
+  // back rather than paying for a second parse, which on an 8.77 MB alignment
+  // is 0.72 s of a 17.6 s fold.
+  const alignment = typeof a3mText === "string" ? parseA3m(a3mText) : a3mText;
   const length = alignment.length; const depth = alignment.depth;
   // No mask means every position is maskable. Materialising that as ones would
   // cost depth by length floats, 31 MiB for an 8,000-row alignment of 1,000
