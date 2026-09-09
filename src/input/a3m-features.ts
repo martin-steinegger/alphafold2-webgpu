@@ -2,6 +2,7 @@ import {
   assignNearestCentres, nearestCentreSets, tieSetWords,
 } from "./msa-clustering-webgpu.js";
 import { CLUSTERED_MSA_CHANNELS, MSA_CODE_NONE } from "./msa-features.js";
+import { maskCentreCodes } from "./msa-masking-webgpu.js";
 import { clusterProfile } from "./msa-profile-webgpu.js";
 import { endPhase, markPhase, timedSync } from "../runtime/phase-ledger.js";
 import { parseA3m, type A3mAlignment } from "./a3m.js";
@@ -134,24 +135,15 @@ function makeColabFoldMultimerFeatures(
     }
 
     markPhase("featurise: mask");
-    // JAX draws each element independently using nested fold_in keys, so skipped
-    // unmasked positions do not alter any other random value.
-    for (let center = 0; center < centers.length; center += 1) for (let residue = 0; residue < length; residue += 1) {
-      if (rowMask[centers[center]!] === 0
-        || jaxPaddingConsistentUniform(keys.maskPosition, [center, residue]) >= 0.15) continue;
-      const original = centerCodes[center * length + residue]!;
-      let bestCode = 0; let bestScore = Number.NEGATIVE_INFINITY;
-      for (let code = 0; code < 23; code += 1) {
-        const uniformProbability = code < 20 ? 0.005 : 0;
-        const profileProbability = code < 22 ? 0.1 * msaProfile[residue * 22 + code]! : 0;
-        const sameProbability = code === original ? 0.1 : 0;
-        const maskProbability = code === 22 ? 0.7 : 0;
-        const score = Math.log(uniformProbability + profileProbability + sameProbability + maskProbability + 1e-6)
-          + gumbel(keys.maskGumbel, [center, residue, code]);
-        if (score > bestScore) { bestScore = score; bestCode = code; }
-      }
-      centerCodes[center * length + residue] = bestCode;
-    }
+    // Each position's key is folded from its own coordinates, so every one of
+    // them is independent and the whole draw is a kernel.
+    const maskedCodes = await maskCentreCodes(device, {
+      codes: centerCodes, centres: centers.length, length,
+      profile: msaProfile,
+      rowValid: Uint8Array.from(centers, (row) => rowMask[row]!),
+      positionKey: keys.maskPosition, gumbelKey: keys.maskGumbel,
+    });
+    centerCodes.set(maskedCodes);
 
     markPhase("featurise: centre rows");
     // The profile accumulates straight into the feature array's profile
