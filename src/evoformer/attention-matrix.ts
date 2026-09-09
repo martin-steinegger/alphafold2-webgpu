@@ -43,7 +43,22 @@ import { attentionMatrixConfig, type MatrixUnitShape } from "../runtime/gemm.js"
 export const ATTENTION_MATRIX_SUBGROUP_SIZE = 32;
 const MATRIX_LANES = ATTENTION_MATRIX_SUBGROUP_SIZE;
 
-const SUBGROUPS = 2;
+/**
+ * Subgroups a workgroup, which is also how many queries share one staged key
+ * tile.
+ *
+ * Four rather than two, swept whole-fold on an RTX PRO 6000 with the card
+ * pinned and the arms alternated, because this machine drifts by more between
+ * repeats than the difference being measured. Milliseconds a recycle at 825
+ * residues over three pairs: 4313/4414/4611 at two subgroups against
+ * 4229/4247/4460 at four, so four wins every pair by about 3%. At 512 it is
+ * 1847 against 1745 and at 256 it is 1041 against 1047, a wash. pLDDT is
+ * 86.76, 86.93 and 84.25 at those three lengths whichever is used.
+ *
+ * The key tile stays 32: 64 measured 1.067 ms against 0.954 for the isolated
+ * attention at two subgroups and 1.056 against 0.936 at four.
+ */
+const SUBGROUPS = 4;
 /** The M of every tile, fixed by the unit shape the device reports. */
 const UNIT = 16;
 /** Queries one workgroup owns. */
@@ -180,16 +195,28 @@ export function createAttentionMatrixFlashShader(
     Array.from({ length: count }, (_, index) => body(index)).join(String.fromCharCode(10));
   // Each lane carries a fixed share of the staged key and value tiles between
   // passes, so the fetch for the next one overlaps this one's multiplies.
-  if ((KEY_TILE * (headDim / 4)) % LANES !== 0) {
-    throw new RangeError("the staged key tile must divide evenly among the lanes");
-  }
-  const keyPerLane = (KEY_TILE * (headDim / 4)) / LANES;
+  //
+  // The share rounds up rather than having to divide: a narrow head makes the
+  // tile smaller than the workgroup, and refusing that geometry cost the
+  // kernel every four-subgroup arrangement at a head of eight, where a 32-key
+  // tile is 64 vector items against 128 lanes. The lanes past the end sit the
+  // fetch and the staging out; their prefetch registers keep the zero they
+  // were declared with, which is what an absent key contributes anyway.
+  const keyItems = KEY_TILE * (headDim / 4);
+  const keyPerLane = Math.ceil(keyItems / LANES);
+  // The guard is emitted only where it is needed, so a geometry whose tile
+  // does fill the lanes generates exactly the shader it did before.
+  const keyBound = (body: string): string => (keyItems % LANES === 0
+    ? body.replace(/^\n/, "")
+    : `    if (item < ${keyItems}u) {${body}
+    }`.replace(/^ {4}if/, "if"));
   if ((rows * (headDim / 4)) % LANES !== 0) {
     throw new RangeError("the output tile must divide evenly among the lanes");
   }
   const outPerLane = (rows * (headDim / 4)) / LANES;
   const fetchKeyValue = (at: string): string => lines(keyPerLane, (i) => `  {
     let item = lane + ${i * LANES}u;
+${keyBound(`
     let global_key = ${at} + item / ${headDim / 4}u;
     let at_index = ((batch_index * p.queries + global_key) * p.heads + head)
       * ${headDim / 4}u + item % ${headDim / 4}u;
@@ -201,7 +228,7 @@ export function createAttentionMatrixFlashShader(
     if (global_key < p.queries) {
       next_k_${i} = key[at_index];
       next_v_${i} = value[at_index];
-    }
+    }`)}
   }`);
   const queriesLength = reach((rows - M) * TILE_STRIDE, TILE_STRIDE, M);
   const keysLength = reach((keyTiles - 1) * N * TILE_STRIDE, TILE_STRIDE, N);
@@ -314,11 +341,12 @@ ${fetchKeyValue("0u")}`}
       && query_origin + ${ATTENTION_MATRIX_QUERY_TILE}u <= p.queries;
 ${storedHalf ? "" : `${lines(keyPerLane, (i) => `    {
       let item = lane + ${i * LANES}u;
+${keyBound(`
       let base = (item / ${vectors}u) * ${TILE_STRIDE}u + (item % ${vectors}u) * 4u;
       keys_tile[base] = f16(next_k_${i}.x); keys_tile[base + 1u] = f16(next_k_${i}.y);
       keys_tile[base + 2u] = f16(next_k_${i}.z); keys_tile[base + 3u] = f16(next_k_${i}.w);
       values_tile[base] = f16(next_v_${i}.x); values_tile[base + 1u] = f16(next_v_${i}.y);
-      values_tile[base + 2u] = f16(next_v_${i}.z); values_tile[base + 3u] = f16(next_v_${i}.w);
+      values_tile[base + 2u] = f16(next_v_${i}.z); values_tile[base + 3u] = f16(next_v_${i}.w);`)}
     }`)}
     workgroupBarrier();
     // The next pass's keys and values are fetched while the units still work
