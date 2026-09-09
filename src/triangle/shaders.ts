@@ -5,6 +5,7 @@ import { type ActivationStorage, storageArray, storedElement } from "../runtime/
 import {
   planShards, shardBindings, shardLoader, shardStorer, shardWordLoader, type ShardLayout,
 } from "../runtime/sharded.js";
+import type { MatrixSpelling } from "../runtime/dialect.js";
 
 /** The whole operand in a single binding, which is the common case. */
 const WHOLE_OPERAND_UNSHARDED: ShardLayout = {
@@ -139,6 +140,8 @@ export function createTriangleShaders(
   wholeShards: ShardLayout = planShards(
     (shape.length * shape.length + (shape.length * shape.length) % 2) * shape.cHidden, 2,
     Number.MAX_SAFE_INTEGER, 4),
+
+  spelling?: MatrixSpelling,
 ): TriangleShaders {
   if (pairStorage === "f16" && precision !== "f32") {
     throw new RangeError("a packed pair needs f32 weight precision: both would claim the same halves of a word");
@@ -360,7 +363,7 @@ ${shardLoader(wholeShards, "whole", packedWhole ? "f16" : "f32")}`,
     store: outgoing
       ? "output[group.z * BLOCK_PAIRS + row * L + column] = element;"
       : "output[group.z * BLOCK_PAIRS + column * block.w + row] = element;",
-  });
+  }, undefined, spelling);
 
   const contracted = { stride: "BLOCK_PAIRS", offset: "" };
   // One invocation per contracted row: adjacent invocations read adjacent

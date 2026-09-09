@@ -5,6 +5,7 @@ import { rowNormalizeLayout, type RowNormalizeLayout } from "../runtime/reductio
 import { shardBindings, shardLoader, type ShardLayout } from "../runtime/sharded.js";
 import { createTiledGemmShader, gemmGrid } from "../runtime/gemm.js";
 import { scratchBudget } from "../runtime/scratch-budget.js";
+import type { MatrixSpelling } from "../runtime/dialect.js";
 
 export interface OuterProductMeanWeights {
   readonly layerNormScale: Float32Array;
@@ -269,7 +270,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
  * alignment they pass what one binding may cover and arrive as several
  * windows each, read through a generated accessor.
  */
-export function createOuterProductMeanContractShader(shards: ShardLayout = CONTRACT_UNSHARDED): string {
+export function createOuterProductMeanContractShader(shards: ShardLayout = CONTRACT_UNSHARDED,
+  spelling?: MatrixSpelling,
+): string {
   return createTiledGemmShader({
   preamble: `${OPM_TILE_COMMON}
 ${shardBindings(shards, "left", "f32", 0, false)}
@@ -330,6 +333,8 @@ export const OUTER_PRODUCT_MEAN_CONTRACT_SHADER = createOuterProductMeanContract
  */
 export function createOuterProductMeanProjectOutputShader(
   residual: boolean, storage: ActivationStorage = "f32",
+
+  spelling?: MatrixSpelling,
 ): string {
   return createTiledGemmShader({
     preamble: `${OPM_TILE_COMMON}

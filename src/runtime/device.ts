@@ -13,6 +13,7 @@ import { TRANSITION_CHUNK_TARGET_BYTES, transitionChunkRows } from "../evoformer
 import { calibrateGemmVariant, type SubgroupMatrixConfig } from "./gemm-selection.js";
 import { timed } from "./phase-ledger.js";
 import { recordSubgroupRange, recordSubgroupMatrixConfigs } from "./subgroups.js";
+import { calibrateDialect } from "./dialect.js";
 import { scratchBudget, setScratchBudgetScale } from "./scratch-budget.js";
 
 const WEBGPU_BASE_MAX_BUFFER_SIZE = 256 * 1024 * 1024;
@@ -424,6 +425,9 @@ export async function requestAlphaFoldDevice(
   });
   recordSubgroupRange(device, adapter);
   recordSubgroupMatrixConfigs(device, adapter);
+  // Before any kernel source exists, so none is generated against a spelling
+  // the device would then reject.
+  await calibrateDialect(device);
   // Which matrix configurations the units implement is reported on the
   // adapter and not on the device, so it is read here and handed down rather
   // than looked up where it is used. An implementation that reports none

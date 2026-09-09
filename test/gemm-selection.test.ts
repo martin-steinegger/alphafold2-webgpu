@@ -7,6 +7,7 @@ import {
   createTiledGemmShader, GEMM_VARIANT_F32, gemmGrid, gemmVariant, setGemmVariant,
   type GemmVariant,
 } from "../src/runtime/gemm.js";
+import { DAWN_MATRIX } from "../src/runtime/dialect.js";
 
 function fakeDevice(
   halfPrecision: boolean, matrixUnits = false,
@@ -192,7 +193,7 @@ describe("the matrix units and what they can serve", () => {
   const matrix = { precision: "matrix", inner: 8 } as const;
 
   it("takes a caller that declared its operands as arrays", () => {
-    const shader = createTiledGemmShader({ ...spec, ...arrays }, matrix);
+    const shader = createTiledGemmShader({ ...spec, ...arrays }, matrix, DAWN_MATRIX);
     expect(shader).toContain("enable chromium_experimental_subgroup_matrix;");
     expect(shader).toContain("subgroupMatrixMultiplyAccumulate");
     // The caller's own store still runs, per element, over the staged region.
@@ -202,7 +203,7 @@ describe("the matrix units and what they can serve", () => {
   it("keeps the hand-tiled kernel for a caller that did not", () => {
     // Operands given only as expressions could be unpacking a half word or
     // windowing a tensor, neither of which a matrix load can do.
-    const shader = createTiledGemmShader(spec, matrix);
+    const shader = createTiledGemmShader(spec, matrix, DAWN_MATRIX);
     expect(shader).not.toContain("subgroup_matrix");
     expect(shader).toContain("var<workgroup> gemm_source");
   });
@@ -221,7 +222,7 @@ describe("the matrix units and what they can serve", () => {
     // second transition linear, the widest contraction in the model, reach
     // the units at all when the pair representation is stored packed.
     const packed = createTiledGemmShader(
-      { ...spec, ...arrays, storeVector: "  let z = values;" }, matrix);
+      { ...spec, ...arrays, storeVector: "  let z = values;" }, matrix, DAWN_MATRIX);
     expect(packed).toContain("subgroupMatrixMultiplyAccumulate");
     expect(packed).toContain("let z = values;");
     expect(packed).toContain("let values = vec4<f32>(gemm_matrix_stage[staged]");
@@ -230,7 +231,7 @@ describe("the matrix units and what they can serve", () => {
   it("covers the same output tile as the kernel it replaces", () => {
     // gemmGrid does not know which shader is asking, so a matrix kernel on a
     // different tile would hand the wrong grid to any caller that opted out.
-    const shader = createTiledGemmShader({ ...spec, ...arrays }, matrix);
+    const shader = createTiledGemmShader({ ...spec, ...arrays }, matrix, DAWN_MATRIX);
     expect(shader).toContain("(gemm_columns + 127u) / 128u");
     expect(shader).toContain("* 64u");
     expect(gemmGrid(64, 128)).toEqual([1, 1]);
@@ -270,7 +271,7 @@ describe("what a browser without the extensions gets", () => {
     };
     for (const precision of ["f32", "f16-mixed", "f16-chunked"] as const) {
       for (const inner of [8, 16] as const) {
-        const shader = createTiledGemmShader({ ...spec, ...arrays }, { precision, inner });
+        const shader = createTiledGemmShader({ ...spec, ...arrays }, { precision, inner }, DAWN_MATRIX);
         expect(shader, `${precision} k${inner}`).not.toContain("chromium");
         expect(shader, `${precision} k${inner}`).not.toContain("subgroup_matrix");
         // f16 is core WebGPU, but still only where it is actually used.

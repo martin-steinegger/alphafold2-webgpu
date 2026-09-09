@@ -13,6 +13,8 @@ import {
 import { type ActivationStorage, storageArray, storedElement } from "../runtime/storage.js";
 import { createTiledGemmShader, gemmGrid, GEMM_TILE_COLUMNS } from "../runtime/gemm.js";
 import { scratchBudget } from "../runtime/scratch-budget.js";
+import { matrixSpelling } from "../runtime/dialect.js";
+import { dialect, type MatrixSpelling } from "../runtime/dialect.js";
 
 export interface AttentionWeights {
   readonly queryNormScale: Float32Array;
@@ -493,6 +495,8 @@ export function attentionProjectShader(
    * index has to be computed per element there.
    */
   tileWideProjection = false,
+  /** Required only when the projection variant reaches the matrix units. */
+  spelling?: MatrixSpelling,
 ): string {
   // The projection stores what the flash kernel reads: keys packed only when
   // the keys are packed, values whenever either half-precision mode is on.
@@ -578,7 +582,8 @@ ${[0, 1, 2, 3].map((lane) => `              {
               }`).join("\n")}
             }
           }` } : {}),
-  });
+  }, undefined, spelling);
+
 }
 
 /**
@@ -1161,7 +1166,7 @@ export function selectAttentionFlashKernel(
     }
     return {
       cacheKey: `attention:flash-matrix-${headDim}`,
-      shader: createAttentionMatrixFlashShader(headDim, shape),
+      shader: createAttentionMatrixFlashShader(headDim, shape, matrixSpelling(device)),
       queryTile: ATTENTION_MATRIX_QUERY_TILE, variant: requested, batchFirst: true,
     };
   }
@@ -1222,6 +1227,8 @@ export function selectAttentionFlashKernel(
 
 export function createAttentionOutputShader(
   residual: boolean, storage: ActivationStorage = "f32", shards: ShardLayout = WHOLE_SHARD,
+
+  spelling?: MatrixSpelling,
 ): string {
   // Rows are numbered within this batch window, and column attention consumes
   // a transposed view, so the result row is remapped both ways.
@@ -1293,7 +1300,7 @@ export class AttentionGpu {
     const [normalize, project, pairProject, flash, outputProject] = await Promise.all([
       this.pipelines.get("attention:normalize", ATTENTION_NORMALIZE_SHADER),
       this.pipelines.get(`attention:project:${wideProjection}`,
-        attentionProjectShader("f32", wideProjection)),
+        attentionProjectShader("f32", wideProjection, dialect(this.device).matrix)),
       this.pipelines.get(`attention:pair-bias:h${input.heads}`,
         createAttentionPairBiasShader(input.heads)),
       this.pipelines.get(flashKernel.cacheKey, flashKernel.shader),

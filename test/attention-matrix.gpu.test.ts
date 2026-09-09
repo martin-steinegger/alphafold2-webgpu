@@ -19,6 +19,7 @@ import {
   attentionPairBiasStride,
 } from "../src/evoformer/attention.js";
 import { recordSubgroupRange, recordSubgroupMatrixConfigs } from "../src/runtime/subgroups.js";
+import { calibrateDialect } from "../src/runtime/dialect.js";
 import { testGpu } from "./support/gpu-instance.js";
 
 const enabled = process.env.AFWEBGPU_GPU_TESTS === "1";
@@ -64,6 +65,7 @@ describe.skipIf(!enabled)("flash attention over the matrix units", () => {
     });
     recordSubgroupRange(candidate, adapter);
     recordSubgroupMatrixConfigs(candidate, adapter);
+    await calibrateDialect(candidate);
     device = supportsAttentionMatrix(candidate, 32) ? candidate : undefined;
   });
 

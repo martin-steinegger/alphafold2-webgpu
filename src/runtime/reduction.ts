@@ -36,6 +36,7 @@
  * accurate, which is not a trade this model makes.
  */
 import { supportsSubgroupSize } from "./subgroups.js";
+import { dialect } from "./dialect.js";
 
 /** Rows one workgroup covers where a subgroup can own one, and its width. */
 const SUBGROUP_ROWS = 8;
@@ -71,10 +72,10 @@ export interface RowNormalizeLayout {
 }
 
 /** One row a subgroup, eight subgroups a workgroup. */
-function subgroupRows(): RowNormalizeLayout {
+function subgroupRows(subgroupEnable: string): RowNormalizeLayout {
   return {
     rowsPerWorkgroup: SUBGROUP_ROWS,
-    enables: "enable subgroups;\nenable subgroup_size_control;\n",
+    enables: `${subgroupEnable}enable subgroup_size_control;\n`,
     declarations: "",
     attributes: `@compute @workgroup_size(${SUBGROUP_ROWS_WORKGROUP})`
       + ` @subgroup_size(${SUBGROUP_LANES})`,
@@ -91,11 +92,11 @@ function subgroupRows(): RowNormalizeLayout {
 }
 
 /** One row a workgroup, its subgroups reduced in one instruction each. */
-function subgroupWorkgroup(): RowNormalizeLayout {
+function subgroupWorkgroup(subgroupEnable: string): RowNormalizeLayout {
   let reductions = 0;
   return {
     rowsPerWorkgroup: 1,
-    enables: "enable subgroups;\n",
+    enables: subgroupEnable,
     declarations: `var<workgroup> norm_partial: array<f32, ${ROW_WORKGROUP}>;`,
     attributes: `@compute @workgroup_size(${ROW_WORKGROUP})`,
     builtins: ", @builtin(subgroup_size) norm_width: u32,"
@@ -158,7 +159,9 @@ function treeWorkgroup(): RowNormalizeLayout {
  */
 export function rowNormalizeLayout(device: GPUDevice | undefined): RowNormalizeLayout {
   if (device?.features?.has("subgroups" as GPUFeatureName) !== true) return treeWorkgroup();
-  return supportsSubgroupSize(device, SUBGROUP_LANES) ? subgroupRows() : subgroupWorkgroup();
+  const { subgroupEnable } = dialect(device);
+  return supportsSubgroupSize(device, SUBGROUP_LANES)
+    ? subgroupRows(subgroupEnable) : subgroupWorkgroup(subgroupEnable);
 }
 
 /** Rows one workgroup of this layout covers, for sizing a dispatch grid. */

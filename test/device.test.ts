@@ -9,7 +9,14 @@ function adapterWithLimits(maxStorageBufferBindingSize: number, maxBufferSize: n
   readonly adapter: GPUAdapter;
   readonly requestDevice: ReturnType<typeof vi.fn>;
 } {
-  const requestDevice = vi.fn(async () => ({}) as GPUDevice);
+  // Enough of a device for the dialect probe, which runs during
+  // requestAlphaFoldDevice: no features, so it settles on no directives.
+  const requestDevice = vi.fn(async () => ({
+    features: new Set<GPUFeatureName>(),
+    createShaderModule: () => ({}),
+    pushErrorScope: () => undefined,
+    popErrorScope: async () => null,
+  }) as unknown as GPUDevice);
   const adapter = {
     features: new Set<GPUFeatureName>(["subgroups" as GPUFeatureName, "timestamp-query"]),
     limits: { maxStorageBufferBindingSize, maxBufferSize, maxStorageBuffersPerShaderStage: 16 },

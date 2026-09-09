@@ -13,6 +13,7 @@
  * shared loads contiguous. Workgroup storage stays at 6 KiB, well inside the
  * 16 KiB every WebGPU implementation guarantees.
  */
+import { lastCalibratedMatrix, type MatrixSpelling } from "./dialect.js";
 
 /**
  * Workgroups one dispatch dimension may hold, which every WebGPU device grants
@@ -405,6 +406,7 @@ export function usesMatrixUnits(shader: TiledGemmShader, variant: GemmVariant): 
  * measured per device rather than written down.
  */
 function createMatrixGemmShaderF16(
+  m: MatrixSpelling,
   shader: TiledGemmShader, unit: MatrixUnitShape, kStep = unit.K,
 ): string {
   const { M, N, K } = unit;
@@ -511,10 +513,7 @@ function createMatrixGemmShaderF16(
         ${shader.storeVector}
       }
     }`;
-  return `enable chromium_experimental_subgroup_matrix;
-enable f16;
-enable subgroups;
-enable subgroup_size_control;
+  return `${m.prelude}enable f16;
 ${shader.preamble}
 
 var<workgroup> gemm_matrix_a: array<f16, ${aLength}>;
@@ -522,7 +521,7 @@ var<workgroup> gemm_matrix_b: array<f16, ${bLength}>;
 var<workgroup> gemm_matrix_out: array<f32, ${outLength}>;
 
 // Pinned: one tile sits on one subgroup and every index counts on its width.
-@compute @workgroup_size(${lanes}, 1, 1) @subgroup_size(${MATRIX_LANES})
+@compute @workgroup_size(${lanes}, 1, 1)${m.subgroupSize(MATRIX_LANES)}
 fn main(
   @builtin(local_invocation_id) local: vec3<u32>,
   @builtin(workgroup_id) group: vec3<u32>,
@@ -536,7 +535,7 @@ fn main(
   let rows_at = (subgroup / ${columnGroups}u) * ${M}u;
   let columns_at = (subgroup % ${columnGroups}u) * ${groupTiles * N}u;
 ${tileOrigins(tileColumns)}
-${lines(groupTiles, (c) => `  var acc_${c} = subgroup_matrix_result<f32, ${N}, ${M}>();`)}
+${lines(groupTiles, (c) => `  var acc_${c} = ${m.zero("f32", N, M)};`)}
 
   // Software pipelined: the operands for the next step are fetched into
   // registers while the units still work on the staged ones, so a global load
@@ -566,24 +565,26 @@ ${fetchA(`k0 + ${kStep}u`, false)}
 ${fetchB(`k0 + ${kStep}u`, false)}
     }
 ${lines(steps, (s) => `    {
-      let left = subgroupMatrixLoad<subgroup_matrix_left<f16, ${K}, ${M}>, row_major>(
-        &gemm_matrix_a, rows_at * ${aStride}u + ${s * K}u, ${aStride}u);
-${lines(groupTiles, (c) => `      acc_${c} = subgroupMatrixMultiplyAccumulate(left,
-        subgroupMatrixLoad<subgroup_matrix_right<f16, ${N}, ${K}>, row_major>(
-          &gemm_matrix_b, ${s * K * bStride}u + columns_at + ${c * N}u, ${bStride}u), acc_${c});`)}
+      let left = ${m.load(m.left("f16", K, M), "gemm_matrix_a",
+        `rows_at * ${aStride}u + ${s * K}u`, `${aStride}u`)};
+${lines(groupTiles, (c) => `      acc_${c} = ${m.multiplyAccumulate("left",
+    m.load(m.right("f16", N, K), "gemm_matrix_b",
+      `${s * K * bStride}u + columns_at + ${c * N}u`, `${bStride}u`), `acc_${c}`)};`)}
     }`)}
     // The next step refills the tiles this multiply just read.
     workgroupBarrier();
   }
-${lines(groupTiles, (c) => `  subgroupMatrixStore<row_major>(&gemm_matrix_out, subgroup * ${M * outStride}u,
-    acc_${c}, ${outStride}u);
+${lines(groupTiles, (c) => `  ${m.store("gemm_matrix_out", `subgroup * ${M * outStride}u`,
+    `acc_${c}`, `${outStride}u`)};
   workgroupBarrier();
 ${drain(c)}
   workgroupBarrier();`)}
 }`;
 }
 
-function createMatrixGemmShader(shader: TiledGemmShader, variant: GemmVariant): string {
+function createMatrixGemmShader(
+  m: MatrixSpelling, shader: TiledGemmShader, variant: GemmVariant,
+): string {
   const unit = variant.matrix ?? MATRIX_SHAPE_F32_8;
   const { M, N, K } = unit;
   const half = unit.componentType === "f16";
@@ -640,17 +641,14 @@ function createMatrixGemmShader(shader: TiledGemmShader, variant: GemmVariant): 
             stage_k < gemm_inner);
         }
         workgroupBarrier();` : "";
-  return `enable chromium_experimental_subgroup_matrix;
-enable subgroups;
-enable subgroup_size_control;
-${half ? "enable f16;\n" : ""}${shader.preamble}
+  return `${m.prelude}${half ? "enable f16;\n" : ""}${shader.preamble}
 
 var<workgroup> gemm_matrix_stage: array<f32, ${region * region}>;${half ? `
 var<workgroup> gemm_matrix_left: array<f16, ${region * K}>;
 var<workgroup> gemm_matrix_right: array<f16, ${K * region}>;` : ""}
 
 // Pinned, for the same reason as the half-precision kernel above.
-@compute @workgroup_size(${MATRIX_LANES}, 1, 1) @subgroup_size(${MATRIX_LANES})
+@compute @workgroup_size(${MATRIX_LANES}, 1, 1)${m.subgroupSize(MATRIX_LANES)}
 fn main(
   @builtin(local_invocation_id) local: vec3<u32>,
   @builtin(workgroup_id) group: vec3<u32>,
@@ -669,23 +667,21 @@ ${tileOrigins(tileColumns)}
         // Pulled back so the last tile still lies inside the source.
         let load_origin = min(row_origin, gemm_rows - ${region}u);
 ${lines(rowTiles, (r) => lines(columnTiles, (c) =>
-    `        var acc_${r}_${c} = subgroup_matrix_result<f32, ${N}, ${M}>();`))}
+    `        var acc_${r}_${c} = ${m.zero("f32", N, M)};`))}
         for (var k0 = 0u; k0 < gemm_inner; k0 += ${K}u) {${staging}
-${lines(rowTiles, (r) => `          let left_${r} = subgroupMatrixLoad<subgroup_matrix_left<${unit.componentType}, ${K}, ${M}>, row_major>(
-            &${leftArray}, ${leftOffset(r)},
-            ${leftStride});`)}
-${lines(columnTiles, (c) => `          let right_${c} = subgroupMatrixLoad<subgroup_matrix_right<${unit.componentType}, ${N}, ${K}>, row_major>(
-            &${rightArray}, ${rightOffset(c)},
-            ${rightStride});`)}
+${lines(rowTiles, (r) => `          let left_${r} = ${m.load(
+    m.left(unit.componentType, K, M), leftArray, leftOffset(r), leftStride)};`)}
+${lines(columnTiles, (c) => `          let right_${c} = ${m.load(
+    m.right(unit.componentType, N, K), rightArray, rightOffset(c), rightStride)};`)}
 ${lines(rowTiles, (r) => lines(columnTiles, (c) =>
-    `          acc_${r}_${c} = subgroupMatrixMultiplyAccumulate(left_${r}, right_${c}, acc_${r}_${c});`))}${half ? `
+    `          acc_${r}_${c} = ${m.multiplyAccumulate(`left_${r}`, `right_${c}`, `acc_${r}_${c}`)};`))}${half ? `
           // The next k step refills the staging tiles this multiply just read.
           workgroupBarrier();` : ""}
         }
         workgroupBarrier();
 ${lines(rowTiles, (r) => lines(columnTiles, (c) =>
-    `        subgroupMatrixStore<row_major>(&gemm_matrix_stage, ${r * M}u * ${region}u + ${c * N}u,
-          acc_${r}_${c}, ${region}u);`))}
+    `        ${m.store("gemm_matrix_stage", `${r * M}u * ${region}u + ${c * N}u`,
+      `acc_${r}_${c}`, `${region}u`)};`))}
         workgroupBarrier();
 ${shader.storeVector === undefined ? `        for (var item = lane; item < ${region * region}u; item += ${MATRIX_LANES}u) {
           let row = row_origin + item / ${region}u;
@@ -750,12 +746,19 @@ ${shader.storeVector === undefined ? `    for (var item = lane; item < ${GEMM_TI
 
 export function createTiledGemmShader(
   shader: TiledGemmShader, variant: GemmVariant = gemmVariant(),
+  // Required for a matrix variant, ignored otherwise. A matrix variant without
+  // one is a RangeError rather than a silent f32 kernel.
+  spelling?: MatrixSpelling,
 ): string {
   if (usesMatrixUnits(shader, variant)) {
+    const m = spelling ?? lastCalibratedMatrix();
+    if (m === undefined) {
+      throw new RangeError("a matrix projection needs the device's matrix spelling");
+    }
     const unit = variant.matrix ?? MATRIX_SHAPE_F32_8;
     return unit.componentType === "f16"
-      ? createMatrixGemmShaderF16(shader, unit, (variant.matrixDepth ?? 1) * unit.K)
-      : createMatrixGemmShader(shader, variant);
+      ? createMatrixGemmShaderF16(m, shader, unit, (variant.matrixDepth ?? 1) * unit.K)
+      : createMatrixGemmShader(m, shader, variant);
   }
   const tileColumns = shader.tileColumns ?? GEMM_TILE_COLUMNS;
   // A caller that cannot reach the matrix units computes the same thing with

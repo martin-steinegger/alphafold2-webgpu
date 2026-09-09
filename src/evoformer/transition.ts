@@ -4,6 +4,7 @@ import { type ActivationStorage, storageArray, storedElement } from "../runtime/
 import { createTiledGemmShader, GEMM_TILE_COLUMNS, GEMM_TILE_ROWS } from "../runtime/gemm.js";
 import { scratchBudget } from "../runtime/scratch-budget.js";
 import { rowNormalizeLayout, type RowNormalizeLayout } from "../runtime/reduction.js";
+import type { MatrixSpelling } from "../runtime/dialect.js";
 
 export interface TransitionWeights {
   readonly layerNormScale: Float32Array;
@@ -89,6 +90,8 @@ export function transitionChunkRows(
  */
 export function createLinearShader(
   residual: boolean, storage: ActivationStorage = "f32", sourceStorage: ActivationStorage = "f32",
+
+  spelling?: MatrixSpelling,
 ): string {
   return createTiledGemmShader({
     preamble: `

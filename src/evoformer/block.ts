@@ -62,6 +62,8 @@ import { packWeights as packTriangleWeights } from "../triangle/weights.js";
 import { triangleOverrides } from "../triangle/shaders.js";
 import type { AllocationSnapshot } from "../runtime/allocator.js";
 import { scratchBudget } from "../runtime/scratch-budget.js";
+import { dialect } from "../runtime/dialect.js";
+import type { MatrixSpelling } from "../runtime/dialect.js";
 
 export interface AttentionModuleWeights {
   readonly heads: number;
@@ -328,7 +330,9 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
 }
 
 /** Projects the per-column mean into every head's query. */
-function globalAttentionQueryShader(): string {
+function globalAttentionQueryShader(
+  spelling?: MatrixSpelling,
+): string {
   // Built on demand, not at module load: the projection variant is installed
   // while the device is created, and this module is imported before that
   // happens. A module-scope constant would freeze the f32 kernel in place and
@@ -453,6 +457,8 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
  */
 function createGlobalAttentionOutputShader(
   residual: boolean, storage: ActivationStorage = "f32", shards: ShardLayout = GLOBAL_UNSHARDED,
+
+  spelling?: MatrixSpelling,
 ): string {
   const sourceBinding = residual ? "output" : "source";
   // Bindings are numbered from zero in the order the dispatch passes them, so
@@ -706,7 +712,8 @@ async function encodeAttention(
       () => createAttentionNormalizeShader(storage, sourceShards, normalizeLayout)),
     execution.pipelines.get(
       `block:attention:project:${keyValueStorage}:${options.channels >= GEMM_TILE_COLUMNS}`,
-      attentionProjectShader(keyValueStorage, options.channels >= GEMM_TILE_COLUMNS)),
+      attentionProjectShader(keyValueStorage, options.channels >= GEMM_TILE_COLUMNS,
+        dialect(execution.device).matrix)),
     execution.pipelines.get(`block:attention:pair-bias:h${options.heads}`,
       () => createAttentionPairBiasShader(options.heads)),
     execution.pipelines.get(

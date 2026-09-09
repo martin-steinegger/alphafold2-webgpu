@@ -22,6 +22,7 @@
  * which is exactly what the reference CUDA kernel does for the same reason.
  */
 import { attentionMatrixConfig, type MatrixUnitShape } from "../runtime/gemm.js";
+import type { MatrixSpelling } from "../runtime/dialect.js";
 
 /**
  * Subgroups per workgroup, each owning sixteen queries.
@@ -166,7 +167,7 @@ export function attentionMatrixStorageBytes(headDim: number, storedHalf = false)
 }
 
 export function createAttentionMatrixFlashShader(
-  headDim: number, unit: MatrixUnitShape, storedHalf = false,
+  headDim: number, unit: MatrixUnitShape, m: MatrixSpelling, storedHalf = false,
 ): string {
   if (headDim % 4 !== 0 || headDim > 32 || headDim < 4) {
     throw new RangeError("matrix attention takes a head of four to thirty-two channels");
@@ -239,10 +240,7 @@ ${keyBound(`
     reach((rows - M) * WEIGHTED_STRIDE + (channelTiles - 1) * N, WEIGHTED_STRIDE, M));
   const probabilitiesLength = reach(
     (rows - M) * PROBABILITY_STRIDE + (keyTiles - 1) * K, PROBABILITY_STRIDE, M);
-  return `enable chromium_experimental_subgroup_matrix;
-enable f16;
-enable subgroups;
-enable subgroup_size_control;
+  return `${m.prelude}enable f16;
 struct Parameters {
   batch: u32, queries: u32, channels: u32, heads: u32,
   head_dim: u32, transpose: u32, has_pair_bias: u32,
@@ -285,7 +283,7 @@ var<workgroup> rescale: array<f32, ${ATTENTION_MATRIX_QUERY_TILE}>;
 var<workgroup> mask_tile: array<f32, ${KEY_TILE}>;
 
 // Pinned, because every index here counts on thirty-two lanes a subgroup.
-@compute @workgroup_size(${LANES}, 1, 1) @subgroup_size(${MATRIX_LANES})
+@compute @workgroup_size(${LANES}, 1, 1)${m.subgroupSize(MATRIX_LANES)}
 fn main(
   @builtin(local_invocation_id) local: vec3<u32>,
   @builtin(workgroup_id) group: vec3<u32>,
@@ -356,20 +354,20 @@ ${fetchKeyValue(`key_origin + ${KEY_TILE}u`)}`}
     // S = Q K^T. The key tile is [key][channel], so a column-major load of it
     // is the transpose the right operand wants, at no cost.
     for (var tile = 0u; tile < ${keyTiles}u; tile += 1u) {
-      var product = subgroup_matrix_result<f32, ${N}, ${M}>();
+      var product = ${m.zero("f32", N, M)};
       for (var step = 0u; step < ${contractions}u; step += 1u) {
-        let left = subgroupMatrixLoad<subgroup_matrix_left<f16, ${K}, ${M}>, row_major>(
-          &queries_tile, rows_at * ${TILE_STRIDE}u + step * ${K}u, ${TILE_STRIDE}u);
+        let left = ${m.load(m.left("f16", K, M), "queries_tile",
+    `rows_at * ${TILE_STRIDE}u + step * ${K}u`, `${TILE_STRIDE}u`)};
         let right = ${storedHalf
-          ? `subgroupMatrixLoad<subgroup_matrix_right<f16, ${N}, ${K}>, col_major>(&key,
-          ((batch_index * p.queries + key_origin + tile * ${N}u) * p.heads + head) * ${headDim}u
-            + step * ${K}u, p.heads * ${headDim}u)`
-          : `subgroupMatrixLoad<subgroup_matrix_right<f16, ${N}, ${K}>, col_major>(
-          &keys_tile, tile * ${N} * ${TILE_STRIDE}u + step * ${K}u, ${TILE_STRIDE}u)`};
-        product = subgroupMatrixMultiplyAccumulate(left, right, product);
+    ? m.load(m.right("f16", N, K), "key",
+      `((batch_index * p.queries + key_origin + tile * ${N}u) * p.heads + head) * ${headDim}u`
+        + ` + step * ${K}u`, `p.heads * ${headDim}u`, "col")
+    : m.load(m.right("f16", N, K), "keys_tile",
+      `tile * ${N} * ${TILE_STRIDE}u + step * ${K}u`, `${TILE_STRIDE}u`, "col")};
+        product = ${m.multiplyAccumulate("left", "right", "product")};
       }
-      subgroupMatrixStore<row_major>(&scores, rows_at * ${SCORE_STRIDE}u + tile * ${N}u,
-        product, ${SCORE_STRIDE}u);
+      ${m.store("scores", `rows_at * ${SCORE_STRIDE}u + tile * ${N}u`,
+    "product", `${SCORE_STRIDE}u`)};
     }
     for (var column = lane; column < ${KEY_TILE}u; column += ${LANES}u) {
       let global_key = key_origin + column;
@@ -450,21 +448,20 @@ ${lines(KEY_TILE / 2, (j) => `      {
     // O = O * previous_scale + P V, with P V into a fresh accumulator because
     // the rescale is per row and a matrix result cannot be scaled row-wise.
     for (var channel = 0u; channel < ${channelTiles}u; channel += 1u) {
-      var product = subgroup_matrix_result<f32, ${N}, ${M}>();
+      var product = ${m.zero("f32", N, M)};
       for (var tile = 0u; tile < ${keyTiles}u; tile += 1u) {
-        let left = subgroupMatrixLoad<subgroup_matrix_left<f16, ${K}, ${M}>, row_major>(
-          &probabilities, rows_at * ${PROBABILITY_STRIDE}u + tile * ${K}u,
-          ${PROBABILITY_STRIDE}u);
+        let left = ${m.load(m.left("f16", K, M), "probabilities",
+    `rows_at * ${PROBABILITY_STRIDE}u + tile * ${K}u`, `${PROBABILITY_STRIDE}u`)};
         let right = ${storedHalf
-          ? `subgroupMatrixLoad<subgroup_matrix_right<f16, ${N}, ${K}>, row_major>(&value,
-          ((batch_index * p.queries + key_origin + tile * ${K}u) * p.heads + head) * ${headDim}u
-            + channel * ${N}u, p.heads * ${headDim}u)`
-          : `subgroupMatrixLoad<subgroup_matrix_right<f16, ${N}, ${K}>, row_major>(
-          &values_tile, tile * ${K} * ${TILE_STRIDE}u + channel * ${N}u, ${TILE_STRIDE}u)`};
-        product = subgroupMatrixMultiplyAccumulate(left, right, product);
+    ? m.load(m.right("f16", N, K), "value",
+      `((batch_index * p.queries + key_origin + tile * ${K}u) * p.heads + head) * ${headDim}u`
+        + ` + channel * ${N}u`, `p.heads * ${headDim}u`)
+    : m.load(m.right("f16", N, K), "values_tile",
+      `tile * ${K} * ${TILE_STRIDE}u + channel * ${N}u`, `${TILE_STRIDE}u`)};
+        product = ${m.multiplyAccumulate("left", "right", "product")};
       }
-      subgroupMatrixStore<row_major>(&scores, rows_at * ${WEIGHTED_STRIDE}u + channel * ${N}u,
-        product, ${WEIGHTED_STRIDE}u);
+      ${m.store("scores", `rows_at * ${WEIGHTED_STRIDE}u + channel * ${N}u`,
+    "product", `${WEIGHTED_STRIDE}u`)};
     }
     workgroupBarrier();
 ${lines(outPerLane, (j) => `    {

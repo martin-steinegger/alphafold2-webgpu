@@ -6,6 +6,7 @@ import {
   MATRIX_REGION, MATRIX_SHAPE_F32_8, setGemmVariant, type GemmVariant, type MatrixUnitShape,
 } from "./gemm.js";
 import { supportsSubgroupSize } from "./subgroups.js";
+import { dialect, type MatrixSpelling } from "./dialect.js";
 
 /**
  * Which arithmetic and which k depth the dense projections use on this device.
@@ -282,7 +283,7 @@ export function gemmVariantName(variant: GemmVariant): string {
 }
 
 /** A bias-free projection with the shared tiling, for probing one variant. */
-function probeShader(variant: GemmVariant): string {
+function probeShader(variant: GemmVariant, spelling: MatrixSpelling | undefined): string {
   return createTiledGemmShader({
     preamble: `
 struct ProbeParameters { rows: u32, inner: u32, columns: u32, padding: u32 };
@@ -299,7 +300,7 @@ struct ProbeParameters { rows: u32, inner: u32, columns: u32, padding: u32 };
     // Plain row-major arrays, so this probe can measure the matrix units too.
     sourceArray: { array: "source", stride: "parameters.inner" },
     weightArray: { array: "weights", stride: "parameters.columns" },
-  }, variant);
+  }, variant, spelling);
 }
 
 /** The same deterministic values on every device, so a run is reproducible. */
@@ -354,7 +355,7 @@ async function pipelineFor(device: GPUDevice, variant: GemmVariant): Promise<GPU
   return device.createComputePipelineAsync({
     label, layout: "auto",
     compute: {
-      module: device.createShaderModule({ label: `${label}.wgsl`, code: probeShader(variant) }),
+      module: device.createShaderModule({ label: `${label}.wgsl`, code: probeShader(variant, dialect(device).matrix) }),
       entryPoint: "main",
     },
   });

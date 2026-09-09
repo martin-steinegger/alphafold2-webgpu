@@ -19,6 +19,8 @@ import {
   gemmVariantName, selectMatrixShape, type SubgroupMatrixConfig,
 } from "../src/runtime/gemm-selection.js";
 import { testGpu } from "./support/gpu-instance.js";
+import { calibrateDialect, matrixSpelling } from "../src/runtime/dialect.js";
+import { recordSubgroupMatrixConfigs } from "../src/runtime/subgroups.js";
 
 const enabled = process.env.AFWEBGPU_GPU_TESTS === "1";
 
@@ -65,6 +67,10 @@ describe.skipIf(!enabled)("projection over the hardware matrix units", () => {
         maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize,
       },
     });
+    // The dialect probe needs a shape the units implement, and the shapes are
+    // on the adapter; requestAlphaFoldDevice does both, this suite does not.
+    recordSubgroupMatrixConfigs(device, adapter);
+    await calibrateDialect(device);
   });
 
   afterAll(() => { device?.destroy(); });
@@ -109,7 +115,7 @@ describe.skipIf(!enabled)("projection over the hardware matrix units", () => {
         store: `output[row * ${columns}u + column] = element;`,
         ...(layout.source === undefined ? {} : { sourceContiguous: layout.source }),
         ...(layout.weight === undefined ? {} : { weightContiguous: layout.weight }),
-      }, { precision: "matrix", inner: 8, matrix: shape });
+      }, { precision: "matrix", inner: 8, matrix: shape }, matrixSpelling(device!));
 
       const storage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
       const created: GPUBuffer[] = [];
@@ -201,7 +207,7 @@ struct Parameters { rows: u32, inner: u32, columns: u32, padding: u32 };
       store: "output[row * parameters.columns + column] = element;",
       sourceArray: { array: "source", stride: "parameters.inner" },
       weightArray: { array: "weights", stride: "parameters.columns" },
-    }, { precision: "matrix", inner: 8, matrix: shape });
+    }, { precision: "matrix", inner: 8, matrix: shape }, matrixSpelling(device!));
     expect(code, "uses the units").toContain("subgroupMatrixMultiplyAccumulate");
     if (shape.componentType === "f16") {
       expect(code, "stages f16 operands").toContain("var<workgroup> gemm_matrix_a");
