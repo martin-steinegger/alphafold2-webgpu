@@ -6,6 +6,11 @@ import { dawnInstanceFlags } from "../src/runtime/dawn.js";
 import { requestAlphaFoldDevice } from "../src/runtime/device.js";
 
 const enabled = process.env.AFWEBGPU_GPU_TESTS === "1";
+// Held at module scope rather than left as a local in beforeAll. dawn.node
+// schedules InstanceBase::ProcessEvents on the event loop, and a callback that
+// runs after the instance is collected dereferences freed memory: a
+// segmentation fault inside pthread_mutex_lock on an unaligned mutex.
+let gpu: GPU;
 let device: GPUDevice;
 
 const deletionValue = (value: number): number => Math.atan(value / 3) * 2 / Math.PI;
@@ -52,7 +57,7 @@ function hostProfile(
 describe.skipIf(!enabled)("the cluster profile on the GPU", () => {
   beforeAll(async () => {
     Object.assign(globalThis, globals);
-    const gpu = create(dawnInstanceFlags({ unclamped: true }));
+    gpu = create(dawnInstanceFlags({ unclamped: true }));
     const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
     device = await requestAlphaFoldDevice(adapter!);
   });
