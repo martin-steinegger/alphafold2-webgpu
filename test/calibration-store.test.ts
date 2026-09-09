@@ -1,6 +1,7 @@
 import { describe, expect, it, afterEach } from "vitest";
 import {
-  calibrationKey, readCalibration, setCalibrationStore, writeCalibration,
+  calibrationKey, readCalibration, setCalibrationStore, useBrowserCalibrationStore,
+  writeCalibration,
 } from "../src/runtime/calibration-store.js";
 
 function memoryStore(): { document: string | undefined } & {
@@ -76,5 +77,20 @@ describe("the calibration store", () => {
     setCalibrationStore(store);
     store.document = "{not json";
     expect(readCalibration("k", (v): v is object => true)).toBeUndefined();
+  });
+
+  // The page folds in a Web Worker, where localStorage does not exist. Before
+  // IndexedDB the store found no backing there and dropped every write, so the
+  // browser measured the projection kernel again on every visit.
+  it("keeps nothing when a worker scope offers no storage at all", async () => {
+    const globals = globalThis as Record<string, unknown>;
+    const had = Object.prototype.hasOwnProperty.call(globals, "indexedDB");
+    const previous = globals["indexedDB"];
+    delete globals["indexedDB"];
+    try {
+      expect(await useBrowserCalibrationStore()).toBe(false);
+    } finally {
+      if (had) globals["indexedDB"] = previous;
+    }
   });
 });

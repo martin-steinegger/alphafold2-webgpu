@@ -6,8 +6,13 @@
  * candidates and times them. Measure once, keep the answer.
  *
  * One JSON document of key to answer, the same in a browser and on a host: a
- * store reads and writes the whole thing, so localStorage holds one entry
- * and node holds one file with identical contents.
+ * store reads and writes the whole thing, so IndexedDB holds one record and
+ * node holds one file with identical contents.
+ *
+ * A store has to be installed, by useBrowserCalibrationStore or by the node
+ * file store. Without one nothing is kept and every start measures, which is
+ * what a browser did for as long as this reached for localStorage: the page
+ * folds in a Web Worker and localStorage belongs to Window.
  */
 
 /** Bumped when a stored answer could no longer be trusted. */
@@ -19,30 +24,68 @@ export interface CalibrationStore {
   write(document: string): void;
 }
 
-let installed: CalibrationStore | undefined;
-let chosen = false;
+const DATABASE = "afwebgpu";
+const STORE = "calibration";
 
-/** Installs a store; undefined restores localStorage. */
-export function setCalibrationStore(store: CalibrationStore | undefined): void {
-  installed = store;
-  chosen = store !== undefined;
+function openDatabase(): Promise<IDBDatabase | undefined> {
+  return new Promise((resolve) => {
+    const factory = (globalThis as { indexedDB?: IDBFactory }).indexedDB;
+    if (factory === undefined) { resolve(undefined); return; }
+    let request: IDBOpenDBRequest;
+    try { request = factory.open(DATABASE, 1); } catch { resolve(undefined); return; }
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains(STORE)) request.result.createObjectStore(STORE);
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => resolve(undefined);
+    request.onblocked = () => resolve(undefined);
+  });
 }
 
-function backing(): CalibrationStore | undefined {
-  if (chosen) return installed;
-  // Reading localStorage throws where site data is blocked.
-  try {
-    const web = (globalThis as { localStorage?: Storage }).localStorage;
-    return web === undefined ? undefined : {
-      read: () => web.getItem(DOCUMENT) ?? undefined,
-      write: (document) => web.setItem(DOCUMENT, document),
-    };
-  } catch { return undefined; }
+/**
+ * Installs the browser store, having loaded what it holds. Await it before the
+ * device is built, since building the device is what calibrates.
+ *
+ * IndexedDB rather than localStorage because a worker has one and not the
+ * other. It is asynchronous and a store is not, so the document is read once
+ * into memory here and writes go back in the background: one that never lands
+ * costs the next visit a measurement and nothing else.
+ *
+ * False where there is no IndexedDB, or a browser refuses it, leaving whatever
+ * store was installed before and measuring as it did.
+ */
+export async function useBrowserCalibrationStore(): Promise<boolean> {
+  const database = await openDatabase();
+  if (database === undefined) return false;
+  let current = await new Promise<string | undefined>((resolve) => {
+    try {
+      const request = database.transaction(STORE, "readonly").objectStore(STORE).get(DOCUMENT);
+      request.onsuccess = () => resolve(typeof request.result === "string" ? request.result : undefined);
+      request.onerror = () => resolve(undefined);
+    } catch { resolve(undefined); }
+  });
+  setCalibrationStore({
+    read: () => current,
+    write: (value) => {
+      current = value;
+      try {
+        database.transaction(STORE, "readwrite").objectStore(STORE).put(value, DOCUMENT);
+      } catch { /* evicted, or the database closed under us */ }
+    },
+  });
+  return true;
+}
+
+let installed: CalibrationStore | undefined;
+
+/** Installs a store; undefined turns remembering off. */
+export function setCalibrationStore(store: CalibrationStore | undefined): void {
+  installed = store;
 }
 
 function load(): Record<string, unknown> {
   try {
-    const raw = backing()?.read();
+    const raw = installed?.read();
     if (raw === undefined) return {};
     const parsed: unknown = JSON.parse(raw);
     return typeof parsed === "object" && parsed !== null
@@ -83,6 +126,6 @@ export function readCalibration<T>(
 /** Remembers an answer. A store that refuses is not worth failing a fold over. */
 export function writeCalibration(key: string, value: unknown): void {
   try {
-    backing()?.write(JSON.stringify({ ...load(), [key]: value }, null, 2));
+    installed?.write(JSON.stringify({ ...load(), [key]: value }, null, 2));
   } catch { /* quota, private mode, or no store: the next start measures. */ }
 }

@@ -25,6 +25,7 @@ import {
 import { setGpuMemoryBudget } from "../src/runtime/allocator.js";
 import { remainingPhrase, remainingTrunkSeconds } from "./progress.js";
 import { adapterDisplayName } from "./webgpu-preflight.js";
+import { useBrowserCalibrationStore } from "../src/runtime/calibration-store.js";
 
 export const inferenceStages = ["device", "msa", "model", "features", "inference", "results"] as const;
 export type InferenceStage = typeof inferenceStages[number];
@@ -175,6 +176,10 @@ async function predictionDevice(
     return { device: sharedPredictionDevice, cached: true };
   }
   resetInferenceDevice();
+  // Before the device, because building it calibrates the projection kernel and
+  // that is the answer worth remembering. The page folds in a worker, which has
+  // no localStorage, so this is IndexedDB.
+  await useBrowserCalibrationStore();
   const device = await requestAlphaFoldDevice(adapter, requirements);
   sharedPredictionDevice = device;
   device.addEventListener("uncapturederror", (event) => {
