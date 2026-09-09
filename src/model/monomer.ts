@@ -814,6 +814,7 @@ export class AlphaFoldMonomerGpu {
           );
         }
         this.device.pushErrorScope("validation");
+        markPhase("readback: submit");
         await submit(readbackEncoder, `readback recycle ${recycle}`);
         // Not the 422 KB transfer: this is the first true synchronisation of
         // the recycle, because a validation error scope resolves at submit and
@@ -825,10 +826,12 @@ export class AlphaFoldMonomerGpu {
         // the GPU is saturated at any of them.
         markPhase("main stack tail");
         const firstRowMapped = await execution.mapFloat32(msaFirstRowTensor);
+        markPhase("readback: unpack");
         const msaFirstRow = this.msaStorage === "f32" ? firstRowMapped
           : unpackHalfWords(new Uint32Array(firstRowMapped.buffer, firstRowMapped.byteOffset, firstRowWords), length * 256);
         const nextPreviousMsa = nextPreviousMsaCopy
           ?? execution.upload(`monomer.recycle-msa-${recycle}`, msaFirstRow);
+        markPhase("readback: release");
         releaseTensor(msaFirstRowTensor); releaseTensor(msaMask);
         if (multimerMainMsa !== undefined) releaseTensor(multimerMainMsa);
         if (multimerMainMsaMask !== undefined) releaseTensor(multimerMainMsaMask);
