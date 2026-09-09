@@ -317,15 +317,17 @@ export class AlphaFoldMonomerGpu {
   async predictA3m(a3mText: string, weights: MonomerModelWeights, featureTables: QueryOnlyFeatureTables,
     options: A3mFeatureOptions = {}, paeBreaks?: Float32Array,
     onRecycle?: MonomerRecycleCallback): Promise<MonomerPrediction> {
-    return this.predict(iterateA3mFeatures(a3mText, featureTables, options), weights, paeBreaks, onRecycle);
+    return this.predict(
+      iterateA3mFeatures(this.device, a3mText, featureTables, options),
+      weights, paeBreaks, onRecycle);
   }
   async predict(featuresByRecycle: RecycleFeatureSource<MonomerRecycleFeatures>,
     weights: MonomerModelWeights | MultimerCompatibleModelWeights,
     paeBreaks?: Float32Array, onRecycle?: MonomerRecycleCallback,
     onRecycleDetails?: MonomerRecycleDetailsCallback): Promise<MonomerPrediction> {
     if (featuresByRecycle.length === 0) throw new RangeError("at least one feature set is required");
-    const featureIterator = featuresByRecycle[Symbol.iterator]();
-    let featureStep = featureIterator.next();
+    const featureIterator = featuresByRecycle[Symbol.asyncIterator]();
+    let featureStep = await featureIterator.next();
     if (featureStep.done) throw new RangeError("at least one feature set is required");
     const length = featureStep.value.aatype.length;
     const pairMask = new Float32Array(length * length);
@@ -895,7 +897,7 @@ export class AlphaFoldMonomerGpu {
           break;
         }
         recycle += 1;
-        featureStep = featureIterator.next();
+        featureStep = await featureIterator.next();
       }
       if (finalDetails === undefined) throw new Error("monomer prediction produced no recycle result");
       let finalPair: Float32Array = EMPTY_PAIR;

@@ -1,15 +1,30 @@
 import { expandClusteredMsaFeatures } from "../src/input/msa-features.js";
 import { readFile } from "node:fs/promises";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import { makeMultimerA3mFeatures } from "../src/input/multimer-features.js";
 import { assembleComplexA3m } from "../src/input/mmseqs2-api.js";
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
 import { errorMetrics } from "../src/triangle/types.js";
+import { create, globals } from "webgpu";
+import { dawnInstanceFlags } from "../src/runtime/dawn.js";
+import { requestAlphaFoldDevice } from "../src/runtime/device.js";
+
+// Featurisation clusters the alignment on the device, so these need one.
+const gpuEnabled = process.env.AFWEBGPU_GPU_TESTS === "1";
+let device: GPUDevice;
+beforeAll(async () => {
+  if (!gpuEnabled) return;
+  Object.assign(globalThis, globals);
+  const gpu = create(dawnInstanceFlags({ unclamped: true }));
+  const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
+  device = await requestAlphaFoldDevice(adapter!);
+});
+
 
 const ROOT = "test/fixtures/multimer-process";
 
-describe("ColabFold Multimer process_features", () => {
+describe.skipIf(!gpuEnabled)("ColabFold Multimer process_features", () => {
   it("matches official paired/unpaired tensors through recycle 3", async () => {
     const [unpairedA, unpairedB, pairedA, pairedB] = await Promise.all([
       "unpaired-a.a3m", "unpaired-b.a3m", "paired-a.a3m", "paired-b.a3m",
@@ -20,7 +35,7 @@ describe("ColabFold Multimer process_features", () => {
     const model = AlphaFoldFixture.fromStore(await FileTensorStore.open(
       "test/fixtures/evoformer/model1-query-59-stack/manifest.json",
     ));
-    const features = makeMultimerA3mFeatures(
+    const features = await makeMultimerA3mFeatures(device, 
       ["ACDE", "GHIK"], assembled.a3m, assembled.mask, await model.queryOnlyFeatureTables(),
       { recycles: 3, randomSeed: 0, maxMsaSequences: 3, maxExtraSequences: 4 },
     );

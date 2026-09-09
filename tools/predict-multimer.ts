@@ -74,7 +74,7 @@ try {
       onProgress: (progress) => console.error(`MMseqs2 ${progress.search ?? ""} ${progress.phase}`),
     });
     console.error(`complex alignment: ${search.depth} rows`);
-    features = iterateMultimerA3mFeatures(chains, search.a3m, search.mask, featureTables, {
+    features = iterateMultimerA3mFeatures(device, chains, search.a3m, search.mask, featureTables, {
       recycles: recycles - 1, randomSeed: 0, maxMsaSequences: 252, maxExtraSequences: 1152,
     });
   }

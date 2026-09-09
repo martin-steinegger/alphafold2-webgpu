@@ -66,9 +66,9 @@ export function prepareTemplate(
 export function withTemplate(
   source: RecycleFeatureSource<MonomerRecycleFeatures>, template: MonomerTemplateFeatures,
 ): RecycleFeatureSource<MonomerRecycleFeatures> {
-  return recycleFeatureSource(source.length, function* recycles() {
+  return recycleFeatureSource(source.length, async function* recycles() {
     let first = true;
-    for (const features of source) {
+    for await (const features of source) {
       yield first ? { ...features, template } : features;
       first = false;
     }

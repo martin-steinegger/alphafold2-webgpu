@@ -67,7 +67,7 @@ describe.skipIf(!enabled)("query-only template collapse", () => {
     // compared on its own in test/pair-storage.gpu.test.ts.
     const run = async (collapseQueryOnlyTemplate: boolean) => new AlphaFoldMonomerGpu(device, {
       collapseQueryOnlyTemplate, ...EXACT_STORAGE,
-    }).predict(iterateA3mFeatures(a3m, tables, { recycles: 0, randomSeed: 0 }), weights, paeBreaks);
+    }).predict(iterateA3mFeatures(device, a3m, tables, { recycles: 0, randomSeed: 0 }), weights, paeBreaks);
     const collapsed = await run(true);
     const exact = await run(false);
     expect(collapsed.final.confidence.meanPlddt).toBeCloseTo(exact.final.confidence.meanPlddt, 2);

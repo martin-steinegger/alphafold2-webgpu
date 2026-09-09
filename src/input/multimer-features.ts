@@ -187,7 +187,7 @@ export function iterateMultimerQueryOnlyFeatures(
   if (!Number.isSafeInteger(recycles) || recycles < 0) {
     throw new RangeError("recycles must be a non-negative safe integer");
   }
-  return recycleFeatureSource(recycles + 1, function* features() {
+  return recycleFeatureSource(recycles + 1, async function* features() {
     for (let recycle = 0; recycle <= recycles; recycle += 1) {
     const random = randomGenerator(((options.randomSeed ?? 0) ^ Math.imul(recycle + 1, 0x9e3779b9)) >>> 0);
     const msaCodes = sequence.aatype.slice();
@@ -229,16 +229,21 @@ export function iterateMultimerQueryOnlyFeatures(
 }
 
 /** Eager compatibility wrapper for callers that need random access. */
-export function makeMultimerQueryOnlyFeatures(
+export async function makeMultimerQueryOnlyFeatures(
   chainsValue: string | readonly string[],
   tables: QueryOnlyFeatureTables,
   options: MultimerFeatureOptions = {},
-): readonly MultimerRecycleFeatures[] {
-  return [...iterateMultimerQueryOnlyFeatures(chainsValue, tables, options)];
+): Promise<readonly MultimerRecycleFeatures[]> {
+  const all: MultimerRecycleFeatures[] = [];
+  for await (const features of iterateMultimerQueryOnlyFeatures(chainsValue, tables, options)) {
+    all.push(features);
+  }
+  return all;
 }
 
 /** Build Multimer-v3 tensors from ColabFold-style paired/unpaired complex MSA rows. */
 export function iterateMultimerA3mFeatures(
+  device: GPUDevice,
   chainsValue: string | readonly string[],
   a3mText: string,
   alignmentMask: Float32Array,
@@ -253,14 +258,14 @@ export function iterateMultimerA3mFeatures(
   if (alignmentMask.length !== alignment.depth * alignment.length) {
     throw new RangeError("complex MSA mask must have shape [depth, total residues]");
   }
-  const source = iterateA3mFeatures(a3mText, tables, {
+  const source = iterateA3mFeatures(device, a3mText, tables, {
     maxExtraSequences: 2048,
     colabFoldMultimerProcess: true,
     ...options,
     alignmentMask,
   });
-  return recycleFeatureSource(source.length, function* features() {
-    for (const recycle of source) yield {
+  return recycleFeatureSource(source.length, async function* features() {
+    for await (const recycle of source) yield {
       ...recycle,
       targetFeatures: sequence.targetFeatures,
       residueIndex: sequence.residueIndex,
@@ -277,12 +282,18 @@ export function iterateMultimerA3mFeatures(
 }
 
 /** Eager compatibility wrapper for callers that need random access. */
-export function makeMultimerA3mFeatures(
+export async function makeMultimerA3mFeatures(
+  device: GPUDevice,
   chainsValue: string | readonly string[],
   a3mText: string,
   alignmentMask: Float32Array,
   tables: QueryOnlyFeatureTables,
   options: A3mFeatureOptions = {},
-): readonly MultimerRecycleFeatures[] {
-  return [...iterateMultimerA3mFeatures(chainsValue, a3mText, alignmentMask, tables, options)];
+): Promise<readonly MultimerRecycleFeatures[]> {
+  const all: MultimerRecycleFeatures[] = [];
+  for await (const features of iterateMultimerA3mFeatures(
+    device, chainsValue, a3mText, alignmentMask, tables, options)) {
+    all.push(features);
+  }
+  return all;
 }

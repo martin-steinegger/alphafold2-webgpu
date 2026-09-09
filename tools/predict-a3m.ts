@@ -12,7 +12,7 @@ import { dawnInstanceFlags, fitScratchBudgetScale } from "../src/runtime/dawn.js
 import { nativeMemoryBudgetBytes, selectGpu } from "./native-device.js";
 import { AlphaFoldMonomerGpu } from "../src/model/monomer.js";
 import { parseA3m } from "../src/input/a3m.js";
-import { makeA3mFeatures, type RecycleFeatureSource } from "../src/input/a3m-features.js";
+import { iterateA3mFeatures, type RecycleFeatureSource } from "../src/input/a3m-features.js";
 import type { MonomerRecycleFeatures } from "../src/model/monomer.js";
 import { prepareTemplate, withTemplate } from "../src/input/template.js";
 import { predictionToPdb } from "../web/prediction-results.js";
@@ -39,9 +39,9 @@ const [embedding, template, extraStack, mainStack, structure, confidence, geomet
   model.embeddingWeights(), model.templateWeights(), model.extraStackWeights(), model.mainStackWeights(),
   model.structureWeights(), model.confidenceWeights(), model.geometryTables(), model.queryOnlyFeatureTables(),
 ]);
-let features: RecycleFeatureSource<MonomerRecycleFeatures> = makeA3mFeatures(a3m, featureTables, {
-  recycles: recycles - 1, maxMsaSequences: msaRows, maxExtraSequences: extraRows, randomSeed: 0,
-});
+let applyTemplate: ((s: RecycleFeatureSource<MonomerRecycleFeatures>)
+  => RecycleFeatureSource<MonomerRecycleFeatures>) | undefined;
+let features: RecycleFeatureSource<MonomerRecycleFeatures>;
 // AFWEBGPU_TEMPLATE=<structure> folds with a custom template, the way the page
 // does; AFWEBGPU_TEMPLATE_CHAIN picks a chain other than the first.
 const templatePath = process.env.AFWEBGPU_TEMPLATE;
@@ -51,7 +51,8 @@ if (templatePath !== undefined && templatePath !== "") {
     ...(process.env.AFWEBGPU_TEMPLATE_CHAIN === undefined
       ? {} : { chainId: process.env.AFWEBGPU_TEMPLATE_CHAIN }),
   });
-  features = withTemplate(features, prepared.features);
+  applyTemplate = (source: RecycleFeatureSource<MonomerRecycleFeatures>) =>
+    withTemplate(source, prepared.features);
   templateReport = {
     file: templatePath, chain: prepared.chain.id, residues: prepared.chain.sequence.length,
     covered: prepared.alignment.alignedResidues,
@@ -91,6 +92,10 @@ const plan = planMonomerDevice(adapter, length, clustered, extra, undefined, fal
 console.error(`device memory budget ${memoryBudget === undefined ? "unknown"
   : `${(memoryBudget / 1024 ** 3).toFixed(1)} GiB`}, scratch budget ${scratchBudgetScale}x`);
 const device = await requestAlphaFoldDevice(adapter, plan.requirements);
+features = iterateA3mFeatures(device, a3m, featureTables, {
+  recycles: recycles - 1, maxMsaSequences: msaRows, maxExtraSequences: extraRows, randomSeed: 0,
+});
+if (applyTemplate !== undefined) features = applyTemplate(features);
 try {
   const prediction = await new AlphaFoldMonomerGpu(device, {
     ...memoryOptions,

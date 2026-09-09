@@ -5,6 +5,7 @@ import { AlphaFoldMonomerGpu, EXACT_STORAGE, type MonomerRecycleFeatures } from 
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
 import { requestAlphaFoldDevice } from "../src/runtime/device.js";
+import { recycleFeatureSourceOf } from "../src/input/a3m-features.js";
 
 const enabled = process.env.AFWEBGPU_GPU_TESTS === "1";
 const A3M_MANIFEST = "test/fixtures/evoformer/model1-a3m-59-stack/manifest.json";
@@ -45,7 +46,7 @@ describe.skipIf(!enabled)("end-to-end uploaded A3M AlphaFold WebGPU", () => {
       model.embeddingWeights(), model.templateWeights(), model.extraStackWeights(), model.mainStackWeights(),
       model.structureWeights(), model.confidenceWeights(), model.geometryTables(),
     ]);
-    const prediction = await new AlphaFoldMonomerGpu(device, { ...EXACT_STORAGE }).predict(features, {
+    const prediction = await new AlphaFoldMonomerGpu(device, { ...EXACT_STORAGE }).predict(recycleFeatureSourceOf(features), {
       embedding, template, extraStack, mainStack, structure, lddt: confidence.lddt, pae: confidence.pae, geometry,
     }, await model.tensor("confidencePaeBreaks"));
     const reference = (input.store.manifest as unknown as Manifest).referencePrediction.recycleMetrics;

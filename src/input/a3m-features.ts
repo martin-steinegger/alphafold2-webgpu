@@ -1,3 +1,4 @@
+import { assignNearestCentres } from "./msa-clustering-webgpu.js";
 import { CLUSTERED_MSA_CHANNELS, MSA_CODE_NONE } from "./msa-features.js";
 import { parseA3m } from "./a3m.js";
 import {
@@ -18,14 +19,23 @@ export interface A3mFeatureOptions {
   readonly alignmentMask?: Float32Array;
 }
 
-/** A replayable, counted feature stream that materializes one recycle at a time. */
-export interface RecycleFeatureSource<T> extends Iterable<T> { readonly length: number; }
+/**
+ * A replayable, counted feature stream that materializes one recycle at a time.
+ *
+ * Asynchronous because each recycle's clustering runs on the device.
+ */
+export interface RecycleFeatureSource<T> extends AsyncIterable<T> { readonly length: number; }
+
+/** Materialised recycles as a source, for a caller that already has them. */
+export function recycleFeatureSourceOf<T>(items: readonly T[]): RecycleFeatureSource<T> {
+  return recycleFeatureSource(items.length, async function* held() { yield* items; });
+}
 
 export function recycleFeatureSource<T>(
   length: number,
-  iterator: () => Iterator<T>,
+  iterator: () => AsyncIterator<T>,
 ): RecycleFeatureSource<T> {
-  return { length, [Symbol.iterator]: iterator };
+  return { length, [Symbol.asyncIterator]: iterator };
 }
 
 function generator(seed: number): () => number {
@@ -89,7 +99,7 @@ function makeColabFoldMultimerFeatures(
   const base = makeQueryOnlyFeatures(alignment.query, tables, { recycles: 0, maskedMsaCodes: [
     Float32Array.from(encoded.subarray(0, length)),
   ] })[0]!;
-  return recycleFeatureSource(recycles + 1, function* features() {
+  return recycleFeatureSource(recycles + 1, async function* features() {
     let rootKey: JaxKey = [0, (options.randomSeed ?? 0) >>> 0];
     for (let recycle = 0; recycle <= recycles; recycle += 1) {
     const keys = multimerMsaKeys(rootKey); rootKey = keys.nextRoot;
@@ -207,8 +217,10 @@ function makeColabFoldMultimerFeatures(
 }
 
 /** Lazily preprocess A3M text, retaining at most one recycle's large feature tensors. */
-export function iterateA3mFeatures(a3mText: string, tables: QueryOnlyFeatureTables,
-  options: A3mFeatureOptions = {}): RecycleFeatureSource<MonomerRecycleFeatures> {
+export function iterateA3mFeatures(
+  device: GPUDevice, a3mText: string, tables: QueryOnlyFeatureTables,
+  options: A3mFeatureOptions = {},
+): RecycleFeatureSource<MonomerRecycleFeatures> {
   const alignment = parseA3m(a3mText);
   const length = alignment.length; const depth = alignment.depth;
   // No mask means every position is maskable. Materialising that as ones would
@@ -236,7 +248,7 @@ export function iterateA3mFeatures(a3mText: string, tables: QueryOnlyFeatureTabl
   }
   const maxMsa = Math.min(options.maxMsaSequences ?? 508, depth);
   const maxExtra = options.maxExtraSequences ?? 1024;
-  return recycleFeatureSource(recycles + 1, function* features() {
+  return recycleFeatureSource(recycles + 1, async function* features() {
     for (let recycle = 0; recycle <= recycles; recycle += 1) {
     const random = generator(((options.randomSeed ?? 0) ^ Math.imul(recycle + 1, 0x9e3779b9)) >>> 0);
     const remainder = Array.from({ length: depth - 1 }, (_, index) => index + 1); shuffle(remainder, random);
@@ -256,19 +268,15 @@ export function iterateA3mFeatures(a3mText: string, tables: QueryOnlyFeatureTabl
       else if (draw >= 0.9) centerCodes[index] = Math.floor(random() * 20);
       else centerCodes[index] = original;
     }
-    const assignments = new Uint16Array(extras.length);
+    // Gathered so the kernel reads the drawn rows densely.
+    const extraCodes = new Uint8Array(extras.length * length);
     for (let extraIndex = 0; extraIndex < extras.length; extraIndex += 1) {
-      const extraRow = extras[extraIndex]!; let best = 0; let bestScore = -1;
-      for (let center = 0; center < centers.length; center += 1) {
-        let score = 0;
-        for (let residue = 0; residue < length; residue += 1) {
-          const code = centerCodes[center * length + residue]!;
-          if (code <= 20 && code === encoded[extraRow * length + residue]!) score += 1;
-        }
-        if (score > bestScore) { bestScore = score; best = center; }
-      }
-      assignments[extraIndex] = best;
+      extraCodes.set(
+        encoded.subarray(extras[extraIndex]! * length, (extras[extraIndex]! + 1) * length),
+        extraIndex * length);
     }
+    const assignments = await assignNearestCentres(
+      device, centerCodes, centers.length, extraCodes, extras.length, length);
     const msaFeatures = new Float32Array(centers.length * length * CLUSTERED_MSA_CHANNELS);
     const deletionSums = new Float32Array(centers.length * length);
     const counts = new Float32Array(centers.length * length).fill(1 + 1e-6);
@@ -323,7 +331,13 @@ export function iterateA3mFeatures(a3mText: string, tables: QueryOnlyFeatureTabl
 }
 
 /** Eager compatibility wrapper. Prefer iterateA3mFeatures for browser inference. */
-export function makeA3mFeatures(a3mText: string, tables: QueryOnlyFeatureTables,
-  options: A3mFeatureOptions = {}): readonly MonomerRecycleFeatures[] {
-  return [...iterateA3mFeatures(a3mText, tables, options)];
+export async function makeA3mFeatures(
+  device: GPUDevice, a3mText: string, tables: QueryOnlyFeatureTables,
+  options: A3mFeatureOptions = {},
+): Promise<readonly MonomerRecycleFeatures[]> {
+  const all: MonomerRecycleFeatures[] = [];
+  for await (const features of iterateA3mFeatures(device, a3mText, tables, options)) {
+    all.push(features);
+  }
+  return all;
 }

@@ -9,6 +9,7 @@ import type { MultimerRecycleFeatures } from "../src/input/multimer-features.js"
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
 import { errorMetrics } from "../src/triangle/types.js";
+import { recycleFeatureSourceOf } from "../src/input/a3m-features.js";
 
 const referenceManifests = (process.env.AFWEBGPU_MULTIMER_REFERENCES
   ?? process.env.AFWEBGPU_MULTIMER_REFERENCE ?? "")
@@ -103,7 +104,7 @@ async function preparePrediction(
 async function predict(device: GPUDevice, prepared: PreparedPrediction): Promise<MultimerPrediction> {
   return new AlphaFoldMultimerGpu(device, {
     compactTransitions: true, recycleEarlyStopTolerance: -1, ...EXACT_STORAGE,
-  }).predict(prepared.features, prepared.weights, prepared.paeBreaks);
+  }).predict(recycleFeatureSourceOf(prepared.features), prepared.weights, prepared.paeBreaks);
 }
 
 for (const referenceManifest of referenceManifests.length > 0 ? referenceManifests : [undefined]) {

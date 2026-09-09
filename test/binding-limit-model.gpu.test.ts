@@ -15,6 +15,7 @@ import { AlphaFoldMonomerGpu, type MonomerRecycleFeatures } from "../src/model/m
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
 import { requestAlphaFoldDevice } from "../src/runtime/device.js";
+import { recycleFeatureSourceOf } from "../src/input/a3m-features.js";
 
 const enabled = process.env.AFWEBGPU_GPU_TESTS === "1";
 const A3M_MANIFEST = "test/fixtures/evoformer/model1-a3m-59-stack/manifest.json";
@@ -73,9 +74,9 @@ describe.skipIf(!enabled)("prediction under a small binding limit", () => {
       lddt: confidence.lddt, pae: confidence.pae, geometry,
     };
     const breaks = await model.tensor("confidencePaeBreaks");
-    const whole = await new AlphaFoldMonomerGpu(device).predict(features, weights, breaks);
+    const whole = await new AlphaFoldMonomerGpu(device).predict(recycleFeatureSourceOf(features), weights, breaks);
     const windowed = new AlphaFoldMonomerGpu(device, { bindingBudgetBytes: BUDGET });
-    const sharded = await windowed.predict(features, weights, breaks);
+    const sharded = await windowed.predict(recycleFeatureSourceOf(features), weights, breaks);
     expect([...windowed.oversizedBindings].map(([label, bytes]) =>
       `${label} ${(bytes / 1024 ** 2).toFixed(2)} MiB`)).toEqual([]);
     expect(sharded.final.confidence.meanPlddt).toBeCloseTo(whole.final.confidence.meanPlddt, 6);

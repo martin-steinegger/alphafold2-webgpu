@@ -1,3 +1,4 @@
+import { recycleFeatureSourceOf } from "../src/input/a3m-features.js";
 import { EXACT_STORAGE } from "../src/model/monomer.js";
 import { CLUSTERED_MSA_CHANNELS, compactClusteredMsaFeatures } from "../src/input/msa-features.js";
 import { AlphaFoldMultimerGpu, type MultimerModelWeights } from "../src/model/multimer.js";
@@ -179,7 +180,7 @@ export async function qualifyMultimer(referenceManifestUrl: string,
       // Qualification compares the pair against the reference, so it pays for
       // the readback a prediction skips.
       compactTransitions: true, recycleEarlyStopTolerance: -1, returnFinalPair: true, ...EXACT_STORAGE,
-    }).predict(features, weights, breaks);
+    }).predict(recycleFeatureSourceOf(features), weights, breaks);
     const initialized = await new StructureInitializeGpu(device).run(
       prediction.final.msaFirstRow, features[0]!.aatype.length, 256, 384, weights.structure.initialize,
     );
