@@ -23,7 +23,8 @@ import {
 } from "./attention.js";
 import { attentionFlashKernelForShape } from "./attention-calibration.js";
 import { calibrateAttentionShape } from "../runtime/attention-queries.js";
-import { createTiledGemmShader, GEMM_TILE_ROWS, gemmGrid } from "../runtime/gemm.js";
+import { timed } from "../runtime/phase-ledger.js";
+import { createTiledGemmShader, GEMM_TILE_COLUMNS, GEMM_TILE_ROWS, gemmGrid } from "../runtime/gemm.js";
 import { rowNormalizeLayout } from "../runtime/reduction.js";
 import { releaseScratch } from "./execution-scratch.js";
 import {
@@ -58,6 +59,7 @@ import {
 } from "../runtime/storage.js";
 import type { TriangleMultiplicationWeights } from "../triangle/types.js";
 import { packWeights as packTriangleWeights } from "../triangle/weights.js";
+import { triangleOverrides } from "../triangle/shaders.js";
 import type { AllocationSnapshot } from "../runtime/allocator.js";
 import { scratchBudget } from "../runtime/scratch-budget.js";
 
@@ -127,12 +129,12 @@ export interface EvoformerBlockInput {
   readonly outerProductMeanFirst?: boolean;
   /** Overrides the scratch budget of every windowed operation, so tests can force windowing. */
   readonly scratchWindowBytes?: number;
-  /** Storage of the triangle multiplication's whole projection; `f16` halves it inexactly. */
+  /** Storage of the triangle multiplication's whole projection; f16 halves it inexactly. */
   readonly triangleWholeStorage?: TriangleWholeStorage;
-  /** Storage of the MSA activations this block reads and updates; `f16` halves them inexactly. */
+  /** Storage of the MSA activations this block reads and updates; f16 halves them inexactly. */
   readonly msaStorage?: ActivationStorage;
   /**
-   * Storage of the pair this block reads and updates; `f16` halves it
+   * Storage of the pair this block reads and updates; f16 halves it
    * inexactly. The pair is one of the three tensors that set the trunk's peak,
    * beside the MSA and the triangle multiplication's whole projection.
    */
@@ -616,13 +618,13 @@ interface EncodeAttentionOptions {
   readonly label: string;
   readonly residualTarget?: GpuTensor;
   readonly windowBytes?: number | undefined;
-  /** Storage of `source` (and of `residualTarget`, which is the same tensor when set). */
+  /** Storage of source (and of residualTarget, which is the same tensor when set). */
   readonly storage?: ActivationStorage | undefined;
-  /** Storage of `pairSource`, which the bias projection normalizes window by window. */
+  /** Storage of pairSource, which the bias projection normalizes window by window. */
   readonly pairStorage?: ActivationStorage | undefined;
-  /** Splits the command buffer between windows; see `SubmissionFlush`. */
+  /** Splits the command buffer between windows; see SubmissionFlush. */
   readonly flush?: SubmissionFlush | undefined;
-  /** Bytes one binding may cover of `source`; defaults to the device's limit. */
+  /** Bytes one binding may cover of source; defaults to the device's limit. */
   readonly bindingBytes?: number | undefined;
 }
 
@@ -647,7 +649,7 @@ async function encodeAttention(
   // packing them as half words measured 1.29x on the shape triangle attention
   // runs. Only the register kernel reads them packed; every other flash
   // variant keeps the single-precision pair it was written against, so a
-  // device that selects one of those is untouched. `pack2x16float` is core
+  // device that selects one of those is untouched. pack2x16float is core
   // WGSL, so this needs no device feature and costs no portability.
   // Every register kernel reads packed keys and values, not only the
   // one-query one: above 128 queries the shape picks the two-query variant,
@@ -668,7 +670,8 @@ async function encodeAttention(
   const registerFamily = flashKernel.variant.startsWith("register");
   const byShape = registerFamily ? flashKernel.queryTile / 64 : 1;
   const choice = registerFamily
-    ? await calibrateAttentionShape(execution.device, options.channels / options.heads)
+    ? await timed("calibrate attention",
+      () => calibrateAttentionShape(execution.device, options.channels / options.heads))
     : undefined;
   const slots = attentionQueriesPerThread(
     byShape === 1 || choice === undefined ? byShape : choice.slots);
@@ -700,22 +703,23 @@ async function encodeAttention(
   const shardKey = `${storage}:${sourceShards.count}:${normalizeLayout.rowsPerWorkgroup}`;
   const [normalize, project, pairProject, flash, outputProject, pairNormalize] = await Promise.all([
     execution.pipelines.get(`block:attention:normalize:${shardKey}`,
-      createAttentionNormalizeShader(storage, sourceShards, normalizeLayout)),
-    execution.pipelines.get(`block:attention:project:${keyValueStorage}`,
-      attentionProjectShader(keyValueStorage)),
+      () => createAttentionNormalizeShader(storage, sourceShards, normalizeLayout)),
+    execution.pipelines.get(
+      `block:attention:project:${keyValueStorage}:${options.channels >= GEMM_TILE_COLUMNS}`,
+      attentionProjectShader(keyValueStorage, options.channels >= GEMM_TILE_COLUMNS)),
     execution.pipelines.get(`block:attention:pair-bias:h${options.heads}`,
-      createAttentionPairBiasShader(options.heads)),
+      () => createAttentionPairBiasShader(options.heads)),
     execution.pipelines.get(
       `block:${flashKernel.cacheKey}:kv-${keyValueStorage}:q${slots}`, flashShader),
     execution.pipelines.get(
       `block:attention:output${options.residualTarget === undefined ? "" : "-residual"}:${shardKey}`,
-      createAttentionOutputShader(options.residualTarget !== undefined, storage, sourceShards),
+      () => createAttentionOutputShader(options.residualTarget !== undefined, storage, sourceShards),
     ),
     // The pair bias source has its own storage, which need not match the
     // attention source's: MSA row attention reads a pair, not an MSA.
     execution.pipelines.get(
       `block:attention:normalize:${options.pairStorage ?? "f32"}:${normalizeLayout.rowsPerWorkgroup}`,
-      createAttentionNormalizeShader(
+      () => createAttentionNormalizeShader(
         options.pairStorage ?? "f32", undefined, rowNormalizeLayout(execution.device))),
   ]);
   const wholeRows = options.batch * options.queries;
@@ -871,6 +875,11 @@ async function encodeGlobalAttention(
   weightsValue: GlobalAttentionWeights,
   label: string,
   residualTarget?: GpuTensor,
+  // The stack hands this buffer to the next block, so storage is all it needs.
+  // A caller that reads the result back asks for COPY_SRC here instead, rather
+  // than every block paying for a usage it never uses and being split off from
+  // the rest of the pool for it.
+  outputUsage: GPUBufferUsageFlags = GPUBufferUsage.STORAGE,
 ): Promise<GpuTensor> {
   const w = weightsValue;
   const tensors = [w.queryNormScale, w.queryNormOffset, w.queryWeight, w.keyWeight, w.valueWeight,
@@ -904,15 +913,15 @@ async function encodeGlobalAttention(
     = await Promise.all([
     execution.pipelines.get(
       `block:attention:statistics:${key}:${statisticsLayout.rowsPerWorkgroup}`,
-      createAttentionStatisticsShader(storage, shards, statisticsLayout)),
-    execution.pipelines.get(`block:global-attention:kv:${key}`, createGlobalAttentionKvShader(storage, shards)),
+      () => createAttentionStatisticsShader(storage, shards, statisticsLayout)),
+    execution.pipelines.get(`block:global-attention:kv:${key}`, () => createGlobalAttentionKvShader(storage, shards)),
     execution.pipelines.get(`block:global-attention:column-mean:${key}`,
-      createGlobalAttentionColumnMeanShader(storage, shards)),
+      () => createGlobalAttentionColumnMeanShader(storage, shards)),
     execution.pipelines.get("block:global-attention:query", globalAttentionQueryShader()),
     execution.pipelines.get("block:global-attention:flash", GLOBAL_ATTENTION_FLASH_SHADER),
     execution.pipelines.get(
       `block:global-attention:output${residualTarget === undefined ? "" : "-residual"}:${key}`,
-      createGlobalAttentionOutputShader(residualTarget !== undefined, storage, shards),
+      () => createGlobalAttentionOutputShader(residualTarget !== undefined, storage, shards),
     ),
   ]);
   const shardsOf = (tensor: GpuTensor): readonly GpuTensor[] => {
@@ -935,7 +944,9 @@ async function encodeGlobalAttention(
   const values = execution.allocate(`${label}.values`, shape.length * shape.sequences * headDim);
   const query = execution.allocate(`${label}.query`, shape.length * w.heads * headDim);
   const attended = execution.allocate(`${label}.attended`, shape.length * w.heads * headDim);
-  const output = residualTarget ?? execution.allocate(`${label}.output`, shape.sequences * shape.length * shape.cM);
+  const output = residualTarget
+    ?? execution.allocate(`${label}.output`,
+      shape.sequences * shape.length * shape.cM, outputUsage);
   let grid = execution.linearGrid(
     shape.length * shape.sequences, statisticsLayout.rowsPerWorkgroup);
   execution.dispatch(encoder, statisticsPipeline, [...sourceViews, normParameters, statistics],
@@ -988,14 +999,14 @@ async function encodeOuterProductMean(
   const opmLayout = rowNormalizeLayout(execution.device);
   const [normalize, project, contractPipeline, pairCountPipeline, projectOutputPipeline] = await Promise.all([
     execution.pipelines.get(`block:opm:normalize:${storage}:${opmLayout.rowsPerWorkgroup}`,
-      createOuterProductMeanNormalizeShader(storage, opmLayout)),
+      () => createOuterProductMeanNormalizeShader(storage, opmLayout)),
     execution.pipelines.get("block:opm:project", OUTER_PRODUCT_MEAN_PROJECT_SHADER),
     execution.pipelines.get(`block:opm:contract:${projectionShards.count}`,
-      createOuterProductMeanContractShader(projectionShards)),
+      () => createOuterProductMeanContractShader(projectionShards)),
     execution.pipelines.get("block:opm:pair-count", OUTER_PRODUCT_MEAN_PAIR_COUNT_SHADER),
     execution.pipelines.get(
       `block:opm:project-output${residualTarget === undefined ? "" : "-residual"}:${input.pairStorage ?? "f32"}`,
-      createOuterProductMeanProjectOutputShader(residualTarget !== undefined, input.pairStorage ?? "f32"),
+      () => createOuterProductMeanProjectOutputShader(residualTarget !== undefined, input.pairStorage ?? "f32"),
     ),
   ]);
   const weights = execution.upload("opm.weights", packed.data);
@@ -1125,18 +1136,49 @@ export function triangleBlockRows(
   return tiled < length && (length % 2 === 1) ? Math.max(2, tiled - (tiled % 2)) : tiled;
 }
 
-async function encodeTriangleMultiplication(
+/**
+ * Sources generated once for a configuration, and weights packed once for a
+ * block, rather than both again on every block of every recycle.
+ *
+ * A fold spends real time here: 316 calls costing 479 ms, against a recycle of
+ * 1037 ms at 256 residues, which is about a seventh of the fold's host time.
+ * Neither result depends on anything that changes between those calls. The
+ * sources are a function of the shape and the storage choices, which the
+ * pipeline key already names in full, so the key serves as the cache key. The
+ * packing is a function of the weights, which are the same objects every
+ * recycle, so it is held against their identity and released with them.
+ *
+ * Holding the packings is a second copy of those weights, 41.8 MB, and buys
+ * 7.5%. Do not extend it to the attention, transition and outer-product
+ * packers: those would hold 321 MB between them to save about 260 ms a
+ * recycle, which a port that runs in a browser should not spend.
+ */
+const TRIANGLE_SHADERS = new Map<string, ReturnType<typeof createTriangleShaders>>();
+const TRIANGLE_PACKED = new WeakMap<
+  TriangleMultiplicationWeights, ReturnType<typeof packTriangleWeights>>();
+
+/**
+ * Everything the triangle multiplication settles before it encodes anything:
+ * its shapes, its windows, and the key and source of every pipeline it needs.
+ *
+ * Split out so that warming the cache and running the kernel cannot disagree
+ * about a key. A warm naming a pipeline differently would compile a second
+ * copy and leave the real one to be compiled on the critical path after all,
+ * which is the failure this shape exists to make impossible.
+ */
+function triangleSetup(
   execution: WebGpuExecution,
-  encoderValue: GPUCommandEncoder,
-  pair: GpuTensor,
-  pairMask: GpuTensor,
   input: EvoformerShape,
   weightsValue: TriangleMultiplicationWeights,
   direction: TriangleDirection,
-  residualTarget?: GpuTensor,
-): Promise<GpuTensor> {
+  residual: boolean,
+) {
   const shape = { length: input.length, cZ: input.cZ, cHidden: input.triangleHidden };
-  const packed = packTriangleWeights(weightsValue, "f32");
+  let packed = TRIANGLE_PACKED.get(weightsValue);
+  if (packed === undefined) {
+    packed = packTriangleWeights(weightsValue, "f32");
+    TRIANGLE_PACKED.set(weightsValue, packed);
+  }
   const blockRows = triangleBlockRows(input.length, input.cZ, input.triangleHidden,
     Math.min(input.scratchWindowBytes ?? scratchBudget(TRIANGLE_BLOCK_TARGET_BYTES),
       execution.bindingLimitBytes));
@@ -1164,24 +1206,65 @@ async function encodeTriangleMultiplication(
       + `Its ${(execution.bindingLimitBytes / 1024 ** 2).toFixed(0)} MiB binding limit is what forces the `
       + "windows: a shorter sequence, or a device that binds more of a buffer at once, will run.");
   }
-  const shaders = createTriangleShaders(shape, "f32", packed.offsets, 1e-5, direction, blockRows, wholeStorage,
-    pairStorage, residualTarget !== undefined, pairShards, wholeShards);
   const pipelineKey = `block:triangle:${direction}:${input.length}:${input.cZ}`
     + `:${input.triangleHidden}:${blockRows}:${wholeStorage}:${pairStorage}:${pairShards.count}`
     + `:${wholeShards.count}`;
-  const [inputStatistics, projectGate, projectBlockOperand, projectWholeOperand, contract, hiddenStatistics, projectOutput]
-    = await Promise.all([
-    execution.pipelines.get(`${pipelineKey}:input-statistics`, shaders.inputStatistics),
-    execution.pipelines.get(`${pipelineKey}:project-gate`, shaders.projectGate),
-    execution.pipelines.get(`${pipelineKey}:project-block-operand`, shaders.projectBlockOperand),
-    execution.pipelines.get(`${pipelineKey}:project-whole-operand`, shaders.projectWholeOperand),
-    execution.pipelines.get(`${pipelineKey}:contract`, shaders.contract),
-    execution.pipelines.get(`${pipelineKey}:hidden-statistics`, shaders.hiddenStatistics),
-    execution.pipelines.get(
-      `${pipelineKey}:project-output${residualTarget === undefined ? "" : "-residual"}`,
-      shaders.projectOutput,
-    ),
-  ]);
+  // The offsets belong to the packing, so they join the key: a bundle packed
+  // differently must not be handed another one's sources.
+  // Length and blockRows are overrides now, so they name a pipeline but not a
+  // source; the shader key keeps only what the source really varies with.
+  const shaderKey = `${direction}:${input.cZ}:${input.triangleHidden}:${wholeStorage}`
+    + `:${pairStorage}:${pairShards.count}:${wholeShards.count}:${residual}`
+    + `:${JSON.stringify(packed.offsets)}`;
+  let shaders = TRIANGLE_SHADERS.get(shaderKey);
+  if (shaders === undefined) {
+    shaders = createTriangleShaders(shape, "f32", packed.offsets, 1e-5, direction, blockRows,
+      wholeStorage, pairStorage, residual, pairShards, wholeShards);
+    TRIANGLE_SHADERS.set(shaderKey, shaders);
+  }
+  // The sources no longer carry the length, so the shader cache key must not
+  // either, or every length would still build its own copy of them.
+  const overrides = triangleOverrides(shape, blockRows);
+  const requests: readonly (readonly [string, string])[] = [
+    [`${pipelineKey}:input-statistics`, shaders.inputStatistics],
+    [`${pipelineKey}:project-gate`, shaders.projectGate],
+    [`${pipelineKey}:project-block-operand`, shaders.projectBlockOperand],
+    [`${pipelineKey}:project-whole-operand`, shaders.projectWholeOperand],
+    [`${pipelineKey}:contract`, shaders.contract],
+    [`${pipelineKey}:hidden-statistics`, shaders.hiddenStatistics],
+    [`${pipelineKey}:project-output${residual ? "-residual" : ""}`, shaders.projectOutput],
+  ];
+  return {
+    packed, blockRows, wholeStorage, pairStorage, pairShards, wholeShards,
+    wholeStride, requests, overrides,
+  };
+}
+
+async function encodeTriangleMultiplication(
+  execution: WebGpuExecution,
+  encoderValue: GPUCommandEncoder,
+  pair: GpuTensor,
+  pairMask: GpuTensor,
+  input: EvoformerShape,
+  weightsValue: TriangleMultiplicationWeights,
+  direction: TriangleDirection,
+  residualTarget?: GpuTensor,
+): Promise<GpuTensor> {
+  const {
+    packed, blockRows, wholeStorage, pairStorage, pairShards, wholeShards, wholeStride, requests,
+    overrides,
+  } = triangleSetup(execution, input, weightsValue, direction, residualTarget !== undefined);
+  // Indexed rather than destructured: requests is the one place the order is
+  // written down, and a tuple type restated here would be a second one.
+  const built = await Promise.all(
+    requests.map(([key, code]) => execution.pipelines.get(key, code, "main", overrides)));
+  const inputStatistics = built[0]!;
+  const projectGate = built[1]!;
+  const projectBlockOperand = built[2]!;
+  const projectWholeOperand = built[3]!;
+  const contract = built[4]!;
+  const hiddenStatistics = built[5]!;
+  const projectOutput = built[6]!;
   const pairs = input.length * input.length;
   const views = (tensor: GpuTensor, layout: ShardLayout, storage: ActivationStorage): readonly GpuTensor[] => {
     if (layout.count === 1) return [tensor];
@@ -1602,7 +1685,8 @@ export class GlobalAttentionGpu {
       this.device.pushErrorScope("validation");
       const output = await encodeGlobalAttention(execution, encoder, source, mask, {
         sequences, length, cM: channels, cZ: 1, cOuter: 1, triangleHidden: 1,
-      }, weights, "global-attention");
+      }, weights, "global-attention", undefined,
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
       const readback = execution.createReadback("global-attention.readback", output, encoder);
       const start = performance.now();
       this.device.queue.submit([encoder.finish()]);

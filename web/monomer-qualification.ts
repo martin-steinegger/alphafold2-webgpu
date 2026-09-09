@@ -1,5 +1,5 @@
 import { EXACT_STORAGE } from "../src/model/monomer.js";
-import { makeA3mFeatures } from "../src/input/a3m-features.js";
+import { iterateA3mFeatures } from "../src/input/a3m-features.js";
 import {
   AlphaFoldMonomerGpu, type MonomerGpuOptions, type MonomerModelWeights,
 } from "../src/model/monomer.js";
@@ -63,12 +63,12 @@ export async function qualifyMonomer(
   try {
     const runner = new AlphaFoldMonomerGpu(device, { compactTransitions: true, ...storageOptions });
     const queryOnly = await runner.predict(
-      makeA3mFeatures(`>query\n${QUERY}\n`, tables, {
+      iterateA3mFeatures(device, `>query\n${QUERY}\n`, tables, {
         recycles: 3, randomSeed: 0, maxMsaSequences: 1, maxExtraSequences: 1,
       }), weights, breaks,
     );
     const deepMsa = await runner.predict(
-      makeA3mFeatures(deepA3m, tables, {
+      iterateA3mFeatures(device, deepA3m, tables, {
         recycles: 0, randomSeed: 0, maxMsaSequences: 508, maxExtraSequences: 1024,
       }), weights, breaks,
     );

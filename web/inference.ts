@@ -290,8 +290,9 @@ export async function runInference(job: InferenceJob, reporter: InferenceReporte
   let features = input.multimer
     ? input.alignmentMask === undefined
       ? iterateMultimerQueryOnlyFeatures(input.chains!, featureTables, featureOptions)
-      : iterateMultimerA3mFeatures(input.chains!, input.a3m, input.alignmentMask, featureTables, featureOptions)
-    : iterateA3mFeatures(input.a3m, featureTables, featureOptions);
+      : iterateMultimerA3mFeatures(
+        device, input.chains!, input.a3m, input.alignmentMask, featureTables, featureOptions)
+    : iterateA3mFeatures(device, input.a3m, featureTables, featureOptions);
   if (input.template !== undefined) {
     if (input.multimer) throw new Error("A custom template is not supported for complexes yet.");
     const prepared = prepareTemplate(input.template.text, input.sequence,
@@ -383,7 +384,7 @@ export async function runInference(job: InferenceJob, reporter: InferenceReporte
   blockStarted = performance.now();
   const prediction: MonomerPrediction | MultimerPrediction = input.multimer
     ? await new AlphaFoldMultimerGpu(device, modelOptions).predict(
-      features as Iterable<MultimerRecycleFeatures> & { readonly length: number },
+      features as RecycleFeatureSource<MultimerRecycleFeatures>,
       { ...commonWeights, multimerTemplate: multimerTemplate! },
       paeBreaks, reportRecycle,
     )

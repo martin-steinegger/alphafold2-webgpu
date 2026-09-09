@@ -1,7 +1,7 @@
 /**
  * What half precision costs a prediction.
  *
- * The microbenchmark in `gemm-calibration.spec.ts` measures one kernel against
+ * The microbenchmark in gemm-calibration.spec.ts measures one kernel against
  * random inputs, which does not answer the question that matters: real
  * activations are not random, rounding partly cancels, and recycling is
  * self-correcting, so a worst-case figure there can be either pessimistic or

@@ -239,7 +239,7 @@ describe("the matrix units and what they can serve", () => {
 
   it("folds the row tiles a dispatch dimension cannot hold into the columns", () => {
     // One dimension holds 65,535 workgroups. The extra-MSA global attention
-    // projects `sequences * length` rows, which passes that at 5,242 extra
+    // projects sequences * length rows, which passes that at 5,242 extra
     // sequences of an 800-residue chain, and the dispatch was refused.
     const rows = 65_536 * 64;
     const [x, y] = gemmGrid(rows, 128);

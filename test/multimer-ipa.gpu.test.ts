@@ -136,9 +136,15 @@ function officialMultimerIpaReference(input: {
 }
 
 describe.skipIf(!enabled)("AlphaFold-Multimer invariant point attention WebGPU", () => {
+  // Bound rather than left a temporary: dawn.node schedules
+  // InstanceBase::ProcessEvents on the event loop, and a callback that runs
+  // after the instance is collected faults inside pthread_mutex_lock.
+  let gpu: GPU;
   let device: GPUDevice;
   beforeAll(async () => {
-    Object.assign(globalThis, globals); const adapter = await create([]).requestAdapter();
+    Object.assign(globalThis, globals);
+    gpu = create([]);
+    const adapter = await gpu.requestAdapter();
     if (adapter === null) throw new Error("no WebGPU adapter"); device = await adapter.requestDevice();
   });
   afterAll(() => device?.destroy());

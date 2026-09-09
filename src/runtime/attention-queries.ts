@@ -6,7 +6,7 @@ import {
 /**
  * How many queries one attention invocation should carry, measured.
  *
- * `attentionFlashKernelForShape` gives an invocation two queries once a shape
+ * attentionFlashKernelForShape gives an invocation two queries once a shape
  * has 128 or more of them, so that one key and value load serves both. Its own
  * comment records where that came from: "measured on GB10 at 1.17x-1.42x for
  * 128 to 1024 queries". On an M4 Pro it is the wrong way round — two queries
@@ -84,7 +84,7 @@ const calibrations = new WeakMap<GPUDevice, Map<number, Promise<AttentionShapeCh
  * Whether to report each candidate's time and error.
  *
  * Guarded, because this module runs in a browser as well as in a test process
- * and `process` does not exist there. Reading it unguarded threw a
+ * and process does not exist there. Reading it unguarded threw a
  * ReferenceError that the catch below turned into "no measurement", which
  * silently reverted every device to the arrangement this file exists to
  * replace — and reverted it only in the browser, which is the only place the

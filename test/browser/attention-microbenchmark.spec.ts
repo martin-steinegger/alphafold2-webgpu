@@ -10,10 +10,10 @@
  *
  * Every lane in a workgroup reads the same key and value for a given key
  * index, so those are sixteen vector loads shared by sixty-four lanes. But the
- * pair bias is indexed `(head * queries + query) * queries + key`, so for one
- * key index the lanes read addresses `queries * 4` bytes apart — sixty-four
+ * pair bias is indexed (head * queries + query) * queries + key, so for one
+ * key index the lanes read addresses queries * 4 bytes apart — sixty-four
  * separate cache lines per key, none of them coalesced. Transposing that
- * layout to `(head * queries + key) * queries + query` makes the same reads
+ * layout to (head * queries + key) * queries + query makes the same reads
  * contiguous.
  *
  * This measures the kernel with the operands it really has, at a real shape,

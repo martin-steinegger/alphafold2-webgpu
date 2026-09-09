@@ -15,7 +15,7 @@ Object.assign(globalThis, globals);
 
 const gpu = create(dawnInstanceFlags({
   // Native, so the bounds clamp goes: the kernels do not rely on it, and it is
-  // worth 11% of a recycle. See `dawnInstanceFlags`.
+  // worth 11% of a recycle. See dawnInstanceFlags.
   unclamped: true,
 }));
 const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });

@@ -9,7 +9,7 @@ export interface MsaCoverageData {
   /** Rows in the order the plot draws them, top first. */
   readonly rows: Uint32Array;
   /**
-   * Indices into `rows` where a block of alignments covering a different set
+   * Indices into rows where a block of alignments covering a different set
    * of chains begins. For a complex this separates the paired rows from each
    * chain's own hits, which is the structure ColabFold's coverage plot shows.
    */
@@ -20,7 +20,7 @@ export interface MsaCoverageData {
 }
 
 /**
- * Row scores and grouping, following ColabFold's `plot_msa_v2`.
+ * Row scores and grouping, following ColabFold's plot_msa_v2.
  *
  * A row is scored against the chains it actually covers: the mean identity to
  * the query over each covered chain's own columns, averaged over those chains.
@@ -93,9 +93,9 @@ export function analyzeMsa(a3m: string, chainLengths?: readonly number[]): MsaCo
 }
 
 /**
- * Matplotlib's `rainbow_r`, which is the colormap ColabFold's coverage plot
+ * Matplotlib's rainbow_r, which is the colormap ColabFold's coverage plot
  * uses: red at no identity, through green and blue, to violet at the query
- * itself. Matplotlib defines `rainbow` by these three functions and samples
+ * itself. Matplotlib defines rainbow by these three functions and samples
  * them into a 256-entry table, so the quantization is reproduced too and the
  * colours match to a level.
  */

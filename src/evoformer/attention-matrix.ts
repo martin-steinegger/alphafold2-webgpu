@@ -4,20 +4,20 @@
  * The register-resident kernel this competes with keeps one query's whole
  * accumulator in registers and reads every key and value itself, which costs
  * no cross-lane traffic and is why it beats every subgroup variant here: those
- * reduce each query-key dot product with `subgroupAdd`, once per key. A matrix
+ * reduce each query-key dot product with subgroupAdd, once per key. A matrix
  * unit does that reduction in hardware, so this kernel pays neither the
  * cross-lane traffic nor the per-key reduction, and reads each staged key tile
  * once for sixteen queries instead of once per query.
  *
  * The shape is the one both reference implementations use: 16x16x16 tiles with
  * f16 operands and an f32 accumulator, which is what Nvidia's units implement
- * and what `subgroupMatrixConfigs` reports. Operands must live in workgroup or
+ * and what subgroupMatrixConfigs reports. Operands must live in workgroup or
  * storage memory as the component type, so the query, key and value tiles are
  * converted into workgroup f16 once per tile rather than per multiply.
  *
  * The online softmax cannot rescale an accumulator in place: its correction is
- * per query row and `subgroupMatrixScalarMultiply` takes one uniform scalar.
- * So `P V` accumulates into a freshly zeroed result each key tile, is stored to
+ * per query row and subgroupMatrixScalarMultiply takes one uniform scalar.
+ * So P V accumulates into a freshly zeroed result each key tile, is stored to
  * workgroup memory, and the running output is rescaled there in plain f32 —
  * which is exactly what the reference CUDA kernel does for the same reason.
  */
@@ -43,7 +43,22 @@ import { attentionMatrixConfig, type MatrixUnitShape } from "../runtime/gemm.js"
 export const ATTENTION_MATRIX_SUBGROUP_SIZE = 32;
 const MATRIX_LANES = ATTENTION_MATRIX_SUBGROUP_SIZE;
 
-const SUBGROUPS = 2;
+/**
+ * Subgroups a workgroup, which is also how many queries share one staged key
+ * tile.
+ *
+ * Four rather than two, swept whole-fold on an RTX PRO 6000 with the card
+ * pinned and the arms alternated, because this machine drifts by more between
+ * repeats than the difference being measured. Milliseconds a recycle at 825
+ * residues over three pairs: 4313/4414/4611 at two subgroups against
+ * 4229/4247/4460 at four, so four wins every pair by about 3%. At 512 it is
+ * 1847 against 1745 and at 256 it is 1041 against 1047, a wash. pLDDT is
+ * 86.76, 86.93 and 84.25 at those three lengths whichever is used.
+ *
+ * The key tile stays 32: 64 measured 1.067 ms against 0.954 for the isolated
+ * attention at two subgroups and 1.056 against 0.936 at four.
+ */
+const SUBGROUPS = 4;
 /** The M of every tile, fixed by the unit shape the device reports. */
 const UNIT = 16;
 /** Queries one workgroup owns. */
@@ -77,17 +92,17 @@ const LANES = SUBGROUPS * 32;
 /**
  * Row lengths of everything the units address, chosen against the banks.
  *
- * Workgroup memory is thirty-two banks of four bytes, so lane `i` reading
- * element `i * stride` lands in bank `(i * stride) % 32` for f32 and
- * `(i * stride / 2) % 32` for f16. A stride sharing a factor with thirty-two
+ * Workgroup memory is thirty-two banks of four bytes, so lane i reading
+ * element i * stride lands in bank (i * stride) % 32 for f32 and
+ * (i * stride / 2) % 32 for f16. A stride sharing a factor with thirty-two
  * collapses the lanes onto few banks and serialises the read; a stride coprime
  * with it spreads them across all thirty-two.
  *
  * The head width is thirty-two, which is the worst case of all: the staged key
  * tile is read column-major, so consecutive lanes are one row apart, and at a
- * stride of thirty-two f16 that is `(16i) % 32` — two banks for thirty-two
+ * stride of thirty-two f16 that is (16i) % 32 — two banks for thirty-two
  * lanes, a sixteen-way conflict on the hottest read in the kernel. Thirty-four
- * gives `(17i) % 32`, and seventeen is coprime with thirty-two, so no two
+ * gives (17i) % 32, and seventeen is coprime with thirty-two, so no two
  * lanes collide. The f32 rows take the same treatment with an odd stride.
  */
 /**
@@ -121,7 +136,7 @@ export function attentionMatrixShape(
 /**
  * Workgroup bytes the kernel declares, which a device must permit.
  *
- * Every array is sized by the same `offset + stride * rows` reach the loads
+ * Every array is sized by the same offset + stride * rows reach the loads
  * and stores claim, not by the last element they touch, so this matches what
  * the shader actually declares.
  */
@@ -169,7 +184,7 @@ export function createAttentionMatrixFlashShader(
   // model's own tensors keep the head's true width.
   const channelTiles = paddedHeadDim(headDim) / N;
   const contractions = paddedHeadDim(headDim) / K;
-  // A matrix load or store reaches `offset + stride * rows` elements, not the
+  // A matrix load or store reaches offset + stride * rows elements, not the
   // last element it actually touches. An array sized to the last element is
   // out of bounds by the extension's own rule, which is undefined behaviour
   // however valid every index in it is.
@@ -180,16 +195,28 @@ export function createAttentionMatrixFlashShader(
     Array.from({ length: count }, (_, index) => body(index)).join(String.fromCharCode(10));
   // Each lane carries a fixed share of the staged key and value tiles between
   // passes, so the fetch for the next one overlaps this one's multiplies.
-  if ((KEY_TILE * (headDim / 4)) % LANES !== 0) {
-    throw new RangeError("the staged key tile must divide evenly among the lanes");
-  }
-  const keyPerLane = (KEY_TILE * (headDim / 4)) / LANES;
+  //
+  // The share rounds up rather than having to divide: a narrow head makes the
+  // tile smaller than the workgroup, and refusing that geometry cost the
+  // kernel every four-subgroup arrangement at a head of eight, where a 32-key
+  // tile is 64 vector items against 128 lanes. The lanes past the end sit the
+  // fetch and the staging out; their prefetch registers keep the zero they
+  // were declared with, which is what an absent key contributes anyway.
+  const keyItems = KEY_TILE * (headDim / 4);
+  const keyPerLane = Math.ceil(keyItems / LANES);
+  // The guard is emitted only where it is needed, so a geometry whose tile
+  // does fill the lanes generates exactly the shader it did before.
+  const keyBound = (body: string): string => (keyItems % LANES === 0
+    ? body.replace(/^\n/, "")
+    : `    if (item < ${keyItems}u) {${body}
+    }`.replace(/^ {4}if/, "if"));
   if ((rows * (headDim / 4)) % LANES !== 0) {
     throw new RangeError("the output tile must divide evenly among the lanes");
   }
   const outPerLane = (rows * (headDim / 4)) / LANES;
   const fetchKeyValue = (at: string): string => lines(keyPerLane, (i) => `  {
     let item = lane + ${i * LANES}u;
+${keyBound(`
     let global_key = ${at} + item / ${headDim / 4}u;
     let at_index = ((batch_index * p.queries + global_key) * p.heads + head)
       * ${headDim / 4}u + item % ${headDim / 4}u;
@@ -201,7 +228,7 @@ export function createAttentionMatrixFlashShader(
     if (global_key < p.queries) {
       next_k_${i} = key[at_index];
       next_v_${i} = value[at_index];
-    }
+    }`)}
   }`);
   const queriesLength = reach((rows - M) * TILE_STRIDE, TILE_STRIDE, M);
   const keysLength = reach((keyTiles - 1) * N * TILE_STRIDE, TILE_STRIDE, N);
@@ -314,11 +341,12 @@ ${fetchKeyValue("0u")}`}
       && query_origin + ${ATTENTION_MATRIX_QUERY_TILE}u <= p.queries;
 ${storedHalf ? "" : `${lines(keyPerLane, (i) => `    {
       let item = lane + ${i * LANES}u;
+${keyBound(`
       let base = (item / ${vectors}u) * ${TILE_STRIDE}u + (item % ${vectors}u) * 4u;
       keys_tile[base] = f16(next_k_${i}.x); keys_tile[base + 1u] = f16(next_k_${i}.y);
       keys_tile[base + 2u] = f16(next_k_${i}.z); keys_tile[base + 3u] = f16(next_k_${i}.w);
       values_tile[base] = f16(next_v_${i}.x); values_tile[base + 1u] = f16(next_v_${i}.y);
-      values_tile[base + 2u] = f16(next_v_${i}.z); values_tile[base + 3u] = f16(next_v_${i}.w);
+      values_tile[base + 2u] = f16(next_v_${i}.z); values_tile[base + 3u] = f16(next_v_${i}.w);`)}
     }`)}
     workgroupBarrier();
     // The next pass's keys and values are fetched while the units still work

@@ -6,6 +6,7 @@ import type { InvariantPointAttentionWeights } from "./ipa.js";
 import type { StructurePostAttentionWeights } from "./iteration.js";
 import { SidechainAnglesGpu, type SidechainWeights } from "./sidechain.js";
 import type { AllocationSnapshot } from "../runtime/allocator.js";
+import { markPhase } from "../runtime/phase-ledger.js";
 
 export interface StructureModuleWeights {
   readonly initialize: StructureInitializeWeights;
@@ -19,7 +20,7 @@ export interface StructureModuleInput {
   readonly pair: Float32Array;
   /** Pair activation already resident on this device. */
   readonly pairBuffer?: GPUBuffer;
-  /** Storage of that activation; `f16` means packed half-precision words. */
+  /** Storage of that activation; f16 means packed half-precision words. */
   readonly pairStorage?: ActivationStorage;
   /** Bytes one binding may cover of the pair; tests lower it. */
   readonly bindingLimitBytes?: number;
@@ -59,9 +60,11 @@ export class StructureModuleGpu {
     const msaChannels = input.msaChannels ?? 256;
     const structureChannels = input.structureChannels ?? 384;
     const pairChannels = input.pairChannels ?? 128;
+    markPhase("structure: initialize");
     const initialized = await new StructureInitializeGpu(this.device).run(
       input.msaFirstRow, input.length, msaChannels, structureChannels, input.weights.initialize,
     );
+    markPhase("structure: core");
     const core = await new StructureCoreGpu(this.device).run({
       activations: initialized.activations,
       pair: input.pair,
@@ -77,9 +80,11 @@ export class StructureModuleGpu {
       postAttentionWeights: input.weights.postAttention,
       ...(input.multimer === undefined ? {} : { multimer: input.multimer }),
     });
+    markPhase("structure: sidechain");
     const sidechain = await new SidechainAnglesGpu(this.device).run(
       core.activations, initialized.initialRepresentation, input.length, structureChannels, 128, input.weights.sidechain,
     );
+    markPhase("structure: geometry");
     const geometry = await new AtomGeometryGpu(this.device).run({
       affine: core.affine,
       angles: sidechain.angles,

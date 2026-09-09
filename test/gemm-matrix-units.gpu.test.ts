@@ -2,15 +2,15 @@
  * The projection over the hardware matrix units, against a CPU reference.
  *
  * The units are reached through a different kernel from every other variant —
- * one subgroup per workgroup, tiles addressed by `subgroupMatrixLoad` rather
+ * one subgroup per workgroup, tiles addressed by subgroupMatrixLoad rather
  * than staged by hand — and on a device whose units take f16 operands it is
  * different again, staging both operands through workgroup memory because the
  * load reinterprets nothing. Neither path is exercised by the hand-tiled
  * differential, so it is checked here on whatever configuration the device
  * actually reports.
  *
- * `AFWEBGPU_DAWN_FEATURES` passes Dawn toggles through, which is what reaches
- * the units on a Vulkan device: Dawn hides both `shader-f16` and the matrix
+ * AFWEBGPU_DAWN_FEATURES passes Dawn toggles through, which is what reaches
+ * the units on a Vulkan device: Dawn hides both shader-f16 and the matrix
  * extension behind toggles on Nvidia.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -33,8 +33,8 @@ function values(count: number, seed: number): Float32Array {
 }
 
 describe.skipIf(!enabled)("projection over the hardware matrix units", () => {
-  // The Dawn instance lives exactly as long as the object `create` returns, so
-  // it is held for the suite rather than left to be collected once `beforeAll`
+  // The Dawn instance lives exactly as long as the object create returns, so
+  // it is held for the suite rather than left to be collected once beforeAll
   // ends, which tore the device down under the test and aborted the worker.
   let gpu: ReturnType<typeof create> | undefined;
   let device: GPUDevice | undefined;
@@ -45,7 +45,7 @@ describe.skipIf(!enabled)("projection over the hardware matrix units", () => {
     // The same flags the model asks for. Built from the environment instead,
     // this suite skipped every case on any host where the caller had not set
     // the variable, and reported the skips as passes: the extension is
-    // experimental, so Dawn hides it without `allow_unsafe_apis`.
+    // experimental, so Dawn hides it without allow_unsafe_apis.
     const adapterName = process.env.AFWEBGPU_ADAPTER;
     gpu = create([
       ...(adapterName === undefined ? [] : [`adapter=${adapterName}`]),

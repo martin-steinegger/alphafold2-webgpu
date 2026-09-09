@@ -1,10 +1,10 @@
 /**
- * Does the matrix kernel `gemm.ts` emits compute the projection?
+ * Does the matrix kernel gemm.ts emits compute the projection?
  *
- * The candidates in `tools/gemm-candidates.ts` are checked by the calibration
+ * The candidates in tools/gemm-candidates.ts are checked by the calibration
  * harness, but those are a different implementation from the one the model
  * runs, and being right there says nothing about being right here. This checks
- * the shader `createTiledGemmShader` actually produces, against a reference
+ * the shader createTiledGemmShader actually produces, against a reference
  * summed in double precision, at shapes that are and are not multiples of the
  * tile — a kernel whose bounds are wrong is exactly right until the edge.
  *

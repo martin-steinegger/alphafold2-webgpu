@@ -1,9 +1,9 @@
 /**
  * The residue and atom naming AlphaFold's template features are written in.
  *
- * These are `residue_constants.atom_types`, `restype_3to1` and `restypes` from
+ * These are residue_constants.atom_types, restype_3to1 and restypes from
  * the official implementation, transcribed rather than derived: the order of
- * `ATOM_TYPES` is the atom37 axis every template tensor is indexed by, so a
+ * ATOM_TYPES is the atom37 axis every template tensor is indexed by, so a
  * single transposition here would misplace coordinates silently. The test
  * beside this file checks the ones the template pair features actually read.
  */
@@ -49,7 +49,7 @@ export const RESIDUE_THREE_TO_ONE: ReadonlyMap<string, string> = new Map(THREE_T
  * Modified residues a structure may carry in place of a standard one.
  *
  * The mmCIF path in AlphaFold resolves these through the file's own
- * `_pdbx_struct_mod_residue` records, which a PDB file does not have. These are
+ * _pdbx_struct_mod_residue records, which a PDB file does not have. These are
  * the substitutions common enough to matter in practice: selenomethionine above
  * all, which is in a large share of crystal structures and would otherwise cost
  * the template every methionine it has.

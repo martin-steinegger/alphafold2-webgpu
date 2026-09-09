@@ -2,7 +2,7 @@
  * The longest complex this machine can predict at all.
  *
  * Deliberately free of anything this branch added, so the same file runs on
- * `main`: no pinned kernel, no import of `gemm-selection`, whatever the device
+ * main: no pinned kernel, no import of gemm-selection, whatever the device
  * selects for itself. That is the only way to tell a capacity ceiling that was
  * always there from one a kernel change introduced, and the difference matters
  * more than the speedup does.

@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resolve } from "node:path";
 import { create, globals } from "webgpu";
+import { dawnInstanceFlags } from "../src/runtime/dawn.js";
 import { loadTriangleReferenceBundleFromFiles } from "../src/reference/node.js";
 import { errorMetrics } from "../src/triangle/types.js";
 import { TriangleMultiplicationOutgoingGpu } from "../src/triangle/webgpu.js";
@@ -16,7 +17,12 @@ describe.skipIf(!enabled)("TriangleMultiplicationOutgoing WebGPU", () => {
   beforeAll(async () => {
     Object.assign(globalThis, globals);
     const adapterName = process.env.AFWEBGPU_ADAPTER;
-    gpu = create(adapterName === undefined ? [] : [`adapter=${adapterName}`]);
+    // With a bare instance this adapter reports no shader-f16, so the two f16
+    // cases below skipped themselves on every NVIDIA run and the path went
+    // years unexercised. A software adapter reports it either way, which is how
+    // that came to light.
+    gpu = create([...dawnInstanceFlags({ unclamped: true }),
+      ...(adapterName === undefined ? [] : [`adapter=${adapterName}`])]);
     const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
     if (adapter === null) throw new Error("no WebGPU adapter is available");
     hasF16 = adapter.features.has("shader-f16");

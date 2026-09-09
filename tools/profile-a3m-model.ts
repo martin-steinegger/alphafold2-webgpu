@@ -6,6 +6,7 @@ import { AlphaFoldMonomerGpu, type MonomerRecycleFeatures } from "../src/model/m
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
 import { requestAlphaFoldDevice } from "../src/runtime/device.js";
+import { recycleFeatureSourceOf } from "../src/input/a3m-features.js";
 
 Object.assign(globalThis, globals);
 const input = AlphaFoldFixture.fromStore(await FileTensorStore.open(
@@ -43,7 +44,7 @@ const [embedding, template, extraStack, mainStack, structure, confidence, geomet
 ]);
 const gpu = create(dawnInstanceFlags({
   // Native, so the bounds clamp goes: the kernels do not rely on it, and it is
-  // worth 11% of a recycle. See `dawnInstanceFlags`.
+  // worth 11% of a recycle. See dawnInstanceFlags.
   unclamped: true,
 }));
 const adapter = await gpu.requestAdapter();
@@ -52,7 +53,7 @@ const device = await requestAlphaFoldDevice(adapter);
 try {
   const prediction = await new AlphaFoldMonomerGpu(device, {
     profile: true, profileRecycle: recycles - 1,
-  }).predict(features, {
+  }).predict(recycleFeatureSourceOf(features), {
     embedding, template, extraStack, mainStack, structure,
     lddt: confidence.lddt, pae: confidence.pae, geometry,
   }, await model.tensor("confidencePaeBreaks"));

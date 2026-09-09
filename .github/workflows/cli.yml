@@ -1,0 +1,73 @@
+name: CLI checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cli-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The suite that needs no GPU: the build, the browser bundle, and the 224
+  # tests that run without an adapter.
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+
+  # The GPU suites that run without a real GPU. Thirteen files, measured: the rest
+  # of the 43 are blocked by the Evoformer and model captures, which the README
+  # keeps out of git on purpose, so they cannot run in CI on any platform.
+  portable-gpu:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      # Linux has no GPU on a hosted runner, so Mesa's software Vulkan stands in.
+      # Dawn comes up on it reporting shader-f16, subgroups and
+      # subgroup-size-control, which is everything these kernels ask for.
+      - name: Install a software Vulkan driver
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers
+      - name: Select lavapipe
+        if: runner.os == 'Linux'
+        run: |
+          echo "VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json" >> "$GITHUB_ENV"
+          echo "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json" >> "$GITHUB_ENV"
+
+      - name: Record the adapter
+        run: npx tsx tools/report-adapter.ts
+
+      - name: Portable GPU suites
+        env:
+          AFWEBGPU_GPU_TESTS: "1"
+        run: npm run test:gpu:portable

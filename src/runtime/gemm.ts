@@ -19,10 +19,10 @@
  * and none here grants more of.
  *
  * The row tiles of a tall contraction outgrow it: the extra-MSA global
- * attention projects `sequences * length` rows, which at 800 residues passes it
+ * attention projects sequences * length rows, which at 800 residues passes it
  * at 5,242 extra sequences, and at the multimer's 1,152 at 3,640 residues. It
  * announced itself as a validation error rather than a wrong answer, but it
- * stopped the prediction. `gemmGrid` folds the excess into the column
+ * stopped the prediction. gemmGrid folds the excess into the column
  * dimension and the kernels take it apart again.
  */
 export const GEMM_GRID_LIMIT = 65_535;
@@ -33,7 +33,7 @@ const GEMM_TILE_INNER = 8;
 const GEMM_THREADS = 256;
 /**
  * Workgroup storage every WebGPU implementation guarantees. A deeper k tile
- * stages more of both operands, and an epilogue reserves `gemm_stage` on top,
+ * stages more of both operands, and an epilogue reserves gemm_stage on top,
  * so the depth is only taken when the three together still fit.
  */
 const GEMM_WORKGROUP_BYTES = 16384;
@@ -44,7 +44,7 @@ export const MATRIX_REGION = 32;
 export const MATRIX_LANES = 32;
 
 /**
- * One hardware matrix configuration: `Accum[M][N] += A[M][K] * B[K][N]`.
+ * One hardware matrix configuration: Accum[M][N] += A[M][K] * B[K][N].
  *
  * A device advertises the shapes and component types its units actually
  * implement, and they differ by vendor rather than by preference. Apple offers
@@ -54,7 +54,7 @@ export const MATRIX_LANES = 32;
  * constant, and a device that reports nothing usable keeps the hand-tiled
  * kernel as before.
  *
- * `resultType` is always f32 here. The units can accumulate in f16 as well and
+ * resultType is always f32 here. The units can accumulate in f16 as well and
  * this deliberately does not: the whole reason the matrix path was exempt from
  * the half-precision margin is that its reduction stays single precision, and
  * a contraction over a deep MSA is exactly where an f16 accumulator fails.
@@ -106,10 +106,10 @@ export const MATRIX_SHAPE_F32_8: MatrixUnitShape = { componentType: "f32", M: 8,
 /**
  * How the k loop computes, chosen per device rather than written down.
  *
- * `precision` is the arithmetic of the staged tiles, the products and the
- * accumulator; `inner` is the depth of one staged k tile. Neither is visible
- * to a caller: the accumulator still reaches the epilogue as `vec4<f32>`, and
- * the k depth does not enter the dispatch grid, which `gemmGrid` derives from
+ * precision is the arithmetic of the staged tiles, the products and the
+ * accumulator; inner is the depth of one staged k tile. Neither is visible
+ * to a caller: the accumulator still reaches the epilogue as vec4<f32>, and
+ * the k depth does not enter the dispatch grid, which gemmGrid derives from
  * the output tile alone. That is what makes them safe to measure and switch
  * without touching a single call site.
  */
@@ -117,25 +117,25 @@ export interface GemmVariant {
   /**
    * Where half precision is used, which is not one choice but three.
    *
-   * `f16` stages, multiplies and accumulates in half precision. It is the
+   * f16 stages, multiplies and accumulates in half precision. It is the
    * fastest and it is not shippable: a contraction over a deep MSA overflows
    * the accumulator, which took a 508-row prediction from 96.8 pLDDT to 69.9
    * and its pTM to NaN.
    *
-   * `f16-mixed` multiplies in half precision and accumulates in single. The
+   * f16-mixed multiplies in half precision and accumulates in single. The
    * multiply is where Apple's rate doubles and the long reduction is where the
    * error grows, so the two can be bought separately.
    *
-   * `f16-chunked` accumulates in half precision for the depth of one staged
+   * f16-chunked accumulates in half precision for the depth of one staged
    * tile and folds that into an f32 running sum once per tile, so the error
    * grows with the square root of 8 or 16 terms rather than of K while all but
    * one add per tile stays in half precision.
    *
-   * `matrix` is not half precision at all: it is the hardware matrix units,
+   * matrix is not half precision at all: it is the hardware matrix units,
    * accumulating in f32, and it is both faster than any of the above and
    * exact. It serves only callers that declared their operands as arrays and
-   * store one element at a time, and `inner` does not apply to it: the units
-   * fix the depth of a multiply, and `matrixDepth` says how many of those a
+   * store one element at a time, and inner does not apply to it: the units
+   * fix the depth of a multiply, and matrixDepth says how many of those a
    * step stages at once.
    */
   readonly precision: "f32" | "f16" | "f16-mixed" | "f16-chunked" | "matrix";
@@ -154,14 +154,14 @@ export interface GemmVariant {
    *
    * Only some projections can use them: an operand that is a function call, or
    * four weight matrices selected by column, is not something
-   * `subgroupMatrixLoad` can address. Those callers would otherwise drop all
+   * subgroupMatrixLoad can address. Those callers would otherwise drop all
    * the way back to f32 whenever the matrix units won, losing the
    * half-precision gain they did qualify for — which on this model is most of
    * the projection time, since the largest single shape is one of them.
    */
   readonly fallback?: "f32" | "f16-mixed" | "f16-chunked";
   /**
-   * Which hardware configuration `matrix` means on this device.
+   * Which hardware configuration matrix means on this device.
    *
    * Absent is Apple's f32 8x8x8, which is what every existing caller and
    * every recorded measurement assumed. An f16 configuration computes the
@@ -175,7 +175,7 @@ export const GEMM_VARIANT_F32: GemmVariant = { precision: "f32", inner: GEMM_TIL
 
 let selectedVariant: GemmVariant = GEMM_VARIANT_F32;
 
-/** The variant every `createTiledGemmShader` uses unless told otherwise. */
+/** The variant every createTiledGemmShader uses unless told otherwise. */
 export function gemmVariant(): GemmVariant {
   return selectedVariant;
 }
@@ -183,10 +183,10 @@ export function gemmVariant(): GemmVariant {
 /**
  * Installs the measured winner.
  *
- * `src/runtime/gemm-selection.ts` calls this once per device, from inside
- * `requestAlphaFoldDevice`, before any consumer can hold the device and so
+ * src/runtime/gemm-selection.ts calls this once per device, from inside
+ * requestAlphaFoldDevice, before any consumer can hold the device and so
  * before any projection shader exists. Setting it later would let one cache
- * key describe two different shaders, which `ComputePipelineCache` reports as
+ * key describe two different shaders, which ComputePipelineCache reports as
  * a collision rather than running.
  */
 export function setGemmVariant(variant: GemmVariant): void {
@@ -202,26 +202,33 @@ export interface TiledGemmShader {
   readonly inner: string;
   /** Expression for the number of output columns. */
   readonly columns: string;
-  /** Expression producing one A element, with `row` and `k` in scope. */
+  /** Expression producing one A element, with row and k in scope. */
   readonly sourceElement: string;
-  /** Expression producing one W element, with `k` and `column` in scope. */
+  /** Expression producing one W element, with k and column in scope. */
   readonly weightElement: string;
-  /** Statements storing one result, with `row`, `column` and `element` in scope. */
+  /**
+   * sourceElement and weightElement may use column_origin, the first
+   * column of the tile being staged, which both kernels define. Arithmetic
+   * that depends only on the tile belongs there: written against column it
+   * is recomputed for every element staged, and a division by a uniform cannot
+   * be strength-reduced.
+   */
+  /** Statements storing one result, with row, column and element in scope. */
   readonly store: string;
   /**
    * Statements storing one invocation's four adjacent results at once, with
-   * `row`, `column` (the first of the four, a multiple of four) and
-   * `values: vec4<f32>` in scope. Replaces `store`; the caller bounds the
+   * row, column (the first of the four, a multiple of four) and
+   * values: vec4<f32> in scope. Replaces store; the caller bounds the
    * columns itself, which lets an epilogue combine neighbouring columns such
    * as a projection and its gate.
    */
   readonly storeVector?: string;
   /**
    * A whole-tile epilogue replacing the per-invocation stores. Runs after the
-   * k loop with `acc0`..`acc{rows per invocation - 1}` (vec4<f32> each, four
-   * adjacent columns of one row), `tile_row_origin`, `row_thread`,
-   * `column_thread`, `column_origin`, `thread`, `gemm_rows` and `gemm_columns`
-   * in scope, and `gemm_stage: array<f32, stageElements>` in workgroup storage
+   * k loop with acc0..acc{rows per invocation - 1} (vec4<f32> each, four
+   * adjacent columns of one row), tile_row_origin, row_thread,
+   * column_thread, column_origin, thread, gemm_rows and gemm_columns
+   * in scope, and gemm_stage: array<f32, stageElements> in workgroup storage
    * for transposing results before storing them. Barriers are permitted: every
    * invocation of the workgroup runs the epilogue.
    */
@@ -232,19 +239,19 @@ export interface TiledGemmShader {
   /**
    * The same operands again, as arrays rather than as expressions.
    *
-   * `sourceElement` and `weightElement` are expressions because a caller may
+   * sourceElement and weightElement are expressions because a caller may
    * unpack a half-precision word, window a tensor past a binding limit, or
    * index something else entirely. The hardware matrix units cannot consume an
-   * expression: `subgroupMatrixLoad` takes an array, a base offset and a row
+   * expression: subgroupMatrixLoad takes an array, a base offset and a row
    * stride, and loads a whole 8x8 tile itself.
    *
-   * A caller whose operands really are plain `array<f32>` in row-major order
+   * A caller whose operands really are plain array<f32> in row-major order
    * says so here, and becomes eligible for the matrix kernel on a device that
    * has the units. Saying nothing is always safe and keeps the hand-tiled
    * kernel. Declaring this when it is not true is not detectable here and will
-   * compute the wrong answer, so it is a claim, not a hint: element `[row][k]`
-   * of A must live at `base + row * stride + k`, and `[k][column]` of W at
-   * `base + k * stride + column`.
+   * compute the wrong answer, so it is a claim, not a hint: element [row][k]
+   * of A must live at base + row * stride + k, and [k][column] of W at
+   * base + k * stride + column.
    */
   readonly sourceArray?: GemmOperandArray;
   readonly weightArray?: GemmOperandArray;
@@ -255,8 +262,8 @@ export interface TiledGemmShader {
    * varies fastest when it fetches a tile and writes it into workgroup memory.
    * Getting it wrong costs bandwidth, not correctness — but the fetch and the
    * write have to agree, and when they did not the prediction came back at 26
-   * pLDDT. The defaults are the common layouts — a source indexed `[row][k]`
-   * and a weight indexed `[k][column]`. The triangle multiplication's incoming
+   * pLDDT. The defaults are the common layouts — a source indexed [row][k]
+   * and a weight indexed [k][column]. The triangle multiplication's incoming
    * direction has its source the other way round and read as though it did
    * not, its tile arrived one block row apart per lane and it cost 0.19s to
    * 0.27s of a recycle.
@@ -266,7 +273,7 @@ export interface TiledGemmShader {
 }
 
 export interface GemmOperandArray {
-  /** Name of an `array<f32>` binding in the preamble. */
+  /** Name of an array<f32> binding in the preamble. */
   readonly array: string;
   /** Expression for the element index the operand starts at. Defaults to zero. */
   readonly base?: string;
@@ -275,10 +282,10 @@ export interface GemmOperandArray {
   /**
    * Whether the operand is stored with the contraction axis outermost.
    *
-   * The default is `[row][k]`: element `[row][k]` at `base + row * stride + k`.
+   * The default is [row][k]: element [row][k] at base + row * stride + k.
    * A contraction whose operand is accumulated over its sequences, as the
-   * outer-product mean's is, has it the other way round — `[k][row]` at
-   * `base + k * stride + row` — and transposing it to satisfy this would cost
+   * outer-product mean's is, has it the other way round — [k][row] at
+   * base + k * stride + row — and transposing it to satisfy this would cost
    * a pass over the whole tensor. Only the f16 matrix kernel honours this; the
    * f32 one addresses the operand where it lies and has no such freedom, so a
    * caller declaring it is not offered that kernel.
@@ -289,7 +296,7 @@ export interface GemmOperandArray {
 /**
  * Workgroup counts for a tiled GEMM dispatch.
  *
- * `tileColumns` must match the tile the shader was generated with; a grid
+ * tileColumns must match the tile the shader was generated with; a grid
  * computed from a narrower tile silently leaves output columns unwritten.
  */
 export function gemmGrid(
@@ -307,8 +314,8 @@ export function gemmGrid(
 /**
  * Where a workgroup's output tile begins.
  *
- * With one fold this is `group.x` across the columns and `group.y` down the
- * rows, as it reads. With more, the folds ride in the high part of `group.x`,
+ * With one fold this is group.x across the columns and group.y down the
+ * rows, as it reads. With more, the folds ride in the high part of group.x,
  * which costs a division of a value the whole workgroup shares.
  */
 const tileOrigins = (tileColumns: number): string => `  let gemm_column_tiles =
@@ -330,8 +337,8 @@ export function usesMatrixUnits(shader: TiledGemmShader, variant: GemmVariant): 
     && (variant.matrix?.componentType === "f16"
       || (shader.sourceArray !== undefined && shader.weightArray !== undefined
         && shader.sourceArray.columnMajor !== true))
-    // A whole-tile epilogue is written against `acc{n}` in the hand-tiled
-    // thread mapping, which a matrix kernel does not have. `storeVector` is
+    // A whole-tile epilogue is written against acc{n} in the hand-tiled
+    // thread mapping, which a matrix kernel does not have. storeVector is
     // fine: the result is staged in workgroup memory, so an invocation can
     // read four adjacent columns of it as easily as one.
     && shader.epilogue === undefined;
@@ -344,10 +351,10 @@ export function usesMatrixUnits(shader: TiledGemmShader, variant: GemmVariant): 
  * sub-regions, four left tiles by four right tiles at a time: sixteen
  * multiply-accumulates per eight loads, where the naive arrangement gets one
  * per two. Keeping the tile the hand-tiled kernel uses is what lets callers
- * opt in one at a time — `gemmGrid` does not know which shader is asking, so
+ * opt in one at a time — gemmGrid does not know which shader is asking, so
  * two kernels with different tiles would hand one of them the wrong grid.
  *
- * `subgroupMatrixStore` requires a uniform offset and WGSL's uniformity
+ * subgroupMatrixStore requires a uniform offset and WGSL's uniformity
  * analysis is workgroup-scoped, so one subgroup per workgroup and every offset
  * from the workgroup id.
  *
@@ -372,7 +379,7 @@ export function usesMatrixUnits(shader: TiledGemmShader, variant: GemmVariant): 
  *
  * The f32 kernel below addresses the operands where they lie, because Apple's
  * units take the component type the tensors already are. An f16 unit cannot:
- * `subgroupMatrixLoad` reinterprets nothing, so the operands have to be f16 in
+ * subgroupMatrixLoad reinterprets nothing, so the operands have to be f16 in
  * memory, and a staged tile is the only place they are.
  *
  * That staging is what the shape is chosen around. One subgroup owning the
@@ -387,7 +394,7 @@ export function usesMatrixUnits(shader: TiledGemmShader, variant: GemmVariant): 
  * thirty-two collapses the lanes of a column read onto a few of them.
  */
 /**
- * The projection over the matrix units, staging `kStep` of the contraction.
+ * The projection over the matrix units, staging kStep of the contraction.
  *
  * One unit of depth a step is two barriers for four multiplies, and the
  * staging around them is the kernel's cost rather than the multiplies: the
@@ -423,7 +430,7 @@ function createMatrixGemmShaderF16(
   const aStride = kStep + 2;
   const bStride = tileColumns + 8;
   const outStride = N + 1;
-  // A load or store reaches `offset + stride * rows`, not the last element it
+  // A load or store reaches offset + stride * rows, not the last element it
   // touches; an array sized to the latter is out of bounds by the extension's
   // own rule however valid every index in it is.
   const reach = (maxOffset: number, stride: number, count: number): number =>
@@ -440,11 +447,11 @@ function createMatrixGemmShaderF16(
   const aPerLane = (GEMM_TILE_ROWS * kStep) / lanes;
   const bPerLane = (kStep * tileColumns) / lanes;
   // The operands come from the caller's own element expressions, which name
-  // `row` and `k` for the source and `k` and `column` for the weight. They are
-  // read under an `if` rather than a `select` so an expression is never
+  // row and k for the source and k and column for the weight. They are
+  // read under an if rather than a select so an expression is never
   // evaluated for an index outside the operand.
   const rowFirst = shader.sourceContiguous === "row";
-  // The staged slot is `[row][k]` however the fetch walked it, so the write
+  // The staged slot is [row][k] however the fetch walked it, so the write
   // index has to be derived the same way the fetch was.
   const stagedA = (offset: number): string => rowFirst
     ? `((lane + ${offset}u) % ${GEMM_TILE_ROWS}u) * ${aStride}u + (lane + ${offset}u) / ${GEMM_TILE_ROWS}u`
@@ -467,7 +474,11 @@ function createMatrixGemmShaderF16(
   const fetchB = (at: string, whole: boolean): string => lines(bPerLane, (i) => `  {
     let item = lane + ${i * lanes}u;
     let k = ${at} + item ${kFirst ? `% ${kStep}u` : `/ ${tileColumns}u`};
-    let column = tile_column_origin + item ${kFirst ? `/ ${kStep}u` : `% ${tileColumns}u`};
+    // Both kernels offer the tile's first column under this name, so a weight
+    // expression can put its loop-invariant arithmetic on the tile rather than
+    // on the element and have it hoisted out of the staging loop.
+    let column_origin = tile_column_origin;
+    let column = column_origin + item ${kFirst ? `/ ${kStep}u` : `% ${tileColumns}u`};
     ${whole ? `next_b_${i} = ${shader.weightElement};` : `var held = 0.0;
     if (k < gemm_inner && column < gemm_columns) { held = ${shader.weightElement}; }
     next_b_${i} = held;`}
@@ -594,7 +605,7 @@ function createMatrixGemmShader(shader: TiledGemmShader, variant: GemmVariant): 
     Array.from({ length: count }, (_, index) => body(index)).join("\n");
   const base = (operand: GemmOperandArray): string => operand.base ?? "0u";
   // Where a tile is read from. With f32 components the units address the
-  // storage buffers directly. With f16 they cannot: `subgroupMatrixLoad`
+  // storage buffers directly. With f16 they cannot: subgroupMatrixLoad
   // reinterprets nothing, so the array it reads must already hold the
   // component type, and the operands here are f32. The tile is therefore
   // converted once into workgroup storage and loaded from there, which is
@@ -780,12 +791,12 @@ export function createTiledGemmShader(
     Array.from({ length: count }, (_, index) => body(index)).join("\n");
   const items = (count: number, body: (index: number) => string): string =>
     Array.from({ length: count }, (_, index) => body(index)).join(", ");
-  // Half precision accumulates under a private name and rebinds `acc{n}` to
+  // Half precision accumulates under a private name and rebinds acc{n} to
   // the converted value once the k loop is done, so every epilogue and store
-  // fragment a caller wrote against `vec4<f32>` keeps compiling unchanged.
+  // fragment a caller wrote against vec4<f32> keeps compiling unchanged.
   const register = halfAccumulator ? "gemm_acc" : "acc";
   const accumulatorScalar = halfAccumulator ? "f16" : "f32";
-  // `enable` must precede every declaration, and a preamble may already carry
+  // enable must precede every declaration, and a preamble may already carry
   // its own copy for an activation stored as f16.
   const enable = half && !shader.preamble.includes("enable f16;") ? "enable f16;\n" : "";
   return `${enable}${shader.preamble}

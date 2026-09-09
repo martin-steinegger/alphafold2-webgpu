@@ -7,7 +7,7 @@ import {
  *
  * The sequence and the coordinates come from the same records, so they cannot
  * disagree. This is the reason AlphaFold needs kalign and we do not: it takes
- * the template's sequence from the mmCIF's `_entity_poly_seq` and its
+ * the template's sequence from the mmCIF's _entity_poly_seq and its
  * coordinates from the model, and when a structure's SEQRES does not line up
  * with the residues it actually resolved, the two have to be realigned before
  * anything can be indexed. Reading only the residues that have atoms leaves
@@ -21,9 +21,9 @@ export interface StructureChain {
   readonly sequence: string;
   /** Author residue numbers, for reporting which part of a structure was used. */
   readonly residueNumbers: Int32Array;
-  /** Coordinates on AlphaFold's 37-atom axis, `[residues, 37, 3]`. */
+  /** Coordinates on AlphaFold's 37-atom axis, [residues, 37, 3]. */
   readonly atomPositions: Float32Array;
-  /** 1 where an atom was present, `[residues, 37]`. */
+  /** 1 where an atom was present, [residues, 37]. */
   readonly atomMask: Float32Array;
 }
 
@@ -219,7 +219,7 @@ function parseMmcif(text: string): StructureChain[] {
  * Reads a template structure.
  *
  * The format is taken from the text rather than from a file extension, since a
- * `.pdb` holding mmCIF and the reverse are both things people upload.
+ * .pdb holding mmCIF and the reverse are both things people upload.
  */
 export function parseStructure(text: string): ParsedStructure {
   const mmcif = /^\s*(data_|#|loop_|_atom_site\.)/m.test(text) && /_atom_site\./.test(text);

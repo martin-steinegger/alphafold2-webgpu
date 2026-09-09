@@ -1,14 +1,14 @@
 /**
  * Why the triangle contraction runs at a fraction of the projection's rate.
  *
- * `triangle.outgoing.contract` and its incoming twin are 14% of an Evoformer
+ * triangle.outgoing.contract and its incoming twin are 14% of an Evoformer
  * block at 708 residues and rising with length — 6.7% at 236, 9.3% at 472 —
  * and the profile puts them at about 500 GFLOP/s where the projection kernel,
  * from the same generator on the same device, reaches 2,800.
  *
  * The suspicion is the access pattern rather than the arithmetic. The
- * contraction computes `out[i][j] = sum_k a[i][k] b[j][k]`, so its second
- * operand is addressed `column * L + k`: the staging loop walks columns at a
+ * contraction computes out[i][j] = sum_k a[i][k] b[j][k], so its second
+ * operand is addressed column * L + k: the staging loop walks columns at a
  * fixed k, and consecutive columns are a whole row apart. Nothing about that
  * coalesces.
  *

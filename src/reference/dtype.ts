@@ -55,7 +55,7 @@ export function readTensor(record: BinaryTensorRecord, buffer: ArrayBufferLike,
 }
 
 /**
- * Decode `count` values starting at value `start` of a stored tensor.
+ * Decode count values starting at value start of a stored tensor.
  *
  * Float32 comes back as a view of the shard; compressed formats decode into a
  * fresh array. Block scales are indexed by absolute position, so a range that

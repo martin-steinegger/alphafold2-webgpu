@@ -1,14 +1,36 @@
 import { CLUSTERED_MSA_CHANNELS } from "../src/input/msa-features.js";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import {
+
   MULTIMER_RELATIVE_CHANNELS, makeMultimerA3mFeatures, makeMultimerQueryOnlyFeatures, makeMultimerSequenceFeatures,
   multimerChainIdentifiers, multimerRelativeFeatures,
 } from "../src/input/multimer-features.js";
 
+import { create, globals } from "webgpu";
+import { dawnInstanceFlags } from "../src/runtime/dawn.js";
+import { requestAlphaFoldDevice } from "../src/runtime/device.js";
+
+// Featurisation clusters the alignment on the device, so these need one.
+const gpuEnabled = process.env.AFWEBGPU_GPU_TESTS === "1";
+// Held at module scope rather than left as a local in beforeAll. dawn.node
+// schedules InstanceBase::ProcessEvents on the event loop, and a callback that
+// runs after the instance is collected dereferences freed memory: a
+// segmentation fault inside pthread_mutex_lock on an unaligned mutex.
+let gpu: GPU;
+let device: GPUDevice;
+beforeAll(async () => {
+  if (!gpuEnabled) return;
+  Object.assign(globalThis, globals);
+  gpu = create(dawnInstanceFlags({ unclamped: true }));
+  const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
+  device = await requestAlphaFoldDevice(adapter!);
+});
+
+
 const HOMOMER_CHAIN = "PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK";
 
-describe("AlphaFold-Multimer sequence features", () => {
-  it("preserves both copies and chain boundaries for the 59-residue homodimer", () => {
+describe.skipIf(!gpuEnabled)("AlphaFold-Multimer sequence features", () => {
+  it("preserves both copies and chain boundaries for the 59-residue homodimer", async () => {
     const tables = {
       atom37ToAtom14: Float32Array.from({ length: 21 * 37 }, (_, index) => index % 14),
       atom37Mask: new Float32Array(21 * 37).fill(1),
@@ -32,7 +54,7 @@ describe("AlphaFold-Multimer sequence features", () => {
     );
   });
 
-  it("assigns three asymmetric chains and symmetry copies to the 59-residue homotrimer", () => {
+  it("assigns three asymmetric chains and symmetry copies to the 59-residue homotrimer", async () => {
     const tables = {
       atom37ToAtom14: Float32Array.from({ length: 21 * 37 }, (_, index) => index % 14),
       atom37Mask: new Float32Array(21 * 37).fill(1),
@@ -55,7 +77,7 @@ describe("AlphaFold-Multimer sequence features", () => {
     }
   });
 
-  it("assigns asym, entity and symmetry identifiers to heteromers and homomers", () => {
+  it("assigns asym, entity and symmetry identifiers to heteromers and homomers", async () => {
     const features = multimerChainIdentifiers(["AC", "G", "AC"]);
     expect([...features.asymId]).toEqual([1, 1, 2, 3, 3]);
     expect([...features.entityId]).toEqual([1, 1, 2, 1, 1]);
@@ -63,7 +85,7 @@ describe("AlphaFold-Multimer sequence features", () => {
     expect([...features.residueIndex]).toEqual([0, 1, 0, 0, 1]);
   });
 
-  it("uses the official 66+1+6 relative encoding", () => {
+  it("uses the official 66+1+6 relative encoding", async () => {
     const tables = {
       atom37ToAtom14: Float32Array.from({ length: 21 * 37 }, (_, index) => index % 37),
       atom37Mask: new Float32Array(21 * 37).fill(1),
@@ -88,18 +110,18 @@ describe("AlphaFold-Multimer sequence features", () => {
     expect(active(0, 4)).toEqual([65, 72]); // different chain and entity
   });
 
-  it("rejects malformed public inputs", () => {
+  it("rejects malformed public inputs", async () => {
     expect(() => multimerChainIdentifiers("AC" )).toThrow(/at least two chains/);
     expect(() => multimerChainIdentifiers("AC::G")).toThrow(/each multimer chain/);
     expect(() => multimerChainIdentifiers("AC:B")).toThrow(/each multimer chain/);
   });
 
-  it("builds deterministic 21/49-channel recycle inputs without joining chain identities", () => {
+  it("builds deterministic 21/49-channel recycle inputs without joining chain identities", async () => {
     const tables = {
       atom37ToAtom14: Float32Array.from({ length: 21 * 37 }, (_, index) => index % 14),
       atom37Mask: new Float32Array(21 * 37).fill(1),
     };
-    const recycles = makeMultimerQueryOnlyFeatures("AC:GG", tables, { recycles: 1, randomSeed: 7 });
+    const recycles = await makeMultimerQueryOnlyFeatures("AC:GG", tables, { recycles: 1, randomSeed: 7 });
     expect(recycles).toHaveLength(2);
     expect(recycles[0]!.targetFeatures).toHaveLength(4 * 21);
     expect(recycles[0]!.msaFeatures).toHaveLength(4 * CLUSTERED_MSA_CHANNELS);
@@ -108,18 +130,18 @@ describe("AlphaFold-Multimer sequence features", () => {
     expect(recycles[0]!.msaFeatures).not.toEqual(recycles[1]!.msaFeatures);
   });
 
-  it("builds paired/unpaired Multimer MSA features with block-padding masks", () => {
+  it("builds paired/unpaired Multimer MSA features with block-padding masks", async () => {
     const tables = {
       atom37ToAtom14: Float32Array.from({ length: 21 * 37 }, (_, index) => index % 14),
       atom37Mask: new Float32Array(21 * 37).fill(1),
     };
-    const features = makeMultimerA3mFeatures(
+    const features = (await makeMultimerA3mFeatures(device, 
       ["AC", "GG"],
       ">query\nACGG\n>paired\nA-G-\n>unpaired_a\nA---\n",
       Float32Array.of(1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0),
       tables,
       { recycles: 0, maxMsaSequences: 3, randomSeed: 0 },
-    )[0]!;
+    ))[0]!;
     expect(features.targetChannels).toBe(21);
     expect(features.msaFeatureChannels).toBe(CLUSTERED_MSA_CHANNELS);
     expect(features.msaSequences).toBe(3);
@@ -129,7 +151,7 @@ describe("AlphaFold-Multimer sequence features", () => {
     expect([...features.residueIndex]).toEqual([0, 1, 0, 1]);
   });
 
-  it("applies the shared clustered and extra-MSA row limits to complexes", () => {
+  it("applies the shared clustered and extra-MSA row limits to complexes", async () => {
     const tables = {
       atom37ToAtom14: Float32Array.from({ length: 21 * 37 }, (_, index) => index % 14),
       atom37Mask: new Float32Array(21 * 37).fill(1),
@@ -140,10 +162,10 @@ describe("AlphaFold-Multimer sequence features", () => {
       ">unpaired_b_1", "--G-", ">unpaired_b_2", "---G",
     ].join("\n");
     const depth = 7;
-    const features = makeMultimerA3mFeatures(
+    const features = (await makeMultimerA3mFeatures(device, 
       ["AC", "GG"], a3m, new Float32Array(depth * 4).fill(1), tables,
       { recycles: 0, randomSeed: 0, maxMsaSequences: 2, maxExtraSequences: 3 },
-    )[0]!;
+    ))[0]!;
     expect(features.msaSequences).toBe(2);
     expect(features.extraSequences).toBe(3);
     expect(features.msaFeatures).toHaveLength(2 * 4 * CLUSTERED_MSA_CHANNELS);

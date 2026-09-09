@@ -8,6 +8,27 @@ export interface A3mAlignment {
 }
 
 const ALIGNED_RESIDUES = /^[ACDEFGHIKLMNPQRSTVWYX-]+$/;
+/**
+ * The same alphabet as a lookup by character code.
+ *
+ * The residue loop runs once per character of the whole alignment, 9.1 million
+ * times on an 8.77 MB file. Doing it with strings meant a one-character string
+ * from the iterator, another from toUpperCase, and a regex match, for every
+ * one of them.
+ */
+const ALIGNED_CODES = new Uint8Array(128);
+for (const residue of "ACDEFGHIKLMNPQRSTVWYX-") ALIGNED_CODES[residue.charCodeAt(0)] = 1;
+
+/** Builds a string from character codes without exceeding the argument limit. */
+function stringFromCodes(codes: Uint16Array, count: number): string {
+  const CHUNK = 4096;
+  if (count <= CHUNK) return String.fromCharCode(...codes.subarray(0, count));
+  let text = "";
+  for (let start = 0; start < count; start += CHUNK) {
+    text += String.fromCharCode(...codes.subarray(start, Math.min(start + CHUNK, count)));
+  }
+  return text;
+}
 
 export function parseA3m(text: string): A3mAlignment {
   const descriptions: string[] = [];
@@ -35,23 +56,24 @@ export function parseA3m(text: string): A3mAlignment {
   for (let row = 0; row < rawSequences.length; row += 1) {
     const raw = rawSequences[row]!;
     if (raw === "") throw new Error(`A3M sequence ${descriptions[row]} is empty`);
-    let aligned = "";
     let insertionCount = 0;
-    const deletions: number[] = [];
-    for (const residue of raw) {
-      if (residue >= "a" && residue <= "z") {
-        insertionCount += 1;
-      } else {
-        const upper = residue.toUpperCase();
-        if (!ALIGNED_RESIDUES.test(upper)) {
-          throw new Error(`A3M sequence ${descriptions[row]} contains invalid residue ${JSON.stringify(residue)}`);
-        }
-        aligned += upper;
-        deletions.push(insertionCount);
-        insertionCount = 0;
+    const kept = new Uint16Array(raw.length);
+    const deletions: number[] = new Array(raw.length);
+    let count = 0;
+    for (let index = 0; index < raw.length; index += 1) {
+      const code = raw.charCodeAt(index);
+      // Lower case is an insertion relative to the query and is not aligned.
+      if (code >= 97 && code <= 122) { insertionCount += 1; continue; }
+      if (code >= 128 || ALIGNED_CODES[code] === 0) {
+        throw new Error(`A3M sequence ${descriptions[row]} contains invalid residue ${JSON.stringify(raw[index])}`);
       }
+      kept[count] = code;
+      deletions[count] = insertionCount;
+      count += 1;
+      insertionCount = 0;
     }
-    sequences.push(aligned);
+    deletions.length = count;
+    sequences.push(stringFromCodes(kept, count));
     deletionMatrix.push(deletions);
   }
 

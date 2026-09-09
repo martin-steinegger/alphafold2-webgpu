@@ -37,7 +37,7 @@ export interface MultimerMockTemplateResult {
 export interface MultimerMockTemplateResidentInput {
   readonly pair: GpuTensor;
   readonly pairMask: GpuTensor;
-  /** Storage of that pair; `f16` means packed half-precision words. */
+  /** Storage of that pair; f16 means packed half-precision words. */
   readonly pairStorage?: ActivationStorage;
 }
 

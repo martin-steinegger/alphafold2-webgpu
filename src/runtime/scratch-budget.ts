@@ -24,8 +24,8 @@
  * browser was tuned for.
  *
  * The scale is process-wide and installed before a prediction starts, exactly
- * as `setGemmVariant` is, because the same budgets decide both what
- * `monomerDeviceRequirements` estimates and what the run then allocates.
+ * as setGemmVariant is, because the same budgets decide both what
+ * monomerDeviceRequirements estimates and what the run then allocates.
  * Setting it between the two would have the estimate describe a different run
  * from the one that executes.
  */

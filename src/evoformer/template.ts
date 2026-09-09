@@ -6,7 +6,7 @@ import type { AllocationSnapshot } from "../runtime/allocator.js";
 import type { TemplateMsaWeights } from "../input/template-msa-row.js";
 
 export interface QueryOnlyTemplateWeights {
-  /** `embedding2d`, the [88, 64] projection of the template pair features. */
+  /** embedding2d, the [88, 64] projection of the template pair features. */
   readonly embeddingWeight: Float32Array;
   readonly embeddingBias: Float32Array;
   readonly blockWeights: readonly TemplatePairBlockWeights[];
@@ -17,7 +17,7 @@ export interface QueryOnlyTemplateWeights {
   readonly outputBias: Float32Array;
   readonly heads: number;
   /**
-   * `template_single_embedding` and `template_projection`, which turn a
+   * template_single_embedding and template_projection, which turn a
    * template's torsion angles into an MSA row.
    *
    * Optional because they are siblings of the template module in AlphaFold
@@ -36,7 +36,7 @@ export interface QueryOnlyTemplateWeights {
  * kernel needs is here, on the residue axis.
  */
 export interface TemplatePairInput {
-  /** CB, or CA for glycine, `[length, 3]`. */
+  /** CB, or CA for glycine, [length, 3]. */
   readonly pseudoBeta: Float32Array;
   readonly pseudoBetaMask: Float32Array;
   /** 1 where N, CA and C are all present. */
@@ -83,12 +83,12 @@ export interface QueryOnlyTemplateResult {
   readonly pairUpdate: Float32Array;
   readonly elapsedMilliseconds: number;
   readonly memory: AllocationSnapshot;
-  /** Present, in place of `pairUpdate`, when the model supplied its execution. */
+  /** Present, in place of pairUpdate, when the model supplied its execution. */
   readonly pairUpdateTensor?: GpuTensor;
 }
 
 /**
- * The template pair features and `embedding2d`, in one pass.
+ * The template pair features and embedding2d, in one pass.
  *
  * AlphaFold builds an 88-channel feature per pair and projects it to 64. Both
  * halves are done here at once, because the feature is far too big to hold —
@@ -292,7 +292,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 /**
  * The pointwise attention's value and output projections, multiplied through.
  *
- * `value_w` is [template channels, heads, head channels] and `output_w` is
+ * value_w is [template channels, heads, head channels] and output_w is
  * [heads, head channels, pair channels]; with one template the attention
  * between them is the identity, so their product is a single [template
  * channels, pair channels] matrix.
@@ -327,7 +327,7 @@ export class QueryOnlyTemplateGpu {
    * Computes the template pair update for one length and mask.
    *
    * A prediction does not call this: with no template search the update is a
-   * constant, which `queryOnlyTemplateConstant` probes once and the model
+   * constant, which queryOnlyTemplateConstant probes once and the model
    * folds into the pair projection's bias. The module runs for the
    * differential tests, and for the padded masks the constant does not cover.
    */

@@ -12,7 +12,7 @@ import { EXACT_STORAGE } from "../src/model/monomer.js";
 import { create, globals } from "webgpu";
 import { dawnInstanceFlags } from "../src/runtime/dawn.js";
 import { AlphaFoldMonomerGpu } from "../src/model/monomer.js";
-import { makeA3mFeatures } from "../src/input/a3m-features.js";
+import { iterateA3mFeatures } from "../src/input/a3m-features.js";
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
 import { planMonomerDevice, requestAlphaFoldDevice } from "../src/runtime/device.js";
@@ -48,13 +48,10 @@ const [embedding, template, extraStack, mainStack, structure, confidence, geomet
   model.embeddingWeights(), model.templateWeights(), model.extraStackWeights(), model.mainStackWeights(),
   model.structureWeights(), model.confidenceWeights(), model.geometryTables(), model.queryOnlyFeatureTables(),
 ]);
-const features = makeA3mFeatures(a3m, featureTables, {
-  recycles: recycles - 1, maxMsaSequences: msaRows, maxExtraSequences: extraRows, randomSeed: 0,
-});
 
 const gpu = create(dawnInstanceFlags({
   // Native, so the bounds clamp goes: the kernels do not rely on it, and it is
-  // worth 11% of a recycle. See `dawnInstanceFlags`.
+  // worth 11% of a recycle. See dawnInstanceFlags.
   unclamped: true,
 }));
 const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
@@ -91,6 +88,9 @@ try {
     ...memoryOptions,
     ...(poolMib > 0 ? { maxPooledBytes: poolMib * 1024 ** 2 } : {}),
     ...(bindingMib > 0 ? { bindingBudgetBytes: bindingMib * 1024 ** 2 } : {}),
+  });
+  const features = iterateA3mFeatures(device, a3m, featureTables, {
+    recycles: recycles - 1, maxMsaSequences: msaRows, maxExtraSequences: extraRows, randomSeed: 0,
   });
   const prediction = await monomer.predict(features, {
     embedding, template, extraStack, mainStack, structure,

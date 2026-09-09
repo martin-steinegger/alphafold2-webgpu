@@ -6,7 +6,7 @@
  * Evoformer stack is 92% of the run — 689 seconds of 746 — and everything
  * else, the structure module and the confidence heads included, is about one
  * percent. So the only question that matters is what a block is made of, and
- * `ExecutionContext` already timestamps every dispatch and labels it.
+ * ExecutionContext already timestamps every dispatch and labels it.
  *
  * This profiles one block of a real prediction at a real length. It is the
  * measurement that says whether any further work on the dense projections can

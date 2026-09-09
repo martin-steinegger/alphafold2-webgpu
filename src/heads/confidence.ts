@@ -51,7 +51,7 @@ export interface ReducedConfidenceResult extends ConfidenceSummaryResult {
 
 export interface ReducedConfidenceOptions {
   readonly pairBuffer?: GPUBuffer;
-  /** Storage of that buffer; `f16` means packed half-precision words. */
+  /** Storage of that buffer; f16 means packed half-precision words. */
   readonly pairStorage?: ActivationStorage;
   /** Test/diagnostic override; production uses the fixed bounded target. */
   readonly maxPaeLogitsBytes?: number;

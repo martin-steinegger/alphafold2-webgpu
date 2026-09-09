@@ -1,29 +1,32 @@
 /**
  * What a native host can find out about its GPU that WebGPU will not tell it.
  *
- * `adapter.info` carries the vendor, the architecture and the subgroup range,
+ * adapter.info carries the vendor, the architecture and the subgroup range,
  * but no memory heaps: Dawn only reports those under a feature this build does
- * not expose, and `maxBufferSize` is the API's theoretical maximum rather than
+ * not expose, and maxBufferSize is the API's theoretical maximum rather than
  * the card's. A browser has to plan without it. A native host does not.
  */
 import { execFileSync } from "node:child_process";
+import { setCalibrationStore } from "../src/runtime/calibration-store.js";
+import { mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { readdirSync, readFileSync } from "node:fs";
 import { totalmem } from "node:os";
 
 /**
  * Points the Vulkan loader at one GPU, by index, before an instance exists.
  *
- * WebGPU cannot choose a device: `requestAdapter` takes a power preference and
- * nothing else, and dawn.node's `adapter=<name>` matches a substring of the
+ * WebGPU cannot choose a device: requestAdapter takes a power preference and
+ * nothing else, and dawn.node's adapter=<name> matches a substring of the
  * device name and takes the first hit — which on a host of identical cards is
  * always the first one. Every adapter here reports the same vendor,
  * architecture, device and description, so there is nothing to match on.
  *
  * Mesa's device-select layer can, and it is already installed wherever Mesa is:
  * it is a GLOBAL implicit layer, so it sits above every driver including
- * Nvidia's own, and `DRI_PRIME` names a card by its PCI address rather than by
+ * Nvidia's own, and DRI_PRIME names a card by its PCI address rather than by
  * a name that repeats. The loader reads the variable when the instance is
- * made, so setting it here works as long as it happens before `create`.
+ * made, so setting it here works as long as it happens before create.
  *
  * Returns the tag it set, or undefined when the host cannot say where the card
  * is, in which case the caller gets whichever device the loader prefers.
@@ -45,18 +48,18 @@ export function selectGpu(index = cudaVisibleDeviceIndex()): string | undefined 
   return tag;
 }
 
-/** The index `selectGpu` chose, so the memory probe can ask about that card. */
+/** The index selectGpu chose, so the memory probe can ask about that card. */
 let selected: number | undefined;
 
 /**
- * The card `CUDA_VISIBLE_DEVICES` names, which is what people reach for.
+ * The card CUDA_VISIBLE_DEVICES names, which is what people reach for.
  *
  * Nothing here uses CUDA, but that variable is how a GPU gets chosen on a
  * shared host and it costs nothing to honour. The first entry wins, since this
- * runs on one card. A plain number is an index as `nvidia-smi` counts them; a
- * `GPU-...` UUID is resolved to one, and is the form to prefer, because CUDA
- * numbers devices fastest-first unless `CUDA_DEVICE_ORDER=PCI_BUS_ID` says
- * otherwise while `nvidia-smi` always counts by bus.
+ * runs on one card. A plain number is an index as nvidia-smi counts them; a
+ * GPU-... UUID is resolved to one, and is the form to prefer, because CUDA
+ * numbers devices fastest-first unless CUDA_DEVICE_ORDER=PCI_BUS_ID says
+ * otherwise while nvidia-smi always counts by bus.
  */
 function cudaVisibleDeviceIndex(): number | undefined {
   const value = process.env.CUDA_VISIBLE_DEVICES?.split(",")[0]?.trim();
@@ -81,7 +84,7 @@ function queryGpu(args: readonly string[]): string | undefined {
 /**
  * Total memory of the selected GPU, or of the smallest visible one.
  *
- * Once `selectGpu` has chosen, this asks about that card. Without a choice it
+ * Once selectGpu has chosen, this asks about that card. Without a choice it
  * takes the smallest visible one, because nothing says which the loader
  * preferred and the smallest is the answer that is right whichever it was.
  */
@@ -97,10 +100,10 @@ export function detectDeviceMemoryBytes(): number | undefined {
 }
 
 /**
- * The same figure for an AMD card, which has no `nvidia-smi` to ask.
+ * The same figure for an AMD card, which has no nvidia-smi to ask.
  *
  * The kernel reports it per card in sysfs, so nothing has to be installed and
- * `rocm-smi` need not be present. The smallest is taken for the reason above:
+ * rocm-smi need not be present. The smallest is taken for the reason above:
  * without a choice, nothing says which card the loader preferred.
  *
  * An integrated part reports a heap it does not have — the Strix Halo here
@@ -163,4 +166,35 @@ export function nativeMemoryBudgetBytes(): number | undefined {
   if (sharesHostMemory()) return undefined;
   const total = detectDeviceMemoryBytes();
   return total === undefined ? undefined : Math.floor(total * 2 / 3);
+}
+
+/**
+ * Keeps the same document in a file beside the manifest, node having no
+ * localStorage without --localstorage-file. AFWEBGPU_CALIBRATION
+ * overrides the path.
+ *
+ * Temporary name then rename, so a reader never sees a half-written file. NOT
+ * serialised: two writers racing can lose one of the answers, which costs a
+ * recalibration and avoids a lock file to clean up after a crash.
+ */
+export function useFileCalibrationStore(manifestPath?: string): string | undefined {
+  const named = process.env.AFWEBGPU_CALIBRATION;
+  const manifest = manifestPath ?? process.env.AFWEBGPU_MANIFEST;
+  const path = named ?? (manifest === undefined
+    ? undefined : join(dirname(manifest), "calibration.json"));
+  if (path === undefined) return undefined;
+  setCalibrationStore({
+    read: () => {
+      try { return readFileSync(path, "utf8"); } catch { return undefined; }
+    },
+    write: (document) => {
+      try {
+        mkdirSync(dirname(path), { recursive: true });
+        const temporary = `${path}.${process.pid}.tmp`;
+        writeFileSync(temporary, document);
+        renameSync(temporary, path);
+      } catch { /* read-only install, or no room. It measures next time. */ }
+    },
+  });
+  return path;
 }

@@ -48,7 +48,7 @@ describe.skipIf(!enabled)("packed pair storage", () => {
       lddt: confidence.lddt, pae: confidence.pae, geometry };
     const a3m = await readFile("test.a3m", "utf8");
     const run = async (pairStorage: "f32" | "f16") => new AlphaFoldMonomerGpu(device, { pairStorage }).predict(
-      iterateA3mFeatures(a3m, tables, { recycles: 1, randomSeed: 0, maxMsaSequences: 64, maxExtraSequences: 128 }),
+      iterateA3mFeatures(device, a3m, tables, { recycles: 1, randomSeed: 0, maxMsaSequences: 64, maxExtraSequences: 128 }),
       weights, paeBreaks,
     );
     const exact = await run("f32");

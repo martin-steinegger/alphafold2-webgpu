@@ -7,6 +7,7 @@ import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
 import { COMPACT_GPU_POOL_BYTES } from "../src/runtime/allocator.js";
 import { monomerDeviceRequirements, planMonomerDevice, requestAlphaFoldDevice } from "../src/runtime/device.js";
+import { recycleFeatureSourceOf } from "../src/input/a3m-features.js";
 
 Object.assign(globalThis, globals);
 const INPUT_MANIFEST = "test/fixtures/evoformer/model1-a3m-59-stack/manifest.json";
@@ -79,7 +80,7 @@ async function run(mode: "auto" | "compact") {
     const prediction = await new AlphaFoldMonomerGpu(device, {
       compactTransitions: mode === "compact" || automatic.transitionMode === "chunked",
       ...(mode === "compact" ? { maxPooledBytes: compactPoolBytes } : {}),
-    }).predict(features, weights, paeBreaks);
+    }).predict(recycleFeatureSourceOf(features), weights, paeBreaks);
     const recycles = prediction.recycles.map((result, recycle) => {
       const expected = reference[recycle]!;
       const plddtError = Math.abs(result.confidence.meanPlddt - expected.meanPlddt);

@@ -73,7 +73,7 @@ export class FileTensorStore {
     return record.shape;
   }
 
-  /** Load and retain the shard holding `name`, so `read` can decode it synchronously. */
+  /** Load and retain the shard holding name, so read can decode it synchronously. */
   async ensureLoaded(name: string): Promise<void> {
     const record = this.manifest.tensors[name];
     if (record === undefined) throw new Error(`manifest contains no tensor named ${name}`);
@@ -82,7 +82,7 @@ export class FileTensorStore {
   }
 
   /**
-   * Decode `name`, or block `block` of its `blocks` stacked blocks, from the
+   * Decode name, or block block of its blocks stacked blocks, from the
    * retained shard. Float32 tensors are views; compressed ones decode on each
    * call, which keeps the model in its stored form between uses.
    */

@@ -32,11 +32,11 @@ export function subgroupRange(device: GPUDevice): readonly [number, number] | un
 }
 
 /**
- * Whether this device can be pinned to subgroups of `size`.
+ * Whether this device can be pinned to subgroups of size.
  *
  * The matrix kernels are written for thirty-two lanes a subgroup: they index
- * `lane % 32`, pair two lanes to a row through `subgroupShuffleXor`, and lay
- * one matrix tile across exactly one subgroup. They declare `@subgroup_size`
+ * lane % 32, pair two lanes to a row through subgroupShuffleXor, and lay
+ * one matrix tile across exactly one subgroup. They declare @subgroup_size
  * to hold the driver to it, which needs the feature; and a device may expose
  * the feature while advertising a range that does not contain thirty-two —
  * SwiftShader fixes it at [4, 4] — in which case the kernels are simply not
@@ -49,7 +49,7 @@ export function supportsSubgroupSize(device: GPUDevice, size: number): boolean {
   return range !== undefined && range[0] <= size && size <= range[1];
 }
 
-/** One entry of the adapter's `subgroupMatrixConfigs`, which the device omits. */
+/** One entry of the adapter's subgroupMatrixConfigs, which the device omits. */
 export interface RecordedMatrixConfig {
   readonly componentType: string;
   readonly resultComponentType: string;

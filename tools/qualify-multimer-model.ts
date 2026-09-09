@@ -8,6 +8,7 @@ import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
 import { errorMetrics } from "../src/triangle/types.js";
 import { InputEmbedderGpu } from "../src/evoformer/input-embedder.js";
+import { recycleFeatureSourceOf } from "../src/input/a3m-features.js";
 
 interface ReferenceManifest {
   readonly recycles: number;
@@ -116,11 +117,14 @@ const references = await Promise.all(referencePaths.map(async (path) => {
 }));
 
 Object.assign(globalThis, globals);
-const adapter = await create(dawnInstanceFlags({
+// Bound rather than left a temporary, so the instance outlives the
+// ProcessEvents callbacks dawn.node schedules against it.
+const gpu = create(dawnInstanceFlags({
   // Qualification checks numbers against reference tensors, so it keeps the
   // clamp the platform promises rather than the fastest arrangement.
   unclamped: false,
-})).requestAdapter();
+}));
+const adapter = await gpu.requestAdapter();
 if (adapter === null) throw new Error("no WebGPU adapter");
 const device = await adapter.requestDevice();
 try {
@@ -139,7 +143,7 @@ try {
     console.log(`Qualifying ${reference.path} against official JAX...`);
     const f32 = await new AlphaFoldMultimerGpu(device, {
       compactTransitions: true, recycleEarlyStopTolerance: -1, ...EXACT_STORAGE,
-    }).predict(reference.features, float32Weights, float32Breaks);
+    }).predict(recycleFeatureSourceOf(reference.features), float32Weights, float32Breaks);
     for (let recycle = 0; recycle < f32.recycles.length; recycle += 1) {
       const actual = f32.recycles[recycle]!.confidence;
       const expected = reference.manifest.reference.recycleMetrics[recycle]!;
@@ -159,7 +163,7 @@ try {
     console.log(`Qualifying compressed weights against f32 for ${reference.path}...`);
     const compressed = await new AlphaFoldMultimerGpu(device, {
       compactTransitions: true, recycleEarlyStopTolerance: -1, ...EXACT_STORAGE,
-    }).predict(reference.features, compressedWeights, compressedBreaks);
+    }).predict(recycleFeatureSourceOf(reference.features), compressedWeights, compressedBreaks);
     for (let recycle = 0; recycle < compressed.recycles.length; recycle += 1) {
       within(`compressed recycle ${recycle} mean pLDDT`, compressed.recycles[recycle]!.confidence.meanPlddt,
         f32.recycles[recycle]!.confidence.meanPlddt, 0.25);

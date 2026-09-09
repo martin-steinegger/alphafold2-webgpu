@@ -7,7 +7,7 @@ import type { StructureChain } from "./structure.js";
 /**
  * AlphaFold's per-template features, indexed by query position.
  *
- * Everything here is what `templates.py` produces for one hit, reached without
+ * Everything here is what templates.py produces for one hit, reached without
  * a hit: the query is aligned to the chain, and each query position takes the
  * template residue aligned to it or a gap. A gap contributes nothing — its
  * aatype is 21, its coordinates are zero and every mask over it is zero — so
@@ -18,11 +18,11 @@ export interface TemplateFeatures {
   readonly length: number;
   /** Template residue per query position; 21 where nothing aligned. */
   readonly aatype: Int32Array;
-  /** `[length, 37, 3]`, zero where nothing aligned. */
+  /** [length, 37, 3], zero where nothing aligned. */
   readonly atomPositions: Float32Array;
-  /** `[length, 37]`. */
+  /** [length, 37]. */
   readonly atomMask: Float32Array;
-  /** CB, or CA for glycine, `[length, 3]`. */
+  /** CB, or CA for glycine, [length, 3]. */
   readonly pseudoBeta: Float32Array;
   readonly pseudoBetaMask: Float32Array;
   /** 1 where N, CA and C are all present, which is what a backbone frame needs. */
@@ -43,7 +43,7 @@ export interface TemplateFeatureOptions {
 /**
  * Builds the features for one template chain against one query sequence.
  *
- * `query` is the ungapped query, one letter per residue. For a complex this is
+ * query is the ungapped query, one letter per residue. For a complex this is
  * one chain's sequence: templates are per chain, and the caller places the
  * result into the concatenated query's window.
  */
