@@ -2,6 +2,7 @@ import {
   assignNearestCentres, nearestCentreSets, tieSetWords,
 } from "./msa-clustering-webgpu.js";
 import { CLUSTERED_MSA_CHANNELS, MSA_CODE_NONE } from "./msa-features.js";
+import { clusterProfile } from "./msa-profile-webgpu.js";
 import { endPhase, markPhase, timedSync } from "../runtime/phase-ledger.js";
 import { parseA3m, type A3mAlignment } from "./a3m.js";
 import {
@@ -328,34 +329,21 @@ function buildA3mFeatureSource(
     const assignments = await assignNearestCentres(
       device, centerCodes, centers.length, extraCodes, extras.length, length);
     markPhase("featurise: profile");
-    const msaFeatures = new Float32Array(centers.length * length * CLUSTERED_MSA_CHANNELS);
-    const deletionSums = new Float32Array(centers.length * length);
-    const counts = new Float32Array(centers.length * length).fill(1 + 1e-6);
-    for (let center = 0; center < centers.length; center += 1) for (let residue = 0; residue < length; residue += 1) {
-      const slot = center * length + residue;
-      msaFeatures[slot * CLUSTERED_MSA_CHANNELS + 3 + centerCodes[slot]!] = 1;
-      deletionSums[slot] = alignment.deletionMatrix[centers[center]!]![residue]!;
+    // Every write of the host's scatter landed at an address the assignment
+    // chose, in a 45 MB array, so it missed cache almost every time.
+    const centreDeletion = new Float32Array(centers.length * length);
+    const extraDeletion = new Float32Array(extras.length * length);
+    for (let center = 0; center < centers.length; center += 1) {
+      centreDeletion.set(alignment.deletionMatrix[centers[center]!]!, center * length);
     }
     for (let extraIndex = 0; extraIndex < extras.length; extraIndex += 1) {
-      const row = extras[extraIndex]!; const center = assignments[extraIndex]!;
-      for (let residue = 0; residue < length; residue += 1) {
-        const slot = center * length + residue;
-        counts[slot] = counts[slot]! + 1;
-        const profileSlot = slot * CLUSTERED_MSA_CHANNELS + 3 + encoded[row * length + residue]!;
-        msaFeatures[profileSlot] = msaFeatures[profileSlot]! + 1;
-        deletionSums[slot] = deletionSums[slot]! + alignment.deletionMatrix[row]![residue]!;
-      }
+      extraDeletion.set(alignment.deletionMatrix[extras[extraIndex]!]!, extraIndex * length);
     }
-    for (let center = 0; center < centers.length; center += 1) for (let residue = 0; residue < length; residue += 1) {
-      const slot = center * length + residue; const output = slot * CLUSTERED_MSA_CHANNELS;
-      msaFeatures[output] = centerCodes[slot]!;
-      const deletion = alignment.deletionMatrix[centers[center]!]![residue]!;
-      msaFeatures[output + 1] = Math.min(deletion, 1); msaFeatures[output + 2] = deletionValue(deletion);
-      for (let code = 0; code < 23; code += 1) {
-        msaFeatures[output + 3 + code] = msaFeatures[output + 3 + code]! / counts[slot]!;
-      }
-      msaFeatures[output + 26] = deletionValue(deletionSums[slot]! / counts[slot]!);
-    }
+    const msaFeatures = await clusterProfile(device, {
+      centreCodes: centerCodes, centres: centers.length,
+      extraCodes, extras: extras.length, length, assignments,
+      centreDeletion, extraDeletion,
+    });
     markPhase("featurise: extra rows");
     const extraSequences = Math.max(1, extras.length);
     const extraMsa = new Float32Array(extraSequences * length);
