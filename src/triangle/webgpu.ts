@@ -1,5 +1,4 @@
 import { GpuBufferAllocator, type AllocatedGpuBuffer, type AllocationSnapshot } from "../runtime/allocator.js";
-import { float32ToFloat16Array } from "../runtime/float16.js";
 import { pipelineCacheForDevice, type ComputePipelineCache } from "../runtime/pipeline-cache.js";
 import { triangleOverrides, createTriangleShaders, type TriangleDirection, type TriangleWholeStorage } from "./shaders.js";
 import type { Precision, TriangleMultiplicationInput } from "./types.js";
@@ -88,7 +87,12 @@ class TriangleMultiplicationGpu {
       this.pipelines.get(`${pipelineKey}:project-output`, shaders.projectOutput, "main", overrides),
     ]);
 
-    const zData = precision === "f16" ? float32ToFloat16Array(input.z) : input.z;
+    // The pair stays f32 whatever precision the weights are in. Packing both
+    // into halves of a word is what createTriangleShaders refuses outright, so
+    // the kernel declares z as array<f32> here; handing it f16 words made it
+    // read one number out of every two and produced a plausible-looking answer
+    // that was wrong by 9e-2.
+    const zData = input.z;
     const storage = GPUBufferUsage.STORAGE;
     const allocations: AllocatedGpuBuffer[] = [];
     const keep = (allocation: AllocatedGpuBuffer): AllocatedGpuBuffer => {

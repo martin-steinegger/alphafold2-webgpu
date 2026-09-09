@@ -32,7 +32,7 @@ jobs:
       - run: npm ci
       - run: npm run check
 
-  # The GPU suites that run without a real GPU. Twelve files, measured: the rest
+  # The GPU suites that run without a real GPU. Thirteen files, measured: the rest
   # of the 43 are blocked by the Evoformer and model captures, which the README
   # keeps out of git on purpose, so they cannot run in CI on any platform.
   portable-gpu:
