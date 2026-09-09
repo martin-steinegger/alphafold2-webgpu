@@ -2,6 +2,7 @@ import {
   assignNearestCentres, nearestCentreSets, tieSetWords,
 } from "./msa-clustering-webgpu.js";
 import { CLUSTERED_MSA_CHANNELS, MSA_CODE_NONE } from "./msa-features.js";
+import { endPhase, markPhase, timedSync } from "../runtime/phase-ledger.js";
 import { parseA3m } from "./a3m.js";
 import {
   jaxPaddingConsistentUniform, multimerMsaKeys, type JaxKey,
@@ -112,6 +113,7 @@ function makeColabFoldMultimerFeatures(
     let rootKey: JaxKey = [0, (options.randomSeed ?? 0) >>> 0];
     for (let recycle = 0; recycle <= recycles; recycle += 1) {
     const keys = multimerMsaKeys(rootKey); rootKey = keys.nextRoot;
+    markPhase("featurise: sample");
     // The noise is a per-row constant, so drawing it once a row rather than
     // once a comparison is the same order for a twentieth of the draws.
     const noise = Float64Array.from({ length: depth },
@@ -130,6 +132,7 @@ function makeColabFoldMultimerFeatures(
       centerCodes.set(encoded.subarray(centers[center]! * length, (centers[center]! + 1) * length), center * length);
     }
 
+    markPhase("featurise: mask");
     // JAX draws each element independently using nested fold_in keys, so skipped
     // unmasked positions do not alter any other random value.
     for (let center = 0; center < centers.length; center += 1) for (let residue = 0; residue < length; residue += 1) {
@@ -149,6 +152,7 @@ function makeColabFoldMultimerFeatures(
       centerCodes[center * length + residue] = bestCode;
     }
 
+    markPhase("featurise: centre rows");
     // The profile accumulates straight into the feature array's profile
     // channels, so the run never holds a second copy of it.
     const msaFeatures = new Float32Array(centers.length * length * CLUSTERED_MSA_CHANNELS);
@@ -161,6 +165,7 @@ function makeColabFoldMultimerFeatures(
       }
       deletionSums[slot] = deletionMatrix[centers[center]! * length + residue]!;
     }
+    markPhase("featurise: cluster");
     // A masked row takes no part in the search, so the padding a block adds is
     // never gathered and never costs the kernel anything.
     const active = extras.filter((row) => rowMask[row] !== 0);
@@ -173,6 +178,7 @@ function makeColabFoldMultimerFeatures(
     const sets = await nearestCentreSets(
       device, centerCodes, centers.length, extraCodes, active.length, length,
       Uint8Array.from(centers, (row) => rowMask[row]!));
+    markPhase("featurise: profile");
     for (let index = 0; index < active.length; index += 1) {
       const extraRow = active[index]!;
       // Multimer keeps every centre tied at the best agreement and splits the
@@ -200,6 +206,7 @@ function makeColabFoldMultimerFeatures(
       }
     }
 
+    markPhase("featurise: normalise");
     const msaMask = new Float32Array(centers.length * length);
     for (let center = 0; center < centers.length; center += 1) for (let residue = 0; residue < length; residue += 1) {
       const slot = center * length + residue; const output = slot * CLUSTERED_MSA_CHANNELS;
@@ -215,6 +222,7 @@ function makeColabFoldMultimerFeatures(
       msaFeatures[output + 26] = deletionValue(deletionSums[slot]! / counts[slot]!);
     }
 
+    markPhase("featurise: extra rows");
     const selectedExtras = extras.slice(0, maxExtra);
     const extraSequences = selectedExtras.length;
     const extraMsa = new Float32Array(extraSequences * length);
@@ -229,6 +237,7 @@ function makeColabFoldMultimerFeatures(
       extraDeletionValue[slot] = deletionValue(deletion);
       extraMsaMask[slot] = rowMask[row]!;
     }
+    endPhase();
     yield {
       targetFeatures: base.targetFeatures, msaFeatures, msaMask,
       extraMsa, extraHasDeletion, extraDeletionValue, extraMsaMask,
@@ -245,6 +254,16 @@ function makeColabFoldMultimerFeatures(
 export function iterateA3mFeatures(
   device: GPUDevice, a3mText: string, tables: QueryOnlyFeatureTables,
   options: A3mFeatureOptions = {},
+): RecycleFeatureSource<MonomerRecycleFeatures> {
+  // Parsing and encoding the alignment happens once, before any recycle, so it
+  // is not part of the per-recycle featurisation and gets its own row.
+  return timedSync("featurise: setup",
+    () => buildA3mFeatureSource(device, a3mText, tables, options));
+}
+
+function buildA3mFeatureSource(
+  device: GPUDevice, a3mText: string, tables: QueryOnlyFeatureTables,
+  options: A3mFeatureOptions,
 ): RecycleFeatureSource<MonomerRecycleFeatures> {
   const alignment = parseA3m(a3mText);
   const length = alignment.length; const depth = alignment.depth;
@@ -275,6 +294,7 @@ export function iterateA3mFeatures(
   const maxExtra = options.maxExtraSequences ?? 1024;
   return recycleFeatureSource(recycles + 1, async function* features() {
     for (let recycle = 0; recycle <= recycles; recycle += 1) {
+    markPhase("featurise: sample");
     const random = generator(((options.randomSeed ?? 0) ^ Math.imul(recycle + 1, 0x9e3779b9)) >>> 0);
     const remainder = Array.from({ length: depth - 1 }, (_, index) => index + 1); shuffle(remainder, random);
     const centers = [0, ...remainder.slice(0, Math.max(0, maxMsa - 1))];
@@ -284,6 +304,7 @@ export function iterateA3mFeatures(
     for (let center = 0; center < centers.length; center += 1) {
       centerCodes.set(encoded.subarray(centers[center]! * length, (centers[center]! + 1) * length), center * length);
     }
+    markPhase("featurise: mask");
     for (let index = 0; index < centerCodes.length; index += 1) {
       const center = Math.floor(index / length); const residue = index % length;
       if (alignmentMask?.[centers[center]! * length + residue] === 0) continue;
@@ -293,6 +314,7 @@ export function iterateA3mFeatures(
       else if (draw >= 0.9) centerCodes[index] = Math.floor(random() * 20);
       else centerCodes[index] = original;
     }
+    markPhase("featurise: cluster");
     // Gathered so the kernel reads the drawn rows densely.
     const extraCodes = new Uint8Array(extras.length * length);
     for (let extraIndex = 0; extraIndex < extras.length; extraIndex += 1) {
@@ -302,6 +324,7 @@ export function iterateA3mFeatures(
     }
     const assignments = await assignNearestCentres(
       device, centerCodes, centers.length, extraCodes, extras.length, length);
+    markPhase("featurise: profile");
     const msaFeatures = new Float32Array(centers.length * length * CLUSTERED_MSA_CHANNELS);
     const deletionSums = new Float32Array(centers.length * length);
     const counts = new Float32Array(centers.length * length).fill(1 + 1e-6);
@@ -330,6 +353,7 @@ export function iterateA3mFeatures(
       }
       msaFeatures[output + 26] = deletionValue(deletionSums[slot]! / counts[slot]!);
     }
+    markPhase("featurise: extra rows");
     const extraSequences = Math.max(1, extras.length);
     const extraMsa = new Float32Array(extraSequences * length);
     const extraHasDeletion = new Float32Array(extraSequences * length);
@@ -342,6 +366,7 @@ export function iterateA3mFeatures(
       extraDeletionValue[slot] = deletionValue(deletion);
       extraMsaMask[slot] = 1;
     }
+    endPhase();
     yield {
       targetFeatures: base.targetFeatures, msaFeatures,
       msaMask: new Float32Array(centers.length * length).fill(1),

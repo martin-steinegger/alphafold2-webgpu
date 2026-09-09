@@ -18,6 +18,7 @@ import {
 } from "../evoformer/template.js";
 import { MultimerMockTemplateGpu, type MultimerMockTemplateWeights } from "../evoformer/multimer-template.js";
 import { WebGpuExecution, type GpuTensor, type GpuTimestampEntry } from "../runtime/execution.js";
+import { endPhase, markPhase, timed } from "../runtime/phase-ledger.js";
 import { StructureModuleGpu, type StructureModuleResult, type StructureModuleWeights } from "../structure/module.js";
 import type { ResidueGeometryTables } from "../structure/geometry.js";
 import {
@@ -327,8 +328,11 @@ export class AlphaFoldMonomerGpu {
     onRecycleDetails?: MonomerRecycleDetailsCallback): Promise<MonomerPrediction> {
     if (featuresByRecycle.length === 0) throw new RangeError("at least one feature set is required");
     const featureIterator = featuresByRecycle[Symbol.asyncIterator]();
-    let featureStep = await featureIterator.next();
+    // Featurisation builds the next recycle's features from inside this loop,
+    // so without a phase of its own its cost reads as the model's.
+    let featureStep = await timed("featurise", () => featureIterator.next());
     if (featureStep.done) throw new RangeError("at least one feature set is required");
+    markPhase("prepare");
     const length = featureStep.value.aatype.length;
     const pairMask = new Float32Array(length * length);
     for (let i = 0; i < length; i += 1) for (let j = 0; j < length; j += 1) {
@@ -532,6 +536,7 @@ export class AlphaFoldMonomerGpu {
           throw new RangeError("Multimer-v3 requires 21 target channels, compact MSA features, and chain identifiers");
         }
         const recycleStart = performance.now();
+        markPhase("embedding");
         const msaMask = execution.upload(`monomer.msa-mask-${recycle}`, features.msaMask);
         const extraMsaMask = execution.upload(`monomer.extra-msa-mask-${recycle}`, features.extraMsaMask);
         const embeddingEncoder = this.device.createCommandEncoder({ label: `monomer.embedding-${recycle}` });
@@ -662,6 +667,7 @@ export class AlphaFoldMonomerGpu {
         const timestampProfile = shouldProfileRecycle && this.device.features.has("timestamp-query");
         let extraProfile: MonomerBlockGpuProfile | undefined;
         let extraSubmissions = 0;
+        markPhase("extra stack");
         for (let block = 0; block < weights.extraStack.length; block += 1) {
           const profileBlock = shouldProfileRecycle ? this.profileExtraMsaBlock : -1;
           const holder = { encoder: this.device.createCommandEncoder(
@@ -706,6 +712,7 @@ export class AlphaFoldMonomerGpu {
         const msaEncoder = this.device.createCommandEncoder({ label: `monomer.msa-embedding-${recycle}` });
         this.device.pushErrorScope("validation");
         const clusteredMsa = embedding.encodeMsa(msaEncoder);
+        markPhase("MSA embedding");
         await submit(msaEncoder, `MSA embedding recycle ${recycle}`);
         releaseMsaInputs();
         // The embedder's inputs retired just now and nothing in the trunk fits them.
@@ -749,6 +756,7 @@ export class AlphaFoldMonomerGpu {
         };
         let mainProfile: MonomerBlockGpuProfile | undefined;
         let mainSubmissions = 0;
+        markPhase("main stack");
         for (let block = 0; block < weights.mainStack.length; block += 1) {
           const profileBlock = shouldProfileRecycle ? this.profileMainEvoformerBlock : -1;
           const holder = { encoder: this.device.createCommandEncoder(
@@ -784,6 +792,7 @@ export class AlphaFoldMonomerGpu {
           mainSubmissions += 1;
         }
         await settleErrors();
+        markPhase("readback");
         const readbackEncoder = this.device.createCommandEncoder({ label: `monomer.readback-${recycle}` });
         const firstRowWords = storageWords(length * 256, this.msaStorage);
         const msaFirstRowTensor = execution.allocate(
@@ -806,6 +815,15 @@ export class AlphaFoldMonomerGpu {
         }
         this.device.pushErrorScope("validation");
         await submit(readbackEncoder, `readback recycle ${recycle}`);
+        // Not the 422 KB transfer: this is the first true synchronisation of
+        // the recycle, because a validation error scope resolves at submit and
+        // not at completion. What it waits for is the host's lead over the GPU,
+        // so it is the tail of the main stack and is named for that. It scales
+        // with BLOCKS_IN_FLIGHT exactly -- 0.04, 0.29 and 0.59 s a recycle at a
+        // window of 2, 4 and 8 -- while the stack row moves the other way and
+        // the sum holds at 3.7 s. Deepening the window buys no throughput here;
+        // the GPU is saturated at any of them.
+        markPhase("main stack tail");
         const firstRowMapped = await execution.mapFloat32(msaFirstRowTensor);
         const msaFirstRow = this.msaStorage === "f32" ? firstRowMapped
           : unpackHalfWords(new Uint32Array(firstRowMapped.buffer, firstRowMapped.byteOffset, firstRowWords), length * 256);
@@ -820,11 +838,13 @@ export class AlphaFoldMonomerGpu {
         // at the live tensors while the structure module and confidence heads
         // allocate their own working sets, and between recycles; the next
         // recycle recreates its handful of large buffers once.
+        markPhase("free scratch pool");
         execution.allocator.destroyPooled();
 
         // The structure module and the confidence heads read the trunk's pair
         // where it lies, packed or not, so no expanded copy is ever made.
         const headsPair = embedding.pairWithoutTemplates;
+        markPhase("structure");
         const structure = await new StructureModuleGpu(this.device).run({
           msaFirstRow, pair: new Float32Array(0), mask: features.seqMask, aatype: features.aatype,
           pairBuffer: headsPair.allocation.buffer,
@@ -844,6 +864,7 @@ export class AlphaFoldMonomerGpu {
           combinedPeakResidentBytes, trunkResidentBytes + structurePeak,
         );
         this.onProgress?.({ recycle, phase: "structure", completed: 1, total: 1 });
+        markPhase("confidence");
         const confidence = await new ConfidenceHeadsGpu(this.device).runReduced(
           structure.finalRepresentation, new Float32Array(0), length, weights.lddt, weights.pae, paeBreaks,
           { pairBuffer: headsPair.allocation.buffer,
@@ -892,13 +913,15 @@ export class AlphaFoldMonomerGpu {
           if (rms <= this.recycleEarlyStopTolerance) stopAfterRecycle = recycle + 1;
         }
         previousConvergencePositions = structure.atom37;
+        endPhase();
         if (recycle >= stopAfterRecycle) {
           featureIterator.return?.();
           break;
         }
         recycle += 1;
-        featureStep = await featureIterator.next();
+        featureStep = await timed("featurise", () => featureIterator.next());
       }
+      markPhase("finish");
       if (finalDetails === undefined) throw new Error("monomer prediction produced no recycle result");
       let finalPair: Float32Array = EMPTY_PAIR;
       if (this.returnFinalPair) {

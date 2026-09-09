@@ -1,6 +1,6 @@
 import { CLUSTERED_MSA_CHANNELS, expandClusteredMsaFeatures } from "../src/input/msa-features.js";
 import { readFile } from "node:fs/promises";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, afterAll } from "vitest";
 import { iterateA3mFeatures, makeA3mFeatures } from "../src/input/a3m-features.js";
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
@@ -18,6 +18,11 @@ beforeAll(async () => {
   const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
   device = await requestAlphaFoldDevice(adapter!);
 });
+
+// dawn.node pumps ProcessEvents from the event loop and deadlocks on the
+// instance mutex if the device outlives the worker's threads, which shows up
+// as a vitest worker exiting unexpectedly rather than as a failure.
+afterAll(() => { device?.destroy(); });
 
 
 describe.skipIf(!gpuEnabled)("A3M model feature preprocessing", () => {

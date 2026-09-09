@@ -11,6 +11,7 @@ import type { TriangleWholeStorage } from "../triangle/shaders.js";
 import type { ActivationStorage } from "./storage.js";
 import { TRANSITION_CHUNK_TARGET_BYTES, transitionChunkRows } from "../evoformer/transition.js";
 import { calibrateGemmVariant, type SubgroupMatrixConfig } from "./gemm-selection.js";
+import { timed } from "./phase-ledger.js";
 import { recordSubgroupRange, recordSubgroupMatrixConfigs } from "./subgroups.js";
 import { scratchBudget, setScratchBudgetScale } from "./scratch-budget.js";
 
@@ -436,6 +437,7 @@ export async function requestAlphaFoldDevice(
   // shader exists, settle which arithmetic and k depth the shared GEMM uses.
   // One model, and its calibration does not depend on it: `measureGemmVariants`
   // runs fixed probe shapes. A port with several models passes their id here.
-  await calibrateGemmVariant(device, subgroupMatrixConfigs, adapter, "");
+  await timed("calibrate gemm",
+    () => calibrateGemmVariant(device, subgroupMatrixConfigs, adapter, ""));
   return device;
 }

@@ -1,3 +1,4 @@
+import { timedSync } from "./phase-ledger.js";
 export class ComputePipelineCache {
   readonly device: GPUDevice;
   /** Modules by source, so an override-only difference costs no compile. */
@@ -45,10 +46,11 @@ export class ComputePipelineCache {
       }
       return cached.pipeline;
     }
-    const source = typeof code === "string" ? code : code();
+    const source = timedSync("shader source", () => typeof code === "string" ? code : code());
     let module = this.#modules.get(source);
     if (module === undefined) {
-      module = this.device.createShaderModule({ label: `${key}.wgsl`, code: source });
+      module = timedSync("shader module", () =>
+        this.device.createShaderModule({ label: `${key}.wgsl`, code: source }));
       this.#modules.set(source, module);
     }
     const pipeline = this.device.createComputePipelineAsync({

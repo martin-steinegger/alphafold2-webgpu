@@ -23,6 +23,7 @@ import {
 } from "./attention.js";
 import { attentionFlashKernelForShape } from "./attention-calibration.js";
 import { calibrateAttentionShape } from "../runtime/attention-queries.js";
+import { timed } from "../runtime/phase-ledger.js";
 import { createTiledGemmShader, GEMM_TILE_COLUMNS, GEMM_TILE_ROWS, gemmGrid } from "../runtime/gemm.js";
 import { rowNormalizeLayout } from "../runtime/reduction.js";
 import { releaseScratch } from "./execution-scratch.js";
@@ -669,7 +670,8 @@ async function encodeAttention(
   const registerFamily = flashKernel.variant.startsWith("register");
   const byShape = registerFamily ? flashKernel.queryTile / 64 : 1;
   const choice = registerFamily
-    ? await calibrateAttentionShape(execution.device, options.channels / options.heads)
+    ? await timed("calibrate attention",
+      () => calibrateAttentionShape(execution.device, options.channels / options.heads))
     : undefined;
   const slots = attentionQueriesPerThread(
     byShape === 1 || choice === undefined ? byShape : choice.slots);
