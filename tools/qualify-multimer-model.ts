@@ -117,11 +117,14 @@ const references = await Promise.all(referencePaths.map(async (path) => {
 }));
 
 Object.assign(globalThis, globals);
-const adapter = await create(dawnInstanceFlags({
+// Bound rather than left a temporary, so the instance outlives the
+// ProcessEvents callbacks dawn.node schedules against it.
+const gpu = create(dawnInstanceFlags({
   // Qualification checks numbers against reference tensors, so it keeps the
   // clamp the platform promises rather than the fastest arrangement.
   unclamped: false,
-})).requestAdapter();
+}));
+const adapter = await gpu.requestAdapter();
 if (adapter === null) throw new Error("no WebGPU adapter");
 const device = await adapter.requestDevice();
 try {

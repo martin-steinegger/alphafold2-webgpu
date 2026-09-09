@@ -875,6 +875,11 @@ async function encodeGlobalAttention(
   weightsValue: GlobalAttentionWeights,
   label: string,
   residualTarget?: GpuTensor,
+  // The stack hands this buffer to the next block, so storage is all it needs.
+  // A caller that reads the result back asks for COPY_SRC here instead, rather
+  // than every block paying for a usage it never uses and being split off from
+  // the rest of the pool for it.
+  outputUsage: GPUBufferUsageFlags = GPUBufferUsage.STORAGE,
 ): Promise<GpuTensor> {
   const w = weightsValue;
   const tensors = [w.queryNormScale, w.queryNormOffset, w.queryWeight, w.keyWeight, w.valueWeight,
@@ -939,7 +944,9 @@ async function encodeGlobalAttention(
   const values = execution.allocate(`${label}.values`, shape.length * shape.sequences * headDim);
   const query = execution.allocate(`${label}.query`, shape.length * w.heads * headDim);
   const attended = execution.allocate(`${label}.attended`, shape.length * w.heads * headDim);
-  const output = residualTarget ?? execution.allocate(`${label}.output`, shape.sequences * shape.length * shape.cM);
+  const output = residualTarget
+    ?? execution.allocate(`${label}.output`,
+      shape.sequences * shape.length * shape.cM, outputUsage);
   let grid = execution.linearGrid(
     shape.length * shape.sequences, statisticsLayout.rowsPerWorkgroup);
   execution.dispatch(encoder, statisticsPipeline, [...sourceViews, normParameters, statistics],
@@ -1678,7 +1685,8 @@ export class GlobalAttentionGpu {
       this.device.pushErrorScope("validation");
       const output = await encodeGlobalAttention(execution, encoder, source, mask, {
         sequences, length, cM: channels, cZ: 1, cOuter: 1, triangleHidden: 1,
-      }, weights, "global-attention");
+      }, weights, "global-attention", undefined,
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
       const readback = execution.createReadback("global-attention.readback", output, encoder);
       const start = performance.now();
       this.device.queue.submit([encoder.finish()]);

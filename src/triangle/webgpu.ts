@@ -1,7 +1,7 @@
 import { GpuBufferAllocator, type AllocatedGpuBuffer, type AllocationSnapshot } from "../runtime/allocator.js";
 import { float32ToFloat16Array } from "../runtime/float16.js";
 import { pipelineCacheForDevice, type ComputePipelineCache } from "../runtime/pipeline-cache.js";
-import { createTriangleShaders, type TriangleDirection, type TriangleWholeStorage } from "./shaders.js";
+import { triangleOverrides, createTriangleShaders, type TriangleDirection, type TriangleWholeStorage } from "./shaders.js";
 import type { Precision, TriangleMultiplicationInput } from "./types.js";
 import { validateTriangleInput } from "./types.js";
 import { packWeights } from "./weights.js";
@@ -73,15 +73,19 @@ class TriangleMultiplicationGpu {
     );
     const pipelineKey = `${this.direction}:${precision}:${length}:${cZ}:${cHidden}:${input.epsilon ?? 1e-5}`
       + `:${blockRows}:${wholeStorage}`;
+    // The length and the strides are override constants, so a pipeline built
+    // without them silently keeps their defaults of one and the kernel reads a
+    // single residue. The block encoder passes these; this entry point did not.
+    const overrides = triangleOverrides(input.shape, blockRows);
     const [inputStatistics, projectGate, projectBlockOperand, projectWholeOperand, contract, hiddenStatistics,
       projectOutput] = await Promise.all([
-      this.pipelines.get(`${pipelineKey}:input-statistics`, shaders.inputStatistics),
-      this.pipelines.get(`${pipelineKey}:project-gate`, shaders.projectGate),
-      this.pipelines.get(`${pipelineKey}:project-block-operand`, shaders.projectBlockOperand),
-      this.pipelines.get(`${pipelineKey}:project-whole-operand`, shaders.projectWholeOperand),
-      this.pipelines.get(`${pipelineKey}:contract`, shaders.contract),
-      this.pipelines.get(`${pipelineKey}:hidden-statistics`, shaders.hiddenStatistics),
-      this.pipelines.get(`${pipelineKey}:project-output`, shaders.projectOutput),
+      this.pipelines.get(`${pipelineKey}:input-statistics`, shaders.inputStatistics, "main", overrides),
+      this.pipelines.get(`${pipelineKey}:project-gate`, shaders.projectGate, "main", overrides),
+      this.pipelines.get(`${pipelineKey}:project-block-operand`, shaders.projectBlockOperand, "main", overrides),
+      this.pipelines.get(`${pipelineKey}:project-whole-operand`, shaders.projectWholeOperand, "main", overrides),
+      this.pipelines.get(`${pipelineKey}:contract`, shaders.contract, "main", overrides),
+      this.pipelines.get(`${pipelineKey}:hidden-statistics`, shaders.hiddenStatistics, "main", overrides),
+      this.pipelines.get(`${pipelineKey}:project-output`, shaders.projectOutput, "main", overrides),
     ]);
 
     const zData = precision === "f16" ? float32ToFloat16Array(input.z) : input.z;

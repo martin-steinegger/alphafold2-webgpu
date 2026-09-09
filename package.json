@@ -29,7 +29,7 @@
     "qualify:hardware": "tsx tools/qualify-hardware.ts",
     "qualify:multimer": "tsx tools/qualify-multimer-model.ts",
     "check": "npm run build && npm run build:web && npm run test",
-    "test:gpu:portable": "vitest run --no-file-parallelism test/gemm-half-precision.gpu.test.ts test/msa-clustering.gpu.test.ts test/msa-profile.gpu.test.ts test/multimer-relative.gpu.test.ts test/multimer-template-windows.gpu.test.ts test/runtime-execution.gpu.test.ts test/shader-compilation.gpu.test.ts test/a3m-features.test.ts test/multimer-features.test.ts test/multimer-process-features.test.ts"
+    "test:gpu:portable": "vitest run --no-file-parallelism test/gemm-half-precision.gpu.test.ts test/global-attention-large-grid.gpu.test.ts test/multimer-ipa.gpu.test.ts test/msa-clustering.gpu.test.ts test/msa-profile.gpu.test.ts test/multimer-relative.gpu.test.ts test/multimer-template-windows.gpu.test.ts test/runtime-execution.gpu.test.ts test/shader-compilation.gpu.test.ts test/a3m-features.test.ts test/multimer-features.test.ts test/multimer-process-features.test.ts"
   },
   "engines": {
     "node": ">=22"
