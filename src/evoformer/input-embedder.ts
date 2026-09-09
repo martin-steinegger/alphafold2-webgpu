@@ -3,7 +3,7 @@ import {
   createAttentionNormalizeInPlaceShader,
 } from "./attention.js";
 import { type ActivationStorage, storageArray, storageWords, storedElement } from "../runtime/storage.js";
-import { GpuBufferAllocator, type AllocatedGpuBuffer, type AllocationSnapshot } from "../runtime/allocator.js";
+import { AllocatedGpuBuffer, GpuBufferAllocator, type AllocationSnapshot } from "../runtime/allocator.js";
 import { pipelineCacheForDevice, type ComputePipelineCache } from "../runtime/pipeline-cache.js";
 import { WebGpuExecution, type GpuTensor } from "../runtime/execution.js";
 
@@ -32,6 +32,8 @@ export interface InputEmbedderInput {
   readonly targetFeatures: Float32Array;
   /** Clustered MSA in the compact layout of src/input/msa-features.ts. */
   readonly msaFeatures: Float32Array;
+  /** The same block already resident, bound rather than uploaded. */
+  readonly msaFeaturesDevice?: GPUBuffer;
   readonly extraMsa: Float32Array;
   readonly extraHasDeletion: Float32Array;
   readonly extraDeletionValue: Float32Array;
@@ -565,8 +567,11 @@ export async function encodeInputEmbedder(
     // The clustered features are read only here, after the extra stack has
     // run, so they are uploaded here rather than sitting on the device
     // through it.
-    const msaFeatures = execution.upload("embed.msa-features", input.msaFeatures);
-    msaTemporaries.push(msaFeatures);
+    const msaFeatures = input.msaFeaturesDevice === undefined
+      ? execution.upload("embed.msa-features", input.msaFeatures)
+      : execution.adopt("embed.msa-features", input.msaFeaturesDevice,
+        input.msaSequences * input.length * input.msaFeatureChannels);
+    if (input.msaFeaturesDevice === undefined) msaTemporaries.push(msaFeatures);
     const msa = execution.allocate("embed.msa", storageWords(msaElements, storage),
       GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
     let msaGrid = execution.linearGrid(input.length, 1);
@@ -623,7 +628,11 @@ export class InputEmbedderGpu {
     ];
     try {
       const target = upload("embed.target", input.targetFeatures);
-      const msaFeatures = upload("embed.msa-features", input.msaFeatures);
+      const msaFeatures = input.msaFeaturesDevice === undefined
+        ? upload("embed.msa-features", input.msaFeatures)
+        : AllocatedGpuBuffer.external(input.msaFeaturesDevice,
+          input.msaSequences * input.length * input.msaFeatureChannels * 4,
+          GPUBufferUsage.STORAGE, "embed.msa-features");
       const extraMsaInput = upload("embed.extra-codes", input.extraMsa);
       const hasDeletion = upload("embed.extra-has-deletion", input.extraHasDeletion);
       const deletionValue = upload("embed.extra-deletion-value", input.extraDeletionValue);

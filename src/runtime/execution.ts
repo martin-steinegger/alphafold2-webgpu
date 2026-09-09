@@ -1,5 +1,5 @@
 import { type ActivationStorage, storageWords } from "./storage.js";
-import { GpuBufferAllocator, type AllocatedGpuBuffer, type AllocationSnapshot } from "./allocator.js";
+import { AllocatedGpuBuffer, GpuBufferAllocator, type AllocationSnapshot } from "./allocator.js";
 import { pipelineCacheForDevice, type ComputePipelineCache } from "./pipeline-cache.js";
 
 const GRID_WIDTH = 32_768;
@@ -157,6 +157,16 @@ export class WebGpuExecution {
     const allocation = this.allocator.upload(label, data, usage);
     this.#allocations.push(allocation);
     return { allocation, elements: data.byteLength / 4 };
+  }
+
+  /**
+   * A tensor over a buffer somebody else owns, so a large one already on the
+   * device is bound rather than copied through the host. It is not tracked
+   * here and not released here.
+   */
+  adopt(label: string, buffer: GPUBuffer, elements: number,
+    usage: GPUBufferUsageFlags = GPUBufferUsage.STORAGE): GpuTensor {
+    return { allocation: AllocatedGpuBuffer.external(buffer, elements * 4, usage, label), elements };
   }
 
   allocate(label: string, elements: number, usage: GPUBufferUsageFlags = GPUBufferUsage.STORAGE): GpuTensor {

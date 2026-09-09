@@ -48,6 +48,11 @@ export interface MonomerTemplateFeatures {
 
 export interface MonomerRecycleFeatures {
   readonly targetFeatures: Float32Array; readonly msaFeatures: Float32Array; readonly msaMask: Float32Array;
+  /**
+   * The clustered block already on the device, in which case msaFeatures is
+   * empty. Saves copying 43 MB to the host and straight back each recycle.
+   */
+  readonly msaFeaturesDevice?: GPUBuffer;
   readonly extraMsa: Float32Array; readonly extraHasDeletion: Float32Array; readonly extraDeletionValue: Float32Array;
   readonly extraMsaMask: Float32Array; readonly residueIndex: Float32Array; readonly aatype: Float32Array;
   readonly seqMask: Float32Array; readonly atom37ToAtom14: Float32Array; readonly atom37Mask: Float32Array;

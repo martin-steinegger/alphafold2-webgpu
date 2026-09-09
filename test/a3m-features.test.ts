@@ -6,6 +6,7 @@ import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
 import { requestAlphaFoldDevice } from "../src/runtime/device.js";
 import { testGpu } from "./support/gpu-instance.js";
+import { readFloat32 } from "../src/runtime/readback.js";
 
 // Featurisation clusters the alignment on the device, so these need one.
 const gpuEnabled = process.env.AFWEBGPU_GPU_TESTS === "1";
@@ -37,12 +38,20 @@ describe.skipIf(!gpuEnabled)("A3M model feature preprocessing", () => {
     const second = (await iterator.next()).value!;
     expect(first.aatype).toBe(second.aatype);
     expect(first.targetFeatures).toBe(second.targetFeatures);
+    // The block lives on the device and its buffer is reused, so each recycle
+    // is read out before the next overwrites it.
     const drain = async (): Promise<number[][]> => {
       const out: number[][] = [];
-      for await (const features of source) out.push([...features.msaFeatures]);
+      for await (const features of source) {
+        out.push([...await readFloat32(device, features.msaFeaturesDevice!)]);
+      }
       return out;
     };
-    expect(await drain()).toEqual(await drain());
+    const drained = await drain();
+    // The whole block, not merely something: empty arrays would compare equal.
+    expect(drained).toHaveLength(3);
+    expect(drained[0]).toHaveLength(first.msaSequences * 4 * CLUSTERED_MSA_CHANNELS);
+    expect(drained).toEqual(await drain());
   });
 
   it("keeps block padding as gaps while excluding it from masked-MSA augmentation", async () => {

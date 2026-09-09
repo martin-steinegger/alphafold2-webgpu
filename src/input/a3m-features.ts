@@ -3,7 +3,8 @@ import {
 } from "./msa-clustering-webgpu.js";
 import { CLUSTERED_MSA_CHANNELS, MSA_CODE_NONE } from "./msa-features.js";
 import { maskCentreCodes } from "./msa-masking-webgpu.js";
-import { clusterProfile } from "./msa-profile-webgpu.js";
+import { clusterProfileOnDevice } from "./msa-profile-webgpu.js";
+import { readFloat32 } from "../runtime/readback.js";
 import { endPhase, markPhase, timedSync } from "../runtime/phase-ledger.js";
 import { parseA3m, type A3mAlignment } from "./a3m.js";
 import {
@@ -13,6 +14,8 @@ import { makeQueryOnlyFeatures, type QueryOnlyFeatureTables } from "./query-only
 import type { MonomerRecycleFeatures } from "../model/monomer.js";
 
 const RESTYPES = "ARNDCQEGHILKMFPSTWYV";
+/** Stands in for the block when it stayed on the device. */
+const NO_FEATURES = new Float32Array(0);
 const INDEX = new Map([...RESTYPES].map((residue, index) => [residue, index]));
 
 export interface A3mFeatureOptions {
@@ -331,7 +334,10 @@ function buildA3mFeatureSource(
     for (let extraIndex = 0; extraIndex < extras.length; extraIndex += 1) {
       extraDeletion.set(alignment.deletionMatrix[extras[extraIndex]!]!, extraIndex * length);
     }
-    const msaFeatures = await clusterProfile(device, {
+    // The block stays where it was computed. The buffer is reused between
+    // recycles, which is why makeA3mFeatures below copies each one out rather
+    // than handing back several views of the last.
+    const msaFeaturesDevice = await clusterProfileOnDevice(device, {
       centreCodes: centerCodes, centres: centers.length,
       extraCodes, extras: extras.length, length, assignments,
       centreDeletion, extraDeletion,
@@ -351,7 +357,7 @@ function buildA3mFeatureSource(
     }
     endPhase();
     yield {
-      targetFeatures: base.targetFeatures, msaFeatures,
+      targetFeatures: base.targetFeatures, msaFeatures: NO_FEATURES, msaFeaturesDevice,
       msaMask: new Float32Array(centers.length * length).fill(1),
       extraMsa, extraHasDeletion, extraDeletionValue, extraMsaMask,
       residueIndex: base.residueIndex, aatype: base.aatype, seqMask: base.seqMask,
@@ -370,7 +376,11 @@ export async function makeA3mFeatures(
 ): Promise<readonly MonomerRecycleFeatures[]> {
   const all: MonomerRecycleFeatures[] = [];
   for await (const features of iterateA3mFeatures(device, a3mText, tables, options)) {
-    all.push(features);
+    // Every recycle is kept, and they share one device buffer, so each is read
+    // out here. A caller wanting them one at a time should iterate instead.
+    if (features.msaFeaturesDevice === undefined) { all.push(features); continue; }
+    const { msaFeaturesDevice, ...rest } = features;
+    all.push({ ...rest, msaFeatures: await readFloat32(device, msaFeaturesDevice) });
   }
   return all;
 }

@@ -150,9 +150,29 @@ function buffersFor(
   return made;
 }
 
+/** The block, copied back to the host. */
 export async function clusterProfile(
   device: GPUDevice, input: ClusterProfileInput,
 ): Promise<Float32Array> {
+  return await encodeClusterProfile(device, input, false) as Float32Array;
+}
+
+/**
+ * The block, left where it was computed.
+ *
+ * The buffer is held for this device and shape and reused, so the next recycle
+ * overwrites it: for a caller that consumes one recycle before asking for the
+ * next, which saves 43 MB out and 43 MB back at 508 rows and 825 residues.
+ */
+export async function clusterProfileOnDevice(
+  device: GPUDevice, input: ClusterProfileInput,
+): Promise<GPUBuffer> {
+  return await encodeClusterProfile(device, input, true) as GPUBuffer;
+}
+
+async function encodeClusterProfile(
+  device: GPUDevice, input: ClusterProfileInput, onDevice: boolean,
+): Promise<Float32Array | GPUBuffer> {
   const { centreCodes, centres, extraCodes, extras, length, assignments } = input;
   if (centreCodes.length !== centres * length || extraCodes.length !== extras * length) {
     throw new RangeError("centre and extra codes must be one code a residue, row-major");
@@ -205,8 +225,14 @@ export async function clusterProfile(
   pass.setBindGroup(0, group);
   pass.dispatchWorkgroups(Math.ceil(slots / LANES), 1, 1);
   pass.end();
-  encoder.copyBufferToBuffer(buffers.output, 0, readback, 0, outputBytes);
+  if (!onDevice) encoder.copyBufferToBuffer(buffers.output, 0, readback, 0, outputBytes);
   device.queue.submit([encoder.finish()]);
+  if (onDevice) {
+    // The buffer is held for this device and shape, so the next recycle
+    // overwrites it. A caller that keeps more than one recycle at a time wants
+    // the array instead.
+    return buffers.output;
+  }
   await readback.mapAsync(GPUMapMode.READ);
   const features = new Float32Array(readback.getMappedRange().slice(0));
   readback.unmap();

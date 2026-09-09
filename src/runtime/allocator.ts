@@ -134,7 +134,17 @@ export class AllocatedGpuBuffer {
   readonly #label: string;
   #allocator: GpuBufferAllocator | undefined;
 
-  constructor(allocator: GpuBufferAllocator, buffer: GPUBuffer, byteLength: number,
+  /**
+   * Wraps a buffer this allocator did not make and must not reclaim: release
+   * is a no-op and nothing is charged to the resident tally, because the owner
+   * is still holding it.
+   */
+  static external(buffer: GPUBuffer, byteLength: number,
+    usage: GPUBufferUsageFlags, label = ""): AllocatedGpuBuffer {
+    return new AllocatedGpuBuffer(undefined, buffer, byteLength, byteLength, usage, usage, label);
+  }
+
+  constructor(allocator: GpuBufferAllocator | undefined, buffer: GPUBuffer, byteLength: number,
     allocationByteLength: number, usage: GPUBufferUsageFlags, allocationUsage: GPUBufferUsageFlags = usage,
     label = "") {
     this.#allocator = allocator;
