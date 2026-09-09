@@ -92,7 +92,7 @@ export class HttpTensorStore {
   readonly manifest: BinaryTensorManifest;
   readonly #cache = new Map<string, Promise<Float32Array>>();
   readonly #fileCache = new Map<string, Promise<ArrayBuffer>>();
-  /** Shards kept for synchronous `read`, in their stored (possibly compressed) form. */
+  /** Shards kept for synchronous read, in their stored (possibly compressed) form. */
   readonly #retained = new Map<string, ArrayBuffer>();
   readonly #ensured = new Set<string>();
   readonly #fileByteLengths = new Map<string, number>();
@@ -144,9 +144,9 @@ export class HttpTensorStore {
     return record.shape;
   }
   /**
-   * Download and retain the shard holding `name` in its stored form, so `read`
+   * Download and retain the shard holding name in its stored form, so read
    * can decode ranges of it synchronously. A compressed shard retained this way
-   * is a quarter of the float32 copy that `tensor` would otherwise keep.
+   * is a quarter of the float32 copy that tensor would otherwise keep.
    */
   async ensureLoaded(name: string): Promise<void> {
     const record = this.manifest.tensors[name];
@@ -164,7 +164,7 @@ export class HttpTensorStore {
     }
     this.#retained.set(record.file, await pendingFile);
   }
-  /** Decode `name`, or block `block` of `blocks`, from a shard retained by `ensureLoaded`. */
+  /** Decode name, or block block of blocks, from a shard retained by ensureLoaded. */
   read(name: string, block?: number, blocks?: number): Float32Array {
     const record = this.manifest.tensors[name];
     if (record === undefined) throw new Error(`missing tensor ${name}`);

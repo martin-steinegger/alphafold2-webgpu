@@ -13,7 +13,7 @@ const ALIGNED_RESIDUES = /^[ACDEFGHIKLMNPQRSTVWYX-]+$/;
  *
  * The residue loop runs once per character of the whole alignment, 9.1 million
  * times on an 8.77 MB file. Doing it with strings meant a one-character string
- * from the iterator, another from `toUpperCase`, and a regex match, for every
+ * from the iterator, another from toUpperCase, and a regex match, for every
  * one of them.
  */
 const ALIGNED_CODES = new Uint8Array(128);

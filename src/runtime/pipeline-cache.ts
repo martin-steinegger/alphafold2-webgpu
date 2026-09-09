@@ -14,9 +14,9 @@ export class ComputePipelineCache {
   }
 
   /**
-   * The pipeline for `key`, compiling it from `code` if it is not held.
+   * The pipeline for key, compiling it from code if it is not held.
    *
-   * `code` may be a thunk, and where the caller can pass one it should. A
+   * code may be a thunk, and where the caller can pass one it should. A
    * shader source is built by string concatenation from the shape and the
    * storage choices, and a block asks for the same pipelines on every block of
    * every recycle: one fold at 256 residues took 7,707 pipelines from this
@@ -30,7 +30,7 @@ export class ComputePipelineCache {
    * depends on.
    */
   /**
-   * `constants` are WGSL `override` values. A module is cached by its source,
+   * constants are WGSL override values. A module is cached by its source,
    * so kernels differing only in an override share one and each length costs a
    * pipeline rather than a compile.
    */

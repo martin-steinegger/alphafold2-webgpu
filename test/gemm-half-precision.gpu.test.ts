@@ -1,13 +1,13 @@
 /**
  * Differential test for the half-precision projection.
  *
- * The shared GEMM can compute in f16 on a device that offers `shader-f16`,
+ * The shared GEMM can compute in f16 on a device that offers shader-f16,
  * and the model reduces over as many as 1024 terms, so the accumulator is
  * where half precision is most exposed. Every variant is checked against a
  * reference summed here in double precision, at both contraction depths the
  * model runs and through both epilogue paths, because the whole reason the
  * f16 kernel needs no caller change is that the accumulator arrives at an
- * epilogue as `vec4<f32>` — an invariant only a compiled shader can confirm.
+ * epilogue as vec4<f32> — an invariant only a compiled shader can confirm.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { create, globals } from "webgpu";
@@ -19,7 +19,7 @@ import { gemmVariantName } from "../src/runtime/gemm-selection.js";
 const enabled = process.env.AFWEBGPU_GPU_TESTS === "1";
 
 /**
- * Every arrangement the generator can emit, including pure `f16`, which the
+ * Every arrangement the generator can emit, including pure f16, which the
  * model does not ship. The kernel still has to compute the right answer at
  * these depths; what disqualified it was a contraction over a deep MSA, which
  * is a property of the model's magnitudes rather than of the kernel.
@@ -30,7 +30,7 @@ const VARIANTS: readonly GemmVariant[] = ([8, 16] as const).flatMap((inner) =>
 /**
  * What each arrangement may be wrong by, from the measured worst case at that
  * depth. These bound the kernel, not the model: what half precision costs a
- * prediction is settled by `test/browser/gemm-differential.spec.ts`.
+ * prediction is settled by test/browser/gemm-differential.spec.ts.
  */
 function tolerance(variant: GemmVariant, inner: number): number {
   if (variant.precision === "f32") return 1e-4;
@@ -87,10 +87,10 @@ function scalarStoreShader(variant: GemmVariant): string {
 }
 
 /**
- * The same result through a whole-tile epilogue, which reads `acc{n}` itself.
+ * The same result through a whole-tile epilogue, which reads acc{n} itself.
  *
  * This is the contract that lets half precision stay invisible to callers: an
- * epilogue written against `vec4<f32>` has to keep compiling and keep
+ * epilogue written against vec4<f32> has to keep compiling and keep
  * computing the same thing when the k loop accumulates in f16.
  */
 function epilogueShader(variant: GemmVariant): string {

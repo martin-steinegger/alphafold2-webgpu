@@ -30,7 +30,7 @@ export interface InputEmbedderWeights {
 
 export interface InputEmbedderInput {
   readonly targetFeatures: Float32Array;
-  /** Clustered MSA in the compact layout of `src/input/msa-features.ts`. */
+  /** Clustered MSA in the compact layout of src/input/msa-features.ts. */
   readonly msaFeatures: Float32Array;
   readonly extraMsa: Float32Array;
   readonly extraHasDeletion: Float32Array;
@@ -44,13 +44,13 @@ export interface InputEmbedderInput {
   readonly msaSequences: number;
   readonly extraSequences: number;
   readonly targetChannels: number;
-  /** Channels per row and position of `msaFeatures`; the compact layout has 27. */
+  /** Channels per row and position of msaFeatures; the compact layout has 27. */
   readonly msaFeatureChannels: number;
   readonly msaChannels: number;
   readonly pairChannels: number;
   readonly extraMsaChannels: number;
   readonly weights: InputEmbedderWeights;
-  /** Storage of the MSA activations the embedder produces (GPU path only); `f16` halves them inexactly. */
+  /** Storage of the MSA activations the embedder produces (GPU path only); f16 halves them inexactly. */
   readonly msaStorage?: ActivationStorage;
   /** Storage of the pair this writes and of the recycled pair it reads. */
   readonly pairStorage?: ActivationStorage;
@@ -379,7 +379,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
 /**
  * The pair embedding written over the recycled pair it reads. Each invocation
- * reads `previous_pair` only at the element it stores, so a single read-write
+ * reads previous_pair only at the element it stores, so a single read-write
  * binding is exact and one pair-shaped tensor serves as input and output.
  */
 export function createPairInPlaceShader(storage: ActivationStorage): string {
@@ -419,7 +419,7 @@ function packedChainIdentifiers(input: InputEmbedderInput): Float32Array {
 }
 
 export interface EncodedInputEmbedder {
-  /** The new pair, written in place over the `previousPair` tensor passed in. */
+  /** The new pair, written in place over the previousPair tensor passed in. */
   readonly pairWithoutTemplates: GpuTensor;
   readonly extraMsa: GpuTensor;
   /** Inputs that may be pooled once the pair and extra-MSA command buffer is submitted. */
@@ -428,7 +428,7 @@ export interface EncodedInputEmbedder {
    * Encodes the clustered-MSA embedding. Nothing in the extra-MSA stack reads
    * it, so a caller may defer this until that stack has finished and keep the
    * largest tensor of the prediction out of the extra stack's peak. It
-   * normalizes `previousMsa` in place; release it and `msaTemporaries` only
+   * normalizes previousMsa in place; release it and msaTemporaries only
    * after the returned command buffer is submitted.
    */
   readonly encodeMsa: (encoder: GPUCommandEncoder) => GpuTensor;
@@ -437,8 +437,8 @@ export interface EncodedInputEmbedder {
 
 /**
  * Encode the input embedding into an existing execution without crossing the
- * CPU boundary. `previousPair` and `previousMsa` are consumed: the new pair is
- * written over `previousPair`, so callers must not release it separately.
+ * CPU boundary. previousPair and previousMsa are consumed: the new pair is
+ * written over previousPair, so callers must not release it separately.
  */
 export async function encodeInputEmbedder(
   execution: WebGpuExecution,

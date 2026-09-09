@@ -2,11 +2,11 @@
  * Calibration remembered between visits.
  *
  * Choosing the projection kernel costs 662-764 ms of every cold start, of a
- * `requestAlphaFoldDevice` that takes 807-864, because it compiles the
+ * requestAlphaFoldDevice that takes 807-864, because it compiles the
  * candidates and times them. Measure once, keep the answer.
  *
  * One JSON document of key to answer, the same in a browser and on a host: a
- * store reads and writes the whole thing, so `localStorage` holds one entry
+ * store reads and writes the whole thing, so localStorage holds one entry
  * and node holds one file with identical contents.
  */
 
@@ -22,7 +22,7 @@ export interface CalibrationStore {
 let installed: CalibrationStore | undefined;
 let chosen = false;
 
-/** Installs a store; `undefined` restores `localStorage`. */
+/** Installs a store; undefined restores localStorage. */
 export function setCalibrationStore(store: CalibrationStore | undefined): void {
   installed = store;
   chosen = store !== undefined;
@@ -30,7 +30,7 @@ export function setCalibrationStore(store: CalibrationStore | undefined): void {
 
 function backing(): CalibrationStore | undefined {
   if (chosen) return installed;
-  // Reading `localStorage` throws where site data is blocked.
+  // Reading localStorage throws where site data is blocked.
   try {
     const web = (globalThis as { localStorage?: Storage }).localStorage;
     return web === undefined ? undefined : {
@@ -53,8 +53,8 @@ function load(): Record<string, unknown> {
 /**
  * What identifies a device well enough to reuse an answer measured on it.
  *
- * `description` carries the driver version, so an update asks a new question.
- * `scope` names the model where the answer depends on it: a pair track 128
+ * description carries the driver version, so an update asks a new question.
+ * scope names the model where the answer depends on it: a pair track 128
  * channels wide can want a different kernel from one 384 wide. Required, so
  * that a caller says which it is rather than defaulting into a shared key.
  */

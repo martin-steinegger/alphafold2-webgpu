@@ -11,7 +11,7 @@ export interface TriangleGpuOptions {
   readonly precision?: Precision;
   /** Residues of the output axis per block; defaults to the whole length. */
   readonly blockRows?: number;
-  /** Storage of the whole projection; `f16` is inexact. */
+  /** Storage of the whole projection; f16 is inexact. */
   readonly wholeStorage?: TriangleWholeStorage;
 }
 

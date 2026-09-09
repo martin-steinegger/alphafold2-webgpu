@@ -1,7 +1,7 @@
 /**
  * Writes one template's features to disk, for differential testing.
  *
- * `tools/capture_alphafold_template_reference.py` reads the same structure with
+ * tools/capture_alphafold_template_reference.py reads the same structure with
  * AlphaFold's own code and compares, so the two halves of the template input
  * path — reading a structure and turning it into features — are each checked
  * against the implementation they are ports of.

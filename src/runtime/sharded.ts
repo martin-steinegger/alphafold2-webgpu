@@ -30,9 +30,9 @@ function greatestCommonDivisor(a: number, b: number): number {
 }
 
 /**
- * Splits `totalElements` so no shard exceeds the binding limit.
+ * Splits totalElements so no shard exceeds the binding limit.
  *
- * Shards start on a multiple of `alignElements`, so a row never straddles two
+ * Shards start on a multiple of alignElements, so a row never straddles two
  * of them and a consumer that reads whole rows stays inside one binding, and
  * on a 256-byte boundary, which is the offset alignment a binding must have.
  */
@@ -62,7 +62,7 @@ export function planShards(
  * Windows of rows, each inside one binding and starting where a binding
  * offset may start.
  *
- * This is the other half of the same problem `planShards` solves. A kernel
+ * This is the other half of the same problem planShards solves. A kernel
  * that reads a tensor row by row can be given the rows it touches instead of
  * the whole tensor, which costs a uniform rather than a binding slot; one that
  * reads across the whole tensor cannot, and takes shards. Several bindings may
@@ -99,7 +99,7 @@ export function shardBindings(
 }
 
 /**
- * A WGSL function reading `name` at a whole-tensor element index.
+ * A WGSL function reading name at a whole-tensor element index.
  *
  * With one shard this is the array access itself; with several it is a chain
  * of comparisons, which a hot loop pays once per element read.
@@ -121,7 +121,7 @@ ${branches}
 }
 
 /**
- * A WGSL function writing `name`, by element for f32 and by packed word for
+ * A WGSL function writing name, by element for f32 and by packed word for
  * f16, where one word carries the two channels an invocation owns.
  */
 export function shardStorer(layout: ShardLayout, name: string, storage: ActivationStorage): string {

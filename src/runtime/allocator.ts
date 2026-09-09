@@ -62,7 +62,7 @@ function deviceTally(device: GPUDevice): DeviceMemoryTally {
   return tally;
 }
 
-/** Cap the resident GPU bytes every allocator on `device` may hold together; `undefined` removes the cap. */
+/** Cap the resident GPU bytes every allocator on device may hold together; undefined removes the cap. */
 export function setGpuMemoryBudget(device: GPUDevice, bytes: number | undefined): void {
   if (bytes !== undefined && (!Number.isSafeInteger(bytes) || bytes <= 0)) {
     throw new RangeError("GPU memory budget must be a positive safe integer");
@@ -70,7 +70,7 @@ export function setGpuMemoryBudget(device: GPUDevice, bytes: number | undefined)
   deviceTally(device).budget = bytes ?? Number.POSITIVE_INFINITY;
 }
 
-/** Resident GPU bytes currently held by all allocators on `device`. */
+/** Resident GPU bytes currently held by all allocators on device. */
 export function gpuMemoryResident(device: GPUDevice): number { return deviceTally(device).resident; }
 
 export class GpuMemoryBudgetError extends Error {

@@ -20,7 +20,7 @@ export interface Candidate {
   readonly requiresF16?: boolean;
   /**
    * Skipped unless the adapter offers a matrix unit of this component type and
-   * shape, and unless the shape's M, N and K are all multiples of `alignment`.
+   * shape, and unless the shape's M, N and K are all multiples of alignment.
    */
   readonly requiresSubgroupMatrix?: { readonly componentType: string; readonly size: number };
   readonly alignment?: number;
@@ -258,7 +258,7 @@ ${Array.from({ length: registerRows }, (_, index) =>
 /**
  * The same arrangement with a wider register block.
  *
- * `f16-source` measured at 1.0x, so the projection is not bandwidth-bound; it
+ * f16-source measured at 1.0x, so the projection is not bandwidth-bound; it
  * is compute-bound at about 2.85 TFLOP/s, well under this GPU's f32 peak. The
  * shipped tiling gives each invocation eight rows by four columns, which is 32
  * multiply-adds against twelve staged reads per k step. Widening the block to
@@ -425,7 +425,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>) {
  * multiply-accumulates — 2.0 per load rather than 0.5, a four-fold improvement
  * in arithmetic intensity from register reuse alone.
  *
- * One subgroup per workgroup, which is not an accident: `subgroupMatrixStore`
+ * One subgroup per workgroup, which is not an accident: subgroupMatrixStore
  * requires its offset to be uniform, and WGSL's uniformity analysis works at
  * workgroup scope, so an offset derived from which subgroup you are in cannot
  * be proven uniform even though it is. Deriving everything from the workgroup
@@ -435,7 +435,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>) {
  * The model's row counts are arbitrary — 29,972, say — so the edges matter. A
  * scalar fallback for a ragged region was tried and is pathological: its inner
  * loop reads the weights with a stride of a whole row, uncoalesced, and it
- * took `opm-out2` to 0.09x. Instead the matrix path runs everywhere and the
+ * took opm-out2 to 0.09x. Instead the matrix path runs everywhere and the
  * *store* is what checks bounds. Loads past the end of a tensor are clamped by
  * WGSL's robustness rules, so a partial region computes garbage in the rows
  * and columns that do not exist, and those are precisely the ones never
@@ -503,9 +503,9 @@ ${guard}    var value = f32(scratch[item]) + weights[parameters.bias_offset + co
 /**
  * The matrix kernel over the shipped 64x128 output tile.
  *
- * `matrix-bounded-f32` covers a 32x32 region per workgroup, which means a
+ * matrix-bounded-f32 covers a 32x32 region per workgroup, which means a
  * different dispatch grid from the hand-tiled kernel. That is fatal to
- * integration: `gemmGrid` derives the grid from the output tile and does not
+ * integration: gemmGrid derives the grid from the output tile and does not
  * know which shader is asking, so if some callers opt into a matrix path and
  * others do not, one of them gets the wrong grid. Keeping the 64x128 tile
  * keeps the grid identical and makes opting in a per-shader decision.

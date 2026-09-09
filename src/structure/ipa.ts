@@ -171,7 +171,7 @@ export interface InvariantPointAttentionInput {
   readonly pair: Float32Array;
   /** Optional device-resident pair tensor, avoiding a second pair-sized upload. */
   readonly pairBuffer?: GPUBuffer;
-  /** Storage of that tensor; `f16` means packed half-precision words. */
+  /** Storage of that tensor; f16 means packed half-precision words. */
   readonly pairStorage?: ActivationStorage;
   /**
    * Bytes one binding may cover of the pair, at most the device's own limit.

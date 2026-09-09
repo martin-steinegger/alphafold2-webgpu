@@ -253,7 +253,7 @@ test("measures every projection kernel", async ({ page }) => {
 /**
  * Whether the per-device probe agrees with the full sweep.
  *
- * `gemm-selection.ts` measures one shape at device creation and has to choose
+ * gemm-selection.ts measures one shape at device creation and has to choose
  * what an eight-shape sweep would have chosen. If it does not, the probe shape
  * is unrepresentative, and the whole mechanism quietly ships the wrong kernel
  * on every device: a selector that measures the wrong thing is worse than a
@@ -281,7 +281,7 @@ test("the per-device probe picks what the sweep picks", async ({ page }) => {
         fastest: Number.NaN, chosenMilliseconds: Number.NaN,
       };
     }
-    // The same features `requestAlphaFoldDevice` asks for, or the probe cannot
+    // The same features requestAlphaFoldDevice asks for, or the probe cannot
     // measure the candidates the real device would have.
     const features = (["shader-f16", "subgroups",
       "chromium-experimental-subgroup-matrix"] as GPUFeatureName[])

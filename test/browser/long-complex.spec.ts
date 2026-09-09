@@ -13,8 +13,8 @@
  * The chain count is a parameter because cost grows with the square of the
  * total length: a 24-mer of the 59-residue acceptance sequence is 1,416
  * residues and hours of work, while a dimer settles the differential in
- * minutes. `AFWEBGPU_COMPLEX_CHAINS` picks how many, and
- * `AFWEBGPU_COMPLEX_VARIANTS` which arrangements to run.
+ * minutes. AFWEBGPU_COMPLEX_CHAINS picks how many, and
+ * AFWEBGPU_COMPLEX_VARIANTS which arrangements to run.
  */
 import { expect, test } from "@playwright/test";
 

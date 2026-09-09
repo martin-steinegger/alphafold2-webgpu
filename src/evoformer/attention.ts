@@ -83,7 +83,7 @@ export interface AttentionFlashKernel {
    *
    * The pair bias does not depend on the batch: every row of the alignment,
    * or every row of the pair in a triangle update, reads the same
-   * `bias[head][query][key]`. Dispatched with the query block varying fastest,
+   * bias[head][query][key]. Dispatched with the query block varying fastest,
    * neighbouring workgroups want different blocks of it and each one's read
    * misses; dispatched with the batch varying fastest they want the same
    * block, and all but the first of them find it in cache. At 1,650 residues
@@ -206,9 +206,9 @@ export function createAttentionParameters(
 }
 
 /**
- * @param batchOffset First batch entry this dispatch covers, and `batchTotal`
- * the number in the whole operation. They differ from `batch` only when the
- * operation is split into windows; `batch` always counts this window.
+ * @param batchOffset First batch entry this dispatch covers, and batchTotal
+ * the number in the whole operation. They differ from batch only when the
+ * operation is split into windows; batch always counts this window.
  */
 export function createAttentionNormParameters(
   rows: number, channels: number, scale: number, offset: number,
@@ -239,7 +239,7 @@ export function createAttentionNormalizeShader(
 /**
  * The same LayerNorm writing over its input. WebGPU rejects one buffer bound
  * both read-only and read-write in a dispatch, so the in-place form has a
- * single read-write binding. It is exact for `transpose == 0` with one batch
+ * single read-write binding. It is exact for transpose == 0 with one batch
  * (every row reads and writes the same offsets): all reads of a row complete
  * before any invocation stores, and each invocation stores only elements it
  * alone read in the final loop.
@@ -432,7 +432,7 @@ fn mask_index(batch: u32, key_index: u32) -> u32 {
  * — triangle attention is 57% of an Evoformer block at 708 residues and more
  * beyond that.
  *
- * `pack2x16float` is core WGSL and needs no device feature, so this costs no
+ * pack2x16float is core WGSL and needs no device feature, so this costs no
  * portability. The query and the gate stay single precision: they are read
  * once per invocation rather than once per key, so narrowing them would buy
  * nothing and round something for free.
@@ -445,7 +445,7 @@ export type AttentionKeyValueStorage = "f32" | "f16" | "f16-value" | "f16-key";
  * Whether narrowing them costs the model anything can only be answered by
  * predicting one input both ways, which needs the choice held still across two
  * runs that would otherwise make it themselves. The counterpart of
- * `forceGemmVariant`, and not a setting: no URL, environment variable or
+ * forceGemmVariant, and not a setting: no URL, environment variable or
  * stored preference reaches it, and production never calls it.
  */
 let pinnedKeyValueStorage: AttentionKeyValueStorage | undefined;
@@ -466,7 +466,7 @@ export function attentionKeyValueStorage(
 /**
  * How many queries one invocation carries, when something wants to override it.
  *
- * `attentionFlashKernelForShape` picks two above 128 queries, from a threshold
+ * attentionFlashKernelForShape picks two above 128 queries, from a threshold
  * measured on an NVIDIA GB10. On this Apple device two is 2.2x *slower* than
  * one and four is 10.9x slower, so the constant is a property of a driver that
  * was written down rather than measured. This exists to compare them where it
@@ -523,9 +523,9 @@ fn projection_weight_offset(matrix: u32) -> u32 {
     columns: "4u * p.heads * p.head_dim",
     sourceElement: "source[row * p.channels + k]",
     // The matrix index is loop-invariant across a tile whenever one projection
-    // is at least as wide as the tile, so it goes on `column_origin` and the
+    // is at least as wide as the tile, so it goes on column_origin and the
     // compiler lifts it out of the weight staging loop. Written against
-    // `column` it is recomputed for every element staged, and neither division
+    // column it is recomputed for every element staged, and neither division
     // can be strength-reduced because the divisor is a uniform: measured 3.685
     // ms to 3.085 on the row projection and 3.313 to 2.710 on the column one.
     //
@@ -610,8 +610,8 @@ const PAIR_BIAS_STRIDE = "p.bias_stride";
  * bandwidth for it. The heads share the row instead, and the weights they
  * want for a channel sit next to each other.
  *
- * `heads` fixes how many accumulators the loop carries, so it is compiled per
- * head count; `p.heads` still gives the weight stride, and the two are the
+ * heads fixes how many accumulators the loop carries, so it is compiled per
+ * head count; p.heads still gives the weight stride, and the two are the
  * same number by construction.
  */
 export function createAttentionPairBiasShader(heads: number): string {

@@ -1,7 +1,7 @@
 import { TEMPLATE_ANGLE_CHANNELS } from "./template-torsions.js";
 
 /**
- * `template_single_embedding` and `template_projection`, the two layers that
+ * template_single_embedding and template_projection, the two layers that
  * turn a template's torsion angles into an MSA row.
  *
  * These live outside the template embedding module in AlphaFold, as siblings of
@@ -9,16 +9,16 @@ import { TEMPLATE_ANGLE_CHANNELS } from "./template-torsions.js";
  * pair stack and still not have them.
  */
 export interface TemplateMsaWeights {
-  /** `[57, 256]`. */
+  /** [57, 256]. */
   readonly inputWeight: Float32Array;
   readonly inputBias: Float32Array;
-  /** `[256, 256]`. */
+  /** [256, 256]. */
   readonly outputWeight: Float32Array;
   readonly outputBias: Float32Array;
 }
 
 /**
- * The MSA row a template contributes, `[length, channels]`.
+ * The MSA row a template contributes, [length, channels].
  *
  * One matrix multiply of 57 by 256 and one of 256 by 256, per residue: about
  * 120 MFLOP for a 1500-residue chain, once for the whole prediction rather than

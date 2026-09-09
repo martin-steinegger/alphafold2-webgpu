@@ -4,20 +4,20 @@
  * The register-resident kernel this competes with keeps one query's whole
  * accumulator in registers and reads every key and value itself, which costs
  * no cross-lane traffic and is why it beats every subgroup variant here: those
- * reduce each query-key dot product with `subgroupAdd`, once per key. A matrix
+ * reduce each query-key dot product with subgroupAdd, once per key. A matrix
  * unit does that reduction in hardware, so this kernel pays neither the
  * cross-lane traffic nor the per-key reduction, and reads each staged key tile
  * once for sixteen queries instead of once per query.
  *
  * The shape is the one both reference implementations use: 16x16x16 tiles with
  * f16 operands and an f32 accumulator, which is what Nvidia's units implement
- * and what `subgroupMatrixConfigs` reports. Operands must live in workgroup or
+ * and what subgroupMatrixConfigs reports. Operands must live in workgroup or
  * storage memory as the component type, so the query, key and value tiles are
  * converted into workgroup f16 once per tile rather than per multiply.
  *
  * The online softmax cannot rescale an accumulator in place: its correction is
- * per query row and `subgroupMatrixScalarMultiply` takes one uniform scalar.
- * So `P V` accumulates into a freshly zeroed result each key tile, is stored to
+ * per query row and subgroupMatrixScalarMultiply takes one uniform scalar.
+ * So P V accumulates into a freshly zeroed result each key tile, is stored to
  * workgroup memory, and the running output is rescaled there in plain f32 —
  * which is exactly what the reference CUDA kernel does for the same reason.
  */
@@ -92,17 +92,17 @@ const LANES = SUBGROUPS * 32;
 /**
  * Row lengths of everything the units address, chosen against the banks.
  *
- * Workgroup memory is thirty-two banks of four bytes, so lane `i` reading
- * element `i * stride` lands in bank `(i * stride) % 32` for f32 and
- * `(i * stride / 2) % 32` for f16. A stride sharing a factor with thirty-two
+ * Workgroup memory is thirty-two banks of four bytes, so lane i reading
+ * element i * stride lands in bank (i * stride) % 32 for f32 and
+ * (i * stride / 2) % 32 for f16. A stride sharing a factor with thirty-two
  * collapses the lanes onto few banks and serialises the read; a stride coprime
  * with it spreads them across all thirty-two.
  *
  * The head width is thirty-two, which is the worst case of all: the staged key
  * tile is read column-major, so consecutive lanes are one row apart, and at a
- * stride of thirty-two f16 that is `(16i) % 32` — two banks for thirty-two
+ * stride of thirty-two f16 that is (16i) % 32 — two banks for thirty-two
  * lanes, a sixteen-way conflict on the hottest read in the kernel. Thirty-four
- * gives `(17i) % 32`, and seventeen is coprime with thirty-two, so no two
+ * gives (17i) % 32, and seventeen is coprime with thirty-two, so no two
  * lanes collide. The f32 rows take the same treatment with an odd stride.
  */
 /**
@@ -136,7 +136,7 @@ export function attentionMatrixShape(
 /**
  * Workgroup bytes the kernel declares, which a device must permit.
  *
- * Every array is sized by the same `offset + stride * rows` reach the loads
+ * Every array is sized by the same offset + stride * rows reach the loads
  * and stores claim, not by the last element they touch, so this matches what
  * the shader actually declares.
  */
@@ -184,7 +184,7 @@ export function createAttentionMatrixFlashShader(
   // model's own tensors keep the head's true width.
   const channelTiles = paddedHeadDim(headDim) / N;
   const contractions = paddedHeadDim(headDim) / K;
-  // A matrix load or store reaches `offset + stride * rows` elements, not the
+  // A matrix load or store reaches offset + stride * rows elements, not the
   // last element it actually touches. An array sized to the last element is
   // out of bounds by the extension's own rule, which is undefined behaviour
   // however valid every index in it is.

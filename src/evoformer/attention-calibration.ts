@@ -8,7 +8,7 @@ import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 /**
  * Runtime selection of the flash-attention kernel.
  *
- * The static heuristic in `selectAttentionFlashKernel` prefers a subgroup
+ * The static heuristic in selectAttentionFlashKernel prefers a subgroup
  * kernel wherever the device advertises subgroups with a 32-lane range and
  * 16 KiB of workgroup storage. On discrete NVIDIA hardware that heuristic is
  * inverted: the register kernel, which keeps one whole head per invocation and
@@ -34,7 +34,7 @@ const PROBE_REPEATS = 3;
  * another process is saturating, a single dispatch of the same kernel reads
  * anywhere between 0.15 ms and 2.4 ms, which ranks the quiet slots rather than
  * the kernels. Batching many dispatches into one command buffer and dividing
- * puts the kernel back in charge of the number. `measureGemmVariants` is sized
+ * puts the kernel back in charge of the number. measureGemmVariants is sized
  * the same way and for the same reason.
  */
 const PROBE_BATCH_MILLISECONDS = 12;
@@ -62,7 +62,7 @@ export function attentionFlashCandidates(device: GPUDevice, headDim: number): re
 interface FlashTiming {
   readonly kernel: AttentionFlashKernel;
   readonly dispatch: (dispatches: number) => Promise<number>;
-  /** Sized so one batch reaches `PROBE_BATCH_MILLISECONDS`, once, up front. */
+  /** Sized so one batch reaches PROBE_BATCH_MILLISECONDS, once, up front. */
   dispatches: number;
   best: number;
 }
@@ -153,7 +153,7 @@ async function measureFlashKernel(device: GPUDevice, headDim: number): Promise<A
     // clock ramping across the sweep ranks the windows and not the kernels: on
     // a Strix Halo the same two kernels at headDim 8 read 0.298 against 0.212
     // ms in one order and 0.220 against 0.257 in the other.
-    // `measureGemmVariants` is swept the same way.
+    // measureGemmVariants is swept the same way.
     // The rough pass warms the pipeline as well as sizing the batch, so its
     // own time is discarded.
     for (const timing of timings) {

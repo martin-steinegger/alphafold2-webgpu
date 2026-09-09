@@ -27,7 +27,17 @@ const SHADER = `
 @group(0) @binding(1) var<storage, read> extras: array<u32>;
 @group(0) @binding(2) var<storage, read> valid: array<u32>;
 @group(0) @binding(3) var<storage, read_write> sets: array<atomic<u32>>;
-struct P { centres: u32, extras: u32, length: u32, words: u32 };
+// The shape is supplied at pipeline creation, not read from a uniform: these
+// are the bounds of the two loops that do all the work, and a uniform load in
+// an inner loop measured 4.7x an override on the triangle kernels. The source
+// does not change with them, so a new alignment costs a pipeline and no
+// compile. See clusteringOverrides, and triangleOverrides for the same idea.
+override CENTRES: u32 = 1u;
+override LENGTH: u32 = 1u;
+override WORDS: u32 = 1u;
+// Only a bound on the dispatch, and it moves between recycles when rows are
+// masked, so it stays a uniform rather than costing a pipeline each time.
+struct P { extras: u32, pad0: u32, pad1: u32, pad2: u32 };
 @group(0) @binding(4) var<uniform> p: P;
 
 // One score a lane, joined by max. A score is stored one above the agreement so
@@ -36,10 +46,10 @@ struct P { centres: u32, extras: u32, length: u32, words: u32 };
 var<workgroup> best: array<u32, ${LANES}>;
 
 fn agreement(centre: u32, extra: u32) -> u32 {
-  let centre_base = centre * p.length;
-  let extra_base = extra * p.length;
+  let centre_base = centre * LENGTH;
+  let extra_base = extra * LENGTH;
   var agree = 0u;
-  for (var residue = 0u; residue < p.length; residue += 1u) {
+  for (var residue = 0u; residue < LENGTH; residue += 1u) {
     let code = centres[centre_base + residue];
     if (code <= ${HIGHEST_RESIDUE_CODE}u && code == extras[extra_base + residue]) {
       agree += 1u;
@@ -55,7 +65,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let lane = local.x;
   var mine = 0u;
   if (extra < p.extras) {
-    for (var candidate = lane; candidate < p.centres; candidate += ${LANES}u) {
+    for (var candidate = lane; candidate < CENTRES; candidate += ${LANES}u) {
       if (valid[candidate] == 0u) { continue; }
       mine = max(mine, agreement(candidate, extra) + 1u);
     }
@@ -70,10 +80,10 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   // of no tie exactly one lane walks its candidates a second time.
   let winner = best[0];
   if (extra >= p.extras || winner == 0u || mine != winner) { return; }
-  for (var candidate = lane; candidate < p.centres; candidate += ${LANES}u) {
+  for (var candidate = lane; candidate < CENTRES; candidate += ${LANES}u) {
     if (valid[candidate] == 0u) { continue; }
     if (agreement(candidate, extra) + 1u == winner) {
-      atomicOr(&sets[extra * p.words + candidate / 32u], 1u << (candidate % 32u));
+      atomicOr(&sets[extra * WORDS + candidate / 32u], 1u << (candidate % 32u));
     }
   }
 }`;
@@ -81,12 +91,17 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 /** Words a row in the returned bitmask. */
 export const tieSetWords = (centres: number): number => Math.max(1, Math.ceil(centres / 32));
 
+/** The shape constants baked into the kernel, and the key that must carry them. */
+export function clusteringOverrides(centres: number, length: number): Record<string, number> {
+  return { CENTRES: centres, LENGTH: length, WORDS: tieSetWords(centres) };
+}
+
 /**
  * For every extra row, the set of centres tied at the best agreement.
  *
- * `centreCodes` and `extraCodes` are one code a residue, row-major. The result
- * is `tieSetWords(centres)` words an extra row, bit `c` set when centre `c`
- * ties. A row with no valid centre comes back empty. `centreValid` excludes
+ * centreCodes and extraCodes are one code a residue, row-major. The result
+ * is tieSetWords(centres) words an extra row, bit c set when centre c
+ * ties. A row with no valid centre comes back empty. centreValid excludes
  * centres from the search without moving the indices the caller writes to;
  * omitting it lets every centre take part.
  */
@@ -104,7 +119,9 @@ export async function nearestCentreSets(
     throw new RangeError("centre validity must be one flag a centre");
   }
   const words = tieSetWords(centres);
-  const pipeline = await pipelineCacheForDevice(device).get("msa:nearest-centre", SHADER);
+  const overrides = clusteringOverrides(centres, length);
+  const pipeline = await pipelineCacheForDevice(device).get(
+    `msa:nearest-centre:${centres}x${length}`, SHADER, "main", overrides);
   const usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
   // A code a word: the codes are bytes, but a storage buffer indexes words and
   // unpacking in the shader would cost more than the four times the bytes,
@@ -126,7 +143,7 @@ export async function nearestCentreSets(
     device.queue.writeBuffer(validBuffer, 0, centreValid === undefined
       ? new Uint32Array(Math.max(1, centres)).fill(1)
       : Uint32Array.from(centreValid, (flag) => (flag === 0 ? 0 : 1)));
-    device.queue.writeBuffer(parameters, 0, new Uint32Array([centres, extras, length, words]));
+    device.queue.writeBuffer(parameters, 0, new Uint32Array([extras, 0, 0, 0]));
     const group = device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),
       entries: [centreBuffer, extraBuffer, validBuffer, out, parameters]
@@ -154,7 +171,7 @@ export async function nearestCentreSets(
 /**
  * The nearest centre for every extra row, breaking a tie towards the lowest
  * index, which is what a host loop keeping the first centre at a given score
- * does. A row with no centre comes back as `0xffffffff`.
+ * does. A row with no centre comes back as 0xffffffff.
  */
 export async function assignNearestCentres(
   device: GPUDevice,

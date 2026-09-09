@@ -28,9 +28,9 @@ export interface TensorStore {
   readonly manifest: BinaryTensorManifest;
   tensor(name: string): Promise<Float32Array>;
   shape(name: string): readonly number[];
-  /** Retain the shard holding `name` in its stored form so `read` can decode from it synchronously. */
+  /** Retain the shard holding name in its stored form so read can decode from it synchronously. */
   ensureLoaded(name: string): Promise<void>;
-  /** Decode `name`, or block `block` of its `blocks` stacked blocks, from a retained shard. */
+  /** Decode name, or block block of its blocks stacked blocks, from a retained shard. */
   read(name: string, block?: number, blocks?: number): Float32Array;
 }
 
@@ -41,7 +41,7 @@ export interface TensorStore {
  * where a compressed model is a quarter of that. A block's tensors are read
  * once when its weights are packed for upload, so the float32 values exist
  * only for that moment. The getters are enumerable, and objects are composed
- * with `mergeLazy` rather than spread so they never materialize by accident.
+ * with mergeLazy rather than spread so they never materialize by accident.
  */
 function lazyWeights<T extends object>(fields: { readonly [K in keyof T]: () => T[K] }): T {
   const target = {} as T;
@@ -112,7 +112,7 @@ export class AlphaFoldFixture {
     return value.subarray(block * size, (block + 1) * size);
   }
 
-  /** A thunk decoding block `block` of a stacked parameter from its retained shard. */
+  /** A thunk decoding block block of a stacked parameter from its retained shard. */
   async #lazyParameter(
     parameters: ParameterMap, module: string, name: string, block: number, blocks: number,
   ): Promise<() => Float32Array> {

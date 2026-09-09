@@ -7,7 +7,7 @@
  * offered, and which a device gets is what it can run rather than what is
  * fastest in the abstract, because the fastest needs the most from it.
  *
- * `rows-per-subgroup` gives each subgroup a whole row and puts eight of them
+ * rows-per-subgroup gives each subgroup a whole row and puts eight of them
  * in a workgroup, so a reduction is one instruction and there is no barrier
  * and no workgroup memory at all. It is the arrangement the Pallas kernel in
  * ColabFold's AlphaFold reaches by handing one program a block of 64 rows: the
@@ -22,8 +22,8 @@
  * time — is 0.0256 and 0.0411 on those two, so it is the rows a workgroup
  * covers that pays and not the barriers, and it is not offered.
  *
- * `subgroup-rows` needs the subgroup width pinned, so a device that has
- * subgroups but cannot be held to 32 lanes falls to `subgroup-workgroup`: one
+ * subgroup-rows needs the subgroup width pinned, so a device that has
+ * subgroups but cannot be held to 32 lanes falls to subgroup-workgroup: one
  * row a workgroup still, but the tree replaced by one subgroup instruction and
  * a single barrier to join the subgroups. That is 0.0229 and 0.0408 on the
  * same two shapes. A device with no subgroups at all keeps the tree.
@@ -32,7 +32,7 @@
  * caching the row in workgroup memory so the source is read once instead of
  * three times is slower everywhere, because the re-reads already hit cache;
  * and accumulating both moments in one pass, so the variance comes from
- * `E[x^2] - mean^2`, is 3% to 5% faster and four to twenty-five times less
+ * E[x^2] - mean^2, is 3% to 5% faster and four to twenty-five times less
  * accurate, which is not a trade this model makes.
  */
 import { supportsSubgroupSize } from "./subgroups.js";
@@ -48,25 +48,25 @@ const ROW_WORKGROUP = 64;
 export interface RowNormalizeLayout {
   /** Rows one workgroup covers. The dispatch grid divides the count by this. */
   readonly rowsPerWorkgroup: number;
-  /** `enable` directives, which must precede everything else in the module. */
+  /** enable directives, which must precede everything else in the module. */
   readonly enables: string;
   /** Module-scope declarations the reduction needs. */
   readonly declarations: string;
   /** The entry point's attributes, workgroup size included. */
   readonly attributes: string;
-  /** Built-ins `main` has to declare, ready to append to its parameter list. */
+  /** Built-ins main has to declare, ready to append to its parameter list. */
   readonly builtins: string;
   /**
-   * Opens `main`, given an expression for the row count.
+   * Opens main, given an expression for the row count.
    *
-   * Defines `norm_row`, which is always a row this dispatch may read — a
+   * Defines norm_row, which is always a row this dispatch may read — a
    * workgroup covering rows past the end clamps to zero rather than branching
    * away, so the reductions stay in uniform control flow — along with
-   * `norm_live`, which says whether the row is a real one and must guard every
-   * store, and `norm_lane` and `norm_stride`, which the channel loops walk by.
+   * norm_live, which says whether the row is a real one and must guard every
+   * store, and norm_lane and norm_stride, which the channel loops walk by.
    */
   open(rows: string): string;
-  /** Sums `source` across the row, into a new `let` named `target`. */
+  /** Sums source across the row, into a new let named target. */
   sum(source: string, target: string): string;
 }
 

@@ -1,7 +1,7 @@
 /**
  * WebGPU preflight for the AFWebGPU front end.
  *
- * A shallow `requestAdapter()` probe collapses several distinct failures into
+ * A shallow requestAdapter() probe collapses several distinct failures into
  * one message. Each of them has a different remedy, so this module separates
  * them: the API being absent (browser or build without WebGPU), an insecure
  * origin, an adapter the driver refuses to hand out, a software rasterizer
@@ -29,7 +29,7 @@ export const AFWEBGPU_REQUIRED_LIMITS = {
 
 export type RequiredLimitName = keyof typeof AFWEBGPU_REQUIRED_LIMITS;
 
-/** Structural subset of `GPUSupportedLimits` this check reads. */
+/** Structural subset of GPUSupportedLimits this check reads. */
 export type PreflightLimits = { readonly [Name in RequiredLimitName]?: number };
 
 export interface PreflightAdapterLike {
@@ -61,7 +61,7 @@ export interface BrowserIdentity {
 }
 
 /**
- * `ready` runs at full speed; `warning` runs but slowly or unverified;
+ * ready runs at full speed; warning runs but slowly or unverified;
  * everything else must block the prediction.
  */
 export type PreflightStatus = "ready" | "warning" | "unsupported" | "blocked" | "insufficient";
@@ -153,7 +153,7 @@ export function identifyBrowser(userAgent: string, platformHint?: string): Brows
 
 const CHROMIUM_ADVICE = "Chrome, Chromium, or Edge 121 or newer ships WebGPU on Windows, macOS, Linux, and ChromeOS.";
 
-/** Explains an absent `navigator.gpu` for the browser that produced it. */
+/** Explains an absent navigator.gpu for the browser that produced it. */
 function missingApiDiagnosis(browser: BrowserIdentity): { detail: string; remedies: readonly string[] } {
   if (browser.engine === "gecko") {
     const linuxLike = browser.platform === "linux" || browser.platform === "unknown";

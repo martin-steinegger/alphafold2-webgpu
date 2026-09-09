@@ -112,7 +112,7 @@ struct MatmulParameters {
     weightElement: "weights[parameters.weight_offset + k * parameters.columns + column]",
     // The same operands as arrays, which the hardware matrix units need and
     // which is only true while the source is unpacked: half-precision storage
-    // puts two values in a word, so `source` is a u32 array and nothing can
+    // puts two values in a word, so source is a u32 array and nothing can
     // load an 8x8 tile out of it. Saying nothing keeps the hand-tiled kernel.
     ...(sourceStorage === "f32"
       ? { sourceArray: { array: "source", stride: "parameters.inner" } } : {}),

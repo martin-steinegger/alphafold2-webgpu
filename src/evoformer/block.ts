@@ -129,12 +129,12 @@ export interface EvoformerBlockInput {
   readonly outerProductMeanFirst?: boolean;
   /** Overrides the scratch budget of every windowed operation, so tests can force windowing. */
   readonly scratchWindowBytes?: number;
-  /** Storage of the triangle multiplication's whole projection; `f16` halves it inexactly. */
+  /** Storage of the triangle multiplication's whole projection; f16 halves it inexactly. */
   readonly triangleWholeStorage?: TriangleWholeStorage;
-  /** Storage of the MSA activations this block reads and updates; `f16` halves them inexactly. */
+  /** Storage of the MSA activations this block reads and updates; f16 halves them inexactly. */
   readonly msaStorage?: ActivationStorage;
   /**
-   * Storage of the pair this block reads and updates; `f16` halves it
+   * Storage of the pair this block reads and updates; f16 halves it
    * inexactly. The pair is one of the three tensors that set the trunk's peak,
    * beside the MSA and the triangle multiplication's whole projection.
    */
@@ -618,13 +618,13 @@ interface EncodeAttentionOptions {
   readonly label: string;
   readonly residualTarget?: GpuTensor;
   readonly windowBytes?: number | undefined;
-  /** Storage of `source` (and of `residualTarget`, which is the same tensor when set). */
+  /** Storage of source (and of residualTarget, which is the same tensor when set). */
   readonly storage?: ActivationStorage | undefined;
-  /** Storage of `pairSource`, which the bias projection normalizes window by window. */
+  /** Storage of pairSource, which the bias projection normalizes window by window. */
   readonly pairStorage?: ActivationStorage | undefined;
-  /** Splits the command buffer between windows; see `SubmissionFlush`. */
+  /** Splits the command buffer between windows; see SubmissionFlush. */
   readonly flush?: SubmissionFlush | undefined;
-  /** Bytes one binding may cover of `source`; defaults to the device's limit. */
+  /** Bytes one binding may cover of source; defaults to the device's limit. */
   readonly bindingBytes?: number | undefined;
 }
 
@@ -649,7 +649,7 @@ async function encodeAttention(
   // packing them as half words measured 1.29x on the shape triangle attention
   // runs. Only the register kernel reads them packed; every other flash
   // variant keeps the single-precision pair it was written against, so a
-  // device that selects one of those is untouched. `pack2x16float` is core
+  // device that selects one of those is untouched. pack2x16float is core
   // WGSL, so this needs no device feature and costs no portability.
   // Every register kernel reads packed keys and values, not only the
   // one-query one: above 128 queries the shape picks the two-query variant,
@@ -1247,7 +1247,7 @@ async function encodeTriangleMultiplication(
     packed, blockRows, wholeStorage, pairStorage, pairShards, wholeShards, wholeStride, requests,
     overrides,
   } = triangleSetup(execution, input, weightsValue, direction, residualTarget !== undefined);
-  // Indexed rather than destructured: `requests` is the one place the order is
+  // Indexed rather than destructured: requests is the one place the order is
   // written down, and a tuple type restated here would be a second one.
   const built = await Promise.all(
     requests.map(([key, code]) => execution.pipelines.get(key, code, "main", overrides)));

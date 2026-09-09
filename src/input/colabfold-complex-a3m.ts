@@ -58,7 +58,7 @@ function splitAligned(sequence: string, lengths: readonly number[]): {
   return { segments, hasResidues };
 }
 
-/** Parse ColabFold's serialized `#lengths<TAB>cardinalities` complex-A3M format. */
+/** Parse ColabFold's serialized #lengths<TAB>cardinalities complex-A3M format. */
 export function parseColabFoldComplexA3m(text: string): ColabFoldComplexA3m | undefined {
   const lines = text.replace(/\0/g, "").replace(/\r/g, "").split("\n");
   const first = lines.findIndex((line) => line.trim() !== "");

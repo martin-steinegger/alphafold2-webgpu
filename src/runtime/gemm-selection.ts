@@ -17,17 +17,17 @@ import { supportsSubgroupSize } from "./subgroups.js";
  * kernel is no faster on adapters whose f16 is emulated, and the depth of the
  * staged k tile swings a few percent either way by driver. So both are
  * measured once per device and the winner is cached, the way
- * `src/evoformer/attention-calibration.ts` already picks the flash kernel.
+ * src/evoformer/attention-calibration.ts already picks the flash kernel.
  *
  * Which arrangements may be measured at all is not a runtime question, and
- * `SHIPPABLE_GEMM_PRECISIONS` below says why.
+ * SHIPPABLE_GEMM_PRECISIONS below says why.
  *
- * The selection is installed before `requestAlphaFoldDevice` hands the device
+ * The selection is installed before requestAlphaFoldDevice hands the device
  * out, which is what keeps it invisible to every call site. No consumer can
  * have generated a projection shader yet, so one pipeline cache key can never
  * come to describe two different shaders, and neither choice enters the
- * dispatch grid: `gemmGrid` derives that from the output tile, which does not
- * move. Callers keep calling `createTiledGemmShader` with no idea any of this
+ * dispatch grid: gemmGrid derives that from the output tile, which does not
+ * move. Callers keep calling createTiledGemmShader with no idea any of this
  * happened.
  */
 
@@ -40,7 +40,7 @@ import { supportsSubgroupSize } from "./subgroups.js";
  * The row count of the first is not arbitrary and is the expensive part. The
  * matrix kernel puts one subgroup in a workgroup, so its occupancy comes
  * entirely from having many workgroups, and a probe with too few rows starves
- * it: measured against `f16-chunked`, a 1,024-row shape ranks it at 0.53 while
+ * it: measured against f16-chunked, a 1,024-row shape ranks it at 0.53 while
  * the projections the model actually runs rank it between 1.23 and 1.45. At
  * 16,384 rows the probe reproduces that ordering at 1.17, which is the
  * cheapest shape tried that still gets the answer right rather than backwards.
@@ -56,12 +56,12 @@ const PROBE_REPEATS = 2;
 /**
  * How long one timed batch should take, and the resolution that forces.
  *
- * A browser clamps `performance.now` to about 0.1 ms, so a batch of four
+ * A browser clamps performance.now to about 0.1 ms, so a batch of four
  * dispatches of a 0.4 ms kernel can only be measured to about 6% — coarser
  * than the 10% to 15% that separates these variants, which makes the ranking
  * noise. Measured that way the probe picked the slowest half-precision
  * arrangement over the fastest. So a rough pass sizes the real batch to reach
- * this many milliseconds, the way `gemm-calibration.spec.ts` already does.
+ * this many milliseconds, the way gemm-calibration.spec.ts already does.
  */
 const PROBE_BATCH_MILLISECONDS = 12;
 const PROBE_ROUGH_DISPATCHES = 4;
@@ -112,7 +112,7 @@ const selections = new WeakMap<GPUDevice, Promise<GemmVariant>>();
  * Whether half precision costs the model anything can only be answered by
  * predicting one input both ways and comparing, which needs the choice held
  * still across two runs that would otherwise measure it. This is that hold,
- * the counterpart of `presetAttentionFlashKernel`. It is not a setting: no URL,
+ * the counterpart of presetAttentionFlashKernel. It is not a setting: no URL,
  * environment variable or stored preference reaches it, and production never
  * calls it, so a device still measures its own arithmetic.
  */
@@ -124,9 +124,9 @@ export function forceGemmVariant(variant: GemmVariant | undefined): void {
 }
 
 /**
- * Whether a device without `shader-f16` has ever been calibrated.
+ * Whether a device without shader-f16 has ever been calibrated.
  *
- * The variant is process-wide, because `createTiledGemmShader` is called
+ * The variant is process-wide, because createTiledGemmShader is called
  * without a device in scope. A process that drives two adapters at once must
  * therefore emit shaders both of them accept, and only f32 qualifies. Tests
  * are the realistic case; a browser session has one device.
@@ -147,13 +147,13 @@ function hasHalfPrecision(device: GPUDevice): boolean {
 /**
  * Arrangements a device is allowed to be measured into, and why not more.
  *
- * Pure `f16` is deliberately absent. It is the fastest of them, at 1.36x to
+ * Pure f16 is deliberately absent. It is the fastest of them, at 1.36x to
  * 1.55x, and it is not safe: accumulating a whole contraction in half
  * precision overflows on a deep MSA, which took the 508-row acceptance
  * prediction from 96.80 pLDDT to 69.94 and its pTM to NaN. No runtime probe
  * can rediscover that, because it only shows up at a depth and a magnitude a
  * cheap probe does not reach, so the exclusion is recorded here instead of
- * being left to a measurement. `test/browser/gemm-differential.spec.ts` holds
+ * being left to a measurement. test/browser/gemm-differential.spec.ts holds
  * every variant in this list to the prediction gate.
  */
 export const SHIPPABLE_GEMM_PRECISIONS: readonly GemmVariant["precision"][] = [
@@ -165,8 +165,8 @@ const MATRIX_FEATURE = "chromium-experimental-subgroup-matrix";
 
 function hasMatrixUnits(device: GPUDevice): boolean {
   const features: GPUSupportedFeatures | undefined = device.features;
-  // The kernel lays one tile across one subgroup and indexes `lane % 32`, and
-  // says so with `@subgroup_size`. A device that cannot be held to that width
+  // The kernel lays one tile across one subgroup and indexes lane % 32, and
+  // says so with @subgroup_size. A device that cannot be held to that width
   // is not offered the units. A stub in a test carries no features at all.
   return features?.has(MATRIX_FEATURE as GPUFeatureName) === true
     && (features.has("subgroups" as GPUFeatureName) !== true
@@ -174,9 +174,9 @@ function hasMatrixUnits(device: GPUDevice): boolean {
 }
 
 /**
- * One entry of `GPUAdapterInfo.subgroupMatrixConfigs`.
+ * One entry of GPUAdapterInfo.subgroupMatrixConfigs.
  *
- * Declared structurally because the shipping `@webgpu/types` does not carry
+ * Declared structurally because the shipping @webgpu/types does not carry
  * the experimental extension, and because only these five fields are read.
  */
 export interface SubgroupMatrixConfig {
@@ -197,7 +197,7 @@ export interface SubgroupMatrixConfig {
  * instruction issued.
  *
  * The accumulator must be f32 either way. A configuration that can only
- * accumulate in f16 is not a faster matrix kernel, it is the `f16` precision
+ * accumulate in f16 is not a faster matrix kernel, it is the f16 precision
  * this file already refuses to ship, reached by another route.
  */
 export function selectMatrixShape(
@@ -211,7 +211,7 @@ export function selectMatrixShape(
   // the calibration probe, so offering the shape here would not merely lose
   // the measurement, it would take the process down before the model started.
   // The attention kernel uses the same units without this, which is why it is
-  // reached through `attentionMatrixConfig` and not through here.
+  // reached through attentionMatrixConfig and not through here.
   const usable = configs.filter((config) =>
     config.resultComponentType === "f32"
     && (config.componentType === "f32"
@@ -247,7 +247,7 @@ export function gemmVariantCandidates(
       // baseline; a device that grants only that keeps the hand-tiled kernel.
       // A stub standing in for a device in a test reports no limits at all,
       // and is read as the baseline rather than as an error, the same way
-      // `hasHalfPrecision` reads a missing feature set.
+      // hasHalfPrecision reads a missing feature set.
       const granted = device.limits?.maxComputeWorkgroupStorageSize ?? 16384;
       if (shape === undefined) continue;
       // One unit of depth a step spends two barriers on as many multiplies as
@@ -445,7 +445,7 @@ interface VariantTiming {
   readonly pipeline: GPUComputePipeline;
   readonly group: GPUBindGroup;
   readonly grid: readonly [number, number];
-  /** Sized so a batch reaches `PROBE_BATCH_MILLISECONDS`, once, up front. */
+  /** Sized so a batch reaches PROBE_BATCH_MILLISECONDS, once, up front. */
   dispatches: number;
   best: number;
 }
@@ -454,7 +454,7 @@ export interface GemmVariantMeasurement {
   readonly variant: GemmVariant;
   /** Total across the probe shapes; what the hand-tiled kernel is ranked by. */
   readonly milliseconds: number;
-  /** Per shape, in `PROBE_SHAPES` order, so unlike things are not compared. */
+  /** Per shape, in PROBE_SHAPES order, so unlike things are not compared. */
   readonly perShape: readonly number[];
   readonly relativeError: number;
 }
@@ -493,7 +493,7 @@ export async function measureGemmVariants(
         // Left out of the ranking entirely.
       }
     }
-    // Size each batch to reach `PROBE_BATCH_MILLISECONDS`. The rough pass also
+    // Size each batch to reach PROBE_BATCH_MILLISECONDS. The rough pass also
     // warms the pipeline, so its own time is discarded.
     for (const entry of entries) {
       for (const timing of entry.timings) {
@@ -534,7 +534,7 @@ export async function measureGemmVariants(
  *
  * Correctness first: a candidate that does not reproduce the reference cannot
  * win however fast it is. Among the rest the fastest f32 tile is the one to
- * beat, and half precision has to beat it by `HALF_PRECISION_MARGIN` to be
+ * beat, and half precision has to beat it by HALF_PRECISION_MARGIN to be
  * chosen, so an adapter where f16 buys nothing stays exact. Anything that
  * throws leaves the f32 kernel in place.
  */

@@ -32,12 +32,12 @@ const [embedding, multimerTemplate, extraStack, mainStack, structure, confidence
     model.queryOnlyFeatureTables(), model.tensor("confidencePaeBreaks"),
   ]);
 // Chosen before the instance exists, because the Vulkan loader reads the
-// selection when it makes one. Honours CUDA_VISIBLE_DEVICES; see `selectGpu`.
+// selection when it makes one. Honours CUDA_VISIBLE_DEVICES; see selectGpu.
 const selectedGpu = selectGpu();
 if (selectedGpu !== undefined) console.error(`pinned to ${selectedGpu}`);
 const gpu = create(dawnInstanceFlags({
   // Native, so the bounds clamp goes: the kernels do not rely on it, and it is
-  // worth 11% of a recycle. See `dawnInstanceFlags`.
+  // worth 11% of a recycle. See dawnInstanceFlags.
   unclamped: true,
 }));
 const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
@@ -45,7 +45,7 @@ if (adapter === null) throw new Error("no WebGPU adapter");
 const baseMemoryOptions = { multimer: true, templateRows: multimerTemplate.templateRows,
   ...(process.env.AFWEBGPU_EXACT === "1" ? EXACT_STORAGE : {}) };
 // Sized to this host's memory rather than the browser's default; see
-// `fitScratchBudgetScale`.
+// fitScratchBudgetScale.
 const memoryBudget = nativeMemoryBudgetBytes();
 const scratchBudgetScale = memoryBudget === undefined ? 1 : fitScratchBudgetScale(
   (scale) => planMonomerDevice(adapter, length, 1, 1, undefined, false,

@@ -5,14 +5,14 @@
  *
  * The archive is written here rather than by a library so the page keeps its
  * "no third-party code at run time" property. Entries are deflated with the
- * platform's own `CompressionStream` where it exists and stored verbatim
+ * platform's own CompressionStream where it exists and stored verbatim
  * where it does not, which every unzip implementation reads either way.
  *
  * Nothing in this module touches the DOM, so the page's canvases are rendered
  * to PNG by the caller and handed over as bytes.
  */
 
-/** One file in the archive. Directories are implied by slashes in `name`. */
+/** One file in the archive. Directories are implied by slashes in name. */
 export interface ZipEntry {
   readonly name: string;
   readonly data: Uint8Array | string;
@@ -23,7 +23,7 @@ export interface ZipEntry {
 const encoder = new TextEncoder();
 
 /**
- * `BlobPart` is typed against a non-shared buffer, which a `Uint8Array` only
+ * BlobPart is typed against a non-shared buffer, which a Uint8Array only
  * promises in its type parameter; every array here owns an ordinary buffer.
  */
 const blobPart = (bytes: Uint8Array): BlobPart => bytes as unknown as BlobPart;
@@ -131,7 +131,7 @@ export interface ResultPackage {
   readonly scoresJson: string;
   readonly a3m: string;
   readonly depth: number;
-  /** Rendered plots, keyed by the ColabFold suffix they carry (`plddt`, `pae`, `coverage`). */
+  /** Rendered plots, keyed by the ColabFold suffix they carry (plddt, pae, coverage). */
   readonly images: readonly { readonly suffix: string; readonly png: Uint8Array }[];
   readonly settings: Readonly<Record<string, unknown>>;
   readonly log: string;

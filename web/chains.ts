@@ -3,7 +3,7 @@
  *
  * A complex is only readable when the same chain carries the same letter and
  * the same colour in the structure, in every plot and in the PDB it downloads,
- * so the letters here are the ones `predictionToPdb` writes and the colours are
+ * so the letters here are the ones predictionToPdb writes and the colours are
  * the ones the viewer, the legend and the plot labels all draw from.
  *
  * ColabFold marks chains with black boundary lines and letters from A onward;

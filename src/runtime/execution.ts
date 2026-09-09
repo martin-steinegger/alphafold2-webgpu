@@ -95,7 +95,7 @@ const SUBMISSION_DISPATCH_RANGE = [8, 384] as const;
 
 /**
  * The dispatch count for the next command buffers, given how the last one
- * went. See `noteSubmissionDuration` for why it falls faster than it climbs.
+ * went. See noteSubmissionDuration for why it falls faster than it climbs.
  */
 export function nextSubmissionDispatchLimit(
   limit: number, milliseconds: number, dispatches: number,
@@ -197,7 +197,7 @@ export class WebGpuExecution {
    * A long block is split across several buffers, and the functions encoding
    * it hold whichever encoder they were called with. Rather than thread a
    * replacement back through each of them, dispatches follow the holder, which
-   * the split updates. Cleared with `undefined` once the block is submitted.
+   * the split updates. Cleared with undefined once the block is submitted.
    */
   setEncoderHolder(holder: { encoder: GPUCommandEncoder } | undefined): void {
     this.#encoderHolder = holder;
@@ -206,7 +206,7 @@ export class WebGpuExecution {
   /**
    * Reports bindings larger than a budget, without a device that enforces one.
    *
-   * A binding may cover only `maxStorageBufferBindingSize` bytes of a buffer,
+   * A binding may cover only maxStorageBufferBindingSize bytes of a buffer,
    * and the adapters here allow gigabytes, so a kernel that binds a whole
    * pair passes at every length that fits in memory and then fails on a
    * device with the 128 MiB default. Setting a budget well under any real

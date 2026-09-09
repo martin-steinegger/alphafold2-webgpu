@@ -40,7 +40,7 @@ import { multimerRecycleDistanceRms } from "./multimer-recycling.js";
 export interface MonomerTemplateFeatures {
   /** What the pair features are built from, one value per residue. */
   readonly pair: TemplatePairInput;
-  /** `template_angle_feat`, `[length, 57]`. */
+  /** template_angle_feat, [length, 57]. */
   readonly angleFeatures: Float32Array;
   /** The psi mask, which is the MSA mask for the row the template adds. */
   readonly rowMask: Float32Array;
@@ -93,7 +93,7 @@ const EMPTY_PAIR = new Float32Array(0);
 
 export interface MonomerRecycleResult {
   readonly msaFirstRow: Float32Array;
-  /** The final pair, empty unless the model was built with `returnFinalPair`. */
+  /** The final pair, empty unless the model was built with returnFinalPair. */
   readonly pair: Float32Array;
   readonly structure: StructureModuleResult; readonly confidence: PredictionConfidenceResult;
   readonly elapsedMilliseconds: number;
@@ -149,7 +149,7 @@ export interface MonomerTrunkSubmissionCounts {
 }
 
 export interface MonomerGpuOptions {
-  /** Called as each Evoformer block finishes; see `MonomerProgressCallback`. */
+  /** Called as each Evoformer block finishes; see MonomerProgressCallback. */
   readonly onProgress?: MonomerProgressCallback;
   /** Profile one extra-MSA and one main Evoformer block in a selected recycle. */
   readonly profile?: boolean;
@@ -158,12 +158,12 @@ export interface MonomerGpuOptions {
   readonly profileMainEvoformerBlock?: number;
   /** Bounds transition scratch even when the device exposes larger binding limits. */
   readonly compactTransitions?: boolean;
-  /** Storage of the triangle multiplication's whole projection; `f16` halves it inexactly. */
+  /** Storage of the triangle multiplication's whole projection; f16 halves it inexactly. */
   readonly triangleWholeStorage?: TriangleWholeStorage;
-  /** Storage of the MSA activations; `f16` halves them inexactly. Monomer only. */
+  /** Storage of the MSA activations; f16 halves them inexactly. Monomer only. */
   readonly msaStorage?: ActivationStorage;
   /**
-   * Storage of the pair; `f16` halves it inexactly. Monomer only.
+   * Storage of the pair; f16 halves it inexactly. Monomer only.
    *
    * The pair is one of the three tensors that set the trunk's peak, beside the
    * MSA activations and the triangle multiplication's whole projection.
@@ -172,7 +172,7 @@ export interface MonomerGpuOptions {
   /** Caps reusable scratch retained between blocks; compact mode uses the bounded shared default. */
   readonly maxPooledBytes?: number;
   /**
-   * Records every binding above this many bytes, in `oversizedBindings`.
+   * Records every binding above this many bytes, in oversizedBindings.
    *
    * A diagnostic for the binding-size limit: adapters here allow far more
    * than the 128 MiB a device gets by default, so a kernel binding a whole
@@ -191,7 +191,7 @@ export interface MonomerGpuOptions {
    * and returning it costs that much again in a mapped staging buffer and once
    * more in the host copy, at the point where the run is otherwise done and
    * the device is at its fullest. Predictions leave it off and get an empty
-   * array in `final.pair`.
+   * array in final.pair.
    */
   readonly returnFinalPair?: boolean;
   /**
@@ -218,7 +218,7 @@ export interface MonomerRecycleGpuProfile {
 /** Where a prediction has got to inside a recycle. */
 export interface MonomerProgress {
   readonly recycle: number;
-  /** The stack running now: `extra-msa`, `evoformer` or `structure`. */
+  /** The stack running now: extra-msa, evoformer or structure. */
   readonly phase: "extra-msa" | "evoformer" | "structure";
   /** Blocks of that stack whose work the device has finished. */
   readonly completed: number;
@@ -554,7 +554,7 @@ export class AlphaFoldMonomerGpu {
         // stack's peak. Multimer's template rows, which are merged into it, are
         // kept aside until then.
         await submit(embeddingEncoder, `embedding recycle ${recycle}`);
-        // The new pair was written over `previousPair`, which therefore stays live.
+        // The new pair was written over previousPair, which therefore stays live.
         for (const temporary of embedding.temporaries) releaseTensor(temporary);
         releaseTensor(previousPositions);
         let templateMilliseconds: number | undefined = templateConstantMilliseconds;

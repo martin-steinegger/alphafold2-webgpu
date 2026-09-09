@@ -2,8 +2,8 @@
  * Dawn instance flags the native entry points ask for.
  *
  * Dawn takes its toggles when the instance is made, so a caller that reaches
- * the GPU through `webgpu`'s `create` chooses them and a browser does not get
- * to. Left to its defaults Dawn does not expose `shader-f16` on Nvidia and
+ * the GPU through webgpu's create chooses them and a browser does not get
+ * to. Left to its defaults Dawn does not expose shader-f16 on Nvidia and
  * does not admit an experimental extension, so the half-precision kernels and
  * the matrix units are both out of reach — which is most of this model's
  * speed. The entry points therefore ask for them rather than each remembering
@@ -13,12 +13,12 @@
 /** Toggles every native entry point wants. */
 const REQUIRED = [
   // Nvidia's Vulkan driver reports f16 support that Dawn does not expose
-  // without this, and without `shader-f16` there is no half-precision
+  // without this, and without shader-f16 there is no half-precision
   // projection and no f16 matrix configuration to select. It is Nvidia-only in
   // effect as well as in name: an instance with no toggles at all reports
-  // `shader-f16` false on a Blackwell and true on an RDNA 3.5 part.
+  // shader-f16 false on a Blackwell and true on an RDNA 3.5 part.
   "vulkan_enable_f16_on_nvidia",
-  // `chromium-experimental-subgroup-matrix` is an experimental feature, and
+  // chromium-experimental-subgroup-matrix is an experimental feature, and
   // Dawn hides experimental features behind this. On every vendor: a bare
   // instance reports no matrix configurations on either of the two above.
   "allow_unsafe_apis",
@@ -29,7 +29,7 @@ const REQUIRED = [
  *
  * Tint clamps every workgroup, private and function access unconditionally —
  * there is no way to relax it per address space — and wraps every
- * `subgroupMatrixLoad` and `subgroupMatrixStore` on workgroup memory in
+ * subgroupMatrixLoad and subgroupMatrixStore on workgroup memory in
  * saturating arithmetic besides. These kernels are little but dynamic indexing
  * into workgroup arrays, and dropping the clamp is worth 11% of a recycle:
  * 20.48 s against 18.23 s on a 1,650-residue dimer, with every confidence
@@ -38,7 +38,7 @@ const REQUIRED = [
  * It is off by default because it is a promise, not a setting. Dropping the
  * clamp makes any access outside an array undefined rather than clamped, so it
  * is only sound while no kernel relies on the clamp. None of them do — a
- * guarded load sits under an `if` rather than inside a `select`, which
+ * guarded load sits under an if rather than inside a select, which
  * evaluates both of its arms, and the pair bias carries a row of slack for the
  * vector read at its end — but that is a property of the shaders that has to
  * be kept true, not one the platform enforces.
@@ -55,10 +55,10 @@ const UNCLAMPED = "disable_robustness";
 export const SCRATCH_BUDGET_SCALES: readonly number[] = [16, 8, 4, 2, 1];
 
 /**
- * The widest scratch budget whose estimated peak fits `budgetBytes`.
+ * The widest scratch budget whose estimated peak fits budgetBytes.
  *
- * WebGPU does not report how much memory a device has — `adapter.info` carries
- * no heaps, and `maxBufferSize` is the API's theoretical maximum rather than
+ * WebGPU does not report how much memory a device has — adapter.info carries
+ * no heaps, and maxBufferSize is the API's theoretical maximum rather than
  * the card's — so the budget comes from the caller, who knows. What does not
  * need guessing is the scale: the planner already estimates a prediction's
  * peak, so each scale is costed and the widest affordable one is taken.
@@ -75,13 +75,13 @@ export function fitScratchBudgetScale(
 }
 
 export interface DawnInstanceOptions {
-  /** Drop the bounds clamp. See `UNCLAMPED`; measure before trusting it. */
+  /** Drop the bounds clamp. See UNCLAMPED; measure before trusting it. */
   readonly unclamped?: boolean;
   /** Report timestamps unrounded. Dawn otherwise quantizes them to ~65.5 us. */
   readonly exactTimestamps?: boolean;
 }
 
-/** Flags for `create`, which takes them as `name=value` strings. */
+/** Flags for create, which takes them as name=value strings. */
 export function dawnInstanceFlags(options: DawnInstanceOptions = {}): string[] {
   const enabled = [...REQUIRED, ...(options.unclamped === true ? [UNCLAMPED] : [])];
   return [

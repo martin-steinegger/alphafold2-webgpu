@@ -41,8 +41,8 @@ function values(count: number, seed: number): Float32Array {
 }
 
 describe.skipIf(!enabled)("flash attention over the matrix units", () => {
-  // Dawn's instance lives as long as the object `create` returns, so it is
-  // held for the suite rather than collected when `beforeAll` ends.
+  // Dawn's instance lives as long as the object create returns, so it is
+  // held for the suite rather than collected when beforeAll ends.
   let gpu: ReturnType<typeof create> | undefined;
   let device: GPUDevice | undefined;
 
@@ -51,7 +51,7 @@ describe.skipIf(!enabled)("flash attention over the matrix units", () => {
     // The same flags the model asks for. Built from the environment instead,
     // this suite skipped every case on any host where the caller had not set
     // the variable, and reported the skips as passes: the extension is
-    // experimental, so Dawn hides it without `allow_unsafe_apis`.
+    // experimental, so Dawn hides it without allow_unsafe_apis.
     const adapterName = process.env.AFWEBGPU_ADAPTER;
     gpu = create([
       ...(adapterName === undefined ? [] : [`adapter=${adapterName}`]),

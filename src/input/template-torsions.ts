@@ -8,7 +8,7 @@ import {
  * The seven torsion angles AlphaFold reads off a template's backbone and side
  * chains, in its order: pre-omega, phi, psi, chi 1 to 4.
  *
- * This is `all_atom.atom37_to_torsion_angles` with `placeholder_for_undefined`
+ * This is all_atom.atom37_to_torsion_angles with placeholder_for_undefined
  * on, which needs saying because inference runs it off.
  *
  * An angle whose four atoms are not all present is computed from a degenerate
@@ -24,11 +24,11 @@ import {
  * It differs from an official run only where the mask is already zero.
  */
 export interface TemplateTorsions {
-  /** `[residues, 7, 2]`, sine then cosine. */
+  /** [residues, 7, 2], sine then cosine. */
   readonly sinCos: Float32Array;
   /** The same angles with the ambiguously named chis turned by pi. */
   readonly alternativeSinCos: Float32Array;
-  /** `[residues, 7]`, 1 where all four defining atoms were present. */
+  /** [residues, 7], 1 where all four defining atoms were present. */
   readonly mask: Float32Array;
 }
 
@@ -166,13 +166,13 @@ export function templateTorsions(features: TemplateFeatures): TemplateTorsions {
   return { sinCos, alternativeSinCos, mask };
 }
 
-/** Channels in `template_angle_feat`: 22 aatype, 14 torsions, 14 alternatives, 7 masks. */
+/** Channels in template_angle_feat: 22 aatype, 14 torsions, 14 alternatives, 7 masks. */
 export const TEMPLATE_ANGLE_CHANNELS = 22 + 14 + 14 + 7;
 
 /**
  * The per-residue template feature the MSA row is embedded from.
  *
- * Returns the `[residues, 57]` feature and, separately, the psi mask, which is
+ * Returns the [residues, 57] feature and, separately, the psi mask, which is
  * what AlphaFold uses as the row's MSA mask: it depends only on one residue's
  * own backbone, so it says whether this position was covered at all.
  */

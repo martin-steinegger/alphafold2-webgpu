@@ -159,9 +159,9 @@ describe.skipIf(!enabled)("query-only mock-template branch WebGPU", () => {
   /**
    * The same module with a real template in it, against an official capture.
    *
-   * `tools/dump-template-features.ts` writes the features and
-   * `tools/capture_alphafold_template_reference.py` runs AlphaFold's own
-   * `TemplateEmbedding` over them, so this compares the whole GPU path: the
+   * tools/dump-template-features.ts writes the features and
+   * tools/capture_alphafold_template_reference.py runs AlphaFold's own
+   * TemplateEmbedding over them, so this compares the whole GPU path: the
    * fused feature-and-projection kernel, the two-block pair stack, the output
    * norm, and the pointwise attention one template collapses to two matrices.
    */

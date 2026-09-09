@@ -15,7 +15,7 @@ export interface StructureCoreInput {
   readonly activations: Float32Array;
   readonly pair: Float32Array;
   readonly pairBuffer?: GPUBuffer;
-  /** Storage of that buffer; `f16` means packed half-precision words. */
+  /** Storage of that buffer; f16 means packed half-precision words. */
   readonly pairStorage?: ActivationStorage;
   /** Bytes one binding may cover of the pair; tests lower it. */
   readonly bindingLimitBytes?: number;

@@ -15,7 +15,7 @@ import { RESTYPES, RESTYPE_INDEX } from "./residue-atoms.js";
 export interface PairwiseAlignment {
   /**
    * Template residue index for each query position, or -1 where the query has
-   * no aligned template residue. This is AlphaFold's `mapping`, densified.
+   * no aligned template residue. This is AlphaFold's mapping, densified.
    */
   readonly queryToTemplate: Int32Array;
   /** Query positions with a template residue behind them. */

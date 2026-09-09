@@ -31,17 +31,23 @@ const SHADER = `
 @group(0) @binding(4) var<storage, read> bucket_start: array<u32>;
 @group(0) @binding(5) var<storage, read> bucket_rows: array<u32>;
 @group(0) @binding(6) var<storage, read_write> features: array<f32>;
-struct P { centres: u32, length: u32, channels: u32, pad: u32 };
-@group(0) @binding(7) var<uniform> p: P;
+// The shape is supplied at pipeline creation, the same way the search kernel
+// and the triangle kernels take theirs: LENGTH is the stride of every index
+// here, so it wants to fold rather than be loaded. The source does not change
+// with them, so a new alignment costs a pipeline and no compile. See
+// profileOverrides.
+override CENTRES: u32 = 1u;
+override LENGTH: u32 = 1u;
+const CHANNELS: u32 = ${CLUSTERED_MSA_CHANNELS}u;
 
 fn deletion_value(value: f32) -> f32 { return atan(value / 3.0) * 2.0 / ${Math.PI}; }
 
 @compute @workgroup_size(${LANES}, 1, 1)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let slot = id.x;
-  if (slot >= p.centres * p.length) { return; }
-  let centre = slot / p.length;
-  let residue = slot % p.length;
+  if (slot >= CENTRES * LENGTH) { return; }
+  let centre = slot / LENGTH;
+  let residue = slot % LENGTH;
 
   var profile: array<f32, ${CODES}>;
   for (var code = 0u; code < ${CODES}u; code += 1u) { profile[code] = 0.0; }
@@ -56,12 +62,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let end = bucket_start[centre + 1u];
   for (var index = start; index < end; index += 1u) {
     let row = bucket_rows[index];
-    profile[extra_codes[row * p.length + residue]] += 1.0;
-    deletion_sum += extra_deletion[row * p.length + residue];
+    profile[extra_codes[row * LENGTH + residue]] += 1.0;
+    deletion_sum += extra_deletion[row * LENGTH + residue];
   }
   let count = 1.0 + 1e-6 + f32(end - start);
 
-  let output = slot * p.channels;
+  let output = slot * CHANNELS;
   features[output] = f32(centre_code);
   features[output + 1u] = min(own_deletion, 1.0);
   features[output + 2u] = deletion_value(own_deletion);
@@ -71,11 +77,16 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   features[output + 26u] = deletion_value(deletion_sum / count);
 }`;
 
+/** The shape constants baked into the kernel, and the key that must carry them. */
+export function profileOverrides(centres: number, length: number): Record<string, number> {
+  return { CENTRES: centres, LENGTH: length };
+}
+
 export interface ClusterProfileInput {
   /** Post-masking centre codes, one a residue, row-major. */
   readonly centreCodes: Uint8Array;
   readonly centres: number;
-  /** Extra rows gathered densely, matching the indices `assignments` refers to. */
+  /** Extra rows gathered densely, matching the indices assignments refers to. */
   readonly extraCodes: Uint8Array;
   readonly extras: number;
   readonly length: number;
@@ -87,7 +98,7 @@ export interface ClusterProfileInput {
 }
 
 /**
- * The clustered MSA feature block, `centres * length * 27` floats.
+ * The clustered MSA feature block, centres * length * 27 floats.
  *
  * An extra row whose assignment is out of range is dropped, which is what the
  * host loop's "no centre" case did.
@@ -97,7 +108,7 @@ interface ProfileBuffers {
   readonly centreCodes: GPUBuffer; readonly extraCodes: GPUBuffer;
   readonly centreDeletion: GPUBuffer; readonly extraDeletion: GPUBuffer;
   readonly bucketStart: GPUBuffer; readonly bucketRows: GPUBuffer;
-  readonly output: GPUBuffer; readonly parameters: GPUBuffer; readonly readback: GPUBuffer;
+  readonly output: GPUBuffer; readonly readback: GPUBuffer;
 }
 
 /**
@@ -132,8 +143,6 @@ function buffersFor(
     bucketRows: device.createBuffer({ size: Math.max(4, extras * 4), usage: read }),
     output: device.createBuffer({
       size: outputBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC }),
-    parameters: device.createBuffer({
-      size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }),
     readback: device.createBuffer({
       size: outputBytes, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ }),
   };
@@ -171,7 +180,9 @@ export async function clusterProfile(
     if (centre < centres) { bucketRows[cursor[centre]!] = extra; cursor[centre] = cursor[centre]! + 1; }
   }
 
-  const pipeline = await pipelineCacheForDevice(device).get("msa:cluster-profile", SHADER);
+  const overrides = profileOverrides(centres, length);
+  const pipeline = await pipelineCacheForDevice(device).get(
+    `msa:cluster-profile:${centres}x${length}`, SHADER, "main", overrides);
   const slots = centres * length;
   const outputBytes = slots * CLUSTERED_MSA_CHANNELS * 4;
   const buffers = buffersFor(device, centres, extras, length);
@@ -182,13 +193,11 @@ export async function clusterProfile(
   device.queue.writeBuffer(buffers.extraDeletion, 0, input.extraDeletion);
   device.queue.writeBuffer(buffers.bucketStart, 0, bucketStart);
   device.queue.writeBuffer(buffers.bucketRows, 0, bucketRows);
-  device.queue.writeBuffer(buffers.parameters, 0,
-    new Uint32Array([centres, length, CLUSTERED_MSA_CHANNELS, 0]));
   const group = device.createBindGroup({
     layout: pipeline.getBindGroupLayout(0),
     entries: [buffers.centreCodes, buffers.extraCodes, buffers.centreDeletion,
-      buffers.extraDeletion, buffers.bucketStart, buffers.bucketRows, buffers.output,
-      buffers.parameters].map((buffer, binding) => ({ binding, resource: { buffer } })),
+      buffers.extraDeletion, buffers.bucketStart, buffers.bucketRows, buffers.output]
+      .map((buffer, binding) => ({ binding, resource: { buffer } })),
   });
   const encoder = device.createCommandEncoder({ label: "msa.cluster-profile" });
   const pass = encoder.beginComputePass();

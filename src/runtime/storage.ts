@@ -1,8 +1,8 @@
 /**
  * Storage of an activation tensor.
  *
- * `f32` is the exact representation every reference was produced with. `f16`
- * packs two half-precision values into each 32-bit word with `pack2x16float`,
+ * f32 is the exact representation every reference was produced with. f16
+ * packs two half-precision values into each 32-bit word with pack2x16float,
  * which needs no device feature and halves the tensor, at the cost of rounding
  * every value written to about three significant digits. Kernels read packed
  * elements one at a time and write them a whole word at a time, so the pair
@@ -10,17 +10,17 @@
  */
 export type ActivationStorage = "f32" | "f16";
 
-/** WGSL element type of an array holding values stored as `storage`. */
+/** WGSL element type of an array holding values stored as storage. */
 export function storageArray(storage: ActivationStorage): "f32" | "u32" {
   return storage === "f16" ? "u32" : "f32";
 }
 
-/** WGSL expression reading value number `index` of `array`, whatever its storage. */
+/** WGSL expression reading value number index of array, whatever its storage. */
 export function storedElement(storage: ActivationStorage, array: string, index: string): string {
   return storage === "f16" ? `unpack2x16float(${array}[(${index}) >> 1u])[(${index}) & 1u]` : `${array}[${index}]`;
 }
 
-/** 32-bit words backing `elements` values stored as `storage`. */
+/** 32-bit words backing elements values stored as storage. */
 export function storageWords(elements: number, storage: ActivationStorage): number {
   return storage === "f16" ? Math.ceil(elements / 2) : elements;
 }
@@ -60,7 +60,7 @@ function floatToHalf(value: number): number {
   return sign | ((exponent + 15) << 10) | mantissa;
 }
 
-/** Unpack `count` half-precision values from packed words. */
+/** Unpack count half-precision values from packed words. */
 export function unpackHalfWords(words: Uint32Array, count: number): Float32Array {
   const output = new Float32Array(count);
   for (let index = 0; index < count; index += 1) {

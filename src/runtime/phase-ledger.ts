@@ -4,7 +4,7 @@
  * Closed is the point. Every millisecond between the ledger's origin and its
  * report belongs to exactly one row, including the ones no phase claimed:
  * entering a phase switches which bucket time accrues to, and anything running
- * outside a phase accrues to `unaccounted`. So the rows always sum to the
+ * outside a phase accrues to unaccounted. So the rows always sum to the
  * total and work nobody thought to name shows up as a gap rather than
  * disappearing into a neighbour.
  *
@@ -17,7 +17,7 @@
  * apart from the rest, which is what separates a cold start's compiles from
  * the steady state without a second mechanism.
  *
- * Off by default and free when off: `phase` calls its body directly when no
+ * Off by default and free when off: phase calls its body directly when no
  * ledger is installed.
  */
 
@@ -43,17 +43,17 @@ export class PhaseLedger {
   readonly #buckets = new Map<string, Bucket>();
   readonly #stack: string[] = [];
   readonly #entered: number[] = [];
-  /** Whether each open level was opened by `mark`, so `mark` can close it. */
+  /** Whether each open level was opened by mark, so mark can close it. */
   readonly #marked: boolean[] = [];
   readonly #origin: number;
   #switched: number;
   #before: string;
 
   /**
-   * `origin` back-dates the ledger, and `before` names the time between it and
-   * the first phase. On node `performance.now()` counts from process start, so
-   * `new PhaseLedger(0, "module load")` bills the imports honestly. Once a
-   * phase has opened, later gaps go back to `unaccounted`.
+   * origin back-dates the ledger, and before names the time between it and
+   * the first phase. On node performance.now() counts from process start, so
+   * new PhaseLedger(0, "module load") bills the imports honestly. Once a
+   * phase has opened, later gaps go back to unaccounted.
    */
   constructor(origin: number = performance.now(), before: string = UNACCOUNTED) {
     this.#origin = origin;
@@ -87,12 +87,12 @@ export class PhaseLedger {
     this.#stack.push(name);
     this.#marked.push(false);
     // The bucket's running exclusive total, so the first entry's own cost is
-    // the delta at `leave` and stays comparable with the column beside it.
+    // the delta at leave and stays comparable with the column beside it.
     this.#entered.push(bucket.milliseconds);
   }
 
   /**
-   * Switches to `name` at the current level, ending whatever mark preceded it.
+   * Switches to name at the current level, ending whatever mark preceded it.
    *
    * A recycle is one long imperative block, and wrapping each of its stages in
    * a closure would mean restructuring the bindings that cross them. A
@@ -134,20 +134,20 @@ export class PhaseLedger {
 
 let installed: PhaseLedger | undefined;
 
-/** Installs a ledger; `undefined` turns the instrumentation back off. */
+/** Installs a ledger; undefined turns the instrumentation back off. */
 export function setPhaseLedger(ledger: PhaseLedger | undefined): void {
   installed = ledger;
 }
 
 export function phaseLedger(): PhaseLedger | undefined { return installed; }
 
-/** Starts a named stage in a sequence; see `PhaseLedger.mark`. */
+/** Starts a named stage in a sequence; see PhaseLedger.mark. */
 export function markPhase(name: string): void { installed?.mark(name); }
 
-/** Ends the current stage started by `markPhase`. */
+/** Ends the current stage started by markPhase. */
 export function endPhase(): void { installed?.endMark(); }
 
-/** Runs `body` as a named phase, or just runs it when no ledger is installed. */
+/** Runs body as a named phase, or just runs it when no ledger is installed. */
 export async function timed<T>(name: string, body: () => Promise<T>): Promise<T> {
   const ledger = installed;
   if (ledger === undefined) return body();

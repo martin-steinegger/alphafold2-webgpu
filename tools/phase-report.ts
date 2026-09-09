@@ -2,7 +2,7 @@
  * Folds an A3M and prints where the wall clock went, end to end.
  *
  * The rows sum to the total by construction, so a phase nobody named shows up
- * as `unaccounted` rather than being absorbed by its neighbour. That is the
+ * as unaccounted rather than being absorbed by its neighbour. That is the
  * whole point: featurisation built each recycle's features from inside the
  * recycle loop, so its seconds read as GPU time until they had a row.
  *
@@ -107,7 +107,7 @@ console.log(formatPhaseReport(report));
 const summed = report.rows.reduce((sum, row) => sum + row.milliseconds, 0);
 console.log(`rows sum to ${(summed / 1000).toFixed(2)} s of ${(report.totalMilliseconds / 1000).toFixed(2)} s`);
 // Without this the process does not exit: dawn.node keeps pumping
-// `InstanceBase::ProcessEvents` from the event loop and deadlocks on the
+// InstanceBase::ProcessEvents from the event loop and deadlocks on the
 // instance mutex once its worker threads have gone. Every other tool here
 // already destroys its device.
 device.destroy();

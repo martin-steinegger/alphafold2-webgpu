@@ -63,14 +63,14 @@ function checkedBytes(label: string, ...factors: number[]): number {
  * set; it is a preflight guard, not a claim about physical memory availability.
  */
 export interface MonomerMemoryOptions {
-  /** Storage of the triangle multiplication's whole projection; `f16` halves it. */
+  /** Storage of the triangle multiplication's whole projection; f16 halves it. */
   readonly triangleWholeStorage?: TriangleWholeStorage;
-  /** Storage of the MSA activations; `f16` halves them. */
+  /** Storage of the MSA activations; f16 halves them. */
   readonly msaStorage?: ActivationStorage;
-  /** Storage of the pair; `f16` halves it inexactly. */
+  /** Storage of the pair; f16 halves it inexactly. */
   readonly pairStorage?: ActivationStorage;
   /**
-   * Multimer-v3: the main-stack MSA carries `templateRows` extra rows, and the
+   * Multimer-v3: the main-stack MSA carries templateRows extra rows, and the
    * template module runs every recycle over the pair with its own scratch.
    */
   readonly multimer?: boolean;
@@ -80,7 +80,7 @@ export interface MonomerMemoryOptions {
    *
    * One, the default, keeps the budgets every shipped adapter was tuned for.
    * A caller that knows it owns a large accelerator raises it and trades
-   * memory for far fewer dispatches; `src/runtime/scratch-budget.ts` says why
+   * memory for far fewer dispatches; src/runtime/scratch-budget.ts says why
    * this cannot be derived from the adapter.
    */
   readonly scratchBudgetScale?: number;
@@ -428,14 +428,14 @@ export async function requestAlphaFoldDevice(
   // adapter and not on the device, so it is read here and handed down rather
   // than looked up where it is used. An implementation that reports none
   // leaves the selection exactly as it was.
-  // `info` itself is optional: it postdates the adapters this runs on, and a
+  // info itself is optional: it postdates the adapters this runs on, and a
   // stub standing in for one in a test does not carry it either.
   const subgroupMatrixConfigs = ((adapter.info as unknown as {
     subgroupMatrixConfigs?: readonly SubgroupMatrixConfig[];
   } | undefined)?.subgroupMatrixConfigs) ?? [];
   // Before the caller can hold the device, and so before any projection
   // shader exists, settle which arithmetic and k depth the shared GEMM uses.
-  // One model, and its calibration does not depend on it: `measureGemmVariants`
+  // One model, and its calibration does not depend on it: measureGemmVariants
   // runs fixed probe shapes. A port with several models passes their id here.
   await timed("calibrate gemm",
     () => calibrateGemmVariant(device, subgroupMatrixConfigs, adapter, ""));

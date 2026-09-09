@@ -21,7 +21,7 @@ export interface TriangleShaders {
   readonly projectGate: string;
   /**
    * The two contraction inputs, each a gated projection of the normalized
-   * pair. `a` is projected one output block at a time; `b` is filled block
+   * pair. a is projected one output block at a time; b is filled block
    * by block into a whole tensor before any block contracts.
    */
   readonly projectBlockOperand: string;
@@ -36,8 +36,8 @@ export interface TriangleShaders {
 export type TriangleDirection = "outgoing" | "incoming";
 
 /**
- * Storage of the whole projection. `f16` packs two half-precision values per
- * 32-bit word with `pack2x16float`, needing no device feature; it halves the
+ * Storage of the whole projection. f16 packs two half-precision values per
+ * 32-bit word with pack2x16float, needing no device feature; it halves the
  * largest scratch tensor of the trunk and rounds the contraction inputs to
  * about three significant digits, so it is not exact.
  */
@@ -84,7 +84,7 @@ const read = (precision: Precision, expression: string): string =>
  * They are overrides rather than literals so that one shader module serves
  * every sequence length: without this each length compiled its own copy of all
  * seven triangle kernels, 14 modules at about 16 ms each. They still fold --
- * `L` is the k bound of the contraction's loop and a runtime bound there
+ * L is the k bound of the contraction's loop and a runtime bound there
  * measured 4.7x, while an override measured 0.129 ms against a literal's 0.129
  * on that kernel.
  */
@@ -389,7 +389,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }`;
 
   // The output is the projected, gated hidden block, written at the pair rows
-  // the block covers; `output` is the whole pair-shaped tensor.
+  // the block covers; output is the whole pair-shaped tensor.
   const projectOutput = createTiledGemmShader({
     preamble: `${common}
 @group(0) @binding(0) var<storage, read> gate: array<f32>;

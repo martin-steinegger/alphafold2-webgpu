@@ -27,7 +27,7 @@ const extraRows = Number(process.argv[4] ?? "1024");
 const recycles = Number(process.argv[5] ?? "4");
 const a3m = readFileSync(file, "utf8");
 // Use the production parser for sizing as well as feature construction. MMseqs2
-// A3Ms begin with a `#length\tchains` metadata line, which is not a sequence.
+// A3Ms begin with a #length\tchains metadata line, which is not a sequence.
 const alignment = parseA3m(a3m);
 const { length, depth } = alignment;
 // AFWEBGPU_MANIFEST runs against a different bundle, such as the quantized one
@@ -61,12 +61,12 @@ if (templatePath !== undefined && templatePath !== "") {
   };
 }
 // Chosen before the instance exists, because the Vulkan loader reads the
-// selection when it makes one. Honours CUDA_VISIBLE_DEVICES; see `selectGpu`.
+// selection when it makes one. Honours CUDA_VISIBLE_DEVICES; see selectGpu.
 const selectedGpu = selectGpu();
 if (selectedGpu !== undefined) console.error(`pinned to ${selectedGpu}`);
 const gpu = create(dawnInstanceFlags({
   // Native, so the bounds clamp goes: the kernels do not rely on it, and it is
-  // worth 11% of a recycle. See `dawnInstanceFlags`.
+  // worth 11% of a recycle. See dawnInstanceFlags.
   unclamped: true,
 }));
 const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
