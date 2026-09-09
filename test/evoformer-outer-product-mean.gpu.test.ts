@@ -1,8 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { create, globals } from "webgpu";
 import { OuterProductMeanGpu, type OuterProductMeanWeights } from "../src/evoformer/outer-product-mean.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
 import { errorMetrics } from "../src/triangle/types.js";
+import { testGpu } from "./support/gpu-instance.js";
 
 const enabled = process.env.AFWEBGPU_GPU_TESTS === "1";
 const MANIFEST = "test/fixtures/evoformer/model1-query-59-block0/manifest.json";
@@ -19,9 +19,8 @@ describe.skipIf(!enabled)("OuterProductMean WebGPU", () => {
   let device: GPUDevice;
 
   beforeAll(async () => {
-    Object.assign(globalThis, globals);
     const adapterName = process.env.AFWEBGPU_ADAPTER;
-    gpu = create(adapterName === undefined ? [] : [`adapter=${adapterName}`]);
+    gpu = testGpu();
     const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
     if (adapter === null) throw new Error("no WebGPU adapter is available");
     device = await adapter.requestDevice();

@@ -10,11 +10,11 @@
  * epilogue as vec4<f32> — an invariant only a compiled shader can confirm.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { create, globals } from "webgpu";
 import {
   createTiledGemmShader, gemmGrid, GEMM_TILE_ROWS, type GemmVariant,
 } from "../src/runtime/gemm.js";
 import { gemmVariantName } from "../src/runtime/gemm-selection.js";
+import { testGpu } from "./support/gpu-instance.js";
 
 const enabled = process.env.AFWEBGPU_GPU_TESTS === "1";
 
@@ -125,9 +125,8 @@ describe.skipIf(!enabled)("half-precision projection", () => {
   let half = false;
 
   beforeAll(async () => {
-    Object.assign(globalThis, globals);
     const adapterName = process.env.AFWEBGPU_ADAPTER;
-    gpu = create(adapterName === undefined ? [] : [`adapter=${adapterName}`]);
+    gpu = testGpu();
     const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
     if (adapter === null) throw new Error("no WebGPU adapter is available");
     half = adapter.features.has("shader-f16");

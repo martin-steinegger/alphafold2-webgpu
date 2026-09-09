@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { create, globals } from "webgpu";
 import { WebGpuExecution } from "../src/runtime/execution.js";
+import { testGpu } from "./support/gpu-instance.js";
 
 const enabled = process.env.AFWEBGPU_GPU_TESTS === "1";
 
@@ -9,8 +9,7 @@ describe.skipIf(!enabled)("WebGPU bounded buffer reuse", () => {
   let device: GPUDevice;
 
   beforeAll(async () => {
-    Object.assign(globalThis, globals);
-    gpu = create([]);
+    gpu = testGpu();
     const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
     if (adapter === null) throw new Error("no WebGPU adapter is available");
     device = await adapter.requestDevice();

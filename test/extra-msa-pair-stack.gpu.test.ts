@@ -1,5 +1,4 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { create, globals } from "webgpu";
 import type { AttentionWeights } from "../src/evoformer/attention.js";
 import type { EvoformerPairBlockWeights, TriangleAttentionModuleWeights } from "../src/evoformer/block.js";
 import type { OuterProductMeanWeights } from "../src/evoformer/outer-product-mean.js";
@@ -7,6 +6,7 @@ import { ExtraMsaPairStackGpu } from "../src/evoformer/stack.js";
 import type { TransitionWeights } from "../src/evoformer/transition.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
 import { errorMetrics, type TriangleMultiplicationWeights } from "../src/triangle/types.js";
+import { testGpu } from "./support/gpu-instance.js";
 
 const enabled = process.env.AFWEBGPU_GPU_TESTS === "1";
 const MANIFEST = "test/fixtures/evoformer/model1-query-59-stack/manifest.json";
@@ -32,8 +32,7 @@ describe.skipIf(!enabled)("query-only extra-MSA pair stack WebGPU", () => {
   let gpu: GPU;
   let device: GPUDevice;
   beforeAll(async () => {
-    Object.assign(globalThis, globals);
-    gpu = create([]);
+    gpu = testGpu();
     const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
     if (adapter === null) throw new Error("no WebGPU adapter");
     device = await adapter.requestDevice();

@@ -6,22 +6,16 @@ import { assembleComplexA3m } from "../src/input/mmseqs2-api.js";
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
 import { errorMetrics } from "../src/triangle/types.js";
-import { create, globals } from "webgpu";
-import { dawnInstanceFlags } from "../src/runtime/dawn.js";
 import { requestAlphaFoldDevice } from "../src/runtime/device.js";
+import { testGpu } from "./support/gpu-instance.js";
 
 // Featurisation clusters the alignment on the device, so these need one.
 const gpuEnabled = process.env.AFWEBGPU_GPU_TESTS === "1";
-// Held at module scope rather than left as a local in beforeAll. dawn.node
-// schedules InstanceBase::ProcessEvents on the event loop, and a callback that
-// runs after the instance is collected dereferences freed memory: a
-// segmentation fault inside pthread_mutex_lock on an unaligned mutex.
 let gpu: GPU;
 let device: GPUDevice;
 beforeAll(async () => {
   if (!gpuEnabled) return;
-  Object.assign(globalThis, globals);
-  gpu = create(dawnInstanceFlags({ unclamped: true }));
+  gpu = testGpu({ unclamped: true });
   const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
   device = await requestAlphaFoldDevice(adapter!);
 });

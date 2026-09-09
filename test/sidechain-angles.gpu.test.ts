@@ -1,8 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { create, globals } from "webgpu";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
 import { SidechainAnglesGpu, type SidechainWeights } from "../src/structure/sidechain.js";
 import { errorMetrics } from "../src/triangle/types.js";
+import { testGpu } from "./support/gpu-instance.js";
 
 const enabled = process.env.AFWEBGPU_GPU_TESTS === "1";
 const MANIFEST = "test/fixtures/evoformer/model1-query-59-stack/manifest.json";
@@ -11,7 +11,7 @@ interface Manifest { readonly structureModule: { readonly parameters: Readonly<R
 describe.skipIf(!enabled)("structure sidechain angle network WebGPU", () => {
   let gpu: GPU; let device: GPUDevice;
   beforeAll(async () => {
-    Object.assign(globalThis, globals); gpu = create([]);
+    gpu = testGpu();
     const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
     if (adapter === null) throw new Error("no WebGPU adapter"); device = await adapter.requestDevice();
   });

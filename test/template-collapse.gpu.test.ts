@@ -1,11 +1,11 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { create, globals } from "webgpu";
 import { AlphaFoldMonomerGpu, EXACT_STORAGE } from "../src/model/monomer.js";
 import { iterateA3mFeatures } from "../src/input/a3m-features.js";
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
 import { queryOnlyTemplateConstant, QueryOnlyTemplateGpu } from "../src/evoformer/template.js";
 import { errorMetrics } from "../src/triangle/types.js";
+import { testGpu } from "./support/gpu-instance.js";
 
 /**
  * The query-only template branch is a constant, and collapsing it must not
@@ -20,8 +20,7 @@ describe.skipIf(!enabled)("query-only template collapse", () => {
   let gpu: GPU;
   let device: GPUDevice;
   beforeAll(async () => {
-    Object.assign(globalThis, globals);
-    gpu = create([]);
+    gpu = testGpu();
     const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
     if (adapter === null) throw new Error("no WebGPU adapter");
     device = await adapter.requestDevice({

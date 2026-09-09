@@ -14,13 +14,12 @@
  * never reaches.
  */
 import { beforeAll, describe, expect, it } from "vitest";
-import { create, globals } from "webgpu";
-import { dawnInstanceFlags } from "../src/runtime/dawn.js";
 import {
   createAttentionRegisterFlashShader, selectAttentionFlashKernel, supportsAttentionMatrix,
   attentionPairBiasStride,
 } from "../src/evoformer/attention.js";
 import { recordSubgroupRange, recordSubgroupMatrixConfigs } from "../src/runtime/subgroups.js";
+import { testGpu } from "./support/gpu-instance.js";
 
 const enabled = process.env.AFWEBGPU_GPU_TESTS === "1";
 // Thirty-two is the width of the trunk's heads and eight the extra-MSA
@@ -41,22 +40,13 @@ function values(count: number, seed: number): Float32Array {
 }
 
 describe.skipIf(!enabled)("flash attention over the matrix units", () => {
-  // Dawn's instance lives as long as the object create returns, so it is
-  // held for the suite rather than collected when beforeAll ends.
-  let gpu: ReturnType<typeof create> | undefined;
+  let gpu: GPU | undefined;
   let device: GPUDevice | undefined;
 
   beforeAll(async () => {
-    Object.assign(globalThis, globals);
-    // The same flags the model asks for. Built from the environment instead,
-    // this suite skipped every case on any host where the caller had not set
-    // the variable, and reported the skips as passes: the extension is
+    // The same flags the model asks for: the matrix extension is
     // experimental, so Dawn hides it without allow_unsafe_apis.
-    const adapterName = process.env.AFWEBGPU_ADAPTER;
-    gpu = create([
-      ...(adapterName === undefined ? [] : [`adapter=${adapterName}`]),
-      ...dawnInstanceFlags(),
-    ]);
+    gpu = testGpu();
     const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
     if (adapter === null) throw new Error("no WebGPU adapter is available");
     const wanted = ["subgroups", "subgroup-size-control", "shader-f16",

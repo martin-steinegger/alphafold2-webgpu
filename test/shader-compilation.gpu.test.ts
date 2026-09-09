@@ -9,12 +9,12 @@
  * their storage and sharding options, and fails on any compilation message.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { create, globals } from "webgpu";
 import { planShards, type ShardLayout } from "../src/runtime/sharded.js";
 import { createTriangleShaders } from "../src/triangle/shaders.js";
 import { packWeights } from "../src/triangle/weights.js";
 import type { TriangleMultiplicationWeights } from "../src/triangle/types.js";
 import type { ActivationStorage } from "../src/runtime/storage.js";
+import { testGpu } from "./support/gpu-instance.js";
 
 const enabled = process.env.AFWEBGPU_GPU_TESTS === "1";
 
@@ -160,13 +160,12 @@ function triangleSources(): [string, string][] {
 }
 
 describe.skipIf(!enabled)("every generated shader compiles", () => {
-  let gpu: ReturnType<typeof create>;
+  let gpu: GPU;
   let device: GPUDevice;
   let subgroups = false;
 
   beforeAll(async () => {
-    Object.assign(globalThis, globals);
-    gpu = create([]);
+    gpu = testGpu();
     const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
     if (adapter === null) throw new Error("no WebGPU adapter");
     // The subgroup kernels need the feature enabled or they will not parse.

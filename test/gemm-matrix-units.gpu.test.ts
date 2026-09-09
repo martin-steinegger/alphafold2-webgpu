@@ -14,12 +14,11 @@
  * extension behind toggles on Nvidia.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { create, globals } from "webgpu";
-import { dawnInstanceFlags } from "../src/runtime/dawn.js";
 import { createTiledGemmShader, gemmGrid } from "../src/runtime/gemm.js";
 import {
   gemmVariantName, selectMatrixShape, type SubgroupMatrixConfig,
 } from "../src/runtime/gemm-selection.js";
+import { testGpu } from "./support/gpu-instance.js";
 
 const enabled = process.env.AFWEBGPU_GPU_TESTS === "1";
 
@@ -36,21 +35,14 @@ describe.skipIf(!enabled)("projection over the hardware matrix units", () => {
   // The Dawn instance lives exactly as long as the object create returns, so
   // it is held for the suite rather than left to be collected once beforeAll
   // ends, which tore the device down under the test and aborted the worker.
-  let gpu: ReturnType<typeof create> | undefined;
+  let gpu: GPU | undefined;
   let device: GPUDevice | undefined;
   let configs: readonly SubgroupMatrixConfig[] = [];
 
   beforeAll(async () => {
-    Object.assign(globalThis, globals);
-    // The same flags the model asks for. Built from the environment instead,
-    // this suite skipped every case on any host where the caller had not set
-    // the variable, and reported the skips as passes: the extension is
+    // The same flags the model asks for: the matrix extension is
     // experimental, so Dawn hides it without allow_unsafe_apis.
-    const adapterName = process.env.AFWEBGPU_ADAPTER;
-    gpu = create([
-      ...(adapterName === undefined ? [] : [`adapter=${adapterName}`]),
-      ...dawnInstanceFlags(),
-    ]);
+    gpu = testGpu();
     const adapter = await gpu!.requestAdapter({ powerPreference: "high-performance" });
     if (adapter === null) throw new Error("no WebGPU adapter is available");
     // The kernels pin their subgroup width, so the feature that lets them is

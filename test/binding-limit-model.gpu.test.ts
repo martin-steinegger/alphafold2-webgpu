@@ -10,12 +10,12 @@
  */
 import { CLUSTERED_MSA_CHANNELS, compactClusteredMsaFeatures } from "../src/input/msa-features.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { create, globals } from "webgpu";
 import { AlphaFoldMonomerGpu, type MonomerRecycleFeatures } from "../src/model/monomer.js";
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
 import { requestAlphaFoldDevice } from "../src/runtime/device.js";
 import { recycleFeatureSourceOf } from "../src/input/a3m-features.js";
+import { testGpu } from "./support/gpu-instance.js";
 
 const enabled = process.env.AFWEBGPU_GPU_TESTS === "1";
 const A3M_MANIFEST = "test/fixtures/evoformer/model1-a3m-59-stack/manifest.json";
@@ -32,8 +32,7 @@ describe.skipIf(!enabled)("prediction under a small binding limit", () => {
   let gpu: GPU;
   let device: GPUDevice;
   beforeAll(async () => {
-    Object.assign(globalThis, globals);
-    gpu = create([]);
+    gpu = testGpu();
     const adapter = await gpu.requestAdapter();
     if (adapter === null) throw new Error("no WebGPU adapter");
     device = await requestAlphaFoldDevice(adapter);

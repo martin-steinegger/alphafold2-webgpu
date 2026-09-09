@@ -1,11 +1,11 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { create, globals } from "webgpu";
 import {
   adaptMultimerInvariantPointAttentionWeights,
   InvariantPointAttentionGpu,
   type MultimerInvariantPointAttentionWeights,
 } from "../src/structure/ipa.js";
 import { errorMetrics } from "../src/triangle/types.js";
+import { testGpu } from "./support/gpu-instance.js";
 
 const enabled = process.env.AFWEBGPU_GPU_TESTS === "1";
 
@@ -136,14 +136,10 @@ function officialMultimerIpaReference(input: {
 }
 
 describe.skipIf(!enabled)("AlphaFold-Multimer invariant point attention WebGPU", () => {
-  // Bound rather than left a temporary: dawn.node schedules
-  // InstanceBase::ProcessEvents on the event loop, and a callback that runs
-  // after the instance is collected faults inside pthread_mutex_lock.
   let gpu: GPU;
   let device: GPUDevice;
   beforeAll(async () => {
-    Object.assign(globalThis, globals);
-    gpu = create([]);
+    gpu = testGpu();
     const adapter = await gpu.requestAdapter();
     if (adapter === null) throw new Error("no WebGPU adapter"); device = await adapter.requestDevice();
   });

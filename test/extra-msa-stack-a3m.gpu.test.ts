@@ -1,9 +1,9 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { create, globals } from "webgpu";
 import { ExtraMsaStackGpu } from "../src/evoformer/stack.js";
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
 import { errorMetrics } from "../src/triangle/types.js";
+import { testGpu } from "./support/gpu-instance.js";
 
 const enabled = process.env.AFWEBGPU_GPU_TESTS === "1";
 const MANIFEST = "test/fixtures/evoformer/model1-a3m-59-stack/manifest.json";
@@ -11,7 +11,7 @@ const MANIFEST = "test/fixtures/evoformer/model1-a3m-59-stack/manifest.json";
 describe.skipIf(!enabled)("full extra-MSA stack WebGPU", () => {
   let gpu: GPU; let device: GPUDevice;
   beforeAll(async () => {
-    Object.assign(globalThis, globals); gpu = create([]); const adapter = await gpu.requestAdapter();
+    gpu = testGpu(); const adapter = await gpu.requestAdapter();
     if (adapter === null) throw new Error("no WebGPU adapter"); device = await adapter.requestDevice();
   });
   afterAll(() => device?.destroy());

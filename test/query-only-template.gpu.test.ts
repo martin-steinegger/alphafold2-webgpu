@@ -1,7 +1,6 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { create, globals } from "webgpu";
 import type { AttentionWeights } from "../src/evoformer/attention.js";
 import type { TemplatePairBlockWeights, TriangleAttentionModuleWeights } from "../src/evoformer/block.js";
 import { QueryOnlyTemplateGpu, type QueryOnlyTemplateWeights } from "../src/evoformer/template.js";
@@ -10,6 +9,7 @@ import { parseStructure } from "../src/input/structure.js";
 import { templateFeatures } from "../src/input/template-features.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
 import { errorMetrics, type TriangleMultiplicationWeights } from "../src/triangle/types.js";
+import { testGpu } from "./support/gpu-instance.js";
 
 const enabled = process.env.AFWEBGPU_GPU_TESTS === "1";
 const reference = process.env.AFWEBGPU_TEMPLATE_REFERENCE;
@@ -35,8 +35,7 @@ describe.skipIf(!enabled)("query-only mock-template branch WebGPU", () => {
   let gpu: GPU;
   let device: GPUDevice;
   beforeAll(async () => {
-    Object.assign(globalThis, globals);
-    gpu = create([]);
+    gpu = testGpu();
     const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
     if (adapter === null) throw new Error("no WebGPU adapter");
     device = await adapter.requestDevice();

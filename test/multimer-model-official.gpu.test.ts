@@ -1,7 +1,6 @@
 import { EXACT_STORAGE } from "../src/model/monomer.js";
 import { CLUSTERED_MSA_CHANNELS, compactClusteredMsaFeatures } from "../src/input/msa-features.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { create, globals } from "webgpu";
 import {
   AlphaFoldMultimerGpu, type MultimerModelWeights, type MultimerPrediction,
 } from "../src/model/multimer.js";
@@ -10,6 +9,7 @@ import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
 import { errorMetrics } from "../src/triangle/types.js";
 import { recycleFeatureSourceOf } from "../src/input/a3m-features.js";
+import { testGpu } from "./support/gpu-instance.js";
 
 const referenceManifests = (process.env.AFWEBGPU_MULTIMER_REFERENCES
   ?? process.env.AFWEBGPU_MULTIMER_REFERENCE ?? "")
@@ -109,9 +109,6 @@ async function predict(device: GPUDevice, prepared: PreparedPrediction): Promise
 
 for (const referenceManifest of referenceManifests.length > 0 ? referenceManifests : [undefined]) {
   const referenceLabel = referenceManifest?.split("/").at(-2) ?? "missing reference";
-// Bound rather than left a temporary: dawn.node schedules
-// InstanceBase::ProcessEvents on the event loop, and a callback that runs
-// after the instance is collected faults inside pthread_mutex_lock.
 let gpu: GPU;
 describe.skipIf(!(gpuEnabled && referenceManifest !== undefined && float32Manifest !== undefined))(
   `official AlphaFold-Multimer-v3 model-1 end-to-end reference (${referenceLabel})`,
@@ -122,8 +119,7 @@ describe.skipIf(!(gpuEnabled && referenceManifest !== undefined && float32Manife
     beforeAll(async () => {
       reference = await FileTensorStore.open(referenceManifest!);
       prepared = await preparePrediction(float32Manifest!, reference);
-      Object.assign(globalThis, globals);
-      gpu = create([]);
+      gpu = testGpu();
       const adapter = await gpu.requestAdapter();
       if (adapter === null) throw new Error("no WebGPU adapter");
       device = await adapter.requestDevice();
@@ -164,8 +160,7 @@ describe.skipIf(!(gpuEnabled && referenceManifest !== undefined
       reference = await FileTensorStore.open(referenceManifest!);
       float32Prepared = await preparePrediction(float32Manifest!, reference);
       compressedPrepared = await preparePrediction(compressedManifest!, reference);
-      Object.assign(globalThis, globals);
-      gpu = create([]);
+      gpu = testGpu();
       const adapter = await gpu.requestAdapter();
       if (adapter === null) throw new Error("no WebGPU adapter");
       device = await adapter.requestDevice();

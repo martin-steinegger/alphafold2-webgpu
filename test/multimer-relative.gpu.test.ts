@@ -1,8 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { create, globals } from "webgpu";
 import { MultimerRelativePositionGpu } from "../src/evoformer/multimer-relative.js";
 import { MULTIMER_RELATIVE_CHANNELS, multimerChainIdentifiers } from "../src/input/multimer-features.js";
 import { errorMetrics } from "../src/triangle/types.js";
+import { testGpu } from "./support/gpu-instance.js";
 
 const enabled = process.env.AFWEBGPU_GPU_TESTS === "1";
 
@@ -10,7 +10,7 @@ describe.skipIf(!enabled)("AlphaFold-Multimer relative projection WebGPU", () =>
   let gpu: GPU;
   let device: GPUDevice;
   beforeAll(async () => {
-    Object.assign(globalThis, globals); gpu = create([]);
+    gpu = testGpu();
     const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
     if (adapter === null) throw new Error("no WebGPU adapter");
     device = await adapter.requestDevice();

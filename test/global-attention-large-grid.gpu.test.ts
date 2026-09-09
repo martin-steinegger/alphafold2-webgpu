@@ -1,9 +1,9 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { create, globals } from "webgpu";
 import {
   GlobalAttentionGpu, type GlobalAttentionInput, type GlobalAttentionWeights,
 } from "../src/evoformer/block.js";
 import { errorMetrics } from "../src/triangle/types.js";
+import { testGpu } from "./support/gpu-instance.js";
 
 const enabled = process.env.AFWEBGPU_GPU_TESTS === "1";
 
@@ -59,16 +59,12 @@ function reference(input: GlobalAttentionInput): Float32Array {
 }
 
 describe.skipIf(!enabled)("extra-MSA global attention large dispatch grid", () => {
-  // Bound rather than left a temporary: dawn.node schedules
-  // InstanceBase::ProcessEvents on the event loop, and a callback that runs
-  // after the instance is collected faults inside pthread_mutex_lock.
   let gpu: GPU;
   let device: GPUDevice;
 
   beforeAll(async () => {
-    Object.assign(globalThis, globals);
     const adapterName = process.env.AFWEBGPU_ADAPTER;
-    gpu = create(adapterName === undefined ? [] : [`adapter=${adapterName}`]);
+    gpu = testGpu();
     const adapter = await gpu.requestAdapter();
     if (adapter === null) throw new Error("no WebGPU adapter is available");
     device = await adapter.requestDevice();

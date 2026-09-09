@@ -10,12 +10,12 @@
  * comparison is against the module itself, not against AlphaFold.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { create, globals } from "webgpu";
 import {
   MultimerMockTemplateGpu, type MultimerMockTemplateWeights,
 } from "../src/evoformer/multimer-template.js";
 import type { TemplatePairBlockWeights } from "../src/evoformer/block.js";
 import { errorMetrics } from "../src/triangle/types.js";
+import { testGpu } from "./support/gpu-instance.js";
 
 const enabled = process.env.AFWEBGPU_GPU_TESTS === "1";
 const LENGTH = 24;
@@ -64,8 +64,7 @@ describe.skipIf(!enabled)("Multimer template windows", () => {
   let gpu: GPU;
   let device: GPUDevice;
   beforeAll(async () => {
-    Object.assign(globalThis, globals);
-    gpu = create([]);
+    gpu = testGpu();
     const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
     if (adapter === null) throw new Error("no WebGPU adapter");
     device = await adapter.requestDevice();
