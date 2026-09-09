@@ -434,6 +434,8 @@ export async function requestAlphaFoldDevice(
   } | undefined)?.subgroupMatrixConfigs) ?? [];
   // Before the caller can hold the device, and so before any projection
   // shader exists, settle which arithmetic and k depth the shared GEMM uses.
-  await calibrateGemmVariant(device, subgroupMatrixConfigs);
+  // One model, and its calibration does not depend on it: `measureGemmVariants`
+  // runs fixed probe shapes. A port with several models passes their id here.
+  await calibrateGemmVariant(device, subgroupMatrixConfigs, adapter, "");
   return device;
 }

@@ -1,4 +1,7 @@
 import {
+  calibrationKey, readCalibration, writeCalibration,
+} from "./calibration-store.js";
+import {
   createTiledGemmShader, gemmGrid, GEMM_VARIANT_F32, MATRIX_LANES, matrixGemmStorageBytes,
   MATRIX_REGION, MATRIX_SHAPE_F32_8, setGemmVariant, type GemmVariant, type MatrixUnitShape,
 } from "./gemm.js";
@@ -535,8 +538,27 @@ export async function measureGemmVariants(
  * chosen, so an adapter where f16 buys nothing stays exact. Anything that
  * throws leaves the f32 kernel in place.
  */
+/** A stored variant is only usable if it still looks like one. */
+function isGemmVariant(value: unknown): value is GemmVariant {
+  const v = value as Partial<GemmVariant> | null;
+  if (v === null || typeof v !== "object") return false;
+  const precisions = ["f32", "f16", "f16-mixed", "f16-chunked", "matrix"];
+  if (!precisions.includes(v.precision as string)) return false;
+  if (v.inner !== 8 && v.inner !== 16) return false;
+  if (v.fallback !== undefined && !precisions.includes(v.fallback)) return false;
+  if (v.matrixDepth !== undefined && !Number.isSafeInteger(v.matrixDepth)) return false;
+  if (v.matrix !== undefined) {
+    const m = v.matrix as Partial<MatrixUnitShape>;
+    if (typeof m !== "object" || m === null) return false;
+    if (![m.M, m.N, m.K].every((n) => Number.isSafeInteger(n))) return false;
+    if (m.componentType !== "f16" && m.componentType !== "f32") return false;
+  }
+  return true;
+}
+
 export function calibrateGemmVariant(
   device: GPUDevice, configs: readonly SubgroupMatrixConfig[] = [],
+  adapter: GPUAdapter | undefined, scope: string,
 ): Promise<GemmVariant> {
   if (pinnedVariant !== undefined) {
     setGemmVariant(pinnedVariant);
@@ -544,6 +566,16 @@ export function calibrateGemmVariant(
   }
   const cached = selections.get(device);
   if (cached !== undefined) return cached;
+  // What this device answered last time. The key carries the configurations
+  // and the features, so a device that changed under us measures again.
+  const key = calibrationKey(adapter, device, configs, scope);
+  const remembered = readCalibration(key, isGemmVariant);
+  if (remembered !== undefined) {
+    setGemmVariant(remembered);
+    const settled = Promise.resolve(remembered);
+    selections.set(device, settled);
+    return settled;
+  }
   const selection = (async (): Promise<GemmVariant> => {
     try {
       if (!hasHalfPrecision(device)) sawDeviceWithoutHalfPrecision = true;
@@ -615,6 +647,7 @@ export function calibrateGemmVariant(
             ...(matrix.variant.matrix === undefined ? {} : { matrix: matrix.variant.matrix }) }
         : classic;
       setGemmVariant(winner);
+      writeCalibration(key, winner);
       return winner;
     } catch {
       setGemmVariant(GEMM_VARIANT_F32);

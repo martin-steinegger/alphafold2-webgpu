@@ -7,6 +7,9 @@
  * the card's. A browser has to plan without it. A native host does not.
  */
 import { execFileSync } from "node:child_process";
+import { setCalibrationStore } from "../src/runtime/calibration-store.js";
+import { mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { readdirSync, readFileSync } from "node:fs";
 import { totalmem } from "node:os";
 
@@ -163,4 +166,35 @@ export function nativeMemoryBudgetBytes(): number | undefined {
   if (sharesHostMemory()) return undefined;
   const total = detectDeviceMemoryBytes();
   return total === undefined ? undefined : Math.floor(total * 2 / 3);
+}
+
+/**
+ * Keeps the same document in a file beside the manifest, node having no
+ * `localStorage` without `--localstorage-file`. `AFWEBGPU_CALIBRATION`
+ * overrides the path.
+ *
+ * Temporary name then rename, so a reader never sees a half-written file. NOT
+ * serialised: two writers racing can lose one of the answers, which costs a
+ * recalibration and avoids a lock file to clean up after a crash.
+ */
+export function useFileCalibrationStore(manifestPath?: string): string | undefined {
+  const named = process.env.AFWEBGPU_CALIBRATION;
+  const manifest = manifestPath ?? process.env.AFWEBGPU_MANIFEST;
+  const path = named ?? (manifest === undefined
+    ? undefined : join(dirname(manifest), "calibration.json"));
+  if (path === undefined) return undefined;
+  setCalibrationStore({
+    read: () => {
+      try { return readFileSync(path, "utf8"); } catch { return undefined; }
+    },
+    write: (document) => {
+      try {
+        mkdirSync(dirname(path), { recursive: true });
+        const temporary = `${path}.${process.pid}.tmp`;
+        writeFileSync(temporary, document);
+        renameSync(temporary, path);
+      } catch { /* read-only install, or no room. It measures next time. */ }
+    },
+  });
+  return path;
 }
