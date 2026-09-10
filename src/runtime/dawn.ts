@@ -81,8 +81,27 @@ export interface DawnInstanceOptions {
   readonly exactTimestamps?: boolean;
 }
 
+/**
+ * Warns when a card was asked for and nothing pointed the loader at it.
+ *
+ * CUDA_VISIBLE_DEVICES does nothing on its own: selectGpu turns it into the
+ * DRI_PRIME tag the Vulkan loader reads, and a harness that forgets to call it
+ * ignores the variable in silence. One that did cost a whole investigation,
+ * measuring a 1,650-residue dimer at 37.2 s a recycle against a real 12.0
+ * because every run landed on a card someone else was using. The check is here
+ * rather than in a harness because this is the one call every native entry
+ * point already has to make.
+ */
+function warnUnselectedGpu(): void {
+  const asked = process.env?.CUDA_VISIBLE_DEVICES;
+  if (asked === undefined || asked === "" || process.env?.DRI_PRIME !== undefined) return;
+  console.error(`CUDA_VISIBLE_DEVICES=${asked} but DRI_PRIME is unset, so the loader will pick the`
+    + " card, not you. Call selectGpu() from tools/native-device.js before creating the instance.");
+}
+
 /** Flags for create, which takes them as name=value strings. */
 export function dawnInstanceFlags(options: DawnInstanceOptions = {}): string[] {
+  warnUnselectedGpu();
   const enabled = [...REQUIRED, ...(options.unclamped === true ? [UNCLAMPED] : [])];
   return [
     `enable-dawn-features=${enabled.join(",")}`,
