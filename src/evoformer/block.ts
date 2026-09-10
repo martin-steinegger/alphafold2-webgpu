@@ -39,7 +39,7 @@ import {
   OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_SHADER,
   OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_RESIDUAL_SHADER, createOuterProductMeanProjectOutputShader,
   OUTER_PRODUCT_MEAN_NORMALIZE_SHADER,
-  createOuterProductMeanProjectShader, outerProductMeanOperands,
+  createOuterProductMeanProjectShader, OUTER_PRODUCT_PROJECT_TILE_COLUMNS, outerProductMeanOperands,
   packOuterProductMeanWeights,
   type OuterProductMeanWeights,
 } from "./outer-product-mean.js";
@@ -1128,10 +1128,14 @@ async function encodeOuterProductMean(
     let windowGrid = execution.linearGrid(count, opmLayout.rowsPerWorkgroup);
     execution.dispatch(encoder, normalize, [msaWindow, weights, params, normalizedWindow],
       windowGrid[0], windowGrid[1], 1, `opm.normalize-${offset}`);
-    windowGrid = execution.linearGrid(opmWords(count * input.cOuter));
+    // The projection is a tiled GEMM over this window's rows, so it needs the
+    // window's own row count: every tensor it touches is a view of one.
+    const projectWindow = uniform(execution, `opm.project-window-${offset}`,
+      new Uint32Array([offset, count, 0, 0]));
+    const projectGrid = gemmGrid(count, 2 * input.cOuter, OUTER_PRODUCT_PROJECT_TILE_COLUMNS);
     execution.dispatch(encoder, project,
-      [normalizedWindow, maskWindow, weights, params, leftWindow, rightWindow],
-      windowGrid[0], windowGrid[1], 1, `opm.project-${offset}`);
+      [normalizedWindow, maskWindow, weights, params, leftWindow, rightWindow, projectWindow],
+      projectGrid[0], projectGrid[1], 1, `opm.project-${offset}`);
   }
   let grid = execution.linearGrid(input.length * input.length);
   execution.dispatch(encoder, pairCountPipeline, [msaMask, params, pairCount],

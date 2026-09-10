@@ -155,6 +155,15 @@ ${layout.sum("squared", "squared_total")}
 export const OUTER_PRODUCT_MEAN_NORMALIZE_SHADER = createOuterProductMeanNormalizeShader("f32");
 
 /**
+ * How wide a tile the projection writes.
+ *
+ * Left and right together are 2 x 32 columns in every released model, which is
+ * exactly this. A model with fewer outer channels still computes the right
+ * answer; it would leave the rest of the tile idle.
+ */
+export const OUTER_PRODUCT_PROJECT_TILE_COLUMNS = 64;
+
+/**
  * The two projections the contraction multiplies together.
  *
  * The operands argument says how they are stored, not how they are computed: both are
@@ -165,46 +174,60 @@ export const OUTER_PRODUCT_MEAN_NORMALIZE_SHADER = createOuterProductMeanNormali
  * Halving them is free where the matrix units run: that kernel stages its
  * operands into f16 workgroup memory, so these values are rounded to f16
  * before any multiply either way, and only the bytes read from global change.
+ *
+ * This is a tiled GEMM and used not to be. Written as one invocation an output
+ * element walking the channels, it reached 10.6 TFLOP/s against 55 to 80 for
+ * every sibling projection and never touched the matrix units at all, which
+ * cost 63 ms of a recycle in the main stack and 13 more in the extra one. The
+ * shape was always an ordinary contraction; only the spelling was not.
+ *
+ * The two projections share one dispatch as two halves of the column range,
+ * rather than alternating column by column: a lane staging the weight tile
+ * then walks one of them along its outer channels instead of hopping between
+ * two weight blocks.
  */
 export function createOuterProductMeanProjectShader(
   operands: ActivationStorage = "f32",
 ): string {
   const packed = operands === "f16";
-  const each = (name: "left" | "right", lane: string, at: string): string =>
-    `  var ${name}_${lane} = weights[p.${name}_bias + ${at}];`;
-  return `${COMMON}
+  const weight = (name: "weight" | "bias"): string =>
+    `select(p.right_${name}, p.left_${name}, column < p.c_outer)`;
+  return createTiledGemmShader({
+    preamble: `${COMMON}
 @group(0) @binding(0) var<storage, read> source: array<f32>;
 @group(0) @binding(1) var<storage, read> mask: array<f32>;
 @group(0) @binding(2) var<storage, read> weights: array<f32>;
 @group(0) @binding(3) var<uniform> p: Parameters;
 @group(0) @binding(4) var<storage, read_write> left: array<${storageArray(operands)}>;
 @group(0) @binding(5) var<storage, read_write> right: array<${storageArray(operands)}>;
-
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let slot = id.x + id.y * GRID_WIDTH * 64u;
-  let rows = p.sequences * p.length;
-  let index = slot${packed ? " * 2u" : ""};
-  if (index >= rows * p.c_outer) { return; }
-  let row = index / p.c_outer;
-  let outer = index % p.c_outer;
-${each("left", "0", "outer")}
-${each("right", "0", "outer")}
-${packed ? `${each("left", "1", "outer + 1u")}
-${each("right", "1", "outer + 1u")}` : ""}
-  for (var c = 0u; c < p.c_m; c += 1u) {
-    let value = source[row * p.c_m + c];
-    left_0 += value * weights[p.left_weight + c * p.c_outer + outer];
-    right_0 += value * weights[p.right_weight + c * p.c_outer + outer];
-${packed ? `    left_1 += value * weights[p.left_weight + c * p.c_outer + outer + 1u];
-    right_1 += value * weights[p.right_weight + c * p.c_outer + outer + 1u];` : ""}
-  }
-  let scale = mask[row];
-${packed ? `  left[slot] = pack2x16float(vec2<f32>(scale * left_0, scale * left_1));
-  right[slot] = pack2x16float(vec2<f32>(scale * right_0, scale * right_1));`
-    : `  left[slot] = scale * left_0;
-  right[slot] = scale * right_0;`}
-}`;
+// x is the first row of this window and y the rows it covers. Every tensor
+// above is bound as a window, so the rows here are relative to it.
+@group(0) @binding(6) var<uniform> window: vec4<u32>;`,
+    rows: "window.y",
+    inner: "p.c_m",
+    columns: "2u * p.c_outer",
+    tileColumns: OUTER_PRODUCT_PROJECT_TILE_COLUMNS,
+    sourceElement: "source[row * p.c_m + k]",
+    weightElement: `weights[${weight("weight")} + k * p.c_outer + column % p.c_outer]`,
+    store: `let outer = column % p.c_outer;
+          let value = mask[row] * (element + weights[${weight("bias")} + outer]);
+          let slot = row * p.c_outer + outer;
+          if (column < p.c_outer) { left[slot] = value; } else { right[slot] = value; }`,
+    // Packed storage is written a word at a time. The four columns an
+    // invocation holds start at a multiple of four and the outer channel count
+    // is one too, so all four fall in the same half and the two words are its
+    // own.
+    ...(packed ? { storeVector: `let outer = column % p.c_outer;
+          let bias = ${weight("bias")};
+          let slot = row * p.c_outer + outer;
+${[0, 2].map((pair) => `          if (column + ${pair + 1}u < gemm_columns) {
+            let word = pack2x16float(vec2<f32>(
+              mask[row] * (values[${pair}] + weights[bias + outer + ${pair}u]),
+              mask[row] * (values[${pair + 1}] + weights[bias + outer + ${pair + 1}u])));
+            if (column < p.c_outer) { left[(slot + ${pair}u) >> 1u] = word; }
+            else { right[(slot + ${pair}u) >> 1u] = word; }
+          }`).join("\n")}` } : {}),
+  });
 }
 
 export const OUTER_PRODUCT_MEAN_PROJECT_SHADER = createOuterProductMeanProjectShader();
@@ -582,9 +605,13 @@ export class OuterProductMeanGpu {
       const normalizeGrid = [Math.min(rows, GRID_WIDTH), ceilDivide(rows, GRID_WIDTH)] as const;
       pass(normalize, [source.buffer, weights.buffer, params.buffer, normalized.buffer],
         normalizeGrid[0], normalizeGrid[1]);
-      const projectGrid = linearGrid(rows * input.cOuter);
-      pass(project, [normalized.buffer, mask.buffer, weights.buffer, params.buffer, left.buffer, right.buffer],
-        projectGrid[0], projectGrid[1]);
+      // The projection is a tiled GEMM and takes the rows it covers, which
+      // here is every row at once rather than a window of them.
+      const projectWindow = keep(this.allocator.upload("opm.project-window",
+        new Uint32Array([0, rows, 0, 0]), GPUBufferUsage.UNIFORM));
+      const projectGrid = gemmGrid(rows, 2 * input.cOuter, OUTER_PRODUCT_PROJECT_TILE_COLUMNS);
+      pass(project, [normalized.buffer, mask.buffer, weights.buffer, params.buffer,
+        left.buffer, right.buffer, projectWindow.buffer], projectGrid[0], projectGrid[1]);
       const pairCountGrid = linearGrid(input.length * input.length);
       pass(pairCountPipeline, [mask.buffer, params.buffer, pairCount.buffer],
         pairCountGrid[0], pairCountGrid[1]);
@@ -594,7 +621,9 @@ export class OuterProductMeanGpu {
           `opm.block-${offset}`, new Uint32Array([offset, count, 0, 0]), GPUBufferUsage.UNIFORM,
         ));
         const contractGrid = gemmGrid(count * input.cOuter, input.length * input.cOuter);
-        pass(contractPipeline, [left.buffer, right.buffer, params.buffer, tile.buffer, outer.buffer],
+        // The contraction divides by the pair count itself, so it binds it.
+        pass(contractPipeline,
+          [left.buffer, right.buffer, params.buffer, tile.buffer, outer.buffer, pairCount.buffer],
           contractGrid[0], contractGrid[1]);
         const outputGrid = gemmGrid(count * input.length, input.cZ);
         pass(projectOutputPipeline,
