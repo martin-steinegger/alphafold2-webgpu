@@ -192,10 +192,12 @@ pub fn create_compute_pipeline(
                     // On whatever the checks are doing, because Dawn does it:
                     // disabling Tint's workgroup initialisation is a separate
                     // toggle from the robustness transform, and dawnInstanceFlags
-                    // turns off only the second. The matrix attention kernel
-                    // depends on the zeroing, and folds to a pLDDT of 48 without
-                    // it, so tying this to unchecked made a whole prediction
-                    // wrong for a saving that was never measured.
+                    // turns off only the second. Tying this to unchecked made
+                    // the backends differ in what they hand a kernel, which is
+                    // how a kernel that read unstaged workgroup memory folded
+                    // correctly on one and to a pLDDT of 50 on the other. The
+                    // kernel is fixed; the zeroing stays because it costs
+                    // nothing measurable and because matching Dawn is the point.
                     zero_initialize_workgroup_memory: true,
                 },
                 cache: None,

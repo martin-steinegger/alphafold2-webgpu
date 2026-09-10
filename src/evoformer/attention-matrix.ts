@@ -215,6 +215,22 @@ export function createAttentionMatrixFlashShader(
     throw new RangeError("the output tile must divide evenly among the lanes");
   }
   const outPerLane = (rows * (headDim / 4)) / LANES;
+  // A head narrower than a matrix unit is contracted over the padded width, so
+  // the units read channels past the head that no staging loop writes. They
+  // have to be zero, and a device is not obliged to hand out zeroed workgroup
+  // memory: Dawn does it and wgpu does it only when asked, which is why the
+  // same kernel folded to a pLDDT of 96.48 on one and 50 on the other. Written
+  // once, because nothing else ever writes them.
+  const padVectors = (paddedHeadDim(headDim) - headDim) / 4;
+  const padTile = (name: string, tileRows: number, type: string): string => padVectors === 0
+    ? "" : `  for (var item = lane; item < ${tileRows * padVectors}u; item += ${LANES}u) {
+    let base = (item / ${padVectors}u) * ${TILE_STRIDE}u
+      + (${vectors}u + item % ${padVectors}u) * 4u;
+${lines(4, (c) => `    ${name}[base + ${c}u] = ${type}(0);`)}
+  }
+`;
+  const padChannels = padTile("queries_tile", rows, "f16")
+    + (storedHalf ? "" : padTile("keys_tile", KEY_TILE, "f16"));
   const fetchKeyValue = (at: string): string => lines(keyPerLane, (i) => `  {
     let item = lane + ${i * LANES}u;
 ${keyBound(`
@@ -293,6 +309,7 @@ fn main(
   @builtin(subgroup_id) subgroup: u32,
 ) {
   let lane = local.x;
+${padChannels}
   // Which sixteen queries this subgroup owns.
   let rows_at = subgroup * ${UNIT}u;
   // The batch is the fastest-varying dimension, so that neighbouring
