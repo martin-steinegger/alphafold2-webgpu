@@ -1,7 +1,8 @@
 import { CLUSTERED_MSA_CHANNELS } from "../input/msa-features.js";
 import { COMPACT_GPU_POOL_BYTES } from "./allocator.js";
 import {
-  OUTER_PRODUCT_BLOCK_LIMIT_BYTES, outerProductMeanNormalizeWindow, outerProductMeanRowBlock,
+  OUTER_PRODUCT_BLOCK_LIMIT_BYTES, outerProductMeanNormalizeWindow, outerProductMeanOperands,
+  outerProductMeanRowBlock,
 } from "../evoformer/outer-product-mean.js";
 import {
   ATTENTION_WINDOW_TARGET_BYTES, attentionBatchWindow, attentionPairBiasStride,
@@ -155,8 +156,14 @@ export function estimateMonomerMemory(
       scratchBudget(TRANSITION_CHUNK_TARGET_BYTES));
     return chunk * (channels + hidden) * bytes;
   };
+  // The contracted block is packed where the matrix kernel wants f16 operands,
+  // which the row block spends on twice the residues rather than on half the
+  // bytes. Both halves must use the same storage, or this term is off by two.
+  const outerStorage = outerProductMeanOperands();
+  const outerBytes = outerStorage === "f16" ? 2 : 4;
   const outerProductScratch = (sequences: number, channels: number, outer: number): number =>
-    outerProductMeanRowBlock(length, outer) * length * outer * outer * bytes
+    outerProductMeanRowBlock(length, outer, scratchBudget(OUTER_PRODUCT_BLOCK_LIMIT_BYTES), outerStorage)
+    * length * outer * outer * outerBytes
     + outerProductMeanNormalizeWindow(sequences * length, channels) * channels * bytes
     + 2 * sequences * length * outer * bytes
     + length * length * bytes;

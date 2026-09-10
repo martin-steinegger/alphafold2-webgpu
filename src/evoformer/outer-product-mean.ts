@@ -327,6 +327,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 export function createOuterProductMeanContractShader(shards: ShardLayout = CONTRACT_UNSHARDED,
   spelling?: MatrixSpelling,
   operands: ActivationStorage = "f32",
+  outerStorage: ActivationStorage = "f32",
 ): string {
   return createTiledGemmShader({
   preamble: `${OPM_TILE_COMMON}
@@ -334,7 +335,7 @@ ${shardBindings(shards, "left", operands, 0, false)}
 ${shardBindings(shards, "right", operands, shards.count, false)}
 @group(0) @binding(${2 * shards.count}) var<uniform> p: Parameters;
 @group(0) @binding(${2 * shards.count + 1}) var<uniform> tile: TileParameters;
-@group(0) @binding(${2 * shards.count + 2}) var<storage, read_write> outer: array<f32>;
+@group(0) @binding(${2 * shards.count + 2}) var<storage, read_write> outer: array<${storageArray(outerStorage)}>;
 // Divided here rather than after the output projection below, which reads this
 // tensor as an operand. A sum over every extra sequence grows with the depth of
 // the alignment and leaves the range of an f16 operand at about 2,650 of them;
@@ -372,6 +373,23 @@ ${shardLoader(shards, "right", operands)}`,
           let pair = (tile.offset + block_i) * p.length + j;
           outer[((block_i * p.length + j) * p.c_outer + outer_left) * p.c_outer + outer_right]
             = element / (p.normalization_epsilon + pair_count[pair]);`,
+  // Packed, the four adjacent columns an invocation holds are two words. The
+  // outer channel count is a multiple of four, so the group never straddles
+  // two residues, and the column count is too, so it is wholly in or out.
+  ...(outerStorage === "f16" ? {
+    storeVector: `let block_i = row / p.c_outer;
+          let outer_left = row % p.c_outer;
+          let j = column / p.c_outer;
+          let outer_right = column % p.c_outer;
+          if (column < gemm_columns) {
+            let pair = (tile.offset + block_i) * p.length + j;
+            let scale = 1.0 / (p.normalization_epsilon + pair_count[pair]);
+            let word = (((block_i * p.length + j) * p.c_outer + outer_left) * p.c_outer
+              + outer_right) >> 1u;
+            outer[word] = pack2x16float(vec2<f32>(values[0] * scale, values[1] * scale));
+            outer[word + 1u] = pack2x16float(vec2<f32>(values[2] * scale, values[3] * scale));
+          }`,
+  } : {}),
   });
 }
 
@@ -393,10 +411,11 @@ export function createOuterProductMeanProjectOutputShader(
   residual: boolean, storage: ActivationStorage = "f32",
 
   spelling?: MatrixSpelling,
+  outerStorage: ActivationStorage = "f32",
 ): string {
   return createTiledGemmShader({
     preamble: `${OPM_TILE_COMMON}
-@group(0) @binding(0) var<storage, read> outer: array<f32>;
+@group(0) @binding(0) var<storage, read> outer: array<${storageArray(outerStorage)}>;
 @group(0) @binding(1) var<storage, read> pair_count: array<f32>;
 @group(0) @binding(2) var<storage, read> weights: array<f32>;
 @group(0) @binding(3) var<uniform> p: Parameters;
@@ -407,10 +426,12 @@ export function createOuterProductMeanProjectOutputShader(
     rows: "tile.count * p.length",
     inner: "p.c_outer * p.c_outer",
     columns: "p.c_z",
-    sourceElement: "outer[row * p.c_outer * p.c_outer + k]",
+    sourceElement: storedElement(outerStorage, "outer", "row * p.c_outer * p.c_outer + k"),
     weightElement: "weights[p.output_weight + k * p.c_z + column]",
-    // Both operands are plain row-major arrays, so the units can address them.
-    sourceArray: { array: "outer", stride: "p.c_outer * p.c_outer" },
+    // Only an unpacked operand is a plain array the units can address; a
+    // packed one is read through its accessor, which the staged kernel wants.
+    ...(outerStorage === "f32"
+      ? { sourceArray: { array: "outer", stride: "p.c_outer * p.c_outer" } } : {}),
     weightArray: { array: "weights", base: "p.output_weight", stride: "p.c_z" },
     // A packed pair takes the four adjacent columns an invocation holds as two
     // words; the pair channel count is a multiple of four, so the group never
@@ -479,11 +500,15 @@ export const OUTER_PRODUCT_BLOCK_LIMIT_BYTES = 16 * 1024 * 1024;
 export function outerProductMeanRowBlock(
   length: number, cOuter: number,
   budgetBytes: number = scratchBudget(OUTER_PRODUCT_BLOCK_LIMIT_BYTES),
+  storage: ActivationStorage = "f32",
 ): number {
   if (![length, cOuter, budgetBytes].every((value) => Number.isSafeInteger(value) && value > 0)) {
     throw new RangeError("outer-product block dimensions and budget must be positive safe integers");
   }
-  const bytesPerResidue = length * cOuter * cOuter * Float32Array.BYTES_PER_ELEMENT;
+  // The budget is bytes, so a packed block covers twice the residues. That is
+  // worth more than the bytes: the contraction reads the whole right operand
+  // once a block, so half the blocks is half those reads.
+  const bytesPerResidue = length * cOuter * cOuter * (storage === "f16" ? 2 : 4);
   return Math.max(1, Math.min(length, Math.floor(budgetBytes / bytesPerResidue)));
 }
 

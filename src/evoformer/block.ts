@@ -1014,6 +1014,10 @@ async function encodeOuterProductMean(
   // them, so their storage is the contraction's to choose.
   const opmOperands = outerProductMeanOperands();
   const opmWords = (elements: number): number => storageWords(elements, opmOperands);
+  // The contracted outer product is the largest scratch tensor the trunk
+  // allocates, and the projection that reads it back is on the same units, so
+  // it is packed under the same condition its operands are.
+  const opmOuter = opmOperands;
   const projectionShards = planShards(rows * input.cOuter, input.cOuter,
     execution.bindingLimitBytes, opmOperands === "f16" ? 2 : 4);
   const opmLayout = rowNormalizeLayout(execution.device);
@@ -1022,12 +1026,15 @@ async function encodeOuterProductMean(
       () => createOuterProductMeanNormalizeShader(storage, opmLayout)),
     execution.pipelines.get(`block:opm:project:${opmOperands}`,
       () => createOuterProductMeanProjectShader(opmOperands)),
-    execution.pipelines.get(`block:opm:contract:${projectionShards.count}:${opmOperands}`,
-      () => createOuterProductMeanContractShader(projectionShards, undefined, opmOperands)),
+    execution.pipelines.get(
+      `block:opm:contract:${projectionShards.count}:${opmOperands}:${opmOuter}`,
+      () => createOuterProductMeanContractShader(projectionShards, undefined, opmOperands, opmOuter)),
     execution.pipelines.get("block:opm:pair-count", OUTER_PRODUCT_MEAN_PAIR_COUNT_SHADER),
     execution.pipelines.get(
-      `block:opm:project-output${residualTarget === undefined ? "" : "-residual"}:${input.pairStorage ?? "f32"}`,
-      () => createOuterProductMeanProjectOutputShader(residualTarget !== undefined, input.pairStorage ?? "f32"),
+      `block:opm:project-output${residualTarget === undefined ? "" : "-residual"}`
+      + `:${input.pairStorage ?? "f32"}:${opmOuter}`,
+      () => createOuterProductMeanProjectOutputShader(
+        residualTarget !== undefined, input.pairStorage ?? "f32", undefined, opmOuter),
     ),
   ]);
   const weights = execution.upload("opm.weights", packed.data);
@@ -1047,8 +1054,9 @@ async function encodeOuterProductMean(
   const left = execution.allocate("opm.left", opmWords(rows * input.cOuter));
   const right = execution.allocate("opm.right", opmWords(rows * input.cOuter));
   const rowBlock = outerProductMeanRowBlock(input.length, input.cOuter,
-    Math.min(scratchBudget(OUTER_PRODUCT_BLOCK_LIMIT_BYTES), execution.bindingLimitBytes));
-  const outer = execution.allocate("opm.outer", rowBlock * input.length * input.cOuter * input.cOuter);
+    Math.min(scratchBudget(OUTER_PRODUCT_BLOCK_LIMIT_BYTES), execution.bindingLimitBytes), opmOuter);
+  const outer = execution.allocate("opm.outer",
+    storageWords(rowBlock * input.length * input.cOuter * input.cOuter, opmOuter));
   const pairCount = execution.allocate("opm.pair-count", input.length * input.length);
   const output = residualTarget ?? execution.allocate("opm.output",
     storageWords(input.length * input.length * input.cZ, input.pairStorage ?? "f32"));
