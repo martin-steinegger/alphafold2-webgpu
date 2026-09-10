@@ -8,6 +8,7 @@ import { FileTensorStore } from "../src/reference/tensor-store.js";
 import { COMPACT_GPU_POOL_BYTES } from "../src/runtime/allocator.js";
 import { monomerDeviceRequirements, planMonomerDevice, requestAlphaFoldDevice } from "../src/runtime/device.js";
 import { recycleFeatureSourceOf } from "../src/input/a3m-features.js";
+import { kernelSelectionReport, refusedFastPaths } from "../src/runtime/kernel-report.js";
 
 Object.assign(globalThis, globals);
 const INPUT_MANIFEST = "test/fixtures/evoformer/model1-a3m-59-stack/manifest.json";
@@ -101,6 +102,11 @@ async function run(mode: "auto" | "compact") {
       elapsedMilliseconds: prediction.elapsedMilliseconds,
       memory: prediction.memory,
       recycles,
+      // Read after the fold, so every calibration has already run and this
+      // costs nothing. A gate that refuses a faster kernel is silent
+      // otherwise, and one wrong feature name has already cost a fold twice
+      // its time on a card that has the hardware.
+      kernels: await kernelSelectionReport(device),
       hardware: {
         adapter: {
           vendor: adapter.info.vendor,
@@ -127,6 +133,11 @@ for (let recycle = 0; recycle < automatic.recycles.length; recycle += 1) {
     throw new Error(`compact-path regression at recycle ${recycle}`);
   }
 }
+const refused = refusedFastPaths(automatic.kernels);
+if (refused.length > 0) {
+  throw new Error(`this adapter reports hardware that a gate then refused:\n`
+    + refused.map((row) => `  ${row.operator}: ${row.fastPath} refused, ${row.reason}`).join("\n"));
+}
 const maximumMilliseconds = Number(process.env.AFWEBGPU_MAX_MS ?? "0");
 if (maximumMilliseconds > 0 && automatic.elapsedMilliseconds > maximumMilliseconds) {
   throw new Error(`automatic path took ${automatic.elapsedMilliseconds.toFixed(1)} ms; `
@@ -141,8 +152,9 @@ console.log(JSON.stringify({
   features: automatic.hardware.features,
   limits: automatic.hardware.limits,
   shape,
+  kernels: automatic.kernels,
   runs: [
-    { ...automatic, hardware: undefined },
-    { ...compact, hardware: undefined },
+    { ...automatic, hardware: undefined, kernels: undefined },
+    { ...compact, hardware: undefined, kernels: undefined },
   ],
 }, null, 2));
