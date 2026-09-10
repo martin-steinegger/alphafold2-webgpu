@@ -1349,17 +1349,6 @@ function triangleSetup(
   const wholeBytes = wholeStorage === "f16" ? 2 : 4;
   const wholeShards = planShards(wholeStride * input.triangleHidden, 2,
     input.pairBindingBytes ?? execution.bindingLimitBytes, wholeBytes);
-  // The projection reads the pair and writes the whole operand in one
-  // dispatch, so their windows share the stage's storage slots with three
-  // more for the mask, the weights and the statistics.
-  const slots = pairShards.count + wholeShards.count + 3;
-  if (slots > execution.device.limits.maxStorageBuffersPerShaderStage) {
-    throw new RangeError(`A ${input.length}-residue pair needs ${slots} storage bindings in the triangle `
-      + `multiplication (${pairShards.count} windows of the pair and ${wholeShards.count} of its projection), `
-      + `past this device's limit of ${execution.device.limits.maxStorageBuffersPerShaderStage}. `
-      + `Its ${(execution.bindingLimitBytes / 1024 ** 2).toFixed(0)} MiB binding limit is what forces the `
-      + "windows: a shorter sequence, or a device that binds more of a buffer at once, will run.");
-  }
   // A projection reads only the pair rows its block covers, so where those
   // rows fit one binding it takes them as a window rather than the shard
   // chain. Worth 2.4x on those kernels: the chain's branch stops the compiler
@@ -1378,6 +1367,21 @@ function triangleSetup(
     : (Math.ceil(input.length / pairChunks) - 1) * input.length + blockRows;
   const pairWindow = pairShards.count > 1
     && storageWords(pairWindowRows * input.cZ, pairStorage) * 4 <= pairBindingBytes;
+  // The widest kernel decides. Windowed, the pair reaches every projection as
+  // one binding, so the most any single stage binds is the projection that
+  // writes the whole operand (its window, the mask, the weights, the
+  // statistics and the operand's own shards) or the output projection (the
+  // gate, the contraction, the weights, the statistics and the pair's shards).
+  // Unwindowed, one dispatch carries the pair's shards and the operand's at
+  // once, which is what used to set this for every length.
+  const slots = triangleStorageSlots(pairShards.count, wholeShards.count, pairWindow);
+  if (slots > execution.device.limits.maxStorageBuffersPerShaderStage) {
+    throw new RangeError(`A ${input.length}-residue pair needs ${slots} storage bindings in the triangle `
+      + `multiplication (${pairShards.count} windows of the pair and ${wholeShards.count} of its projection), `
+      + `past this device's limit of ${execution.device.limits.maxStorageBuffersPerShaderStage}. `
+      + `Its ${(execution.bindingLimitBytes / 1024 ** 2).toFixed(0)} MiB binding limit is what forces the `
+      + "windows: a shorter sequence, or a device that binds more of a buffer at once, will run.");
+  }
   const pipelineKey = `block:triangle:${direction}:${input.length}:${input.cZ}`
     + `:${input.triangleHidden}:${blockRows}:${wholeStorage}:${pairStorage}:${pairShards.count}`
     + `:${wholeShards.count}:${pairWindow}`;
@@ -1410,6 +1414,28 @@ function triangleSetup(
     packed, blockRows, wholeStorage, pairStorage, pairShards, wholeShards, pairWindow,
     pairChunks, wholeStride, requests, overrides,
   };
+}
+
+/**
+ * Storage bindings the widest triangle kernel needs of one shader stage.
+ *
+ * Windowed, the pair reaches every projection as one binding, so the most any
+ * single stage binds is the projection that writes the whole operand -- its
+ * window, the mask, the weights, the statistics and the operand's own shards --
+ * or the output projection, which carries the gate, the contraction, the
+ * weights, the statistics and the pair's shards. Unwindowed, one dispatch
+ * carries the pair's shards and the operand's at once, which is what used to
+ * set this at every length.
+ *
+ * It decides how long a prediction a device will run: at the 128 MiB binding a
+ * browser grants by default and the eight bindings WebGPU guarantees, the
+ * windowed count takes the triangle from 1,024 residues to 1,448, and from
+ * 1,773 to 2,508 on an adapter reporting sixteen.
+ */
+export function triangleStorageSlots(
+  pairShards: number, wholeShards: number, windowed: boolean,
+): number {
+  return windowed ? Math.max(pairShards, wholeShards) + 4 : pairShards + wholeShards + 3;
 }
 
 /**

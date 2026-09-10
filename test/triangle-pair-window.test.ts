@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createTriangleShaders } from "../src/triangle/shaders.js";
 import { planShards } from "../src/runtime/sharded.js";
-import { residueChunks } from "../src/evoformer/block.js";
+import { residueChunks, triangleStorageSlots } from "../src/evoformer/block.js";
 
 /**
  * A projection reading only its block's pair rows takes them as one binding.
@@ -117,5 +117,34 @@ describe("how many residue chunks the incoming projections need", () => {
       const window = (Math.ceil(length / chunks) - 1) * length + rows;
       expect(window * 128 * 2).toBeLessThanOrEqual(GiB);
     }
+  });
+});
+
+describe("storage bindings the widest triangle kernel needs", () => {
+  it("counts the pair and the operand together only when neither is windowed", () => {
+    // One dispatch then carries both, which is what set this at every length.
+    expect(triangleStorageSlots(6, 6, false)).toBe(15);
+    expect(triangleStorageSlots(1, 1, false)).toBe(5);
+  });
+
+  it("counts the wider of the two once the pair is a window", () => {
+    // The pair reaches every projection as one binding, so the most a stage
+    // binds is the whole operand's shards, or the pair's in the output
+    // projection, plus four.
+    expect(triangleStorageSlots(6, 6, true)).toBe(10);
+    expect(triangleStorageSlots(6, 2, true)).toBe(10);
+    expect(triangleStorageSlots(2, 6, true)).toBe(10);
+  });
+
+  it("never counts fewer than the five a windowed dispatch really binds", () => {
+    // Window, mask, weights, statistics and one operand shard.
+    expect(triangleStorageSlots(1, 1, true)).toBe(5);
+  });
+
+  it("is what lets a longer chain run on a device that binds little", () => {
+    // 128 MiB and eight bindings is the browser default. A 1,448-residue pair
+    // packed is 512 MiB, so four shards, and four plus four is eight.
+    expect(triangleStorageSlots(4, 4, true)).toBeLessThanOrEqual(8);
+    expect(triangleStorageSlots(4, 4, false)).toBeGreaterThan(8);
   });
 });
