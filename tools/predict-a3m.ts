@@ -167,6 +167,16 @@ try {
       }
     }
   }
+  // AFWEBGPU_PROFILE_JSON=<file> saves the same timings for tools/kernel-tflops.ts,
+  // which turns them into arithmetic a second and holds them against Pallas.
+  const profileJson = process.env.AFWEBGPU_PROFILE_JSON;
+  if (profile !== undefined && profileJson !== undefined && profileJson !== "") {
+    writeFileSync(profileJson, `${JSON.stringify({
+      file, length, msaSequences: clustered, extraSequences: extra,
+      extraMsa: profile.extraMsa, mainEvoformer: profile.mainEvoformer,
+    }, undefined, 2)}\n`);
+    console.error(`profile written to ${profileJson}`);
+  }
   // AFWEBGPU_PDB=<file> writes the structure, for comparing against a template.
   const pdbPath = process.env.AFWEBGPU_PDB;
   if (pdbPath !== undefined && pdbPath !== "") {

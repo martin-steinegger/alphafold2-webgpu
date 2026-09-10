@@ -1,0 +1,59 @@
+{
+  "comment": [
+    "ColabFold's Pallas kernels, measured on the same card this project is developed on:",
+    "an NVIDIA RTX PRO 6000 Blackwell. Reproduce with the recipe in docs, or read the",
+    "sources listed on each row. Add a row when a new Pallas kernel is measured; the",
+    "tool matches a row to our kernels by the labels it names and says nothing where",
+    "no row matches, rather than inventing a comparison.",
+    "",
+    "Two kinds of figure appear. tflops is a rate measured on one kernel at one shape",
+    "and is the honest thing to compare, because it survives a change of length.",
+    "millisecondsPerBlock is what a profile of a whole Evoformer block reported and",
+    "only compares at the length it was taken at, which every row carries."
+  ],
+  "device": "NVIDIA RTX PRO 6000 Blackwell",
+  "baselines": [
+    {
+      "name": "tri_flash, attention",
+      "kernels": [
+        "msa-row-attention.flash",
+        "msa-column-attention.flash",
+        "triangle-attention-starting.flash",
+        "triangle-attention-ending.flash"
+      ],
+      "tflops": 107.0,
+      "millisecondsPerBlock": 23.4,
+      "length": 825,
+      "source": "rate on batch 64, 825 queries, 8 heads, head 32, against our 87.4 on the same shape; block total from a traced steady-state recycle, 2026-09-08. Head 32 only: the extra stack attends over 8 and pads it to the matrix unit's 16, so it does twice the counted work and this rate is not its rate",
+      "headDim": 32,
+      "stack": "mainEvoformer"
+    },
+    {
+      "name": "gated dual projection",
+      "kernels": [
+        "triangle.project-gate",
+        "triangle.project-block",
+        "triangle.project-whole"
+      ],
+      "millisecondsPerBlock": 1.7,
+      "length": 825,
+      "source": "_gdp_kernel in alphafold/model/tri_mul.py, traced steady-state recycle, 2026-09-08",
+      "stack": "mainEvoformer"
+    },
+    {
+      "name": "pallas_layer_norm",
+      "kernels": [
+        "msa-row-attention.normalize",
+        "msa-column-attention.normalize",
+        "msa-transition.normalize",
+        "pair-transition.normalize",
+        "triangle-attention-starting.normalize",
+        "triangle-attention-ending.normalize"
+      ],
+      "millisecondsPerBlock": 3.0,
+      "length": 825,
+      "source": "bandwidth bound at 1.37 TB/s, about 75% of this card's peak; a FLOP rate says nothing here, 2026-09-08",
+      "stack": "mainEvoformer"
+    }
+  ]
+}

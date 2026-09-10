@@ -26,6 +26,7 @@
     "bench:shape": "tsx tools/benchmark-shape.ts",
     "bench:gemm": "tsx tools/benchmark-gemm.ts",
     "profile:a3m-model": "tsx tools/profile-a3m-model.ts",
+    "kernel:tflops": "tsx tools/kernel-tflops.ts",
     "qualify:hardware": "tsx tools/qualify-hardware.ts",
     "qualify:multimer": "tsx tools/qualify-multimer-model.ts",
     "check": "npm run build && npm run build:web && npm run test",
