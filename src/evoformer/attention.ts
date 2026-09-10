@@ -1252,6 +1252,13 @@ export function createAttentionOutputShader(
   residual: boolean, storage: ActivationStorage = "f32", shards: ShardLayout = WHOLE_SHARD,
 
   spelling?: MatrixSpelling,
+  /**
+   * How wide a tile one workgroup writes. The main stack projects 256
+   * channels and fills the default; the extra stack projects 64, where half
+   * of every workgroup's accumulators would be masked off at the store and
+   * the multiplies behind them thrown away.
+   */
+  tileColumns: number = GEMM_TILE_COLUMNS,
 ): string {
   // Rows are numbered within this batch window, and column attention consumes
   // a transposed view, so the result row is remapped both ways.
@@ -1269,6 +1276,7 @@ ${storage === "f16" ? shardWordLoader(shards, "output") : (residual ? shardLoade
     rows: "p.batch * p.queries",
     inner: "p.heads * p.head_dim",
     columns: "p.channels",
+    tileColumns,
     sourceElement: "source[row * p.heads * p.head_dim + k]",
     weightElement: "weights[p.output_weight + k * p.channels + column]",
     // The same operands as arrays, for the hardware matrix units. Both really

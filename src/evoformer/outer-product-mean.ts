@@ -157,7 +157,7 @@ export const OUTER_PRODUCT_MEAN_NORMALIZE_SHADER = createOuterProductMeanNormali
 /**
  * The two projections the contraction multiplies together.
  *
- * `operands` is how they are stored, not how they are computed: both are
+ * The operands argument says how they are stored, not how they are computed: both are
  * accumulated in f32 whatever this says. Packed, one invocation owns a word
  * and so the two channels beside each other, which is exact because the outer
  * channel count is even and a pair therefore never spans two rows.

@@ -456,7 +456,15 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
  * every gate read from every store.
  */
 /** Output columns one workgroup covers; the extra-MSA channel count. */
-const GLOBAL_OUTPUT_TILE_COLUMNS = 64;
+/**
+ * How wide a tile the output projection writes where the channel count does
+ * not fill the default one. Half of a 128-wide tile is masked off at the
+ * store for a 64-channel stack, and the multiplies behind it are thrown away.
+ */
+const NARROW_OUTPUT_TILE_COLUMNS = 64;
+
+const outputTileColumns = (channels: number): number =>
+  channels < GEMM_TILE_COLUMNS ? NARROW_OUTPUT_TILE_COLUMNS : GEMM_TILE_COLUMNS;
 
 function createGlobalAttentionOutputShader(
   residual: boolean, storage: ActivationStorage = "f32", shards: ShardLayout = GLOBAL_UNSHARDED,
@@ -500,7 +508,7 @@ fn gated_attention(row: u32, projected_channel: u32) -> f32 {
     // The extra-MSA channel count is 64 against a 128-wide tile, so half of
     // every workgroup's accumulators would be masked off at the store and the
     // multiplies behind them thrown away.
-    tileColumns: GLOBAL_OUTPUT_TILE_COLUMNS,
+    tileColumns: NARROW_OUTPUT_TILE_COLUMNS,
     sourceElement: "gated_attention(row, k)",
     weightElement: "weights[p.output_weight + k * p.channels + column]",
     store: `let index = row * p.channels + column;
@@ -714,6 +722,7 @@ async function encodeAttention(
   }
   const normalizeLayout = rowNormalizeLayout(execution.device);
   const shardKey = `${storage}:${sourceShards.count}:${normalizeLayout.rowsPerWorkgroup}`;
+  const outputTile = outputTileColumns(options.channels);
   const [normalize, project, pairProject, flash, outputProject, pairNormalize] = await Promise.all([
     execution.pipelines.get(`block:attention:normalize:${shardKey}`,
       () => createAttentionNormalizeShader(storage, sourceShards, normalizeLayout)),
@@ -726,8 +735,10 @@ async function encodeAttention(
     execution.pipelines.get(
       `block:${flashKernel.cacheKey}:kv-${keyValueStorage}:q${slots}`, flashShader),
     execution.pipelines.get(
-      `block:attention:output${options.residualTarget === undefined ? "" : "-residual"}:${shardKey}`,
-      () => createAttentionOutputShader(options.residualTarget !== undefined, storage, sourceShards),
+      `block:attention:output${options.residualTarget === undefined ? "" : "-residual"}`
+      + `:${shardKey}:t${outputTile}`,
+      () => createAttentionOutputShader(options.residualTarget !== undefined, storage, sourceShards,
+        undefined, outputTile),
     ),
     // The pair bias source has its own storage, which need not match the
     // attention source's: MSA row attention reads a pair, not an MSA.
@@ -872,7 +883,7 @@ async function encodeAttention(
       flashKernel.batchFirst === true ? count : flashBlocks,
       flashKernel.batchFirst === true ? flashBlocks : count,
       options.heads, `${options.label}.flash-${offset}`);
-    const outputGrid = gemmGrid(rows, options.channels);
+    const outputGrid = gemmGrid(rows, options.channels, outputTile);
     execution.dispatch(encoder, outputProject, [weighted, weights, params, ...outputViews],
       outputGrid[0], outputGrid[1], 1, `${options.label}.output-${offset}`);
   }
@@ -979,7 +990,7 @@ async function encodeGlobalAttention(
   execution.dispatch(encoder, flashPipeline, [query, keys, values, mask, parameters, attended],
     shape.length, w.heads, 1, `${label}.flash`);
   const outputGrid = gemmGrid(shape.sequences * shape.length, shape.cM,
-    GLOBAL_OUTPUT_TILE_COLUMNS);
+    NARROW_OUTPUT_TILE_COLUMNS);
   // The residual form reads the output binding, so the source is not bound twice.
   const outputViews = output === source ? sourceViews : shardsOf(output);
   execution.dispatch(encoder, outputPipeline,
