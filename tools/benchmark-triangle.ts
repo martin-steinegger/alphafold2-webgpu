@@ -1,6 +1,8 @@
 import { create, globals } from "webgpu";
 import { dawnInstanceFlags } from "../src/runtime/dawn.js";
 import { requestAlphaFoldDevice } from "../src/runtime/device.js";
+import { forceGemmVariant } from "../src/runtime/gemm-selection.js";
+import { GEMM_VARIANT_F32 } from "../src/runtime/gemm.js";
 import { requestWgpuAdapter } from "../src/runtime/wgpu/adapter.js";
 import { createDeterministicTriangleInput } from "../src/testing/deterministic-input.js";
 import { TriangleMultiplicationOutgoingGpu } from "../src/triangle/webgpu.js";
@@ -47,6 +49,10 @@ if (precision === "f16" && !adapter.features.has("shader-f16")) {
 const largest = Math.max(...lengths) ** 2 * cZ * 4;
 const device = await requestAlphaFoldDevice(adapter,
   { maxBufferSize: largest, maxStorageBufferBindingSize: largest });
+// AFWEBGPU_GEMM pins the projection variant, so a comparison of anything else
+// is not really a comparison of which projection the calibration picked.
+const gemmPin = process.env.AFWEBGPU_GEMM;
+if (gemmPin === "f32") forceGemmVariant(GEMM_VARIANT_F32);
 const runner = new TriangleMultiplicationOutgoingGpu(device);
 
 console.log(`precision=${precision} c_z=${cZ} c_hidden=${cHidden}`);

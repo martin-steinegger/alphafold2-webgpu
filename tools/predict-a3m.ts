@@ -98,17 +98,66 @@ const plan = planMonomerDevice(adapter, length, clustered, extra, undefined, fal
 console.error(`device memory budget ${memoryBudget === undefined ? "unknown"
   : `${(memoryBudget / 1024 ** 3).toFixed(1)} GiB`}, scratch budget ${scratchBudgetScale}x`);
 const device = await requestAlphaFoldDevice(adapter, plan.requirements);
+// AFWEBGPU_GEMM=f32 pins the projection away from the matrix units, so a fold
+// can say what those units are worth to the model rather than to a probe.
+if (process.env.AFWEBGPU_GEMM === "f32") {
+  const { forceGemmVariant } = await import("../src/runtime/gemm-selection.js");
+  const { GEMM_VARIANT_F32 } = await import("../src/runtime/gemm.js");
+  forceGemmVariant(GEMM_VARIANT_F32);
+  console.error("projection pinned to f32");
+}
+// AFWEBGPU_ATTENTION pins the flash kernel, so a fold can check what the
+// calibration chose. Either one variant for every head width, or a comma-list
+// of <headDim>:<variant>. Worth having: the probe measures sixteen batches of
+// 256 queries, which is not the shape of every attention the model runs.
+const pinnedAttention = process.env.AFWEBGPU_ATTENTION;
+if (pinnedAttention !== undefined && pinnedAttention !== "") {
+  const { presetAttentionFlashKernel } = await import("../src/evoformer/attention-calibration.js");
+  for (const entry of pinnedAttention.split(",")) {
+    const [head, variant] = entry.includes(":")
+      ? [Number(entry.split(":")[0]), entry.split(":")[1]!] : [undefined, entry];
+    for (const headDim of head === undefined ? [8, 16, 32, 64] : [head]) {
+      // A head width with no such kernel keeps whatever it measured.
+      try { presetAttentionFlashKernel(device, headDim, variant as never); } catch { /* none */ }
+    }
+  }
+  console.error(`attention pinned to ${pinnedAttention}`);
+}
 features = iterateA3mFeatures(device, a3m, featureTables, {
   recycles: recycles - 1, maxMsaSequences: msaRows, maxExtraSequences: extraRows, randomSeed: 0,
 });
 if (applyTemplate !== undefined) features = applyTemplate(features);
 try {
+  // AFWEBGPU_PROFILE=1 times every dispatch of one extra-MSA and one main
+  // block, which is the only view that says where the main stack goes.
+  const profiling = process.env.AFWEBGPU_PROFILE === "1";
   const prediction = await new AlphaFoldMonomerGpu(device, {
     ...memoryOptions,
+    ...(profiling ? { profile: true, profileRecycle: recycles - 1 } : {}),
   }).predict(features, {
     embedding, template, extraStack, mainStack, structure,
     lddt: confidence.lddt, pae: confidence.pae, geometry,
   }, await model.tensor("confidencePaeBreaks"));
+  const profile = prediction.final.gpuProfile;
+  if (profile !== undefined) {
+    for (const [name, block] of
+      [["extra-MSA", profile.extraMsa], ["main-Evoformer", profile.mainEvoformer]] as const) {
+      const gpuMilliseconds = block.entries.reduce((sum, entry) => sum + entry.nanoseconds, 0) / 1e6;
+      console.error(`\n== ${name} block ${block.block} ==  ${block.entries.length} dispatches, `
+        + `gpu ${gpuMilliseconds.toFixed(3)} ms, wall ${block.wallMilliseconds.toFixed(3)} ms`);
+      const byLabel = new Map<string, { total: number; count: number }>();
+      for (const entry of block.entries) {
+        const key = entry.label.replace(/[.-]?\d+$/, "");
+        const held = byLabel.get(key) ?? { total: 0, count: 0 };
+        byLabel.set(key, { total: held.total + entry.nanoseconds, count: held.count + 1 });
+      }
+      for (const [label, value] of [...byLabel].sort((left, right) => right[1].total - left[1].total)) {
+        const share = (value.total / 1e6) / gpuMilliseconds * 100;
+        console.error(`  ${(value.total / 1e6).toFixed(3)} ms  ${share.toFixed(1).padStart(5)}%  `
+          + `x${String(value.count).padStart(3)}  ${label}`);
+      }
+    }
+  }
   // AFWEBGPU_PDB=<file> writes the structure, for comparing against a template.
   const pdbPath = process.env.AFWEBGPU_PDB;
   if (pdbPath !== undefined && pdbPath !== "") {
