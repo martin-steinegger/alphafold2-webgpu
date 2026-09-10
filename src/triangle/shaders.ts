@@ -283,25 +283,37 @@ fn normalized_input(pair_row: u32, k: u32) -> f32 {
       sourceElement: "normalized_input(pair_row_of(row), k)",
       weightElement: `select(${weight("G")}, ${weight("P")}, (column & 1u) == 0u)`,
       store: "",
-      // What the epilogue below does, for a kernel that has no acc{n} to write
-      // it against. The matrix kernel stages its result in workgroup memory
-      // and hands out four adjacent columns, which is one channel and its gate
-      // twice over, so the arithmetic carries across unchanged. What does not
-      // carry is the transpose: these stores are the scattered ones the
-      // epilogue exists to avoid, and whether the units pay for that is a
-      // measurement. A packed operand cannot come this way at all, because one
-      // word holds two pair rows and an invocation here has one.
-      ...(packed ? {} : { storeVector: `
-      let h = column >> 1u;
-      let pair_mask = mask[pair_row_of(row)];
-      if (h < CH) {
-        ${operand}_store(h * ${stride} + ${storeRow},
-          pair_mask * (values[0] + ${bias("P", "h")}) * logistic(values[1] + ${bias("G", "h")}));
+      // What the epilogue below does, for the matrix kernel, which has no
+      // acc{n} to write it against. Its accumulator arrives transposed, so
+      // this tile is already channel-major and a lane walking local_row walks
+      // consecutive pair rows of one channel, which is what the store wants.
+      // The transpose costs nothing: the instruction does it while the result
+      // is still spread over the lanes.
+      matrixEpilogue: `
+    let pairs = tile_columns >> 1u;
+    let rows_each = tile_rows${packed ? " >> 1u" : ""};
+    for (var item = in_subgroup; item < pairs * rows_each; item += tile_lanes) {
+      let h = (tile_column_first >> 1u) + item / rows_each;
+      let r = (item % rows_each)${packed ? " * 2u" : ""};
+      let row = tile_row_first + r;
+      if (row >= gemm_rows || h >= CH) { continue; }
+      let at = tile_base + ((item / rows_each) << 1u) * tile_stride + r;
+      let bias_p = ${bias("P", "h")};
+      let bias_g = ${bias("G", "h")};
+      let gated = mask[pair_row_of(row)]
+        * (gemm_matrix_out[at] + bias_p) * logistic(gemm_matrix_out[at + tile_stride] + bias_g);
+${packed ? `      // Two consecutive pair rows share a word, and a tile starts on an even
+      // one, so this lane owns both halves and no neighbour has to be asked.
+      var second = 0.0;
+      if (row + 1u < gemm_rows) {
+        let next_row = row + 1u;
+        second = mask[pair_row_of(next_row)]
+          * (gemm_matrix_out[at + 1u] + bias_p)
+          * logistic(gemm_matrix_out[at + tile_stride + 1u] + bias_g);
       }
-      if (h + 1u < CH) {
-        ${operand}_store((h + 1u) * ${stride} + ${storeRow},
-          pair_mask * (values[2] + ${bias("P", "h + 1u")}) * logistic(values[3] + ${bias("G", "h + 1u")}));
-      }` }),
+      ${operand}_store((h * ${stride} + ${storeRow}) >> 1u,
+        pack2x16float(vec2<f32>(gated, second)));` : `      ${operand}_store(h * ${stride} + ${storeRow}, gated);`}
+    }`,
       // The contraction reads the projection channel-major, so a direct store
       // from the row-major tile would scatter every write across the whole
       // tensor. Each invocation drops its channel/gate pairs into a staged

@@ -88,6 +88,14 @@ describe("the shader dialect", () => {
     expect(WGPU_MATRIX.subgroupSize(32)).toBe("");
   });
 
+  it("transposes a store where the caller asks, in both spellings", () => {
+    expect(DAWN_MATRIX.store("t", "0u", "acc", "20u", "col")).toContain("col_major");
+    expect(DAWN_MATRIX.store("t", "0u", "acc", "20u")).toContain("row_major");
+    // coopStoreT is the row-major store, as coopLoadT is the row-major load.
+    expect(WGPU_MATRIX.store("t", "0u", "acc", "20u", "col")).toContain("coopStore(");
+    expect(WGPU_MATRIX.store("t", "0u", "acc", "20u")).toContain("coopStoreT(");
+  });
+
   it("keeps the majorness the right way round, which a reversal would hide", () => {
     // coopLoadT is the row-major load. Reversed, this compiles and computes a
     // transposed product.

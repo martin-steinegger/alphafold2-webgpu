@@ -40,8 +40,14 @@ export interface MatrixSpelling {
    */
   load(operand: string, array: string, offset: string, stride: string,
     major?: "row" | "col"): string;
-  /** Writes an accumulator out, row-major. */
-  store(array: string, offset: string, value: string, stride: string): string;
+  /**
+   * Writes an accumulator out. "col" transposes it on the way, which the
+   * instruction does for nothing: the tile is already spread over the lanes,
+   * so a caller wanting its result the other way round should ask here rather
+   * than transpose it again through workgroup memory.
+   */
+  store(array: string, offset: string, value: string, stride: string,
+    major?: "row" | "col"): string;
   /** acc + left * right. */
   multiplyAccumulate(left: string, right: string, accumulator: string): string;
   /**
@@ -94,8 +100,8 @@ export const DAWN_MATRIX: MatrixSpelling = {
   zero: (type, columns, rows) => `subgroup_matrix_result<${type}, ${columns}, ${rows}>()`,
   load: (operand, array, offset, stride, major = "row") =>
     `subgroupMatrixLoad<${operand}, ${major}_major>(&${array}, ${offset}, ${stride})`,
-  store: (array, offset, value, stride) =>
-    `subgroupMatrixStore<row_major>(&${array}, ${offset}, ${value}, ${stride})`,
+  store: (array, offset, value, stride, major = "row") =>
+    `subgroupMatrixStore<${major}_major>(&${array}, ${offset}, ${value}, ${stride})`,
   multiplyAccumulate: (left, right, accumulator) =>
     `subgroupMatrixMultiplyAccumulate(${left}, ${right}, ${accumulator})`,
 };
@@ -126,8 +132,8 @@ export const WGPU_MATRIX: MatrixSpelling = {
   zero: (type, columns, rows) => `${coopMat(type, columns, rows, "C")}()`,
   load: (operand, array, offset, stride, major = "row") =>
     `${major === "row" ? "coopLoadT" : "coopLoad"}<${operand}>((&${array}[${offset}]), ${stride})`,
-  store: (array, offset, value, stride) =>
-    `coopStoreT(${value}, (&${array}[${offset}]), ${stride})`,
+  store: (array, offset, value, stride, major = "row") =>
+    `${major === "row" ? "coopStoreT" : "coopStore"}(${value}, (&${array}[${offset}]), ${stride})`,
   multiplyAccumulate: (left, right, accumulator) =>
     `coopMultiplyAdd(${left}, ${right}, ${accumulator})`,
 };

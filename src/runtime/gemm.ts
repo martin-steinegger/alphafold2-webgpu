@@ -240,6 +240,22 @@ export interface TiledGemmShader {
    * invocation of the workgroup runs the epilogue.
    */
   readonly epilogue?: string;
+  /**
+   * The epilogue again, for the matrix kernel, which has no acc{n}.
+   *
+   * Its accumulator is stored transposed, which the instruction does for
+   * nothing, so this runs with one unit tile of the result in
+   * gemm_matrix_out laid out column-major: element [local_row][local_column]
+   * at tile_base + local_column * tile_stride + local_row. A caller whose
+   * output is column-major therefore reads along local_row and writes
+   * consecutive addresses, which is the whole point of an epilogue here.
+   *
+   * In scope: gemm_matrix_out, tile_base, tile_stride, tile_rows,
+   * tile_columns, tile_lanes, tile_row_first, tile_column_first, in_subgroup,
+   * gemm_rows and gemm_columns. It runs once per unit tile, so every lane of
+   * the subgroup enters it and a barrier inside is not permitted.
+   */
+  readonly matrixEpilogue?: string;
   readonly stageElements?: number;
   /** Narrower tile for outputs that would otherwise waste most of a workgroup. */
   readonly tileColumns?: number;
@@ -348,9 +364,14 @@ export function usesMatrixUnits(shader: TiledGemmShader, variant: GemmVariant): 
     // thread mapping, which a matrix kernel does not have. storeVector is
     // fine: the result is staged in workgroup memory, so an invocation can
     // read four adjacent columns of it as easily as one. A caller that has
-    // both keeps its epilogue on the hand-tiled kernel, which prefers it, and
-    // reaches the units through the storeVector.
-    && (shader.epilogue === undefined || shader.storeVector !== undefined);
+    // either of those keeps its epilogue on the hand-tiled kernel, which
+    // prefers it, and reaches the units the other way.
+    && (shader.epilogue === undefined || shader.storeVector !== undefined
+      || shader.matrixEpilogue !== undefined)
+    // A transposed store writes the tile N rows deep where the buffer is sized
+    // for M, so the matrix epilogue is offered on a square unit only.
+    && (shader.matrixEpilogue === undefined
+      || variant.matrix === undefined || variant.matrix.M === variant.matrix.N);
 }
 
 /**
@@ -589,9 +610,18 @@ ${lines(groupTiles, (c) => `      acc_${c} = ${m.multiplyAccumulate("left",
     workgroupBarrier();
   }
 ${lines(groupTiles, (c) => `  ${m.store("gemm_matrix_out", `subgroup * ${M * outStride}u`,
-    `acc_${c}`, `${outStride}u`)};
+    `acc_${c}`, `${outStride}u`, shader.matrixEpilogue === undefined ? "row" : "col")};
   workgroupBarrier();
-${drain(c)}
+${shader.matrixEpilogue === undefined ? drain(c) : `  {
+    let tile_base = subgroup * ${M * outStride}u;
+    let tile_stride = ${outStride}u;
+    let tile_rows = ${M}u;
+    let tile_columns = ${N}u;
+    let tile_lanes = ${MATRIX_LANES}u;
+    let tile_row_first = tile_row_origin + rows_at;
+    let tile_column_first = tile_column_origin + columns_at + ${c * N}u;
+    ${shader.matrixEpilogue}
+  }`}
   workgroupBarrier();`)}
 }`;
 }
