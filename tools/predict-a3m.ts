@@ -98,6 +98,15 @@ const plan = planMonomerDevice(adapter, length, clustered, extra, undefined, fal
 console.error(`device memory budget ${memoryBudget === undefined ? "unknown"
   : `${(memoryBudget / 1024 ** 3).toFixed(1)} GiB`}, scratch budget ${scratchBudgetScale}x`);
 const device = await requestAlphaFoldDevice(adapter, plan.requirements);
+// AFWEBGPU_OPM=f16|f32 pins how the outer product mean stores the two
+// projections its contraction reads. Packed halves the bytes that contraction
+// fetches; the default packs wherever the units round them to f16 anyway.
+const opmOperands = process.env.AFWEBGPU_OPM;
+if (opmOperands === "f16" || opmOperands === "f32") {
+  const { forceOuterProductMeanOperands } = await import("../src/evoformer/outer-product-mean.js");
+  forceOuterProductMeanOperands(opmOperands);
+  console.error(`outer product mean operands pinned to ${opmOperands}`);
+}
 // AFWEBGPU_GEMM=f32 pins the projection away from the matrix units, so a fold
 // can say what those units are worth to the model rather than to a probe.
 if (process.env.AFWEBGPU_GEMM === "f32") {

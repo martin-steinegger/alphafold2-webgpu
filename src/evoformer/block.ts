@@ -39,7 +39,7 @@ import {
   OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_SHADER,
   OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_RESIDUAL_SHADER, createOuterProductMeanProjectOutputShader,
   OUTER_PRODUCT_MEAN_NORMALIZE_SHADER,
-  OUTER_PRODUCT_MEAN_PROJECT_SHADER,
+  createOuterProductMeanProjectShader, outerProductMeanOperands,
   packOuterProductMeanWeights,
   type OuterProductMeanWeights,
 } from "./outer-product-mean.js";
@@ -1002,14 +1002,20 @@ async function encodeOuterProductMean(
   const rows = input.sequences * input.length;
   // Both projections carry every sequence, so a deep alignment at a long
   // length puts them past one binding; the contraction reads them as windows.
-  const projectionShards = planShards(rows * input.cOuter, input.cOuter, execution.bindingLimitBytes);
+  // The contraction reads these two far more often than the projection writes
+  // them, so their storage is the contraction's to choose.
+  const opmOperands = outerProductMeanOperands();
+  const opmWords = (elements: number): number => storageWords(elements, opmOperands);
+  const projectionShards = planShards(rows * input.cOuter, input.cOuter,
+    execution.bindingLimitBytes, opmOperands === "f16" ? 2 : 4);
   const opmLayout = rowNormalizeLayout(execution.device);
   const [normalize, project, contractPipeline, pairCountPipeline, projectOutputPipeline] = await Promise.all([
     execution.pipelines.get(`block:opm:normalize:${storage}:${opmLayout.rowsPerWorkgroup}`,
       () => createOuterProductMeanNormalizeShader(storage, opmLayout)),
-    execution.pipelines.get("block:opm:project", OUTER_PRODUCT_MEAN_PROJECT_SHADER),
-    execution.pipelines.get(`block:opm:contract:${projectionShards.count}`,
-      () => createOuterProductMeanContractShader(projectionShards)),
+    execution.pipelines.get(`block:opm:project:${opmOperands}`,
+      () => createOuterProductMeanProjectShader(opmOperands)),
+    execution.pipelines.get(`block:opm:contract:${projectionShards.count}:${opmOperands}`,
+      () => createOuterProductMeanContractShader(projectionShards, undefined, opmOperands)),
     execution.pipelines.get("block:opm:pair-count", OUTER_PRODUCT_MEAN_PAIR_COUNT_SHADER),
     execution.pipelines.get(
       `block:opm:project-output${residualTarget === undefined ? "" : "-residual"}:${input.pairStorage ?? "f32"}`,
@@ -1026,12 +1032,12 @@ async function encodeOuterProductMean(
     if (projectionShards.count === 1) return [tensor];
     return Array.from({ length: projectionShards.count }, (_, index) => {
       const offset = index * projectionShards.shardElements;
-      return execution.view(tensor, offset,
-        Math.min(projectionShards.shardElements, projectionShards.totalElements - offset));
+      const span = Math.min(projectionShards.shardElements, projectionShards.totalElements - offset);
+      return execution.view(tensor, opmWords(offset), opmWords(span));
     });
   };
-  const left = execution.allocate("opm.left", rows * input.cOuter);
-  const right = execution.allocate("opm.right", rows * input.cOuter);
+  const left = execution.allocate("opm.left", opmWords(rows * input.cOuter));
+  const right = execution.allocate("opm.right", opmWords(rows * input.cOuter));
   const rowBlock = outerProductMeanRowBlock(input.length, input.cOuter,
     Math.min(scratchBudget(OUTER_PRODUCT_BLOCK_LIMIT_BYTES), execution.bindingLimitBytes));
   const outer = execution.allocate("opm.outer", rowBlock * input.length * input.cOuter * input.cOuter);
@@ -1052,12 +1058,12 @@ async function encodeOuterProductMean(
       storageWords(offset * input.cM, storage), storageWords(count * input.cM, storage));
     const maskWindow = execution.view(msaMask, offset, count);
     const normalizedWindow = execution.view(normalized, 0, count * input.cM);
-    const leftWindow = execution.view(left, offset * input.cOuter, count * input.cOuter);
-    const rightWindow = execution.view(right, offset * input.cOuter, count * input.cOuter);
+    const leftWindow = execution.view(left, opmWords(offset * input.cOuter), opmWords(count * input.cOuter));
+    const rightWindow = execution.view(right, opmWords(offset * input.cOuter), opmWords(count * input.cOuter));
     let windowGrid = execution.linearGrid(count, opmLayout.rowsPerWorkgroup);
     execution.dispatch(encoder, normalize, [msaWindow, weights, params, normalizedWindow],
       windowGrid[0], windowGrid[1], 1, `opm.normalize-${offset}`);
-    windowGrid = execution.linearGrid(count * input.cOuter);
+    windowGrid = execution.linearGrid(opmWords(count * input.cOuter));
     execution.dispatch(encoder, project,
       [normalizedWindow, maskWindow, weights, params, leftWindow, rightWindow],
       windowGrid[0], windowGrid[1], 1, `opm.project-${offset}`);

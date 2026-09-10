@@ -3,7 +3,7 @@ import { pipelineCacheForDevice, type ComputePipelineCache } from "../runtime/pi
 import { type ActivationStorage, storageArray, storedElement } from "../runtime/storage.js";
 import { rowNormalizeLayout, type RowNormalizeLayout } from "../runtime/reduction.js";
 import { shardBindings, shardLoader, type ShardLayout } from "../runtime/sharded.js";
-import { createTiledGemmShader, gemmGrid } from "../runtime/gemm.js";
+import { createTiledGemmShader, gemmGrid, gemmVariant } from "../runtime/gemm.js";
 import { scratchBudget } from "../runtime/scratch-budget.js";
 import type { MatrixSpelling } from "../runtime/dialect.js";
 
@@ -154,31 +154,85 @@ ${layout.sum("squared", "squared_total")}
 
 export const OUTER_PRODUCT_MEAN_NORMALIZE_SHADER = createOuterProductMeanNormalizeShader("f32");
 
-export const OUTER_PRODUCT_MEAN_PROJECT_SHADER = `${COMMON}
+/**
+ * The two projections the contraction multiplies together.
+ *
+ * `operands` is how they are stored, not how they are computed: both are
+ * accumulated in f32 whatever this says. Packed, one invocation owns a word
+ * and so the two channels beside each other, which is exact because the outer
+ * channel count is even and a pair therefore never spans two rows.
+ *
+ * Halving them is free where the matrix units run: that kernel stages its
+ * operands into f16 workgroup memory, so these values are rounded to f16
+ * before any multiply either way, and only the bytes read from global change.
+ */
+export function createOuterProductMeanProjectShader(
+  operands: ActivationStorage = "f32",
+): string {
+  const packed = operands === "f16";
+  const each = (name: "left" | "right", lane: string, at: string): string =>
+    `  var ${name}_${lane} = weights[p.${name}_bias + ${at}];`;
+  return `${COMMON}
 @group(0) @binding(0) var<storage, read> source: array<f32>;
 @group(0) @binding(1) var<storage, read> mask: array<f32>;
 @group(0) @binding(2) var<storage, read> weights: array<f32>;
 @group(0) @binding(3) var<uniform> p: Parameters;
-@group(0) @binding(4) var<storage, read_write> left: array<f32>;
-@group(0) @binding(5) var<storage, read_write> right: array<f32>;
+@group(0) @binding(4) var<storage, read_write> left: array<${storageArray(operands)}>;
+@group(0) @binding(5) var<storage, read_write> right: array<${storageArray(operands)}>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x + id.y * GRID_WIDTH * 64u;
+  let slot = id.x + id.y * GRID_WIDTH * 64u;
   let rows = p.sequences * p.length;
+  let index = slot${packed ? " * 2u" : ""};
   if (index >= rows * p.c_outer) { return; }
   let row = index / p.c_outer;
   let outer = index % p.c_outer;
-  var left_value = weights[p.left_bias + outer];
-  var right_value = weights[p.right_bias + outer];
+${each("left", "0", "outer")}
+${each("right", "0", "outer")}
+${packed ? `${each("left", "1", "outer + 1u")}
+${each("right", "1", "outer + 1u")}` : ""}
   for (var c = 0u; c < p.c_m; c += 1u) {
     let value = source[row * p.c_m + c];
-    left_value += value * weights[p.left_weight + c * p.c_outer + outer];
-    right_value += value * weights[p.right_weight + c * p.c_outer + outer];
+    left_0 += value * weights[p.left_weight + c * p.c_outer + outer];
+    right_0 += value * weights[p.right_weight + c * p.c_outer + outer];
+${packed ? `    left_1 += value * weights[p.left_weight + c * p.c_outer + outer + 1u];
+    right_1 += value * weights[p.right_weight + c * p.c_outer + outer + 1u];` : ""}
   }
-  left[index] = mask[row] * left_value;
-  right[index] = mask[row] * right_value;
+  let scale = mask[row];
+${packed ? `  left[slot] = pack2x16float(vec2<f32>(scale * left_0, scale * left_1));
+  right[slot] = pack2x16float(vec2<f32>(scale * right_0, scale * right_1));`
+    : `  left[slot] = scale * left_0;
+  right[slot] = scale * right_0;`}
 }`;
+}
+
+export const OUTER_PRODUCT_MEAN_PROJECT_SHADER = createOuterProductMeanProjectShader();
+
+let forcedOperands: ActivationStorage | undefined;
+
+/**
+ * How the two projections the contraction reads are stored.
+ *
+ * A measurement, not a setting, in the shape of forceGemmVariant: the packed
+ * form halves the bytes the contraction's staging fetches and is exact where
+ * the matrix units run, because that kernel rounds these values to f16 before
+ * any multiply regardless. It is not exact on the kernels that do not.
+ */
+export function forceOuterProductMeanOperands(storage: ActivationStorage | undefined): void {
+  forcedOperands = storage;
+}
+
+/**
+ * Packed wherever the projection runs on the matrix units, which is the exact
+ * condition under which packing loses nothing: that kernel stages its operands
+ * into f16 workgroup memory, so these values are rounded to f16 before any
+ * multiply either way. On the kernels that keep f32 arithmetic it would be a
+ * real loss of precision, so they keep f32 storage.
+ */
+export function outerProductMeanOperands(): ActivationStorage {
+  return forcedOperands ?? (gemmVariant().precision === "matrix" ? "f16" : "f32");
+}
 
 export const OUTER_PRODUCT_MEAN_INTERMEDIATE_SHADER = `${COMMON}
 @group(0) @binding(0) var<storage, read> left: array<f32>;
@@ -272,11 +326,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
  */
 export function createOuterProductMeanContractShader(shards: ShardLayout = CONTRACT_UNSHARDED,
   spelling?: MatrixSpelling,
+  operands: ActivationStorage = "f32",
 ): string {
   return createTiledGemmShader({
   preamble: `${OPM_TILE_COMMON}
-${shardBindings(shards, "left", "f32", 0, false)}
-${shardBindings(shards, "right", "f32", shards.count, false)}
+${shardBindings(shards, "left", operands, 0, false)}
+${shardBindings(shards, "right", operands, shards.count, false)}
 @group(0) @binding(${2 * shards.count}) var<uniform> p: Parameters;
 @group(0) @binding(${2 * shards.count + 1}) var<uniform> tile: TileParameters;
 @group(0) @binding(${2 * shards.count + 2}) var<storage, read_write> outer: array<f32>;
@@ -285,8 +340,8 @@ ${shardBindings(shards, "right", "f32", shards.count, false)}
 // the alignment and leaves the range of an f16 operand at about 2,650 of them;
 // the mean is of order one whatever the depth.
 @group(0) @binding(${2 * shards.count + 3}) var<storage, read> pair_count: array<f32>;
-${shardLoader(shards, "left", "f32")}
-${shardLoader(shards, "right", "f32")}`,
+${shardLoader(shards, "left", operands)}
+${shardLoader(shards, "right", operands)}`,
   rows: "tile.count * p.c_outer",
   inner: "p.sequences",
   columns: "p.length * p.c_outer",
@@ -300,7 +355,10 @@ ${shardLoader(shards, "right", "f32")}`,
   // and so is stored with the contraction axis outermost; the right one is
   // already row-major in it. A sharded projection keeps the expressions,
   // whose loader chooses a binding per element.
-  ...(shards.count === 1 ? {
+  // Only an f32 operand is a plain array the units can address directly. A
+  // packed one is read through its loader, which the staged kernel wants
+  // anyway: it fetches through the element expressions and converts to f16.
+  ...(shards.count === 1 && operands === "f32" ? {
     sourceArray: {
       array: "left_0", base: "tile.offset * p.c_outer",
       stride: "p.length * p.c_outer", columnMajor: true,
