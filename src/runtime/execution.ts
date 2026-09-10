@@ -10,6 +10,10 @@ const GRID_WIDTH: u32 = 32768u;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let index = id.x + id.y * GRID_WIDTH * 64u;
+  // The packed forms below always checked; this one relied on the bounds
+  // clamp, which the native path turns off, and a windowed residual makes the
+  // overshoot land in the next window rather than in padding.
+  if (index >= arrayLength(&base)) { return; }
   base[index] += update[index];
 }`;
 
@@ -360,8 +364,26 @@ export class WebGpuExecution {
       : packedUpdate
         ? await this.pipelines.get("runtime:add-in-place-both-packed", ADD_IN_PLACE_BOTH_PACKED_SHADER)
         : await this.pipelines.get("runtime:add-in-place-packed", ADD_IN_PLACE_PACKED_SHADER);
-    const grid = this.linearGrid(base.elements);
-    this.dispatch(encoder, pipeline, [base, update], grid[0], grid[1], 1, label);
+    // A pair-shaped residual passes the 2 GiB binding limit at about 2,900
+    // residues, which is where a tetramer of ordinary chains sits. The add is
+    // elementwise, so it is windowed rather than refused.
+    const updatePerBase = packedUpdate || storage === "f32" ? 1 : 2;
+    // A storage binding starts on a 256 byte boundary, which is 64 words.
+    const alignment = 64;
+    const limit = Math.floor(this.bindingLimitBytes / 4 / updatePerBase / alignment) * alignment;
+    const windowWords = Math.max(alignment, Math.min(base.elements, limit));
+    if (windowWords >= base.elements) {
+      const grid = this.linearGrid(base.elements);
+      this.dispatch(encoder, pipeline, [base, update], grid[0], grid[1], 1, label);
+      return;
+    }
+    for (let offset = 0; offset < base.elements; offset += windowWords) {
+      const count = Math.min(windowWords, base.elements - offset);
+      const grid = this.linearGrid(count);
+      this.dispatch(encoder, pipeline,
+        [this.view(base, offset, count), this.view(update, offset * updatePerBase, count * updatePerBase)],
+        grid[0], grid[1], 1, `${label}-${offset}`);
+    }
   }
 
   /** Packs f32 elements into half-precision words. */
