@@ -158,6 +158,14 @@ export function createTriangleShaders(
     (shape.length * shape.length + (shape.length * shape.length) % 2) * shape.cHidden, 2,
     Number.MAX_SAFE_INTEGER, 4),
 
+  /**
+   * Whether the pair arrives as the block's own rows in one binding.
+   *
+   * Only where those rows are contiguous, which the caller decides: the
+   * outgoing direction and, in both directions, the whole operand.
+   */
+  pairWindow = false,
+
   spelling?: MatrixSpelling,
 ): TriangleShaders {
   if (pairStorage === "f16" && precision !== "f32") {
@@ -167,10 +175,22 @@ export function createTriangleShaders(
   const t = scalar(precision);
   // The pair may be stored packed, whatever precision the weights are in, and
   // it may be too large for one binding, in which case it arrives as several.
-  const pairBindings = (name: string, first: number, writable: boolean): string =>
-    shardBindings(pairShards, name, pairStorage === "f16" ? "f16" : "f32", first, writable);
-  const pairAccessors = (name: string): string =>
-    shardLoader(pairShards, name, pairStorage === "f16" ? "f16" : "f32");
+  const pairElementStorage: ActivationStorage = pairStorage === "f16" ? "f16" : "f32";
+  // A kernel that reads only the pair rows of its block can be given those
+  // rows as one binding, which the shard chain is not. That is worth 2.4x on
+  // the kernel: a chain puts a branch between the loop and the array, and the
+  // compiler then cannot form the wide contiguous loads a staged matrix tile
+  // wants. Removing the divide the chain also does changed nothing, measured,
+  // so it is the branch. Only kernels whose pair rows are block.x + row may
+  // ask; the incoming direction reads a column window of every row and has to
+  // take the chain. See pairWindow in block.ts for the binding.
+  const pairLayout = (windowed: boolean): ShardLayout =>
+    windowed ? WHOLE_OPERAND_UNSHARDED : pairShards;
+  const pairBindings = (name: string, first: number, writable: boolean, windowed = false): string =>
+    shardBindings(pairLayout(windowed), name, pairElementStorage, first, writable);
+  const pairAccessors = (name: string, windowed = false): string =>
+    shardLoader(pairLayout(windowed), name, pairElementStorage);
+  const pairSlotsOf = (windowed: boolean): number => windowed ? 1 : pairShards.count;
   const pairSlots = pairShards.count;
   const pairElement = (index: string): string => `z_load(${index})`;
   const outgoing = direction === "outgoing";
@@ -231,27 +251,33 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
 
   // The output gate is a projection of the normalized input, so like the
   // contraction inputs it normalizes the raw pair while loading it.
+  // Only the outgoing direction reads its block as a run of pair rows.
+  const gateWindowed = pairWindow && outgoing;
+  const gateSlots = pairSlotsOf(gateWindowed);
   const projectGate = createTiledGemmShader({
     preamble: `${common}
-${pairBindings("z", 0, false)}
-@group(0) @binding(${pairSlots}) var<storage, read> weights: array<${t}>;
-@group(0) @binding(${pairSlots + 1}) var<storage, read> statistics: array<f32>;
-@group(0) @binding(${pairSlots + 2}) var<storage, read_write> gate: array<f32>;
+${pairBindings("z", 0, false, gateWindowed)}
+@group(0) @binding(${gateSlots}) var<storage, read> weights: array<${t}>;
+@group(0) @binding(${gateSlots + 1}) var<storage, read> statistics: array<f32>;
+@group(0) @binding(${gateSlots + 2}) var<storage, read_write> gate: array<f32>;
 // x is the first row of this block within the whole pair tensor, y the
 // number of rows it spans.
-@group(0) @binding(${pairSlots + 3}) var<uniform> block: vec4<u32>;
-${pairAccessors("z")}
+@group(0) @binding(${gateSlots + 3}) var<uniform> block: vec4<u32>;
+${pairAccessors("z", gateWindowed)}
 
 fn pair_row_of(row: u32) -> u32 { return ${blockPairRow}; }
+// Where the row starts in the binding, which is the block for a window.
+fn pair_base_of(row: u32) -> u32 { return ${gateWindowed ? "row" : "pair_row_of(row)"} * CZ; }
 
-fn normalized_input(pair_row: u32, k: u32) -> f32 {
-  return (${pairElement("pair_row * CZ + k")} - statistics[2u * pair_row]) * statistics[2u * pair_row + 1u]
+fn normalized_input(row: u32, k: u32) -> f32 {
+  let pair_row = pair_row_of(row);
+  return (${pairElement("pair_base_of(row) + k")} - statistics[2u * pair_row]) * statistics[2u * pair_row + 1u]
     * ${read(precision, "weights[W_LAYERNORMINWEIGHT + k]")} + ${read(precision, "weights[W_LAYERNORMINBIAS + k]")};
 }`,
     rows: "block.y",
     inner: "CZ",
     columns: "CZ",
-    sourceElement: "normalized_input(pair_row_of(row), k)",
+    sourceElement: "normalized_input(row, k)",
     // Every weight here is stored channel-major, so k runs contiguously and a
     // lane staging the tile should vary k rather than column. The default is
     // the other layout, and reading it that way costs bandwidth silently.
@@ -271,8 +297,9 @@ fn normalized_input(pair_row: u32, k: u32) -> f32 {
    */
   const project = (
     operand: "a" | "b", stride: string, pairRow: string, storeRow: string, packed: boolean,
-    shards: ShardLayout = WHOLE_OPERAND_UNSHARDED,
+    shards: ShardLayout = WHOLE_OPERAND_UNSHARDED, windowed = false,
   ): string => {
+    const pairSlots = pairSlotsOf(windowed);
     const upper = operand.toUpperCase();
     const wholeStorage: ActivationStorage = packed ? "f16" : "f32";
     const weight = (kind: "P" | "G"): string =>
@@ -281,7 +308,7 @@ fn normalized_input(pair_row: u32, k: u32) -> f32 {
       read(precision, `weights[W_LINEAR${upper}${kind}BIAS + ${channel}]`);
     return createTiledGemmShader({
       preamble: `${common}
-${pairBindings("z", 0, false)}
+${pairBindings("z", 0, false, windowed)}
 @group(0) @binding(${pairSlots}) var<storage, read> mask: array<f32>;
 @group(0) @binding(${pairSlots + 1}) var<storage, read> weights: array<${t}>;
 @group(0) @binding(${pairSlots + 2}) var<storage, read> statistics: array<f32>;
@@ -289,19 +316,22 @@ ${shardBindings(shards, operand, wholeStorage, pairSlots + 3, true)}
 // x is the first pair row of this block, y the number of pair rows it spans,
 // w the residues it covers.
 @group(0) @binding(${pairSlots + 3 + shards.count}) var<uniform> block: vec4<u32>;
-${pairAccessors("z")}
+${pairAccessors("z", windowed)}
 ${shardStorer(shards, operand, wholeStorage)}
 
 fn pair_row_of(row: u32) -> u32 { return ${pairRow}; }
+// Where the row starts in the binding, which is the block for a window.
+fn pair_base_of(row: u32) -> u32 { return ${windowed ? "row" : "pair_row_of(row)"} * CZ; }
 
-fn normalized_input(pair_row: u32, k: u32) -> f32 {
-  return (${pairElement("pair_row * CZ + k")} - statistics[2u * pair_row]) * statistics[2u * pair_row + 1u]
+fn normalized_input(row: u32, k: u32) -> f32 {
+  let pair_row = pair_row_of(row);
+  return (${pairElement("pair_base_of(row) + k")} - statistics[2u * pair_row]) * statistics[2u * pair_row + 1u]
     * ${read(precision, "weights[W_LAYERNORMINWEIGHT + k]")} + ${read(precision, "weights[W_LAYERNORMINBIAS + k]")};
 }`,
       rows: "block.y",
       inner: "CZ",
       columns: "2u * CH",
-      sourceElement: "normalized_input(pair_row_of(row), k)",
+      sourceElement: "normalized_input(row, k)",
       // Channel-major, as the gate and the output projection are.
       weightContiguous: "k",
       weightElement: `select(${weight("G")}, ${weight("P")}, (column & 1u) == 0u)`,
@@ -513,9 +543,12 @@ fn normalized_hidden(row: u32, h: u32) -> f32 {
   // The block operand is stored block-relative, the whole operand at its pair row.
   // Outgoing contracts a's rows i against b's rows j; incoming contracts a's
   // columns j against b's columns i. In both, a is the block operand.
-  const projectBlockOperand = project("a", "BLOCK_PAIRS", blockPairRow, "row", false);
+  const projectBlockOperand = project("a", "BLOCK_PAIRS", blockPairRow, "row", false,
+    WHOLE_OPERAND_UNSHARDED, pairWindow && outgoing);
+  // The whole operand is written at its pair row in both directions, so it
+  // reads the block's own rows either way and always takes the window.
   const projectWholeOperand = project("b", "WHOLE_STRIDE", "block.x + row", "block.x + row", packedWhole,
-    wholeShards);
+    wholeShards, pairWindow);
   return {
     inputStatistics, projectGate, projectBlockOperand, projectWholeOperand, contract, hiddenStatistics, projectOutput,
   };

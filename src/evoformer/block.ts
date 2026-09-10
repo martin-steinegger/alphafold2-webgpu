@@ -1360,20 +1360,28 @@ function triangleSetup(
       + `Its ${(execution.bindingLimitBytes / 1024 ** 2).toFixed(0)} MiB binding limit is what forces the `
       + "windows: a shorter sequence, or a device that binds more of a buffer at once, will run.");
   }
+  // A projection reads only the pair rows its block covers, so where those
+  // rows fit one binding it takes them as a window rather than the shard
+  // chain. Worth 2.4x on those kernels: the chain's branch stops the compiler
+  // forming the wide contiguous loads a staged matrix tile wants. Blocks step
+  // by whole residues, so a window always starts where a binding may.
+  const pairWindowBytes = storageWords(blockRows * input.length * input.cZ, pairStorage) * 4;
+  const pairWindow = pairShards.count > 1
+    && pairWindowBytes <= (input.pairBindingBytes ?? execution.bindingLimitBytes);
   const pipelineKey = `block:triangle:${direction}:${input.length}:${input.cZ}`
     + `:${input.triangleHidden}:${blockRows}:${wholeStorage}:${pairStorage}:${pairShards.count}`
-    + `:${wholeShards.count}`;
+    + `:${wholeShards.count}:${pairWindow}`;
   // The offsets belong to the packing, so they join the key: a bundle packed
   // differently must not be handed another one's sources.
   // Length and blockRows are overrides now, so they name a pipeline but not a
   // source; the shader key keeps only what the source really varies with.
   const shaderKey = `${direction}:${input.cZ}:${input.triangleHidden}:${wholeStorage}`
-    + `:${pairStorage}:${pairShards.count}:${wholeShards.count}:${residual}`
+    + `:${pairStorage}:${pairShards.count}:${wholeShards.count}:${residual}:${pairWindow}`
     + `:${JSON.stringify(packed.offsets)}`;
   let shaders = TRIANGLE_SHADERS.get(shaderKey);
   if (shaders === undefined) {
     shaders = createTriangleShaders(shape, "f32", packed.offsets, 1e-5, direction, blockRows,
-      wholeStorage, pairStorage, residual, pairShards, wholeShards);
+      wholeStorage, pairStorage, residual, pairShards, wholeShards, pairWindow);
     TRIANGLE_SHADERS.set(shaderKey, shaders);
   }
   // The sources no longer carry the length, so the shader cache key must not
@@ -1389,7 +1397,7 @@ function triangleSetup(
     [`${pipelineKey}:project-output${residual ? "-residual" : ""}`, shaders.projectOutput],
   ];
   return {
-    packed, blockRows, wholeStorage, pairStorage, pairShards, wholeShards,
+    packed, blockRows, wholeStorage, pairStorage, pairShards, wholeShards, pairWindow,
     wholeStride, requests, overrides,
   };
 }
@@ -1435,7 +1443,7 @@ async function encodeTriangleMultiplication(
   residualTarget?: GpuTensor,
 ): Promise<GpuTensor> {
   const {
-    packed, blockRows, wholeStorage, pairStorage, pairShards, wholeShards, wholeStride, requests,
+    packed, blockRows, wholeStorage, pairStorage, pairShards, wholeShards, pairWindow, wholeStride, requests,
     overrides,
   } = triangleSetup(execution, input, weightsValue, direction, residualTarget !== undefined);
   // Indexed rather than destructured: requests is the one place the order is
@@ -1480,12 +1488,24 @@ async function encodeTriangleMultiplication(
   execution.dispatch(encoder, inputStatistics, [...pairViews, statistics],
     statisticsGrid[0], statisticsGrid[1], 1, `triangle.${direction}.input-statistics`);
   const gate = execution.allocate(`triangle.${direction}.gate`, blockPairs * input.cZ);
+  // The block's own pair rows, as one binding. A projection given this reads a
+  // plain array where the shard chain put a branch, which is what the chain
+  // costs: 2.4x on these kernels, measured at 1,650 residues with the pair
+  // split in two. Only the readers whose rows are block.x + row may take it.
+  const windowOf = (block: (typeof blocks)[number]): readonly GpuTensor[] => [execution.view(pair,
+    storageWords(block.offset * input.length * input.cZ, pairStorage),
+    storageWords(block.count * input.length * input.cZ, pairStorage))];
   const project = (pipeline: GPUComputePipeline, target: readonly GpuTensor[],
-    block: (typeof blocks)[number], label: string): void => {
+    block: (typeof blocks)[number], label: string, windowed = false): void => {
     const grid = gemmGrid(block.count * input.length, 2 * input.triangleHidden);
-    execution.dispatch(encoder, pipeline, [...pairViews, pairMask, weights, statistics, ...target, block.uniform],
+    const source = windowed ? windowOf(block) : pairViews;
+    execution.dispatch(encoder, pipeline, [...source, pairMask, weights, statistics, ...target, block.uniform],
       grid[0], grid[1], 1, `triangle.${direction}.${label}-${block.offset}`);
   };
+  // The whole operand is written at its pair row in both directions; the block
+  // operand and the gate only run over a run of rows in the outgoing one.
+  const outgoing = direction === "outgoing";
+  const blockWindowed = pairWindow && outgoing;
 
   // Both directions block the output rows. The operand indexed by the output's
   // first residue is projected per block; the other has to be complete before
@@ -1495,7 +1515,7 @@ async function encodeTriangleMultiplication(
     storageWords(wholeStride * input.triangleHidden, wholeStorage === "f16" ? "f16" : "f32"));
   const wholeElementStorage: ActivationStorage = wholeStorage === "f16" ? "f16" : "f32";
   const wholeViews = views(wholeProjection, wholeShards, wholeElementStorage);
-  for (const block of blocks) project(projectWholeOperand, wholeViews, block, "project-whole");
+  for (const block of blocks) project(projectWholeOperand, wholeViews, block, "project-whole", pairWindow);
   // One binding of the projection a dispatch, and one uniform saying which
   // channels it holds. The two operands the contraction binds whole are
   // channel-major as well, so the group's first channel is all they need.
@@ -1518,7 +1538,7 @@ async function encodeTriangleMultiplication(
     [encoder, dispatchedAtSplit] = await splitWhenLong(execution, encoder, dispatchedAtSplit, input.flush,
       `triangle.${direction}.flush-${block.offset}`);
     const rows = block.count * input.length;
-    project(projectBlockOperand, [blockedProjection], block, "project-block");
+    project(projectBlockOperand, [blockedProjection], block, "project-block", blockWindowed);
     const contractGrid = gemmGrid(block.count, input.length);
     for (const group of channelGroups) {
       execution.dispatch(encoder, contract,
@@ -1533,7 +1553,8 @@ async function encodeTriangleMultiplication(
     // projection is the first thing to write it.
     const gateGrid = gemmGrid(rows, input.cZ);
     const gateBlock = execution.view(gate, 0, rows * input.cZ);
-    execution.dispatch(encoder, projectGate, [...pairViews, weights, statistics, gateBlock, block.uniform],
+    execution.dispatch(encoder, projectGate,
+      [...(blockWindowed ? windowOf(block) : pairViews), weights, statistics, gateBlock, block.uniform],
       gateGrid[0], gateGrid[1], 1, `triangle.${direction}.project-gate-${block.offset}`);
     execution.dispatch(encoder, projectOutput,
       [gateBlock, contracted, weights, stats, ...outputViews, block.uniform],

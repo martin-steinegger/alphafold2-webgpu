@@ -49,7 +49,7 @@ function emitTriangle(prefix: string, spelling?: import("../src/runtime/dialect.
   const offsets = Object.fromEntries(ORDER.map((name) => [name, 0])) as never;
   for (const direction of ["outgoing", "incoming"] as const) {
     const shaders = triangle.createTriangleShaders(shape, "f16", offsets, 1e-5, direction,
-      64, "f16", "f32", false, undefined, undefined, spelling);
+      64, "f16", "f32", false, undefined, undefined, true, spelling);
     for (const [name, code] of Object.entries(shaders)) {
       emit(`${prefix}-triangle-${direction}-${name.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}`,
         code);
