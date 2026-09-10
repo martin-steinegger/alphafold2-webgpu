@@ -70,6 +70,17 @@ export interface Dialect {
    * device advertises that width and no other. See supportsSubgroupSize.
    */
   subgroupSize(lanes: number): string;
+  /**
+   * How to synchronise one subgroup, which is not the same as the workgroup.
+   *
+   * A barrier between two accesses that only one subgroup makes need only
+   * order that subgroup. WGSL has subgroupBarrier for it and naga lowers it;
+   * Dawn answers "unresolved call target", so this falls back to
+   * workgroupBarrier there, which is stronger and always correct. Barriers
+   * ablate at about 10% of the flash attention kernel at the model's own
+   * shape, so this is where that is reachable at all.
+   */
+  readonly subgroupBarrier: string;
   /** Undefined on a device reporting no matrix units. */
   readonly matrix: MatrixSpelling | undefined;
 }
@@ -81,7 +92,7 @@ export interface Dialect {
  * implements the builtins, has no counterpart to subgroup-size-control, and
  * once patched takes the plain directive.
  */
-const SUBGROUP_HALVES: readonly Omit<Dialect, "matrix">[] = [
+const SUBGROUP_HALVES: readonly Omit<Dialect, "matrix" | "subgroupBarrier">[] = [
   {
     subgroupEnable: "enable subgroups;\nenable subgroup_size_control;\n",
     subgroupSize: (lanes) => ` @subgroup_size(${lanes})`,
@@ -146,7 +157,8 @@ function coopMat(type: string, columns: number, rows: number, role: string): str
 }
 
 const DIRECTIVE_FREE: Dialect = {
-  subgroupEnable: "", subgroupSize: () => "", matrix: undefined,
+  subgroupEnable: "", subgroupSize: () => "",
+  subgroupBarrier: "workgroupBarrier()", matrix: undefined,
 };
 const settled = new WeakMap<GPUDevice, Dialect>();
 
@@ -164,6 +176,7 @@ export async function calibrateDialect(device: GPUDevice): Promise<Dialect> {
   const answer: Dialect = {
     subgroupEnable: subgroups.subgroupEnable,
     subgroupSize: subgroups.subgroupSize,
+    subgroupBarrier: await settleSubgroupBarrier(device, subgroups.subgroupEnable),
     matrix,
   };
   settled.set(device, answer);
@@ -225,7 +238,9 @@ async function settleMatrix(device: GPUDevice): Promise<MatrixSpelling | undefin
   return undefined;
 }
 
-async function firstAccepted(device: GPUDevice): Promise<Omit<Dialect, "matrix">> {
+async function firstAccepted(
+  device: GPUDevice,
+): Promise<Omit<Dialect, "matrix" | "subgroupBarrier">> {
   for (const half of SUBGROUP_HALVES) {
     // The builtin and the attribute as well as the directives, since an
     // implementation that ignores an unknown directive would otherwise accept
@@ -237,6 +252,25 @@ async function firstAccepted(device: GPUDevice): Promise<Omit<Dialect, "matrix">
     if (await compiles(device, source)) return half;
   }
   return DIRECTIVE_FREE;
+}
+
+/**
+ * subgroupBarrier where the implementation has it, workgroupBarrier where not.
+ *
+ * Probed by compiling it, like everything else here. wgpu needs the device to
+ * have been asked for its subgroup-barrier feature; a device that was not gets
+ * the fallback, which is why this compiles the call rather than reading a
+ * feature name.
+ */
+async function settleSubgroupBarrier(device: GPUDevice, enable: string): Promise<string> {
+  // AFWEBGPU_WORKGROUP_BARRIER=1 keeps the workgroup barrier on an
+  // implementation that has the narrower one, which is the other arm of the
+  // measurement. Guarded, because this module runs in a browser too.
+  if (typeof process !== "undefined" && process.env?.AFWEBGPU_WORKGROUP_BARRIER === "1") {
+    return "workgroupBarrier()";
+  }
+  const source = `${enable}@compute @workgroup_size(32)\nfn main() { subgroupBarrier(); }\n`;
+  return await compiles(device, source) ? "subgroupBarrier()" : "workgroupBarrier()";
 }
 
 async function compiles(device: GPUDevice, code: string): Promise<boolean> {

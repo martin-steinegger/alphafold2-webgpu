@@ -47,6 +47,7 @@ pub fn request_device(
         match name.as_str() {
             "shader-f16" => wanted |= wgpu::Features::SHADER_F16,
             "subgroups" => wanted |= wgpu::Features::SUBGROUP,
+            "subgroup-barrier" => wanted |= wgpu::Features::SUBGROUP_BARRIER,
             "timestamp-query" => {
                 wanted |= wgpu::Features::TIMESTAMP_QUERY
                     | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS

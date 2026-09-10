@@ -1206,7 +1206,8 @@ export function selectAttentionFlashKernel(
     }
     return {
       cacheKey: `attention:flash-matrix-${headDim}`,
-      shader: createAttentionMatrixFlashShader(headDim, shape, matrixSpelling(device)),
+      shader: createAttentionMatrixFlashShader(headDim, shape, matrixSpelling(device),
+        false, dialect(device).subgroupBarrier),
       queryTile: ATTENTION_MATRIX_QUERY_TILE, variant: requested, batchFirst: true,
     };
   }

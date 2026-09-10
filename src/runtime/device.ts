@@ -390,7 +390,10 @@ export async function requestAlphaFoldDevice(
   // the adapter does not use costs nothing; not asking for the one it does
   // costs the units, and with them every kernel gated on the dialect probe.
   const optional = ["subgroups", "subgroup-size-control", "timestamp-query", "shader-f16",
-    "chromium-experimental-subgroup-matrix", "wgpu-cooperative-matrix"] as const;
+    "chromium-experimental-subgroup-matrix", "wgpu-cooperative-matrix",
+    // Only wgpu has it. Without it naga refuses subgroupBarrier and the
+    // dialect probe falls back to the workgroup barrier, silently.
+    "subgroup-barrier"] as const;
   const requiredFeatures = optional.filter(
     (feature) => adapter.features.has(feature as GPUFeatureName),
   ) as GPUFeatureName[];

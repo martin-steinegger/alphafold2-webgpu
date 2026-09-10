@@ -181,6 +181,13 @@ export function attentionMatrixStorageBytes(headDim: number, storedHalf = false)
 
 export function createAttentionMatrixFlashShader(
   headDim: number, unit: MatrixUnitShape, m: MatrixSpelling, storedHalf = false,
+  /**
+   * How to synchronise one subgroup, from dialect(device).subgroupBarrier.
+   *
+   * Defaults to the workgroup barrier, which is stronger and always correct,
+   * so a caller that does not know stays right.
+   */
+  subgroupBarrier = "workgroupBarrier()",
 ): string {
   if (headDim % 4 !== 0 || headDim > 32 || headDim < 4) {
     throw new RangeError("matrix attention takes a head of four to thirty-two channels");
@@ -332,8 +339,14 @@ ${padChannels}
   // workgroup memory it was a third of the traffic of the pass, and the array
   // it needed is workgroup storage that occupancy wants back. Each lane owns a
   // fixed set of four-channel groups, so the indices are computed once.
-${lines(outPerLane, (j) => `  let own_row_${j} = (lane + ${j * LANES}u) / ${vectors}u;
-  let own_vector_${j} = (lane + ${j * LANES}u) % ${vectors}u;
+  // Owned inside the subgroup rather than spread over the workgroup. It is the
+  // same four groups a lane either way -- ${UNIT} rows over ${MATRIX_LANES}
+  // lanes is what ${rows} over ${LANES} was -- but every row a lane touches is
+  // then one its own subgroup wrote, which is what lets the barrier around the
+  // weighted sum synchronise a subgroup rather than the workgroup.
+  let in_lane = lane % ${MATRIX_LANES}u;
+${lines(outPerLane, (j) => `  let own_row_${j} = rows_at + (in_lane + ${j * MATRIX_LANES}u) / ${vectors}u;
+  let own_vector_${j} = (in_lane + ${j * MATRIX_LANES}u) % ${vectors}u;
   var out_${j} = vec4<f32>(0.0);`)}
   let batch_index = group.x;
   let head = group.z;
@@ -473,7 +486,11 @@ ${lines(KEY_TILE / 2, (j) => `      {
         running_sum[row] = running_sum[row] * previous_scale + total;
       }
     }
-    workgroupBarrier();
+    // Everything written above and read below belongs to this subgroup:
+    // probabilities, rescale, running_max and running_sum are all indexed by a
+    // row this subgroup owns, and the P by V multiply below reads
+    // probabilities at rows_at.
+    ${subgroupBarrier};
 
     // O = O * previous_scale + P V, with P V into a fresh accumulator because
     // the rescale is per row and a matrix result cannot be scaled row-wise.
@@ -493,7 +510,11 @@ ${lines(KEY_TILE / 2, (j) => `      {
       ${m.store("scores", `rows_at * ${WEIGHTED_STRIDE}u + channel * ${N}u`,
     "product", `${WEIGHTED_STRIDE}u`)};
     }
-    workgroupBarrier();
+    // Stored at this subgroup's rows and read back at them, now that a lane
+    // owns rows inside its own subgroup. The barrier at the end of the pass
+    // stays a workgroup one: it is what keeps a subgroup that has finished
+    // reading from staging the next key tile over one still reading this one.
+    ${subgroupBarrier};
 ${lines(outPerLane, (j) => `    {
       let staged = own_row_${j} * ${WEIGHTED_STRIDE}u + own_vector_${j} * 4u;
       out_${j} = out_${j} * rescale[own_row_${j}] + vec4<f32>(scores[staged],

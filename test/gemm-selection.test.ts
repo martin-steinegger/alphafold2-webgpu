@@ -24,6 +24,7 @@ function fakeDevice(
   // name: each implementation spells that feature differently.
   presetDialect(device, {
     subgroupEnable: "", subgroupSize: () => "",
+    subgroupBarrier: "workgroupBarrier()",
     matrix: matrixUnits ? DAWN_MATRIX : undefined,
   });
   return device;

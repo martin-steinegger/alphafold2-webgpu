@@ -117,7 +117,7 @@ function emitMatrix(prefix: string, reductionDevice: GPUDevice): void {
       try {
         emit(`${prefix}-flash-matrix-${name}-d${headDim}`,
           attentionMatrix.createAttentionMatrixFlashShader(headDim, config,
-            dialect(device).matrix!));
+            dialect(device).matrix!, false, dialect(device).subgroupBarrier));
       } catch { /* no matrix kernel at this width and shape */ }
     }
   }
@@ -128,10 +128,13 @@ const settled = dialect(device);
 presetDialect(device, { ...settled, matrix: DAWN_MATRIX });
 emitMatrix("dawn", device);
 // What wgpu looks like: subgroups without the directive and without
-// subgroup-size-control, so the reduction takes its workgroup path.
+// subgroup-size-control, so the reduction takes its workgroup path, and the
+// subgroup barrier naga implements and Dawn does not.
 const wgpuLike = { features: new Set(["subgroups", "shader-f16"]) } as unknown as GPUDevice;
-presetDialect(wgpuLike, { subgroupEnable: "", subgroupSize: () => "", matrix: WGPU_MATRIX });
-presetDialect(device, { subgroupEnable: "", subgroupSize: () => "", matrix: WGPU_MATRIX });
+const wgpuDialect = { subgroupEnable: "", subgroupSize: () => "",
+  subgroupBarrier: "subgroupBarrier()", matrix: WGPU_MATRIX };
+presetDialect(wgpuLike, wgpuDialect);
+presetDialect(device, wgpuDialect);
 emitMatrix("wgpu", wgpuLike);
 presetDialect(device, settled);
 

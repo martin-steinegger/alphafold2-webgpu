@@ -19,6 +19,7 @@ function stubDevice(options: {
   } as unknown as GPUDevice;
   presetDialect(device, {
     subgroupEnable: "", subgroupSize: () => "",
+    subgroupBarrier: "workgroupBarrier()",
     matrix: options.matrix === true ? DAWN_MATRIX : undefined,
   });
   recordSubgroupRange(device, { info: {

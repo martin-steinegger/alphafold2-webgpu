@@ -77,7 +77,8 @@ describe("the shader dialect", () => {
 
   it("takes a forced dialect, for a test that wants one deliberately", () => {
     const device = stubDevice(dawnLike, []);
-    presetDialect(device, { subgroupEnable: "", subgroupSize: () => "", matrix: WGPU_MATRIX });
+    presetDialect(device, { subgroupEnable: "", subgroupSize: () => "",
+    subgroupBarrier: "workgroupBarrier()", matrix: WGPU_MATRIX });
     expect(matrixSpelling(device)).toBe(WGPU_MATRIX);
   });
 

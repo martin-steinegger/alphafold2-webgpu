@@ -21,6 +21,7 @@ fn feature_names(features: wgpu::Features) -> Vec<&'static str> {
     for (flag, name) in [
         (wgpu::Features::SHADER_F16, "shader-f16"),
         (wgpu::Features::SUBGROUP, "subgroups"),
+        (wgpu::Features::SUBGROUP_BARRIER, "subgroup-barrier"),
         (wgpu::Features::TIMESTAMP_QUERY, "timestamp-query"),
         (
             wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX,

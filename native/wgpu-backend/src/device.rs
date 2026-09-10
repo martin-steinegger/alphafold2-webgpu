@@ -154,6 +154,10 @@ fn wanted_features() -> wgpu::Features {
     wgpu::Features::SHADER_F16
         | wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX
         | wgpu::Features::SUBGROUP
+        // A barrier that synchronises one subgroup rather than the whole
+        // workgroup. WGSL has subgroupBarrier and naga lowers it; Dawn does
+        // not, so only this backend can be asked for it.
+        | wgpu::Features::SUBGROUP_BARRIER
         | wgpu::Features::TIMESTAMP_QUERY
         | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
 }
