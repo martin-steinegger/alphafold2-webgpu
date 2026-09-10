@@ -59,7 +59,7 @@ import {
 } from "../runtime/storage.js";
 import type { TriangleMultiplicationWeights } from "../triangle/types.js";
 import { packWeights as packTriangleWeights } from "../triangle/weights.js";
-import { triangleOverrides } from "../triangle/shaders.js";
+import { triangleOverrides, wholeProjectionStride } from "../triangle/shaders.js";
 import type { AllocationSnapshot } from "../runtime/allocator.js";
 import { scratchBudget } from "../runtime/scratch-budget.js";
 import { dialect } from "../runtime/dialect.js";
@@ -1342,11 +1342,13 @@ function triangleSetup(
     input.pairBindingBytes ?? execution.bindingLimitBytes,
     pairStorage === "f16" ? 2 : 4);
   // The whole operand is the pair's size in hidden channels, so it passes the
-  // binding limit before the pair does and is windowed the same way.
-  const wholeStride = input.length * input.length + (input.length * input.length) % 2;
+  // binding limit before the pair does. The projection that writes it is
+  // windowed the same way as the pair; the contraction that reads it is not,
+  // and takes whole channels instead. See wholeChannelGroups.
+  const wholeStride = wholeProjectionStride(input.length);
+  const wholeBytes = wholeStorage === "f16" ? 2 : 4;
   const wholeShards = planShards(wholeStride * input.triangleHidden, 2,
-    input.pairBindingBytes ?? execution.bindingLimitBytes,
-    wholeStorage === "f16" ? 2 : 4);
+    input.pairBindingBytes ?? execution.bindingLimitBytes, wholeBytes);
   // The projection reads the pair and writes the whole operand in one
   // dispatch, so their windows share the stage's storage slots with three
   // more for the mask, the weights and the statistics.
@@ -1390,6 +1392,36 @@ function triangleSetup(
     packed, blockRows, wholeStorage, pairStorage, pairShards, wholeShards,
     wholeStride, requests, overrides,
   };
+}
+
+/**
+ * Hidden channels the contraction covers in one dispatch.
+ *
+ * The projection, the blocked operand and the contraction's output are all
+ * channel-major, so a range of channels is a contiguous range of each and the
+ * kernel can be given the projection as one binding. That is what keeps a
+ * shard chain, with its divide and its branch, out of the inner loop of an
+ * L-cubed kernel. wholeProjectionStride pads a channel so every group starts
+ * where a binding may start.
+ *
+ * A group is as many channels as one binding covers, so a device that binds
+ * more dispatches fewer times; at the 2 GiB a native adapter grants, a
+ * 3,300-residue tetramer takes two groups where it used to take two shards.
+ */
+export function wholeChannelGroups(
+  channels: number, stride: number, bindingBytes: number, bytesPerElement: number,
+): readonly { readonly first: number; readonly count: number }[] {
+  const perGroup = Math.floor(bindingBytes / bytesPerElement / stride);
+  if (perGroup <= 0) {
+    throw new RangeError(`One hidden channel of the triangle projection is `
+      + `${stride * bytesPerElement} bytes, past the ${bindingBytes} bytes one binding may cover. `
+      + "A shorter sequence, or a device that binds more of a buffer at once, will run.");
+  }
+  const groups: { first: number; count: number }[] = [];
+  for (let first = 0; first < channels; first += perGroup) {
+    groups.push({ first, count: Math.min(perGroup, channels - first) });
+  }
+  return groups;
 }
 
 async function encodeTriangleMultiplication(
@@ -1461,8 +1493,22 @@ async function encodeTriangleMultiplication(
   // requested.
   const wholeProjection = execution.allocate(`triangle.${direction}.whole`,
     storageWords(wholeStride * input.triangleHidden, wholeStorage === "f16" ? "f16" : "f32"));
-  const wholeViews = views(wholeProjection, wholeShards, wholeStorage === "f16" ? "f16" : "f32");
+  const wholeElementStorage: ActivationStorage = wholeStorage === "f16" ? "f16" : "f32";
+  const wholeViews = views(wholeProjection, wholeShards, wholeElementStorage);
   for (const block of blocks) project(projectWholeOperand, wholeViews, block, "project-whole");
+  // One binding of the projection a dispatch, and one uniform saying which
+  // channels it holds. The two operands the contraction binds whole are
+  // channel-major as well, so the group's first channel is all they need.
+  const channelGroups = wholeChannelGroups(input.triangleHidden, wholeStride,
+    input.pairBindingBytes ?? execution.bindingLimitBytes, wholeStorage === "f16" ? 2 : 4)
+    .map((group) => ({
+      ...group,
+      view: execution.view(wholeProjection,
+        storageWords(group.first * wholeStride, wholeElementStorage),
+        storageWords(group.count * wholeStride, wholeElementStorage)),
+      uniform: uniform(execution, `triangle.${direction}.channels-${group.first}`,
+        new Uint32Array([group.first, group.count, 0, 0])),
+    }));
   const blockedProjection = execution.allocate(`triangle.${direction}.blocked`, blockPairs * input.triangleHidden);
   const contracted = execution.allocate(`triangle.${direction}.contracted`, blockPairs * input.triangleHidden);
   const hiddenStats = execution.allocate(`triangle.${direction}.hidden-statistics`, blockPairs * 2);
@@ -1474,8 +1520,12 @@ async function encodeTriangleMultiplication(
     const rows = block.count * input.length;
     project(projectBlockOperand, [blockedProjection], block, "project-block");
     const contractGrid = gemmGrid(block.count, input.length);
-    execution.dispatch(encoder, contract, [blockedProjection, ...wholeViews, contracted, block.uniform],
-      contractGrid[0], contractGrid[1], input.triangleHidden, `triangle.${direction}.contract-${block.offset}`);
+    for (const group of channelGroups) {
+      execution.dispatch(encoder, contract,
+        [blockedProjection, group.view, contracted, block.uniform, group.uniform],
+        contractGrid[0], contractGrid[1], group.count,
+        `triangle.${direction}.contract-${block.offset}`);
+    }
     const stats = execution.view(hiddenStats, 0, rows * 2);
     execution.dispatch(encoder, hiddenStatistics, [contracted, stats, block.uniform],
       Math.ceil(rows / 64), 1, 1, `triangle.${direction}.hidden-statistics-${block.offset}`);

@@ -1,6 +1,6 @@
 import { GpuBufferAllocator, type AllocatedGpuBuffer, type AllocationSnapshot } from "../runtime/allocator.js";
 import { pipelineCacheForDevice, type ComputePipelineCache } from "../runtime/pipeline-cache.js";
-import { triangleOverrides, createTriangleShaders, type TriangleDirection, type TriangleWholeStorage } from "./shaders.js";
+import { triangleOverrides, wholeProjectionStride, createTriangleShaders, type TriangleDirection, type TriangleWholeStorage } from "./shaders.js";
 import type { Precision, TriangleMultiplicationInput } from "./types.js";
 import { validateTriangleInput } from "./types.js";
 import { packWeights } from "./weights.js";
@@ -65,7 +65,10 @@ class TriangleMultiplicationGpu {
     const blockRows = Math.max(1, Math.min(length, options.blockRows ?? length));
     const wholeStorage = options.wholeStorage ?? "f32";
     const blockPairs = blockRows * length;
-    const wholeStride = pairCount + (pairCount % 2);
+    // Padded so a channel starts where a binding may start. This path binds
+    // the projection whole and needs no groups, but the stride is an override
+    // the shader shares with the block encoder, which does.
+    const wholeStride = wholeProjectionStride(length);
     const packedWeights = packWeights(input.weights, precision);
     const shaders = createTriangleShaders(
       input.shape, precision, packedWeights.offsets, input.epsilon ?? 1e-5, this.direction, blockRows, wholeStorage,
@@ -110,6 +113,10 @@ class TriangleMultiplicationGpu {
       const whole = keep(this.allocator.allocate("triangle.whole",
         wholeStorage === "f16" ? wholeStride * cHidden * 2 : wholeStride * cHidden * 4, storage));
       const contracted = keep(this.allocator.allocate("triangle.contracted", blockPairs * cHidden * 4, storage));
+      // The projection is bound entire here, so the group starts at channel
+      // zero and covers all of them.
+      const channels = keep(this.allocator.upload("triangle.channels",
+        new Uint32Array([0, cHidden, 0, 0]), GPUBufferUsage.UNIFORM));
       const hiddenStatisticsBuffer = keep(this.allocator.allocate("triangle.hidden-statistics", blockPairs * 2 * 4, storage));
       const output = keep(this.allocator.allocate(
         "triangle.output", pairCount * cZ * 4, storage | GPUBufferUsage.COPY_SRC,
@@ -163,7 +170,8 @@ class TriangleMultiplicationGpu {
           [z.buffer, mask.buffer, weights.buffer, statistics.buffer, blocked.buffer, block.params],
           projectionGrid[0], projectionGrid[1]);
         const contractGrid = gemmGrid(block.count, length);
-        runPass(`contract-${block.offset}`, contract, [blocked.buffer, whole.buffer, contracted.buffer, block.params],
+        runPass(`contract-${block.offset}`, contract,
+          [blocked.buffer, whole.buffer, contracted.buffer, block.params, channels.buffer],
           contractGrid[0], contractGrid[1], cHidden);
         runPass(`hidden-statistics-${block.offset}`, hiddenStatistics,
           [contracted.buffer, hiddenStatisticsBuffer.buffer, block.params], ceilDivide(rows, 64));

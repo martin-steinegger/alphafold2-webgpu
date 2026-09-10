@@ -92,9 +92,26 @@ const read = (precision: Precision, expression: string): string =>
 export function triangleOverrides(
   shape: TriangleShape, blockRows = shape.length,
 ): Record<string, number> {
-  const pairs = shape.length * shape.length;
-  return { L: shape.length, WHOLE_STRIDE: pairs + (pairs % 2), BLOCK_ROWS: blockRows };
+  return { L: shape.length, WHOLE_STRIDE: wholeProjectionStride(shape.length), BLOCK_ROWS: blockRows };
 }
+
+/**
+ * Elements one hidden channel of the whole projection occupies.
+ *
+ * The pair count itself would do, but the contraction is dispatched a channel
+ * group at a time and each group is bound at its own offset, which WebGPU
+ * requires to be a multiple of 256 bytes. Padding a channel to 128 elements
+ * makes every channel boundary such an offset in both storages: 128 halves are
+ * 256 bytes and 128 words are 512. The padding is at most 127 elements a
+ * channel, which is 32 KiB over the whole tensor at any length.
+ */
+export function wholeProjectionStride(length: number): number {
+  const pairs = length * length;
+  return pairs + (WHOLE_CHANNEL_ALIGNMENT - pairs % WHOLE_CHANNEL_ALIGNMENT) % WHOLE_CHANNEL_ALIGNMENT;
+}
+
+/** Elements a channel is padded to, which is 256 bytes of the narrower storage. */
+export const WHOLE_CHANNEL_ALIGNMENT = 128;
 
 function prelude(
   shape: TriangleShape, precision: Precision, offsets: WeightOffsets, epsilon: number,
@@ -375,20 +392,32 @@ ${packed ? `    // Two consecutive pair rows share a word. Blocks start on even 
   // GEMM rows being the block's columns and its columns every i.
   const packedWhole = wholeStorage === "f16";
   const wholeElement = (index: string): string => `whole_load(${index})`;
-  const wholeSlots = wholeShards.count;
+  // The projection reaches this kernel as one binding however large it is,
+  // because all three of its operands are channel-major and the dispatch
+  // covers a group of channels that fits. A shard chain here would put an
+  // integer divide and a branch in the inner loop of the hottest kernel of the
+  // trunk, and stop the operand being staged as a contiguous tile with it: at
+  // 1,650 residues that measured 2.5x on this kernel alone. See
+  // wholeProjectionStride, and encodeTriangleMultiplication for the grouping.
+  // The channel the dispatch starts at, which the two operands bound whole
+  // still need; the projection is bound at the group, so its own index is
+  // local.
+  const channel = "(channels.x + group.z)";
   const contract = createTiledGemmShader({
     preamble: `${common}
 @group(0) @binding(0) var<storage, read> blocked: array<f32>;
-${shardBindings(wholeShards, "whole", packedWhole ? "f16" : "f32", 1, false)}
-@group(0) @binding(${1 + wholeSlots}) var<storage, read_write> output: array<f32>;
+${shardBindings(WHOLE_OPERAND_UNSHARDED, "whole", packedWhole ? "f16" : "f32", 1, false)}
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
 // x is the first pair row of the block, w the residue count it spans.
-@group(0) @binding(${2 + wholeSlots}) var<uniform> block: vec4<u32>;
-${shardLoader(wholeShards, "whole", packedWhole ? "f16" : "f32")}`,
+@group(0) @binding(3) var<uniform> block: vec4<u32>;
+// x is the first hidden channel of the group this dispatch covers.
+@group(0) @binding(4) var<uniform> channels: vec4<u32>;
+${shardLoader(WHOLE_OPERAND_UNSHARDED, "whole", packedWhole ? "f16" : "f32")}`,
     rows: "block.w",
     inner: "L",
     columns: "L",
     sourceElement: outgoing
-      ? "blocked[group.z * BLOCK_PAIRS + row * L + k]" : "blocked[group.z * BLOCK_PAIRS + k * block.w + row]",
+      ? `blocked[${channel} * BLOCK_PAIRS + row * L + k]` : `blocked[${channel} * BLOCK_PAIRS + k * block.w + row]`,
     weightElement: outgoing
       ? wholeElement("group.z * WHOLE_STRIDE + column * L + k") : wholeElement("group.z * WHOLE_STRIDE + k * L + column"),
     // Which index of each operand is contiguous, so a staged tile is fetched
@@ -398,8 +427,8 @@ ${shardLoader(wholeShards, "whole", packedWhole ? "f16" : "f32")}`,
     // The block's output entries are enumerated like its operand: by pair row
     // (i, j) outgoing, by (i, block column j) incoming.
     store: outgoing
-      ? "output[group.z * BLOCK_PAIRS + row * L + column] = element;"
-      : "output[group.z * BLOCK_PAIRS + column * block.w + row] = element;",
+      ? `output[${channel} * BLOCK_PAIRS + row * L + column] = element;`
+      : `output[${channel} * BLOCK_PAIRS + column * block.w + row] = element;`,
   }, undefined, spelling);
 
   const contracted = { stride: "BLOCK_PAIRS", offset: "" };

@@ -30,6 +30,7 @@ import {
   GLOBAL_GATE_TARGET_BYTES, globalAttentionGateRows, TRIANGLE_BLOCK_TARGET_BYTES, triangleBlockRows,
 } from "../evoformer/block.js";
 import { OUTER_PRODUCT_BLOCK_LIMIT_BYTES, outerProductMeanRowBlock } from "../evoformer/outer-product-mean.js";
+import { wholeProjectionStride } from "../triangle/shaders.js";
 import { TRANSITION_CHUNK_TARGET_BYTES, transitionChunkRows } from "../evoformer/transition.js";
 import { type ActivationStorage, storageWords } from "./storage.js";
 import { planShards } from "./sharded.js";
@@ -106,7 +107,10 @@ export function predictionBindingSizes(shape: PredictionShape): readonly Binding
 
   // The pair itself, and the triangle's whole projection, which matches it.
   sharded("pair", pairs * cZ, cZ, pairBytes);
-  const wholeStride = pairs + pairs % 2;
+  // Written a shard at a time by the projection, read a channel group at a
+  // time by the contraction; the projection's shards are the larger of the two
+  // and are what a device has to allow.
+  const wholeStride = wholeProjectionStride(length);
   sharded("triangle.whole", wholeStride * hidden, 2, bytesOf(wholeStorage));
   // The triangle writes a pair-shaped output and a mean and variance a pair.
   sharded("triangle.output", pairs * cZ, cZ, pairBytes);
