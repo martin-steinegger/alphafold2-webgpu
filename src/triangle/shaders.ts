@@ -283,6 +283,25 @@ fn normalized_input(pair_row: u32, k: u32) -> f32 {
       sourceElement: "normalized_input(pair_row_of(row), k)",
       weightElement: `select(${weight("G")}, ${weight("P")}, (column & 1u) == 0u)`,
       store: "",
+      // What the epilogue below does, for a kernel that has no acc{n} to write
+      // it against. The matrix kernel stages its result in workgroup memory
+      // and hands out four adjacent columns, which is one channel and its gate
+      // twice over, so the arithmetic carries across unchanged. What does not
+      // carry is the transpose: these stores are the scattered ones the
+      // epilogue exists to avoid, and whether the units pay for that is a
+      // measurement. A packed operand cannot come this way at all, because one
+      // word holds two pair rows and an invocation here has one.
+      ...(packed ? {} : { storeVector: `
+      let h = column >> 1u;
+      let pair_mask = mask[pair_row_of(row)];
+      if (h < CH) {
+        ${operand}_store(h * ${stride} + ${storeRow},
+          pair_mask * (values[0] + ${bias("P", "h")}) * logistic(values[1] + ${bias("G", "h")}));
+      }
+      if (h + 1u < CH) {
+        ${operand}_store((h + 1u) * ${stride} + ${storeRow},
+          pair_mask * (values[2] + ${bias("P", "h + 1u")}) * logistic(values[3] + ${bias("G", "h + 1u")}));
+      }` }),
       // The contraction reads the projection channel-major, so a direct store
       // from the row-major tile would scatter every write across the whole
       // tensor. Each invocation drops its channel/gate pairs into a staged

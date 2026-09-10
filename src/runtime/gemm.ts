@@ -341,8 +341,10 @@ export function usesMatrixUnits(shader: TiledGemmShader, variant: GemmVariant): 
     // A whole-tile epilogue is written against acc{n} in the hand-tiled
     // thread mapping, which a matrix kernel does not have. storeVector is
     // fine: the result is staged in workgroup memory, so an invocation can
-    // read four adjacent columns of it as easily as one.
-    && shader.epilogue === undefined;
+    // read four adjacent columns of it as easily as one. A caller that has
+    // both keeps its epilogue on the hand-tiled kernel, which prefers it, and
+    // reaches the units through the storeVector.
+    && (shader.epilogue === undefined || shader.storeVector !== undefined);
 }
 
 /**
