@@ -13,7 +13,7 @@ import {
   attentionQueriesPerThread,
   attentionProjectShader,
   createAttentionRegisterFlashShader,
-  ATTENTION_WINDOW_TARGET_BYTES,
+  ATTENTION_WINDOW_MAX_SCALE, ATTENTION_WINDOW_TARGET_BYTES,
   attentionBatchWindow,
   createAttentionNormParameters,
   createAttentionParameters,
@@ -843,7 +843,7 @@ async function encodeAttention(
   // Attention is independent across batch entries, so the per-row tensors only
   // ever have to hold one window of them.
   const windowBatch = attentionBatchWindow(options.batch, options.queries, options.channels,
-    Math.min(options.windowBytes ?? scratchBudget(ATTENTION_WINDOW_TARGET_BYTES),
+    Math.min(options.windowBytes ?? scratchBudget(ATTENTION_WINDOW_TARGET_BYTES, ATTENTION_WINDOW_MAX_SCALE),
       execution.bindingLimitBytes));
   const windowElements = windowBatch * options.queries * options.channels;
 
@@ -900,7 +900,7 @@ async function encodeAttention(
       const channels = options.pairBias.channels;
       const rowElements = options.queries * channels;
       const pairWindowRows = Math.max(1, Math.min(options.queries, Math.floor(
-        Math.min(options.windowBytes ?? scratchBudget(ATTENTION_WINDOW_TARGET_BYTES),
+        Math.min(options.windowBytes ?? scratchBudget(ATTENTION_WINDOW_TARGET_BYTES, ATTENTION_WINDOW_MAX_SCALE),
           execution.bindingLimitBytes)
           / (rowElements * Float32Array.BYTES_PER_ELEMENT),
       )));

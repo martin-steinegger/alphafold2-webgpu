@@ -156,9 +156,18 @@ export interface PackedAttentionWeights { readonly data: Float32Array; readonly 
  */
 export const ATTENTION_WINDOW_TARGET_BYTES = 8 * 1024 * 1024;
 
+/**
+ * The most this window takes of the process scratch scale.
+ *
+ * Past this it measures worse rather than better: at 3,300 residues a scale of
+ * 64 took triangle attention from 74.6 TFLOP/s to 59.3, where the same raise
+ * more than doubled the triangle contraction. See scratchBudget.
+ */
+export const ATTENTION_WINDOW_MAX_SCALE = 16;
+
 export function attentionBatchWindow(
   batch: number, queries: number, channels: number,
-  budgetBytes: number = scratchBudget(ATTENTION_WINDOW_TARGET_BYTES),
+  budgetBytes: number = scratchBudget(ATTENTION_WINDOW_TARGET_BYTES, ATTENTION_WINDOW_MAX_SCALE),
 ): number {
   if (![batch, queries, channels, budgetBytes].every((value) => Number.isSafeInteger(value) && value > 0)) {
     throw new RangeError("attention window dimensions and budget must be positive safe integers");

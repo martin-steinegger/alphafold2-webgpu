@@ -5,7 +5,7 @@ import {
   outerProductMeanRowBlock,
 } from "../evoformer/outer-product-mean.js";
 import {
-  ATTENTION_WINDOW_TARGET_BYTES, attentionBatchWindow, attentionPairBiasStride,
+  ATTENTION_WINDOW_MAX_SCALE, ATTENTION_WINDOW_TARGET_BYTES, attentionBatchWindow, attentionPairBiasStride,
 } from "../evoformer/attention.js";
 import { GLOBAL_GATE_TARGET_BYTES, globalAttentionGateRows, triangleBlockRows } from "../evoformer/block.js";
 import type { TriangleWholeStorage } from "../triangle/shaders.js";
@@ -174,7 +174,7 @@ export function estimateMonomerMemory(
   // built from the pair one row window at a time. Its rows are padded to four,
   // so the flash kernels can read four of one at once.
   const pairBias = 8 * length * attentionPairBiasStride(length) * bytes
-    + Math.min(pair, scratchBudget(ATTENTION_WINDOW_TARGET_BYTES));
+    + Math.min(pair, scratchBudget(ATTENTION_WINDOW_TARGET_BYTES, ATTENTION_WINDOW_MAX_SCALE));
   const operatorScratch = Math.max(
     // Row and column attention over the clustered and extra alignments: the
     // normalized input, query, key, value and gate, one batch window each.

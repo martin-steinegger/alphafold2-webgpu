@@ -25,7 +25,7 @@
  * scaled impossibly; each formula here was read back out of the allocation
  * that makes it.
  */
-import { ATTENTION_WINDOW_TARGET_BYTES, attentionBatchWindow, attentionPairBiasStride } from "../evoformer/attention.js";
+import { ATTENTION_WINDOW_MAX_SCALE, ATTENTION_WINDOW_TARGET_BYTES, attentionBatchWindow, attentionPairBiasStride } from "../evoformer/attention.js";
 import {
   GLOBAL_GATE_TARGET_BYTES, globalAttentionGateRows, TRIANGLE_BLOCK_TARGET_BYTES, triangleBlockRows,
 } from "../evoformer/block.js";
@@ -133,7 +133,7 @@ export function predictionBindingSizes(shape: PredictionShape): readonly Binding
   // the batch window the flash kernels read.
   add("attention.pair-bias", 8 * length * attentionPairBiasStride(length) * 4, "whole");
   const pairAttentionWindow = attentionBatchWindow(length, length, cZ,
-    Math.min(scratchBudget(ATTENTION_WINDOW_TARGET_BYTES), limit));
+    Math.min(scratchBudget(ATTENTION_WINDOW_TARGET_BYTES, ATTENTION_WINDOW_MAX_SCALE), limit));
   add("attention.pair-window", pairAttentionWindow * length * cZ * 4, "window");
 
   // The pair transition, chunked against the binding limit itself.

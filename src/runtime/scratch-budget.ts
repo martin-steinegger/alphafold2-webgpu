@@ -55,10 +55,24 @@ export function setScratchBudgetScale(next: number): void {
   scale = next;
 }
 
-/** One budget, scaled. Windows stay whole bytes and never shrink. */
-export function scratchBudget(baseBytes: number): number {
+/**
+ * One budget, scaled. Windows stay whole bytes and never shrink.
+ *
+ * maxScale caps how much of the process scale this budget takes, because not
+ * every window wants the same one. A 3,300-residue tetramer measured on an
+ * empty card: taking the scale from 16 to 64 moved the triangle contraction
+ * from 41.5 to 93.2 TFLOP/s, and triangle attention the other way, from 74.6
+ * to 59.3. The contraction is a GEMM whose rows are the block, so a bigger
+ * block is more rows a tile and fewer passes over the operand it contracts
+ * against; attention already had every query it needed and a wider window only
+ * costs it. A window that measures worse as it grows says so here.
+ */
+export function scratchBudget(baseBytes: number, maxScale = MAX_SCRATCH_BUDGET_SCALE): number {
   if (!Number.isSafeInteger(baseBytes) || baseBytes <= 0) {
     throw new RangeError("a scratch budget must be a positive safe integer of bytes");
   }
-  return Math.floor(baseBytes * scale);
+  if (!Number.isFinite(maxScale) || maxScale < 1) {
+    throw new RangeError("a scratch budget scale ceiling must be at least one");
+  }
+  return Math.floor(baseBytes * Math.min(scale, maxScale));
 }
