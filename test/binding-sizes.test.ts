@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  maximumPredictionLength, oversizedBindings, predictionBindingSizes, STORAGE_BINDING_LIMIT_BYTES,
+  maximumPredictionLength, oversizedBindings, predictionBindingSizes,
+  STORAGE_BINDING_LIMIT_BYTES, triangleSlotsFit,
 } from "../src/runtime/binding-sizes.js";
 import { setScratchBudgetScale } from "../src/runtime/scratch-budget.js";
 
@@ -104,5 +105,44 @@ describe("what a prediction binds, without running one", () => {
         expect(size.bindingBytes).toBeLessThanOrEqual(STORAGE_BINDING_LIMIT_BYTES);
       }
     }
+  });
+});
+
+describe("the second ceiling: bindings a stage may make", () => {
+  it("reports only the size ceiling when the count is not given", () => {
+    // What this always did, and what a caller that has not asked still gets.
+    setScratchBudgetScale(NATIVE_SCALE);
+    expect(maximumPredictionLength(MONOMER)).toBe(6688);
+  });
+
+  it("caps a browser far lower than any binding size does", () => {
+    // 128 MiB and eight bindings is the WebGPU default. Every binding a
+    // 1,500-residue fold makes is comfortably inside the size limit; the
+    // triangle still cannot bind them all in one stage.
+    setScratchBudgetScale(1);
+    const browser = { ...MONOMER, bindingLimitBytes: 128 * 1024 ** 2, storageBuffersPerStage: 8 };
+    expect(oversizedBindings({ ...browser, length: 1500 })).toEqual([]);
+    expect(triangleSlotsFit({ ...browser, length: 1500 })).toBe(false);
+    expect(maximumPredictionLength(browser)).toBe(1448);
+  });
+
+  it("moves with the bindings the adapter reports, until something else bites", () => {
+    setScratchBudgetScale(1);
+    const at = (perStage: number) => maximumPredictionLength(
+      { ...MONOMER, bindingLimitBytes: 128 * 1024 ** 2, storageBuffersPerStage: perStage });
+    // Eight is the triangle's own ceiling. Sixteen is not: the triangle would
+    // run to 2,508 there, and ipa.pair-bias stops the model at 1,672 first.
+    expect(at(8)).toBe(1448);
+    expect(at(16)).toBe(1672);
+    const browser = { ...MONOMER, bindingLimitBytes: 128 * 1024 ** 2, storageBuffersPerStage: 16 };
+    expect(triangleSlotsFit({ ...browser, length: 1672 })).toBe(true);
+    expect(oversizedBindings({ ...browser, length: 1673 }).map((size) => size.label))
+      .toEqual(["ipa.pair-bias", "ipa.logits"]);
+  });
+
+  it("stops being the constraint where a binding covers 2 GiB", () => {
+    // The triangle would run to 10,033 there; ipa.pair-bias caps it first.
+    setScratchBudgetScale(NATIVE_SCALE);
+    expect(maximumPredictionLength({ ...MONOMER, storageBuffersPerStage: 16 })).toBe(6688);
   });
 });

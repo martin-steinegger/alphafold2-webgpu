@@ -30,6 +30,7 @@ import {
   GLOBAL_GATE_TARGET_BYTES, globalAttentionGateRows, TRIANGLE_BLOCK_TARGET_BYTES, triangleBlockRows,
 } from "../evoformer/block.js";
 import { OUTER_PRODUCT_BLOCK_LIMIT_BYTES, outerProductMeanRowBlock } from "../evoformer/outer-product-mean.js";
+import { residueChunks, triangleStorageSlots } from "../evoformer/block.js";
 import { wholeProjectionStride } from "../triangle/shaders.js";
 import { TRANSITION_CHUNK_TARGET_BYTES, transitionChunkRows } from "../evoformer/transition.js";
 import { type ActivationStorage, storageWords } from "./storage.js";
@@ -51,6 +52,17 @@ export interface PredictionShape {
   readonly triangleWholeStorage?: ActivationStorage;
   /** What one binding may cover. Defaults to the Vulkan ceiling. */
   readonly bindingLimitBytes?: number;
+  /**
+   * Bindings one shader stage may make, which is a second, separate ceiling.
+   *
+   * A tensor can be cut into windows that each fit, and still be refused
+   * because the kernel reading it has run out of slots. That is what stops a
+   * browser first: at the 128 MiB binding and the eight bindings WebGPU
+   * guarantees, the triangle caps at 1,448 residues while every binding it
+   * makes is comfortably inside the size limit. Left undefined this reports
+   * only the size ceiling, which is what it always did.
+   */
+  readonly storageBuffersPerStage?: number;
 }
 
 /** How a tensor reaches a shader, which is what decides whether it has a ceiling. */
@@ -204,6 +216,31 @@ export function oversizedBindings(shape: PredictionShape): readonly BindingSize[
 }
 
 /**
+ * Whether the triangle can bind what this shape needs of one shader stage.
+ *
+ * The size of a binding and the number of them are separate limits, and on a
+ * device that binds little the count is the one that bites. See
+ * triangleStorageSlots, which is what the encoder actually checks.
+ */
+export function triangleSlotsFit(shape: PredictionShape): boolean {
+  const perStage = shape.storageBuffersPerStage;
+  if (perStage === undefined) return true;
+  const { length } = shape;
+  const limit = shape.bindingLimitBytes ?? STORAGE_BINDING_LIMIT_BYTES;
+  const pairStorage = shape.pairStorage ?? "f16";
+  const pairBytes = bytesOf(pairStorage);
+  const pairs = length * length;
+  const pair = planShards(pairs * 128, 128, limit, pairBytes).count;
+  const whole = planShards(wholeProjectionStride(length) * 128, 2,
+    limit, bytesOf(shape.triangleWholeStorage ?? "f16")).count;
+  const rows = triangleBlockRows(length, 128, 128, scratchBudget(TRIANGLE_BLOCK_TARGET_BYTES));
+  const chunks = residueChunks(length, rows, 128, pairStorage, limit);
+  const windowRows = (Math.ceil(length / chunks) - 1) * length + rows;
+  const windowed = pair > 1 && storageWords(windowRows * 128, pairStorage) * 4 <= limit;
+  return triangleStorageSlots(pair, whole, windowed) <= perStage;
+}
+
+/**
  * The longest prediction of this shape whose every binding fits.
  *
  * Found by bisection rather than by algebra: the sizes come from the same
@@ -213,7 +250,8 @@ export function oversizedBindings(shape: PredictionShape): readonly BindingSize[
 export function maximumPredictionLength(
   shape: Omit<PredictionShape, "length">, ceiling = 16_384,
 ): number {
-  const fits = (length: number): boolean => oversizedBindings({ ...shape, length }).length === 0;
+  const fits = (length: number): boolean => oversizedBindings({ ...shape, length }).length === 0
+    && triangleSlotsFit({ ...shape, length });
   if (!fits(1)) return 0;
   if (fits(ceiling)) return ceiling;
   let low = 1;
