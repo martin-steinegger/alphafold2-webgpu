@@ -141,13 +141,14 @@ describe("which hardware matrix configuration is used", () => {
     // hand-tiled kernel rather than being offered a shape it cannot run.
     expect(gemmVariantCandidates(fakeDevice(true, true), [config("f16", 12, 12, 16)])
       .some((variant) => variant.precision === "matrix")).toBe(false);
-    // The staged kernel fits the storage every implementation guarantees, so
-    // a device is not asked for more than that to be offered it.
+    // Aligning the staged tile strides took the shallowest 128-wide kernel to
+    // 17,888 bytes, past the 16 KiB every implementation guarantees. A device
+    // that grants only the baseline keeps the hand-tiled kernel; the alignment
+    // is worth 2.1% of a main block and this is what it costs.
     expect(gemmVariantCandidates(fakeDevice(true, true, 16384), [config("f16", 16, 16, 16)])
-      .some((variant) => variant.precision === "matrix")).toBe(true);
-    // One that grants less than it declares still keeps the hand-tiled kernel.
-    expect(gemmVariantCandidates(fakeDevice(true, true, 8192), [config("f16", 16, 16, 16)])
       .some((variant) => variant.precision === "matrix")).toBe(false);
+    expect(gemmVariantCandidates(fakeDevice(true, true, 32768), [config("f16", 16, 16, 16)])
+      .some((variant) => variant.precision === "matrix")).toBe(true);
   });
 });
 

@@ -118,11 +118,24 @@ const LANES = SUBGROUPS * 32;
  */
 const paddedHeadDim = (headDim: number): number => Math.max(headDim, UNIT);
 
-/** Row length of the staged query, key and value tiles, padded past the head. */
-const tileStride = (headDim: number): number => paddedHeadDim(headDim) + 2;
-const SCORE_STRIDE = KEY_TILE + 1;
-const WEIGHTED_STRIDE = 33;
-const PROBABILITY_STRIDE = KEY_TILE + 2;
+/**
+ * Row lengths of the staged tiles, padded past what they hold.
+ *
+ * The padding is what the matrix instructions want, not what avoids bank
+ * conflicts. A tile a matrix load reads wants a row length that is a multiple
+ * of eight halves; one a matrix store writes wants a multiple of four words.
+ * These were one and two before, which is the right padding for the banks and
+ * the wrong alignment for the units: it cost the four flash kernels 21.2 ms of
+ * a main block against 15.2, and a whole fold 11%.
+ *
+ * ColabFold's Volta kernels say the same in a comment, which is where this
+ * came from: "SS_LD = BK + 4, f32 ldm: multiple of 4 for wmma stores" and
+ * "PS_LD = BK + 8, f16 ldm: multiple of 8 for wmma loads".
+ */
+const tileStride = (headDim: number): number => paddedHeadDim(headDim) + 8;
+const SCORE_STRIDE = KEY_TILE + 4;
+const WEIGHTED_STRIDE = 36;
+const PROBABILITY_STRIDE = KEY_TILE + 8;
 
 /** Whether this device can run it, and with which unit shape. */
 export function attentionMatrixShape(

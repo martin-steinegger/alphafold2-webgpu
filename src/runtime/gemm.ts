@@ -91,9 +91,15 @@ export function matrixGemmStorageBytes(
   const columnTiles = tileColumns / N;
   const columnGroups = columnTiles % 2 === 0 ? 2 : 1;
   const subgroups = (GEMM_TILE_ROWS / M) * columnGroups;
-  const aStride = kStep + 2;
+  // Padded for the instructions rather than for the banks: a tile a matrix
+  // load reads wants a row length that is a multiple of eight halves, and one
+  // a matrix store writes a multiple of four words. These read plus two and
+  // plus one before, against the weight tile's plus eight, and squaring them
+  // up is 2.1% of a main block. See attention-matrix.ts, which had the same
+  // four constants wrong for the same reason.
+  const aStride = kStep + 8;
   const bStride = tileColumns + 8;
-  const outStride = N + 1;
+  const outStride = N + 4;
   const reach = (maxOffset: number, stride: number, count: number): number =>
     maxOffset + stride * count;
   return reach((GEMM_TILE_ROWS - M) * aStride, aStride, M) * 2
@@ -431,9 +437,15 @@ function createMatrixGemmShaderF16(
   const subgroups = rowGroups * columnGroups;
   const lanes = subgroups * MATRIX_LANES;
   const groupTiles = columnTiles / columnGroups;
-  const aStride = kStep + 2;
+  // Padded for the instructions rather than for the banks: a tile a matrix
+  // load reads wants a row length that is a multiple of eight halves, and one
+  // a matrix store writes a multiple of four words. These read plus two and
+  // plus one before, against the weight tile's plus eight, and squaring them
+  // up is 2.1% of a main block. See attention-matrix.ts, which had the same
+  // four constants wrong for the same reason.
+  const aStride = kStep + 8;
   const bStride = tileColumns + 8;
-  const outStride = N + 1;
+  const outStride = N + 4;
   // A load or store reaches offset + stride * rows, not the last element it
   // touches; an array sized to the latter is out of bounds by the extension's
   // own rule however valid every index in it is.
