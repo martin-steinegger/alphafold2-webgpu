@@ -5,7 +5,7 @@
  * Usage: tsx tools/predict-multimer.ts <manifest.json> <CHAIN_A:CHAIN_B[:...]> [recycles]
  */
 import { create, globals } from "webgpu";
-import { dawnInstanceFlags, fitScratchBudgetScale } from "../src/runtime/dawn.js";
+import { dawnInstanceFlags, fitScratchBudgetScale, scratchBudgetScalesFor } from "../src/runtime/dawn.js";
 import { nativeMemoryBudgetBytes, selectGpu } from "./native-device.js";
 import { AlphaFoldMultimerGpu } from "../src/model/multimer.js";
 import { EXACT_STORAGE } from "../src/model/monomer.js";
@@ -50,7 +50,7 @@ const memoryBudget = nativeMemoryBudgetBytes();
 const scratchBudgetScale = memoryBudget === undefined ? 1 : fitScratchBudgetScale(
   (scale) => planMonomerDevice(adapter, length, 1, 1, undefined, false,
     { ...baseMemoryOptions, scratchBudgetScale: scale }).memory.estimatedPeakBytes,
-  memoryBudget);
+  memoryBudget, scratchBudgetScalesFor(length));
 const plan = planMonomerDevice(adapter, length, 1, 1, undefined, false,
   { ...baseMemoryOptions, scratchBudgetScale });
 console.error(`device memory budget ${memoryBudget === undefined ? "unknown"

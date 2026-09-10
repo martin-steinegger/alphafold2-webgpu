@@ -8,7 +8,7 @@
 import { EXACT_STORAGE } from "../src/model/monomer.js";
 import { readFileSync, writeFileSync } from "node:fs";
 import { create, globals } from "webgpu";
-import { dawnInstanceFlags, fitScratchBudgetScale } from "../src/runtime/dawn.js";
+import { dawnInstanceFlags, fitScratchBudgetScale, scratchBudgetScalesFor } from "../src/runtime/dawn.js";
 import { nativeMemoryBudgetBytes, selectGpu } from "./native-device.js";
 import { AlphaFoldMonomerGpu } from "../src/model/monomer.js";
 import { parseA3m } from "../src/input/a3m.js";
@@ -92,7 +92,7 @@ const memoryBudget = nativeMemoryBudgetBytes();
 const scratchBudgetScale = memoryBudget === undefined ? 1 : fitScratchBudgetScale(
   (scale) => planMonomerDevice(adapter, length, clustered, extra, undefined, false,
     { ...baseMemoryOptions, scratchBudgetScale: scale }).memory.estimatedPeakBytes,
-  memoryBudget);
+  memoryBudget, scratchBudgetScalesFor(length));
 const plan = planMonomerDevice(adapter, length, clustered, extra, undefined, false,
   { ...baseMemoryOptions, scratchBudgetScale });
 console.error(`device memory budget ${memoryBudget === undefined ? "unknown"

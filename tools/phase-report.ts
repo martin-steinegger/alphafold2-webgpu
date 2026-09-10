@@ -13,7 +13,7 @@ import { create, globals } from "webgpu";
 import { AlphaFoldMonomerGpu } from "../src/model/monomer.js";
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
-import { dawnInstanceFlags, fitScratchBudgetScale } from "../src/runtime/dawn.js";
+import { dawnInstanceFlags, fitScratchBudgetScale, scratchBudgetScalesFor } from "../src/runtime/dawn.js";
 import { iterateA3mFeatures } from "../src/input/a3m-features.js";
 import { nativeMemoryBudgetBytes, selectGpu, useFileCalibrationStore } from "./native-device.js";
 import { parseA3m } from "../src/input/a3m.js";
@@ -77,7 +77,8 @@ const extra = Math.max(1, Math.min(extraRows, Math.max(0, depth - clustered)));
 const budget = nativeMemoryBudgetBytes();
 const scratchBudgetScale = budget === undefined ? 1 : fitScratchBudgetScale(
   (scale) => planMonomerDevice(adapter, length, clustered, extra, undefined, false,
-    { scratchBudgetScale: scale }).memory.estimatedPeakBytes, budget);
+    { scratchBudgetScale: scale }).memory.estimatedPeakBytes,
+  budget, scratchBudgetScalesFor(length));
 const plan = planMonomerDevice(adapter, length, clustered, extra, undefined, false,
   { scratchBudgetScale });
 markPhase("request device");
