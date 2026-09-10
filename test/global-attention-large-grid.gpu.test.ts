@@ -16,8 +16,10 @@ function reference(input: GlobalAttentionInput): Float32Array {
     const x0 = activations[row * 2]!; const x1 = activations[row * 2 + 1]!;
     const mean = (x0 + x1) / 2;
     const inverseStd = 1 / Math.sqrt(((x0 - mean) ** 2 + (x1 - mean) ** 2) / 2 + 1e-5);
-    normalized[row * 2] = (x0 - mean) * inverseStd;
-    normalized[row * 2 + 1] = (x1 - mean) * inverseStd;
+    normalized[row * 2] = (x0 - mean) * inverseStd * weights.queryNormScale[0]!
+      + weights.queryNormOffset[0]!;
+    normalized[row * 2 + 1] = (x1 - mean) * inverseStd * weights.queryNormScale[1]!
+      + weights.queryNormOffset[1]!;
   }
   const output = new Float32Array(activations.length);
   for (let column = 0; column < length; column += 1) {
@@ -81,7 +83,10 @@ describe.skipIf(!enabled)("extra-MSA global attention large dispatch grid", () =
     }
     const weights: GlobalAttentionWeights = {
       heads: 1,
-      queryNormScale: new Float32Array([1, 1]), queryNormOffset: new Float32Array(2),
+      // Neither identity: the gate folds the normalization into its weight, so
+      // a unit scale and a zero offset would leave that folding unmeasured.
+      queryNormScale: new Float32Array([1.3, 0.6]),
+      queryNormOffset: new Float32Array([-0.2, 0.45]),
       queryWeight: new Float32Array([0.3, -0.2]),
       keyWeight: new Float32Array([0.4, 0.1]), valueWeight: new Float32Array([0.2, -0.5]),
       gatingWeight: new Float32Array([0.15, -0.25]), gatingBias: new Float32Array([0.05]),

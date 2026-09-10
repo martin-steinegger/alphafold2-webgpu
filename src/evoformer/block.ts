@@ -224,8 +224,8 @@ type EvoformerShape = Pick<
 const GLOBAL_ATTENTION_COMMON = `
 struct Parameters {
   length: u32, sequences: u32, channels: u32, heads: u32, head_dim: u32,
-  query_weight: u32, key_weight: u32, value_weight: u32, gating_weight: u32,
-  gating_bias: u32, output_weight: u32, output_bias: u32,
+  query_weight: u32, key_weight: u32, value_weight: u32, scaled_gating: u32,
+  gating_const: u32, output_weight: u32, output_bias: u32,
   norm_scale: u32, norm_offset: u32, padding_0: u32, padding_1: u32,
 };
 const GRID_WIDTH: u32 = 32768u;
@@ -466,6 +466,36 @@ const NARROW_OUTPUT_TILE_COLUMNS = 64;
 const outputTileColumns = (channels: number): number =>
   channels < GEMM_TILE_COLUMNS ? NARROW_OUTPUT_TILE_COLUMNS : GEMM_TILE_COLUMNS;
 
+/**
+ * The gate's weight with the query normalization already in it.
+ *
+ * The gate contracts the normalized row over its channels, and the
+ * normalization is an affine per channel: scale times weight is a weight, and
+ * offset times weight sums into the bias. Folding them here takes the shader's
+ * inner loop from four loads to two. The sums accumulate in the host's double
+ * precision, so the folded bias is no worse than the loop it replaces.
+ */
+function foldNormalizationIntoGate(
+  weights: GlobalAttentionWeights, channels: number, projected: number,
+): { readonly scaledGating: Float32Array; readonly gatingConst: Float32Array } {
+  const scaledGating = new Float32Array(channels * projected);
+  const constants = new Float64Array(projected);
+  for (let channel = 0; channel < channels; channel += 1) {
+    const scale = weights.queryNormScale[channel]!;
+    const offset = weights.queryNormOffset[channel]!;
+    for (let column = 0; column < projected; column += 1) {
+      const weight = weights.gatingWeight[channel * projected + column]!;
+      scaledGating[channel * projected + column] = scale * weight;
+      constants[column] = constants[column]! + offset * weight;
+    }
+  }
+  const gatingConst = new Float32Array(projected);
+  for (let column = 0; column < projected; column += 1) {
+    gatingConst[column] = constants[column]! + weights.gatingBias[column]!;
+  }
+  return { scaledGating, gatingConst };
+}
+
 function createGlobalAttentionOutputShader(
   residual: boolean, storage: ActivationStorage = "f32", shards: ShardLayout = GLOBAL_UNSHARDED,
 
@@ -490,16 +520,26 @@ ${residual ? "" : shardLoader(shards, "source", storage)}
 ${shardStorer(shards, "output", storage)}
 ${storage === "f16" || residual ? shardLoader(shards, "output", storage) : ""}
 ${storage === "f16" ? shardWordLoader(shards, "output") : ""}
-${globalAttentionLoader(sourceBinding)}
 
 // Rows and the MSA are both sequence-major here.
+//
+// The normalization is folded into the gating weight rather than applied to
+// every value read: the scale and the offset are per channel and the gate
+// contracts over channels, so scale times weight is one tensor and offset
+// times weight sums into the bias. That leaves two loads an iteration where
+// there were four, and this loop is the largest single cost in the extra
+// stack. The mean stays inside the sum, which keeps the arithmetic the same
+// as the normalized form rather than trading it for a cancelling difference.
 fn gated_attention(row: u32, projected_channel: u32) -> f32 {
   let column = row % p.length;
   let projected = p.heads * p.head_dim;
-  var gate = weights[p.gating_bias + projected_channel];
+  let mean = statistics[2u * row];
+  var gate = 0.0;
   for (var c = 0u; c < p.channels; c += 1u) {
-    gate += normalized_element(row, c) * weights[p.gating_weight + c * projected + projected_channel];
+    gate += (${sourceBinding}_load(row * p.channels + c) - mean)
+      * weights[p.scaled_gating + c * projected + projected_channel];
   }
+  gate = gate * statistics[2u * row + 1u] + weights[p.gating_const + projected_channel];
   return attended[column * projected + projected_channel] / (1.0 + exp(-gate));
 }`,
     rows: "p.sequences * p.length",
@@ -524,9 +564,6 @@ ${[0, 2].map((pair) => `          if (column + ${pair + 1}u < p.channels) {
           }`).join("\n")}` } : {}),
   });
 }
-
-const GLOBAL_ATTENTION_OUTPUT_SHADER = createGlobalAttentionOutputShader(false);
-const GLOBAL_ATTENTION_OUTPUT_RESIDUAL_SHADER = createGlobalAttentionOutputShader(true);
 
 function uniform(execution: WebGpuExecution, label: string, data: ArrayBufferView): GpuTensor {
   return execution.upload(label, data, GPUBufferUsage.UNIFORM);
@@ -907,14 +944,15 @@ async function encodeGlobalAttention(
   outputUsage: GPUBufferUsageFlags = GPUBufferUsage.STORAGE,
 ): Promise<GpuTensor> {
   const w = weightsValue;
+  const headDim = w.gatingBias.length / w.heads;
+  const { scaledGating, gatingConst } = foldNormalizationIntoGate(w, shape.cM, w.heads * headDim);
   const tensors = [w.queryNormScale, w.queryNormOffset, w.queryWeight, w.keyWeight, w.valueWeight,
-    w.gatingWeight, w.gatingBias, w.outputWeight, w.outputBias] as const;
+    scaledGating, gatingConst, w.outputWeight, w.outputBias] as const;
   const offsets: number[] = [];
   let size = 0;
   for (const tensor of tensors) { offsets.push(size); size += tensor.length; }
   const packed = new Float32Array(size);
   tensors.forEach((tensor, index) => packed.set(tensor, offsets[index]));
-  const headDim = w.gatingBias.length / w.heads;
   const params = new Uint32Array([
     shape.length, shape.sequences, shape.cM, w.heads, headDim,
     offsets[2]!, offsets[3]!, offsets[4]!, offsets[5]!, offsets[6]!, offsets[7]!, offsets[8]!,
