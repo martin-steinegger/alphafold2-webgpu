@@ -123,6 +123,16 @@ export interface WebGpuExecutionOptions {
    * takes on a device with a small limit, and reports what still exceeds it.
    */
   readonly bindingBudgetBytes?: number;
+  /**
+   * Bytes above which a binding is recorded, without changing any behaviour.
+   *
+   * bindingBudgetBytes cannot do this: it is the limit every kernel windows
+   * and shards against, so lowering it far enough to enumerate the small
+   * bindings asks the triangle for 131 of them and the device refuses. This
+   * only reports, so a short prediction can list what it binds and at what
+   * size while taking exactly the path it normally takes.
+   */
+  readonly bindingReportBytes?: number;
 }
 
 export class WebGpuExecution {
@@ -153,6 +163,7 @@ export class WebGpuExecution {
       throw new RangeError("transitionBufferLimit must be a positive safe integer");
     }
     this.#bindingBudgetBytes = options.bindingBudgetBytes;
+    this.#bindingReportBytes = options.bindingReportBytes;
     this.bindingLimitBytes = Math.min(
       device.limits.maxStorageBufferBindingSize, options.bindingBudgetBytes ?? Number.MAX_SAFE_INTEGER);
   }
@@ -237,7 +248,7 @@ export class WebGpuExecution {
   }
 
   #recordOversizedBindings(tensors: readonly GpuTensor[], label: string | undefined): void {
-    const budget = this.#bindingBudgetBytes;
+    const budget = this.#bindingReportBytes ?? this.#bindingBudgetBytes;
     if (budget === undefined) return;
     for (const tensor of tensors) {
       const bytes = tensor.elements * 4;
@@ -250,6 +261,7 @@ export class WebGpuExecution {
   }
 
   #bindingBudgetBytes: number | undefined;
+  #bindingReportBytes: number | undefined;
   readonly #oversizedBindings = new Map<string, number>();
 
   /** Dispatches a growing loop puts in one command buffer before splitting it. */
@@ -317,7 +329,9 @@ export class WebGpuExecution {
         timestampWrites: timestampWrites!,
       });
     }
-    if (this.#bindingBudgetBytes !== undefined) this.#recordOversizedBindings(tensors, label);
+    if (this.#bindingBudgetBytes !== undefined || this.#bindingReportBytes !== undefined) {
+      this.#recordOversizedBindings(tensors, label);
+    }
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, this.device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),

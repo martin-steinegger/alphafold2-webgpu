@@ -16,8 +16,13 @@ import { iterateA3mFeatures } from "../src/input/a3m-features.js";
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { FileTensorStore } from "../src/reference/tensor-store.js";
 import { planMonomerDevice, requestAlphaFoldDevice } from "../src/runtime/device.js";
+import { selectGpu } from "./native-device.js";
+import { formatProbedBindings, probeBindings } from "../src/runtime/binding-probe.js";
 
 Object.assign(globalThis, globals);
+// CUDA_VISIBLE_DEVICES alone does nothing here. Without this the run lands on
+// whichever card the driver enumerates first, which on this host is contended.
+selectGpu();
 
 const length = Number(process.argv[2] ?? "128");
 const msaRows = Number(process.argv[3] ?? "128");
@@ -76,6 +81,9 @@ if (process.env.AFWEBGPU_MEMORY === "1") {
     return original(descriptor);
   };
 }
+// AFWEBGPU_PROBE_BINDINGS=1 lists every storage binding the whole prediction
+// makes, the heads included, which the execution's own report cannot see.
+const probe = process.env.AFWEBGPU_PROBE_BINDINGS === "1" ? probeBindings(device) : undefined;
 try {
   const profileMode = process.env.AFWEBGPU_PROFILE ?? "";
   const profile = profileMode !== "";
@@ -83,11 +91,15 @@ try {
   // AFWEBGPU_BINDING_MIB lists the kernels that bind more than that of one
   // buffer, which is what a device with a small binding limit would refuse.
   const bindingMib = Number(process.env.AFWEBGPU_BINDING_MIB ?? "");
+  const reportMib = Number(process.env.AFWEBGPU_BINDING_REPORT_MIB ?? "");
   const monomer = new AlphaFoldMonomerGpu(device, {
     ...(profile ? { profile: true } : {}),
     ...memoryOptions,
     ...(poolMib > 0 ? { maxPooledBytes: poolMib * 1024 ** 2 } : {}),
     ...(bindingMib > 0 ? { bindingBudgetBytes: bindingMib * 1024 ** 2 } : {}),
+    // AFWEBGPU_BINDING_REPORT_MIB lists what a prediction binds without
+    // changing how it binds it, which a lowered budget cannot do.
+    ...(reportMib > 0 ? { bindingReportBytes: Math.round(reportMib * 1024 ** 2) } : {}),
   });
   const features = iterateA3mFeatures(device, a3m, featureTables, {
     recycles: recycles - 1, maxMsaSequences: msaRows, maxExtraSequences: extraRows, randomSeed: 0,
@@ -109,9 +121,13 @@ try {
     dispatchesPerSubmission: monomer.submissionDispatchLimit,
     meanPlddt: Number(prediction.final.confidence.meanPlddt.toFixed(3)),
   }));
+  if (probe !== undefined) {
+    console.error(`\nEvery storage binding (${probe.bindings.length} labels):`);
+    console.error(formatProbedBindings(probe.bindings));
+  }
   if (monomer.oversizedBindings.size > 0) {
     const over = [...monomer.oversizedBindings].sort((a, b) => b[1] - a[1]);
-    console.error(`\nBindings over ${bindingMib} MiB (${over.length} labels):`);
+    console.error(`\nBindings over ${reportMib > 0 ? reportMib : bindingMib} MiB (${over.length} labels):`);
     for (const [label, bytes] of over) {
       console.error(`  ${(bytes / 1024 ** 2).toFixed(1).padStart(8)} MiB  ${label}`);
     }

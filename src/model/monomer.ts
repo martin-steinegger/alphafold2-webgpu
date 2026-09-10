@@ -185,6 +185,8 @@ export interface MonomerGpuOptions {
    * kernels that would fail there, at a length small enough to run quickly.
    */
   readonly bindingBudgetBytes?: number;
+  /** Records every binding above this many bytes without changing behaviour. */
+  readonly bindingReportBytes?: number;
   /** Internal model architecture selector used by AlphaFoldMultimerGpu. */
   readonly multimer?: boolean;
   /** Multimer CA-distance RMS threshold; negative disables early stopping. */
@@ -269,6 +271,7 @@ export class AlphaFoldMonomerGpu {
   readonly maxPooledBytes: number | undefined;
   readonly onProgress: MonomerProgressCallback | undefined;
   readonly bindingBudgetBytes: number | undefined;
+  readonly bindingReportBytes: number | undefined;
   /** Dispatch label to largest binding, for the labels above the budget. */
   oversizedBindings: ReadonlyMap<string, number> = new Map();
   /** Dispatches a command buffer held by the end of the last prediction. */
@@ -290,6 +293,7 @@ export class AlphaFoldMonomerGpu {
     this.maxPooledBytes = options.maxPooledBytes
       ?? (this.compactTransitions ? COMPACT_GPU_POOL_BYTES : undefined);
     this.bindingBudgetBytes = options.bindingBudgetBytes;
+    this.bindingReportBytes = options.bindingReportBytes;
     this.onProgress = options.onProgress;
     this.multimer = options.multimer ?? false;
     this.returnFinalPair = options.returnFinalPair ?? false;
@@ -420,6 +424,7 @@ export class AlphaFoldMonomerGpu {
       ...(this.compactTransitions ? { transitionBufferLimit: TRANSITION_CHUNK_TARGET_BYTES } : {}),
       ...(this.maxPooledBytes === undefined ? {} : { maxPooledBytes: this.maxPooledBytes }),
       ...(this.bindingBudgetBytes === undefined ? {} : { bindingBudgetBytes: this.bindingBudgetBytes }),
+      ...(this.bindingReportBytes === undefined ? {} : { bindingReportBytes: this.bindingReportBytes }),
     });
     this.oversizedBindings = execution.oversizedBindings;
     const results: MonomerRecycleSummary[] = [];
