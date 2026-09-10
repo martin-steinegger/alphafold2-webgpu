@@ -455,6 +455,9 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
  * workgroup owns whole rows, and the contraction's last barrier separates
  * every gate read from every store.
  */
+/** Output columns one workgroup covers; the extra-MSA channel count. */
+const GLOBAL_OUTPUT_TILE_COLUMNS = 64;
+
 function createGlobalAttentionOutputShader(
   residual: boolean, storage: ActivationStorage = "f32", shards: ShardLayout = GLOBAL_UNSHARDED,
 
@@ -494,6 +497,10 @@ fn gated_attention(row: u32, projected_channel: u32) -> f32 {
     rows: "p.sequences * p.length",
     inner: "p.heads * p.head_dim",
     columns: "p.channels",
+    // The extra-MSA channel count is 64 against a 128-wide tile, so half of
+    // every workgroup's accumulators would be masked off at the store and the
+    // multiplies behind them thrown away.
+    tileColumns: GLOBAL_OUTPUT_TILE_COLUMNS,
     sourceElement: "gated_attention(row, k)",
     weightElement: "weights[p.output_weight + k * p.channels + column]",
     store: `let index = row * p.channels + column;
@@ -971,7 +978,8 @@ async function encodeGlobalAttention(
     queryGrid[0], queryGrid[1], 1, `${label}.query`);
   execution.dispatch(encoder, flashPipeline, [query, keys, values, mask, parameters, attended],
     shape.length, w.heads, 1, `${label}.flash`);
-  const outputGrid = gemmGrid(shape.sequences * shape.length, shape.cM);
+  const outputGrid = gemmGrid(shape.sequences * shape.length, shape.cM,
+    GLOBAL_OUTPUT_TILE_COLUMNS);
   // The residual form reads the output binding, so the source is not bound twice.
   const outputViews = output === source ? sourceViews : shardsOf(output);
   execution.dispatch(encoder, outputPipeline,
