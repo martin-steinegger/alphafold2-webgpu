@@ -1365,9 +1365,19 @@ function triangleSetup(
   // chain. Worth 2.4x on those kernels: the chain's branch stops the compiler
   // forming the wide contiguous loads a staged matrix tile wants. Blocks step
   // by whole residues, so a window always starts where a binding may.
-  const pairWindowBytes = storageWords(blockRows * input.length * input.cZ, pairStorage) * 4;
+  const pairBindingBytes = input.pairBindingBytes ?? execution.bindingLimitBytes;
+  // The outgoing direction reads a run of pair rows outright. The incoming one
+  // reads a column window of every row, so its residue axis is cut into chunks
+  // whose rows are contiguous: a chunk of C residues touches (C - 1) * L +
+  // blockRows of them. Two chunks cover a 3,300-residue pair, so this costs
+  // dispatches rather than traffic.
+  const pairChunks = direction === "outgoing" ? 1
+    : residueChunks(input.length, blockRows, input.cZ, pairStorage, pairBindingBytes);
+  const pairWindowRows = direction === "outgoing"
+    ? blockRows * input.length
+    : (Math.ceil(input.length / pairChunks) - 1) * input.length + blockRows;
   const pairWindow = pairShards.count > 1
-    && pairWindowBytes <= (input.pairBindingBytes ?? execution.bindingLimitBytes);
+    && storageWords(pairWindowRows * input.cZ, pairStorage) * 4 <= pairBindingBytes;
   const pipelineKey = `block:triangle:${direction}:${input.length}:${input.cZ}`
     + `:${input.triangleHidden}:${blockRows}:${wholeStorage}:${pairStorage}:${pairShards.count}`
     + `:${wholeShards.count}:${pairWindow}`;
@@ -1398,8 +1408,26 @@ function triangleSetup(
   ];
   return {
     packed, blockRows, wholeStorage, pairStorage, pairShards, wholeShards, pairWindow,
-    wholeStride, requests, overrides,
+    pairChunks, wholeStride, requests, overrides,
   };
+}
+
+/**
+ * Residue chunks the incoming projections need to read the pair as a window.
+ *
+ * A chunk of C residues touches (C - 1) * L + blockRows pair rows, contiguous,
+ * so the largest C whose window fits one binding gives the fewest dispatches.
+ * One where the whole pair already fits.
+ */
+export function residueChunks(
+  length: number, blockRows: number, cZ: number,
+  storage: ActivationStorage, bindingBytes: number,
+): number {
+  const rowBytes = storageWords(cZ, storage) * 4;
+  const maxRows = Math.floor(bindingBytes / rowBytes);
+  if (maxRows >= length * length) return 1;
+  const perChunk = Math.floor((maxRows - blockRows) / length) + 1;
+  return perChunk < 1 ? length : Math.ceil(length / perChunk);
 }
 
 /**
@@ -1443,8 +1471,8 @@ async function encodeTriangleMultiplication(
   residualTarget?: GpuTensor,
 ): Promise<GpuTensor> {
   const {
-    packed, blockRows, wholeStorage, pairStorage, pairShards, wholeShards, pairWindow, wholeStride, requests,
-    overrides,
+    packed, blockRows, wholeStorage, pairStorage, pairShards, wholeShards, pairWindow, pairChunks,
+    wholeStride, requests, overrides,
   } = triangleSetup(execution, input, weightsValue, direction, residualTarget !== undefined);
   // Indexed rather than destructured: requests is the one place the order is
   // written down, and a tuple type restated here would be a second one.
@@ -1476,7 +1504,10 @@ async function encodeTriangleMultiplication(
     const count = Math.min(blockRows, input.length - offset);
     blocks.push({ offset, count,
       uniform: uniform(execution, `triangle.${direction}.block-${offset}`,
-        new Uint32Array([offset * input.length, count * input.length, offset === 0 ? 1 : 0, count])) });
+        // z is the first residue of the chunk this dispatch covers, which is
+        // zero for a pass over the whole block. It held a first-block flag no
+        // shader ever read.
+        new Uint32Array([offset * input.length, count * input.length, 0, count])) });
   }
 
   // Every consumer of the normalized pair normalizes the raw pair while
@@ -1492,20 +1523,56 @@ async function encodeTriangleMultiplication(
   // plain array where the shard chain put a branch, which is what the chain
   // costs: 2.4x on these kernels, measured at 1,650 residues with the pair
   // split in two. Only the readers whose rows are block.x + row may take it.
-  const windowOf = (block: (typeof blocks)[number]): readonly GpuTensor[] => [execution.view(pair,
-    storageWords(block.offset * input.length * input.cZ, pairStorage),
-    storageWords(block.count * input.length * input.cZ, pairStorage))];
+  const windowOf = (firstRow: number, rows: number): readonly GpuTensor[] => [execution.view(pair,
+    storageWords(firstRow * input.cZ, pairStorage), storageWords(rows * input.cZ, pairStorage))];
+  // One pass a block going out, one a residue chunk coming in. A chunk starts
+  // at residue i0, so its first pair row is i0 * L + the block's own offset,
+  // and it spans (C - 1) * L + count of them.
+  const perChunk = Math.ceil(input.length / pairChunks);
+  const passes = (block: (typeof blocks)[number]): readonly {
+    readonly uniform: GpuTensor; readonly rows: number; readonly window: readonly GpuTensor[];
+    readonly label: string;
+  }[] => {
+    if (direction === "outgoing") {
+      return [{ uniform: block.uniform, rows: block.count * input.length,
+        window: windowOf(block.offset * input.length, block.count * input.length),
+        label: `${block.offset}` }];
+    }
+    return Array.from({ length: pairChunks }, (_, chunk) => {
+      const first = chunk * perChunk;
+      const residues = Math.min(perChunk, input.length - first);
+      return {
+        uniform: uniform(execution, `triangle.${direction}.chunk-${block.offset}-${first}`,
+          new Uint32Array([block.offset * input.length, residues * block.count, first, block.count])),
+        rows: residues * block.count,
+        window: windowOf(first * input.length + block.offset, (residues - 1) * input.length + block.count),
+        label: `${block.offset}-${first}`,
+      };
+    });
+  };
+  /** The block's own rows, which is what a kernel that is not chunked reads. */
+  const wholeBlockPass = (block: (typeof blocks)[number], windowed: boolean) => [{
+    uniform: block.uniform, rows: block.count * input.length, label: `${block.offset}`,
+    window: windowed
+      ? windowOf(block.offset * input.length, block.count * input.length) : pairViews,
+  }];
   const project = (pipeline: GPUComputePipeline, target: readonly GpuTensor[],
-    block: (typeof blocks)[number], label: string, windowed = false): void => {
-    const grid = gemmGrid(block.count * input.length, 2 * input.triangleHidden);
-    const source = windowed ? windowOf(block) : pairViews;
-    execution.dispatch(encoder, pipeline, [...source, pairMask, weights, statistics, ...target, block.uniform],
-      grid[0], grid[1], 1, `triangle.${direction}.${label}-${block.offset}`);
+    block: (typeof blocks)[number], label: string, windowed = false,
+    // The whole operand is written at its own pair row in both directions, so
+    // it reads a run of them and must not be cut by residue: its rows are
+    // block.x + row, which a chunk's window does not start at.
+    chunked = false): void => {
+    for (const pass of windowed && chunked ? passes(block) : wholeBlockPass(block, windowed)) {
+      const grid = gemmGrid(pass.rows, 2 * input.triangleHidden);
+      execution.dispatch(encoder, pipeline,
+        [...pass.window, pairMask, weights, statistics, ...target, pass.uniform],
+        grid[0], grid[1], 1, `triangle.${direction}.${label}-${pass.label}`);
+    }
   };
   // The whole operand is written at its pair row in both directions; the block
   // operand and the gate only run over a run of rows in the outgoing one.
   const outgoing = direction === "outgoing";
-  const blockWindowed = pairWindow && outgoing;
+  const blockWindowed = pairWindow;
 
   // Both directions block the output rows. The operand indexed by the output's
   // first residue is projected per block; the other has to be complete before
@@ -1538,7 +1605,7 @@ async function encodeTriangleMultiplication(
     [encoder, dispatchedAtSplit] = await splitWhenLong(execution, encoder, dispatchedAtSplit, input.flush,
       `triangle.${direction}.flush-${block.offset}`);
     const rows = block.count * input.length;
-    project(projectBlockOperand, [blockedProjection], block, "project-block", blockWindowed);
+    project(projectBlockOperand, [blockedProjection], block, "project-block", blockWindowed, true);
     const contractGrid = gemmGrid(block.count, input.length);
     for (const group of channelGroups) {
       execution.dispatch(encoder, contract,
@@ -1553,9 +1620,12 @@ async function encodeTriangleMultiplication(
     // projection is the first thing to write it.
     const gateGrid = gemmGrid(rows, input.cZ);
     const gateBlock = execution.view(gate, 0, rows * input.cZ);
-    execution.dispatch(encoder, projectGate,
-      [...(blockWindowed ? windowOf(block) : pairViews), weights, statistics, gateBlock, block.uniform],
-      gateGrid[0], gateGrid[1], 1, `triangle.${direction}.project-gate-${block.offset}`);
+    for (const pass of blockWindowed ? passes(block) : wholeBlockPass(block, false)) {
+      const grid = gemmGrid(pass.rows, input.cZ);
+      execution.dispatch(encoder, projectGate,
+        [...pass.window, weights, statistics, gateBlock, pass.uniform],
+        grid[0], grid[1], 1, `triangle.${direction}.project-gate-${pass.label}`);
+    }
     execution.dispatch(encoder, projectOutput,
       [gateBlock, contracted, weights, stats, ...outputViews, block.uniform],
       gateGrid[0], gateGrid[1], 1, `triangle.${direction}.project-output-${block.offset}`);

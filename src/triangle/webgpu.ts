@@ -151,7 +151,9 @@ class TriangleMultiplicationGpu {
       for (let offset = 0; offset < length; offset += blockRows) {
         const count = Math.min(blockRows, length - offset);
         blocks.push({ offset, count, params: keep(this.allocator.upload(`triangle.block-${offset}`,
-          new Uint32Array([offset * length, count * length, offset === 0 ? 1 : 0, count]), GPUBufferUsage.UNIFORM)).buffer });
+          // z is the chunk's first residue, zero for a pass over the whole
+          // block; this path never chunks. It held an unread first-block flag.
+          new Uint32Array([offset * length, count * length, 0, count]), GPUBufferUsage.UNIFORM)).buffer });
       }
       // One workgroup per pair row.
       const rowGrid: readonly [number, number] = [

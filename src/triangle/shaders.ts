@@ -202,8 +202,20 @@ export function createTriangleShaders(
   // overwrites pair entries no later block reads, so the output can be the
   // pair itself, and the whole operand b is a plain projection in pair-row
   // order.
+  // block.z carries the first residue index of the chunk this dispatch covers,
+  // which is zero unless the incoming projections were split. The incoming
+  // direction reads a column window of every pair row, so the only way to give
+  // it one binding is to cut the residue axis: a chunk of C of them touches
+  // pair rows i0 * L + offset up to (i0 + C - 1) * L + offset + count, which is
+  // contiguous. Two chunks cover a 3,300-residue pair.
   const blockPairRow = outgoing
-    ? "block.x + row" : "(row / block.w) * L + block.x / L + row % block.w";
+    ? "block.x + row"
+    : "(block.z + row / block.w) * L + block.x / L + row % block.w";
+  // The same row counted from the start of that window.
+  const localPairRow = outgoing ? "row" : "((row / block.w) * L + row % block.w)";
+  // Where the row sits in the block, which is what the block operand and the
+  // gate are stored at and what the output projection later reads them by.
+  const blockRow = outgoing ? "row" : "(block.z * block.w + row)";
 
   // One workgroup per pair row, so the channel reads of a row are contiguous
   // across lanes. The statistics let every later consumer normalize the raw
@@ -251,8 +263,9 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
 
   // The output gate is a projection of the normalized input, so like the
   // contraction inputs it normalizes the raw pair while loading it.
-  // Only the outgoing direction reads its block as a run of pair rows.
-  const gateWindowed = pairWindow && outgoing;
+  // Both directions now: outgoing reads a run of pair rows outright, incoming
+  // reads one once the residue axis is chunked. See blockPairRow.
+  const gateWindowed = pairWindow;
   const gateSlots = pairSlotsOf(gateWindowed);
   const projectGate = createTiledGemmShader({
     preamble: `${common}
@@ -266,8 +279,8 @@ ${pairBindings("z", 0, false, gateWindowed)}
 ${pairAccessors("z", gateWindowed)}
 
 fn pair_row_of(row: u32) -> u32 { return ${blockPairRow}; }
-// Where the row starts in the binding, which is the block for a window.
-fn pair_base_of(row: u32) -> u32 { return ${gateWindowed ? "row" : "pair_row_of(row)"} * CZ; }
+// Where the row starts in the binding, which is the chunk for a window.
+fn pair_base_of(row: u32) -> u32 { return ${gateWindowed ? localPairRow : "pair_row_of(row)"} * CZ; }
 
 fn normalized_input(row: u32, k: u32) -> f32 {
   let pair_row = pair_row_of(row);
@@ -283,7 +296,8 @@ fn normalized_input(row: u32, k: u32) -> f32 {
     // the other layout, and reading it that way costs bandwidth silently.
     weightContiguous: "k",
     weightElement: read(precision, "weights[W_LINEARGWEIGHT + column * CZ + k]"),
-    store: `gate[row * CZ + column] = logistic(element + ${read(precision, "weights[W_LINEARGBIAS + column]")});`,
+    store: `gate[${blockRow} * CZ + column] = logistic(element`
+      + ` + ${read(precision, "weights[W_LINEARGBIAS + column]")});`,
   });
 
   /**
@@ -297,7 +311,7 @@ fn normalized_input(row: u32, k: u32) -> f32 {
    */
   const project = (
     operand: "a" | "b", stride: string, pairRow: string, storeRow: string, packed: boolean,
-    shards: ShardLayout = WHOLE_OPERAND_UNSHARDED, windowed = false,
+    shards: ShardLayout = WHOLE_OPERAND_UNSHARDED, windowed = false, localRow = "row",
   ): string => {
     const pairSlots = pairSlotsOf(windowed);
     const upper = operand.toUpperCase();
@@ -320,8 +334,8 @@ ${pairAccessors("z", windowed)}
 ${shardStorer(shards, operand, wholeStorage)}
 
 fn pair_row_of(row: u32) -> u32 { return ${pairRow}; }
-// Where the row starts in the binding, which is the block for a window.
-fn pair_base_of(row: u32) -> u32 { return ${windowed ? "row" : "pair_row_of(row)"} * CZ; }
+// Where the row starts in the binding, which is the chunk for a window.
+fn pair_base_of(row: u32) -> u32 { return ${windowed ? localRow : "pair_row_of(row)"} * CZ; }
 
 fn normalized_input(row: u32, k: u32) -> f32 {
   let pair_row = pair_row_of(row);
@@ -543,8 +557,8 @@ fn normalized_hidden(row: u32, h: u32) -> f32 {
   // The block operand is stored block-relative, the whole operand at its pair row.
   // Outgoing contracts a's rows i against b's rows j; incoming contracts a's
   // columns j against b's columns i. In both, a is the block operand.
-  const projectBlockOperand = project("a", "BLOCK_PAIRS", blockPairRow, "row", false,
-    WHOLE_OPERAND_UNSHARDED, pairWindow && outgoing);
+  const projectBlockOperand = project("a", "BLOCK_PAIRS", blockPairRow, blockRow, false,
+    WHOLE_OPERAND_UNSHARDED, pairWindow, localPairRow);
   // The whole operand is written at its pair row in both directions, so it
   // reads the block's own rows either way and always takes the window.
   const projectWholeOperand = project("b", "WHOLE_STRIDE", "block.x + row", "block.x + row", packedWhole,
