@@ -496,66 +496,117 @@ function foldNormalizationIntoGate(
   return { scaledGating, gatingConst };
 }
 
+/**
+ * How many rows of gated attention values one window holds.
+ *
+ * The gate is a contraction over the input channels and its result is as wide
+ * as the projection it gates, so materializing it whole is a tensor the size
+ * of the MSA: 1.08 GB at 825 residues and 5,120 rows. A window keeps that
+ * bounded while still letting the contraction be a GEMM.
+ */
+export const GLOBAL_GATE_TARGET_BYTES = 32 * 1024 * 1024;
+
+export function globalAttentionGateRows(
+  rows: number, projected: number, budgetBytes: number,
+): number {
+  const perRow = projected * Float32Array.BYTES_PER_ELEMENT;
+  // Whole tiles, so a window never leaves most of a workgroup masked off.
+  const tiles = Math.max(1, Math.floor(budgetBytes / perRow / GEMM_TILE_ROWS));
+  return Math.min(rows, tiles * GEMM_TILE_ROWS);
+}
+
+/**
+ * The gate, as the contraction it is.
+ *
+ * It used to be computed inside the output projection's source expression, one
+ * scalar dot an element, and that loop was 9.5 ms of an extra-MSA block
+ * against 2.5 for the projection wrapped round it. The shape is a plain
+ * rows x channels x projected GEMM; only the spelling was not. Writing it here
+ * also lets the projection declare its operand as an array and address the
+ * matrix units directly, which a function call can never be.
+ *
+ * The value stored is already gated and divided, so the projection reads what
+ * it used to compute.
+ */
+function createGlobalAttentionGateShader(
+  storage: ActivationStorage, shards: ShardLayout = GLOBAL_UNSHARDED,
+): string {
+  const n = shards.count;
+  return createTiledGemmShader({
+    preamble: `${GLOBAL_ATTENTION_COMMON}
+${shardBindings(shards, "source", storage, 0, false)}
+@group(0) @binding(${n}) var<storage, read> attended: array<f32>;
+@group(0) @binding(${n + 1}) var<storage, read> weights: array<f32>;
+@group(0) @binding(${n + 2}) var<uniform> p: Parameters;
+@group(0) @binding(${n + 3}) var<storage, read> statistics: array<f32>;
+@group(0) @binding(${n + 4}) var<storage, read_write> gated: array<f32>;
+// x is the first row of this window and y the rows it covers. The MSA and the
+// statistics are bound whole and read at the row this window is on; only the
+// result is a window.
+@group(0) @binding(${n + 5}) var<uniform> window: vec4<u32>;
+${shardLoader(shards, "source", storage)}`,
+    rows: "window.y",
+    inner: "p.channels",
+    columns: "p.heads * p.head_dim",
+    tileColumns: NARROW_OUTPUT_TILE_COLUMNS,
+    // The normalization is folded into the gating weight: the scale and the
+    // offset are per channel and this contracts over channels, so scale times
+    // weight is one tensor and offset times weight sums into the bias. The
+    // mean stays inside the sum, which keeps the arithmetic the same as the
+    // normalized form rather than trading it for a cancelling difference.
+    sourceElement: "source_load((window.x + row) * p.channels + k)"
+      + " - statistics[2u * (window.x + row)]",
+    weightElement: "weights[p.scaled_gating + k * (p.heads * p.head_dim) + column]",
+    store: `let source_row = window.x + row;
+          let projected = p.heads * p.head_dim;
+          let gate = element * statistics[2u * source_row + 1u]
+            + weights[p.gating_const + column];
+          gated[row * projected + column] =
+            attended[(source_row % p.length) * projected + column] / (1.0 + exp(-gate));`,
+  });
+}
+
 function createGlobalAttentionOutputShader(
   residual: boolean, storage: ActivationStorage = "f32", shards: ShardLayout = GLOBAL_UNSHARDED,
 
   spelling?: MatrixSpelling,
 ): string {
   const sourceBinding = residual ? "output" : "source";
-  // Bindings are numbered from zero in the order the dispatch passes them, so
-  // the residual form's list is one set shorter rather than one hole longer.
+  // Bindings are numbered from zero in the order the dispatch passes them.
   let binding = 0;
   const next = (): number => binding++;
   const take = (count: number): number => { const first = binding; binding += count; return first; };
-  const sourceDeclaration = residual ? "" : shardBindings(shards, "source", storage, take(shards.count), false);
   return createTiledGemmShader({
     preamble: `${GLOBAL_ATTENTION_COMMON}
-${sourceDeclaration}
-@group(0) @binding(${next()}) var<storage, read> attended: array<f32>;
+@group(0) @binding(${next()}) var<storage, read> gated: array<f32>;
 @group(0) @binding(${next()}) var<storage, read> weights: array<f32>;
 @group(0) @binding(${next()}) var<uniform> p: Parameters;
 ${shardBindings(shards, "output", storage, take(shards.count), true)}
-@group(0) @binding(${next()}) var<storage, read> statistics: array<f32>;
-${residual ? "" : shardLoader(shards, "source", storage)}
+// x is the first row of this window and y the rows it covers. The gate is a
+// window and the output is bound whole, so one index is relative and one not.
+@group(0) @binding(${next()}) var<uniform> window: vec4<u32>;
 ${shardStorer(shards, "output", storage)}
 ${storage === "f16" || residual ? shardLoader(shards, "output", storage) : ""}
-${storage === "f16" ? shardWordLoader(shards, "output") : ""}
-
-// Rows and the MSA are both sequence-major here.
-//
-// The normalization is folded into the gating weight rather than applied to
-// every value read: the scale and the offset are per channel and the gate
-// contracts over channels, so scale times weight is one tensor and offset
-// times weight sums into the bias. That leaves two loads an iteration where
-// there were four, and this loop is the largest single cost in the extra
-// stack. The mean stays inside the sum, which keeps the arithmetic the same
-// as the normalized form rather than trading it for a cancelling difference.
-fn gated_attention(row: u32, projected_channel: u32) -> f32 {
-  let column = row % p.length;
-  let projected = p.heads * p.head_dim;
-  let mean = statistics[2u * row];
-  var gate = 0.0;
-  for (var c = 0u; c < p.channels; c += 1u) {
-    gate += (${sourceBinding}_load(row * p.channels + c) - mean)
-      * weights[p.scaled_gating + c * projected + projected_channel];
-  }
-  gate = gate * statistics[2u * row + 1u] + weights[p.gating_const + projected_channel];
-  return attended[column * projected + projected_channel] / (1.0 + exp(-gate));
-}`,
-    rows: "p.sequences * p.length",
+${storage === "f16" ? shardWordLoader(shards, "output") : ""}`,
+    rows: "window.y",
     inner: "p.heads * p.head_dim",
     columns: "p.channels",
     // The extra-MSA channel count is 64 against a 128-wide tile, so half of
     // every workgroup's accumulators would be masked off at the store and the
     // multiplies behind them thrown away.
     tileColumns: NARROW_OUTPUT_TILE_COLUMNS,
-    sourceElement: "gated_attention(row, k)",
+    sourceElement: "gated[row * (p.heads * p.head_dim) + k]",
     weightElement: "weights[p.output_weight + k * p.channels + column]",
-    store: `let index = row * p.channels + column;
+    // Both operands really are plain row-major f32 arrays now that the gate is
+    // a tensor rather than a function call, which is what lets this address
+    // the matrix units directly.
+    sourceArray: { array: "gated", stride: "p.heads * p.head_dim" },
+    weightArray: { array: "weights", base: "p.output_weight", stride: "p.channels" },
+    store: `let index = (window.x + row) * p.channels + column;
           let written = element + weights[p.output_bias + column];
           output_store(index, ${residual ? "output_load(index) + written" : "written"});`,
     // Packed storage is written a word (two adjacent channels) at a time.
-    ...(storage === "f16" ? { storeVector: `let base = row * p.channels + column;
+    ...(storage === "f16" ? { storeVector: `let base = (window.x + row) * p.channels + column;
 ${[0, 2].map((pair) => `          if (column + ${pair + 1}u < p.channels) {
             var stored = vec2<f32>(values[${pair}] + weights[p.output_bias + column + ${pair}u],
               values[${pair + 1}] + weights[p.output_bias + column + ${pair + 1}u]);
@@ -965,15 +1016,19 @@ async function encodeGlobalAttention(
   const shards = planShards(shape.sequences * shape.length * shape.cM, shape.cM,
     shape.msaBindingBytes ?? execution.bindingLimitBytes, storage === "f16" ? 2 : 4);
   const key = `${storage}:${shards.count}`;
-  const slots = shards.count * (residualTarget === undefined ? 2 : 1) + 3;
+  // The gate binds the most: every window of the alignment beside the attended
+  // values, the weights, the statistics and the result it writes. The
+  // projection that follows binds the windows of the output and no MSA at all,
+  // which is why the residual form no longer needs a set of its own.
+  const slots = shards.count + 4;
   if (slots > execution.device.limits.maxStorageBuffersPerShaderStage) {
     throw new RangeError(`${label} needs ${slots} storage bindings for ${shards.count} windows of the extra `
       + `alignment, past this device's limit of `
       + `${execution.device.limits.maxStorageBuffersPerShaderStage}. Fewer extra MSA rows will run.`);
   }
   const statisticsLayout = rowNormalizeLayout(execution.device);
-  const [statisticsPipeline, kvPipeline, columnMeanPipeline, queryPipeline, flashPipeline, outputPipeline]
-    = await Promise.all([
+  const [statisticsPipeline, kvPipeline, columnMeanPipeline, queryPipeline, flashPipeline, outputPipeline,
+    gatePipeline] = await Promise.all([
     execution.pipelines.get(
       `block:attention:statistics:${key}:${statisticsLayout.rowsPerWorkgroup}`,
       () => createAttentionStatisticsShader(storage, shards, statisticsLayout)),
@@ -986,6 +1041,8 @@ async function encodeGlobalAttention(
       `block:global-attention:output${residualTarget === undefined ? "" : "-residual"}:${key}`,
       () => createGlobalAttentionOutputShader(residualTarget !== undefined, storage, shards),
     ),
+    execution.pipelines.get(`block:global-attention:gate:${key}`,
+      () => createGlobalAttentionGateShader(storage, shards)),
   ]);
   const shardsOf = (tensor: GpuTensor): readonly GpuTensor[] => {
     if (shards.count === 1) return [tensor];
@@ -1027,16 +1084,29 @@ async function encodeGlobalAttention(
     queryGrid[0], queryGrid[1], 1, `${label}.query`);
   execution.dispatch(encoder, flashPipeline, [query, keys, values, mask, parameters, attended],
     shape.length, w.heads, 1, `${label}.flash`);
-  const outputGrid = gemmGrid(shape.sequences * shape.length, shape.cM,
-    NARROW_OUTPUT_TILE_COLUMNS);
-  // The residual form reads the output binding, so the source is not bound twice.
-  const outputViews = output === source ? sourceViews : shardsOf(output);
-  execution.dispatch(encoder, outputPipeline,
-    residualTarget === undefined
-      ? [...sourceViews, attended, weights, parameters, ...outputViews, statistics]
-      : [attended, weights, parameters, ...outputViews, statistics],
-    outputGrid[0], outputGrid[1], 1, `${label}.output`);
-  releaseScratch([statistics, means, keys, values, query, attended], output);
+  // The gate and the projection it gates run a window of rows at a time: the
+  // gate's result is as wide as the projection and as long as the MSA, which
+  // is over a gigabyte whole at full depth.
+  const projected = w.heads * headDim;
+  const rows = shape.sequences * shape.length;
+  const gateRows = globalAttentionGateRows(rows, projected,
+    Math.min(scratchBudget(GLOBAL_GATE_TARGET_BYTES), execution.bindingLimitBytes));
+  const gated = execution.allocate(`${label}.gated`, gateRows * projected);
+  const outputViews = shardsOf(output);
+  for (let offset = 0; offset < rows; offset += gateRows) {
+    const count = Math.min(gateRows, rows - offset);
+    const window = uniform(execution, `${label}.gate-window-${offset}`,
+      new Uint32Array([offset, count, 0, 0]));
+    const gateGrid = gemmGrid(count, projected, NARROW_OUTPUT_TILE_COLUMNS);
+    execution.dispatch(encoder, gatePipeline,
+      [...sourceViews, attended, weights, parameters, statistics, gated, window],
+      gateGrid[0], gateGrid[1], 1, `${label}.gate-${offset}`);
+    const outputGrid = gemmGrid(count, shape.cM, NARROW_OUTPUT_TILE_COLUMNS);
+    execution.dispatch(encoder, outputPipeline,
+      [gated, weights, parameters, ...outputViews, window],
+      outputGrid[0], outputGrid[1], 1, `${label}.output-${offset}`);
+  }
+  releaseScratch([statistics, means, keys, values, query, attended, gated], output);
   return output;
 }
 

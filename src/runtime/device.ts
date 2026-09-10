@@ -7,7 +7,7 @@ import {
 import {
   ATTENTION_WINDOW_TARGET_BYTES, attentionBatchWindow, attentionPairBiasStride,
 } from "../evoformer/attention.js";
-import { triangleBlockRows } from "../evoformer/block.js";
+import { GLOBAL_GATE_TARGET_BYTES, globalAttentionGateRows, triangleBlockRows } from "../evoformer/block.js";
 import type { TriangleWholeStorage } from "../triangle/shaders.js";
 import type { ActivationStorage } from "./storage.js";
 import { TRANSITION_CHUNK_TARGET_BYTES, transitionChunkRows } from "../evoformer/transition.js";
@@ -191,6 +191,12 @@ export function estimateMonomerMemory(
     transitionScratch(length * length, 128, 512),
     outerProductScratch(msaSequences, 256, 32),
     outerProductScratch(extraSequences, 64, 32),
+    // Global column attention over the extra alignment keeps its keys, values
+    // and statistics whole and a window of the gated attention values, which
+    // is as wide as the projection and follows the same budget the block does.
+    extraSequences * length * (2 * 8 + 2) * bytes
+    + globalAttentionGateRows(extraSequences * length, 8 * 8,
+      scratchBudget(GLOBAL_GATE_TARGET_BYTES)) * 8 * 8 * bytes,
   );
   // Readbacks, uniforms and allocation padding, none of which scale with the
   // shape, plus headroom for the operator this model does not enumerate.

@@ -133,10 +133,14 @@ const KERNEL_FLOPS: Readonly<Record<string, (shape: EvoformerCostShape) => numbe
     gemm(s.length, s.cM, s.globalHeads * s.globalHeadDim),
   "msa-column-global-attention.flash": (s) =>
     flash(s.length, s.globalHeads, 1, s.sequences, s.globalHeadDim),
-  // The gate is a contraction of the same shape as the projection it gates,
-  // fused into the projection's source. Both halves count.
+  // The gate contracts the input channels into the projection's width, and
+  // the projection contracts that back. They were one kernel until the gate
+  // got a tensor of its own; a profile from before that carries the pair
+  // under the output's label and reads at half the rate for it.
+  "msa-column-global-attention.gate": (s) =>
+    gemm(s.sequences * s.length, s.cM, s.globalHeads * s.globalHeadDim),
   "msa-column-global-attention.output": (s) =>
-    2 * gemm(s.sequences * s.length, s.globalHeads * s.globalHeadDim, s.cM),
+    gemm(s.sequences * s.length, s.globalHeads * s.globalHeadDim, s.cM),
 
   // Transitions, four times the channels wide in the middle.
   "msa-transition.first": (s) => gemm(s.sequences * s.length, s.cM, 4 * s.cM),
