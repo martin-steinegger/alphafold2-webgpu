@@ -235,6 +235,10 @@ fn normalized_input(pair_row: u32, k: u32) -> f32 {
     inner: "CZ",
     columns: "CZ",
     sourceElement: "normalized_input(pair_row_of(row), k)",
+    // Every weight here is stored channel-major, so k runs contiguously and a
+    // lane staging the tile should vary k rather than column. The default is
+    // the other layout, and reading it that way costs bandwidth silently.
+    weightContiguous: "k",
     weightElement: read(precision, "weights[W_LINEARGWEIGHT + column * CZ + k]"),
     store: `gate[row * CZ + column] = logistic(element + ${read(precision, "weights[W_LINEARGBIAS + column]")});`,
   });
@@ -281,6 +285,8 @@ fn normalized_input(pair_row: u32, k: u32) -> f32 {
       inner: "CZ",
       columns: "2u * CH",
       sourceElement: "normalized_input(pair_row_of(row), k)",
+      // Channel-major, as the gate and the output projection are.
+      weightContiguous: "k",
       weightElement: `select(${weight("G")}, ${weight("P")}, (column & 1u) == 0u)`,
       store: "",
       // What the epilogue below does, for the matrix kernel, which has no
@@ -446,6 +452,10 @@ fn normalized_hidden(row: u32, h: u32) -> f32 {
     inner: "CH",
     columns: "CZ",
     sourceElement: "normalized_hidden(row, k)",
+    // Every weight here is stored channel-major, so k runs contiguously and a
+    // lane staging the tile should vary k rather than column. The default is
+    // the other layout, and reading it that way costs bandwidth silently.
+    weightContiguous: "k",
     weightElement: read(precision, "weights[W_LINEARZWEIGHT + column * CH + k]"),
     // A packed pair is written a word at a time, so the four adjacent columns
     // an invocation holds become two words; an unpacked one keeps the scalar
