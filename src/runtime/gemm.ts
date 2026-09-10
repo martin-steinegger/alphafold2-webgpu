@@ -85,12 +85,13 @@ const GEMM_STAGE_STEPS = 1;
  */
 export function matrixGemmStorageBytes(
   unit: MatrixUnitShape, tileColumns = GEMM_TILE_COLUMNS, kStep = unit.K,
+  tileRows = GEMM_TILE_ROWS,
 ): number {
   if (unit.componentType !== "f16") return 0;
   const { M, N, K } = unit;
   const columnTiles = tileColumns / N;
   const columnGroups = columnTiles % 2 === 0 ? 2 : 1;
-  const subgroups = (GEMM_TILE_ROWS / M) * columnGroups;
+  const subgroups = (tileRows / M) * columnGroups;
   // Padded for the instructions rather than for the banks: a tile a matrix
   // load reads wants a row length that is a multiple of eight halves, and one
   // a matrix store writes a multiple of four words. These read plus two and
@@ -102,9 +103,35 @@ export function matrixGemmStorageBytes(
   const outStride = N + 4;
   const reach = (maxOffset: number, stride: number, count: number): number =>
     maxOffset + stride * count;
-  return reach((GEMM_TILE_ROWS - M) * aStride, aStride, M) * 2
+  return reach((tileRows - M) * aStride, aStride, M) * 2
     + reach((columnTiles - 1) * N, bStride, kStep) * 2
     + reach((subgroups - 1) * M * outStride, outStride, M) * 4;
+}
+
+/**
+ * The taller output tile, for a contraction whose weight staging dominates.
+ *
+ * See TiledGemmShader.tileRows for what it buys and what it costs. This
+ * decides whether a device can carry it at all: sixteen subgroups rather than
+ * eight, and 39,648 workgroup bytes rather than 24,288, both of which the
+ * WebGPU baseline refuses and this host grants.
+ */
+export const TALL_GEMM_TILE_ROWS = 128;
+
+export function tallGemmTileRows(limits: GPUSupportedLimits): number {
+  const variant = gemmVariant();
+  const unit = variant.matrix;
+  // Only the f16 matrix kernel tiles anything but the default, so a device
+  // that does not build it keeps the tile its other kernels are written for.
+  if (variant.precision !== "matrix" || unit === undefined || unit.componentType !== "f16") {
+    return GEMM_TILE_ROWS;
+  }
+  const columnGroups = (GEMM_TILE_COLUMNS / unit.N) % 2 === 0 ? 2 : 1;
+  const lanes = (TALL_GEMM_TILE_ROWS / unit.M) * columnGroups * MATRIX_LANES;
+  const bytes = matrixGemmStorageBytes(unit, GEMM_TILE_COLUMNS,
+    (variant.matrixDepth ?? 1) * unit.K, TALL_GEMM_TILE_ROWS);
+  return lanes <= limits.maxComputeInvocationsPerWorkgroup
+    && bytes <= limits.maxComputeWorkgroupStorageSize ? TALL_GEMM_TILE_ROWS : GEMM_TILE_ROWS;
 }
 
 /** Apple's configuration, and what a variant naming no shape means. */
@@ -293,6 +320,22 @@ export interface TiledGemmShader {
    */
   readonly sourceContiguous?: "k" | "row";
   readonly weightContiguous?: "column" | "k";
+  /**
+   * Rows of output one workgroup carries, where the default is too few.
+   *
+   * A tall, skinny contraction stages the same weight tile again for every
+   * tile of rows, so a taller tile halves that staging without changing the
+   * arithmetic. Measured on the triangle contraction, which is the model's
+   * largest: 128 rows took it from 91.2 TFLOP/s to 102.3 and a 3,300-residue
+   * recycle from 61220 ms to 59728. It costs workgroup storage and subgroups,
+   * 39,648 B and sixteen against 25,600 B and eight, so the caller asks for it
+   * only where the device grants both.
+   *
+   * Only the f16 matrix kernel honours it. The others refuse anything but the
+   * default rather than tile one way and be dispatched the other, and a caller
+   * asking for it has already settled that this device builds that kernel.
+   */
+  readonly tileRows?: number;
 }
 
 export interface GemmOperandArray {
@@ -324,12 +367,13 @@ export interface GemmOperandArray {
  */
 export function gemmGrid(
   rows: number, columns: number, tileColumns: number = GEMM_TILE_COLUMNS,
+  tileRows: number = GEMM_TILE_ROWS,
 ): readonly [number, number] {
   if (![rows, columns].every((value) => Number.isSafeInteger(value) && value > 0)) {
     throw new RangeError("GEMM dispatch dimensions must be positive safe integers");
   }
   const columnTiles = Math.ceil(columns / tileColumns);
-  const rowTiles = Math.ceil(rows / GEMM_TILE_ROWS);
+  const rowTiles = Math.ceil(rows / tileRows);
   const folds = Math.ceil(rowTiles / GEMM_GRID_LIMIT);
   return [columnTiles * folds, Math.min(rowTiles, GEMM_GRID_LIMIT)];
 }
@@ -341,11 +385,11 @@ export function gemmGrid(
  * rows, as it reads. With more, the folds ride in the high part of group.x,
  * which costs a division of a value the whole workgroup shares.
  */
-const tileOrigins = (tileColumns: number): string => `  let gemm_column_tiles =
+const tileOrigins = (tileColumns: number, tileRows: number): string => `  let gemm_column_tiles =
     (gemm_columns + ${tileColumns - 1}u) / ${tileColumns}u;
   let tile_column_origin = (group.x % gemm_column_tiles) * ${tileColumns}u;
   let tile_row_origin = (group.y + (group.x / gemm_column_tiles) * ${GEMM_GRID_LIMIT}u)
-    * ${GEMM_TILE_ROWS}u;`;
+    * ${tileRows}u;`;
 
 /** Whether this shader and this variant can use the hardware matrix units. */
 export function usesMatrixUnits(shader: TiledGemmShader, variant: GemmVariant): boolean {
@@ -442,13 +486,14 @@ function createMatrixGemmShaderF16(
   if (kStep % K !== 0) throw new RangeError("the staged depth must be whole units");
   const steps = kStep / K;
   const tileColumns = shader.tileColumns ?? GEMM_TILE_COLUMNS;
-  const rowGroups = GEMM_TILE_ROWS / M;
+  const tileRows = shader.tileRows ?? GEMM_TILE_ROWS;
+  const rowGroups = tileRows / M;
   const columnTiles = tileColumns / N;
   if (!Number.isInteger(rowGroups) || !Number.isInteger(columnTiles)) {
-    throw new RangeError(`a ${M}x${N} unit does not tile a ${GEMM_TILE_ROWS}x${tileColumns} output`);
+    throw new RangeError(`a ${M}x${N} unit does not tile a ${tileRows}x${tileColumns} output`);
   }
-  // Subgroups are laid out across the columns as well as down the rows, so a
-  // 64x128 tile is carried by 256 lanes rather than 128. The staging is what
+  // Subgroups are laid out across the columns as well as down the rows, so the
+  // default 64x128 tile is carried by 256 lanes rather than 128. The staging is what
   // wanted them — three thousand operand elements a step is the kernel's cost,
   // not the multiplies — and it halves the accumulators each subgroup holds.
   // Two, measured: one leaves 128 lanes staging three thousand elements a
@@ -472,16 +517,16 @@ function createMatrixGemmShaderF16(
   // own rule however valid every index in it is.
   const reach = (maxOffset: number, stride: number, count: number): number =>
     maxOffset + stride * count;
-  const aLength = reach((GEMM_TILE_ROWS - M) * aStride, aStride, M);
+  const aLength = reach((tileRows - M) * aStride, aStride, M);
   const bLength = reach((columnTiles - 1) * N, bStride, kStep);
   const outLength = reach((subgroups - 1) * M * outStride, outStride, M);
   const lines = (count: number, body: (index: number) => string): string =>
     Array.from({ length: count }, (_, index) => body(index)).join(String.fromCharCode(10));
   // Each lane carries a fixed share of both staged tiles between steps.
-  if ((GEMM_TILE_ROWS * kStep) % lanes !== 0 || (kStep * tileColumns) % lanes !== 0) {
+  if ((tileRows * kStep) % lanes !== 0 || (kStep * tileColumns) % lanes !== 0) {
     throw new RangeError("the staged tiles must divide evenly among the lanes");
   }
-  const aPerLane = (GEMM_TILE_ROWS * kStep) / lanes;
+  const aPerLane = (tileRows * kStep) / lanes;
   const bPerLane = (kStep * tileColumns) / lanes;
   // The operands come from the caller's own element expressions, which name
   // row and k for the source and k and column for the weight. They are
@@ -491,15 +536,15 @@ function createMatrixGemmShaderF16(
   // The staged slot is [row][k] however the fetch walked it, so the write
   // index has to be derived the same way the fetch was.
   const stagedA = (offset: number): string => rowFirst
-    ? `((lane + ${offset}u) % ${GEMM_TILE_ROWS}u) * ${aStride}u + (lane + ${offset}u) / ${GEMM_TILE_ROWS}u`
+    ? `((lane + ${offset}u) % ${tileRows}u) * ${aStride}u + (lane + ${offset}u) / ${tileRows}u`
     : `((lane + ${offset}u) / ${kStep}u) * ${aStride}u + (lane + ${offset}u) % ${kStep}u`;
   // A tile wholly inside the operand needs no test at all. The condition is
   // uniform across the workgroup, so the whole of it takes one branch, and
   // only the last tile of a row or of the contraction takes the checked one.
   const fetchA = (at: string, whole: boolean): string => lines(aPerLane, (i) => `  {
     let item = lane + ${i * lanes}u;
-    let row = tile_row_origin + item ${rowFirst ? `% ${GEMM_TILE_ROWS}u` : `/ ${kStep}u`};
-    let k = ${at} + item ${rowFirst ? `/ ${GEMM_TILE_ROWS}u` : `% ${kStep}u`};
+    let row = tile_row_origin + item ${rowFirst ? `% ${tileRows}u` : `/ ${kStep}u`};
+    let k = ${at} + item ${rowFirst ? `/ ${tileRows}u` : `% ${kStep}u`};
     ${whole ? `next_a_${i} = ${shader.sourceElement};` : `var held = 0.0;
     if (row < gemm_rows && k < gemm_inner) { held = ${shader.sourceElement}; }
     next_a_${i} = held;`}
@@ -569,7 +614,7 @@ fn main(
   let in_subgroup = lane % ${MATRIX_LANES}u;
   let rows_at = (subgroup / ${columnGroups}u) * ${M}u;
   let columns_at = (subgroup % ${columnGroups}u) * ${groupTiles * N}u;
-${tileOrigins(tileColumns)}
+${tileOrigins(tileColumns, tileRows)}
 ${lines(groupTiles, (c) => `  var acc_${c} = ${m.zero("f32", N, M)};`)}
 
   // Software pipelined: the operands for the next step are fetched into
@@ -579,7 +624,7 @@ ${lines(groupTiles, (c) => `  var acc_${c} = ${m.zero("f32", N, M)};`)}
 ${lines(aPerLane, (i) => `  var next_a_${i} = 0.0;`)}
 ${lines(bPerLane, (i) => `  var next_b_${i} = 0.0;`)}
   // Whole in the operands' other index; the contraction is tested per step.
-  let whole_tile = tile_row_origin + ${GEMM_TILE_ROWS}u <= gemm_rows
+  let whole_tile = tile_row_origin + ${tileRows}u <= gemm_rows
     && tile_column_origin + ${tileColumns}u <= gemm_columns;
   if (whole_tile && ${kStep}u <= gemm_inner) {
 ${fetchA("0u", true)}
@@ -701,7 +746,7 @@ fn main(
   let gemm_inner = ${shader.inner};
   let gemm_columns = ${shader.columns};
   let lane = local.x;
-${tileOrigins(tileColumns)}
+${tileOrigins(tileColumns, GEMM_TILE_ROWS)}
   // Uniform: every invocation of the workgroup takes the same branch.
   if (gemm_rows >= ${region}u) {
     for (var row_block = 0u; row_block < ${rowBlocks}u; row_block += 1u) {
@@ -794,6 +839,10 @@ export function createTiledGemmShader(
   // one is a RangeError rather than a silent f32 kernel.
   spelling?: MatrixSpelling,
 ): string {
+  if (shader.tileRows !== undefined && shader.tileRows !== GEMM_TILE_ROWS
+    && !(usesMatrixUnits(shader, variant) && variant.matrix?.componentType === "f16")) {
+    throw new RangeError(`only the f16 matrix kernel tiles ${shader.tileRows} rows`);
+  }
   if (usesMatrixUnits(shader, variant)) {
     const m = spelling ?? lastCalibratedMatrix();
     if (m === undefined) {
@@ -867,7 +916,7 @@ fn main(
   let thread = local.x;
   let column_thread = thread % ${columnThreads}u;
   let row_thread = thread / ${columnThreads}u;
-${tileOrigins(tileColumns)}
+${tileOrigins(tileColumns, GEMM_TILE_ROWS)}
   let row_origin = tile_row_origin + row_thread * ${rowsPerThread}u;
   let column_origin = tile_column_origin;
   let tile_column = column_origin + column_thread * 4u;

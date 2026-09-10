@@ -24,7 +24,9 @@ import {
 import { attentionFlashKernelForShape } from "./attention-calibration.js";
 import { calibrateAttentionShape } from "../runtime/attention-queries.js";
 import { timed } from "../runtime/phase-ledger.js";
-import { createTiledGemmShader, GEMM_TILE_COLUMNS, GEMM_TILE_ROWS, gemmGrid } from "../runtime/gemm.js";
+import {
+  createTiledGemmShader, GEMM_TILE_COLUMNS, GEMM_TILE_ROWS, gemmGrid, tallGemmTileRows,
+} from "../runtime/gemm.js";
 import { rowNormalizeLayout } from "../runtime/reduction.js";
 import { releaseScratch } from "./execution-scratch.js";
 import {
@@ -1382,20 +1384,26 @@ function triangleSetup(
       + `Its ${(execution.bindingLimitBytes / 1024 ** 2).toFixed(0)} MiB binding limit is what forces the `
       + "windows: a shorter sequence, or a device that binds more of a buffer at once, will run.");
   }
+  // The contraction is the one GEMM whose weight tile is the whole operand, so
+  // it is the one that pays for a taller tile of rows. Settled here rather
+  // than in the shader builder because only the device knows whether it can be
+  // carried at all, and it names both the source and the grid.
+  const contractTileRows = tallGemmTileRows(execution.device.limits);
   const pipelineKey = `block:triangle:${direction}:${input.length}:${input.cZ}`
     + `:${input.triangleHidden}:${blockRows}:${wholeStorage}:${pairStorage}:${pairShards.count}`
-    + `:${wholeShards.count}:${pairWindow}`;
+    + `:${wholeShards.count}:${pairWindow}:${contractTileRows}`;
   // The offsets belong to the packing, so they join the key: a bundle packed
   // differently must not be handed another one's sources.
   // Length and blockRows are overrides now, so they name a pipeline but not a
   // source; the shader key keeps only what the source really varies with.
   const shaderKey = `${direction}:${input.cZ}:${input.triangleHidden}:${wholeStorage}`
     + `:${pairStorage}:${pairShards.count}:${wholeShards.count}:${residual}:${pairWindow}`
-    + `:${JSON.stringify(packed.offsets)}`;
+    + `:${contractTileRows}:${JSON.stringify(packed.offsets)}`;
   let shaders = TRIANGLE_SHADERS.get(shaderKey);
   if (shaders === undefined) {
     shaders = createTriangleShaders(shape, "f32", packed.offsets, 1e-5, direction, blockRows,
-      wholeStorage, pairStorage, residual, pairShards, wholeShards, pairWindow);
+      wholeStorage, pairStorage, residual, pairShards, wholeShards, pairWindow,
+      undefined, contractTileRows);
     TRIANGLE_SHADERS.set(shaderKey, shaders);
   }
   // The sources no longer carry the length, so the shader cache key must not
@@ -1412,7 +1420,7 @@ function triangleSetup(
   ];
   return {
     packed, blockRows, wholeStorage, pairStorage, pairShards, wholeShards, pairWindow,
-    pairChunks, wholeStride, requests, overrides,
+    pairChunks, wholeStride, contractTileRows, requests, overrides,
   };
 }
 
@@ -1498,7 +1506,7 @@ async function encodeTriangleMultiplication(
 ): Promise<GpuTensor> {
   const {
     packed, blockRows, wholeStorage, pairStorage, pairShards, wholeShards, pairWindow, pairChunks,
-    wholeStride, requests, overrides,
+    wholeStride, contractTileRows, requests, overrides,
   } = triangleSetup(execution, input, weightsValue, direction, residualTarget !== undefined);
   // Indexed rather than destructured: requests is the one place the order is
   // written down, and a tuple type restated here would be a second one.
@@ -1632,7 +1640,9 @@ async function encodeTriangleMultiplication(
       `triangle.${direction}.flush-${block.offset}`);
     const rows = block.count * input.length;
     project(projectBlockOperand, [blockedProjection], block, "project-block", blockWindowed, true);
-    const contractGrid = gemmGrid(block.count, input.length);
+    // The tile the contraction was generated with, or a grid narrower than the
+    // shader leaves output rows unwritten.
+    const contractGrid = gemmGrid(block.count, input.length, GEMM_TILE_COLUMNS, contractTileRows);
     for (const group of channelGroups) {
       execution.dispatch(encoder, contract,
         [blockedProjection, group.view, contracted, block.uniform, group.uniform],

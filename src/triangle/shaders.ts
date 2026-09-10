@@ -167,6 +167,17 @@ export function createTriangleShaders(
   pairWindow = false,
 
   spelling?: MatrixSpelling,
+
+  /**
+   * Output rows one workgroup of the contraction carries.
+   *
+   * The contraction is the model's largest GEMM and its weight tile is the
+   * whole operand, staged again for every tile of rows, so a taller tile is
+   * worth more here than anywhere else. The caller decides, because only a
+   * device that grants the subgroups and the workgroup storage can run it:
+   * see tallGemmTileRows.
+   */
+  contractTileRows: number = GEMM_TILE_ROWS,
 ): TriangleShaders {
   if (pairStorage === "f16" && precision !== "f32") {
     throw new RangeError("a packed pair needs f32 weight precision: both would claim the same halves of a word");
@@ -468,6 +479,7 @@ ${shardLoader(WHOLE_OPERAND_UNSHARDED, "whole", packedWhole ? "f16" : "f32")}`,
     // along memory rather than across it.
     sourceContiguous: outgoing ? "k" : "row",
     weightContiguous: outgoing ? "k" : "column",
+    tileRows: contractTileRows,
     // The block's output entries are enumerated like its operand: by pair row
     // (i, j) outgoing, by (i, block column j) incoming.
     store: outgoing
