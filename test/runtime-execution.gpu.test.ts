@@ -48,4 +48,37 @@ describe.skipIf(!enabled)("WebGPU bounded buffer reuse", () => {
       execution.release();
     }
   });
+
+  it("makes a bind group once for what it binds, and again for a different range", async () => {
+    // A stack's blocks bind the same pooled buffers over and over; a new bind
+    // group for each dispatch was 70% of them repeated, and each one costs the
+    // host time Dawn and a browser charge for.
+    const execution = new WebGpuExecution(device);
+    const createBindGroup = device.createBindGroup.bind(device);
+    let made = 0;
+    device.createBindGroup = (descriptor) => { made += 1; return createBindGroup(descriptor); };
+    try {
+      const base = execution.upload("base", new Float32Array([1, 2, 3, 4]),
+        GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST);
+      const update = execution.upload("update", new Float32Array([1, 1, 1, 1]));
+      const half = { ...update, elements: 2 };
+      const halfBase = { ...base, elements: 2 };
+      const encoder = device.createCommandEncoder();
+      device.pushErrorScope("validation");
+      await execution.addInPlace(encoder, base, update, "cache.add");
+      await execution.addInPlace(encoder, base, update, "cache.add");
+      await execution.addInPlace(encoder, halfBase, half, "cache.add-half");
+      execution.endComputePass(encoder);
+      const readback = execution.createReadback("cache.readback", base, encoder);
+      device.queue.submit([encoder.finish()]);
+      const validationError = await device.popErrorScope();
+      if (validationError !== null) throw new Error(validationError.message);
+
+      expect(made).toBe(2);
+      expect(Array.from(await execution.mapFloat32(readback))).toEqual([4, 5, 5, 6]);
+    } finally {
+      device.createBindGroup = createBindGroup;
+      execution.release();
+    }
+  });
 });

@@ -135,6 +135,21 @@ export interface WebGpuExecutionOptions {
   readonly bindingReportBytes?: number;
 }
 
+/** Bind groups an execution keeps before it drops them all: about eight recycles at 59 residues. */
+const BIND_GROUP_CACHE_LIMIT = 8192;
+
+/** An identity for each buffer, so a bind group can be looked up by what it binds. */
+const bufferIds = new WeakMap<GPUBuffer, number>();
+let nextBufferId = 0;
+function bufferId(buffer: GPUBuffer): number {
+  let id = bufferIds.get(buffer);
+  if (id === undefined) {
+    id = nextBufferId++;
+    bufferIds.set(buffer, id);
+  }
+  return id;
+}
+
 export class WebGpuExecution {
   readonly device: GPUDevice;
   readonly allocator: GpuBufferAllocator;
@@ -149,6 +164,21 @@ export class WebGpuExecution {
   #encoderHolder: { encoder: GPUCommandEncoder } | undefined;
   #activeEncoder: GPUCommandEncoder | undefined;
   #activePass: GPUComputePassEncoder | undefined;
+  /**
+   * Bind groups by pipeline and by the buffers, offsets and sizes they bind.
+   *
+   * Every dispatch made a new one, 5,157 a recycle at 59 residues, and 70% of
+   * them bound exactly what one made earlier in the same stack did: the 48
+   * main blocks bind the same buffers and differ only in their uniforms. Dawn
+   * spent 9 us on each and wgpu 3.7, and a browser pays a trip to its GPU
+   * process for each. The hits come from the pool: a block's scratch goes
+   * back to it and the next block is handed the same buffers. A hit needs the
+   * same buffer object, so a destroyed one is never served from here, only
+   * held; the cache is dropped with the execution, or once it grows past
+   * BIND_GROUP_CACHE_LIMIT, which a long multimer run would otherwise reach.
+   */
+  readonly #bindGroups = new Map<GPUComputePipeline, Map<string, GPUBindGroup>>();
+  #cachedBindGroups = 0;
 
   constructor(device: GPUDevice, options: WebGpuExecutionOptions = {}) {
     this.device = device;
@@ -333,14 +363,32 @@ export class WebGpuExecution {
       this.#recordOversizedBindings(tensors, label);
     }
     pass.setPipeline(pipeline);
-    pass.setBindGroup(0, this.device.createBindGroup({
-      layout: pipeline.getBindGroupLayout(0),
-      entries: tensors.map((tensor, binding) => ({ binding, resource: {
-        buffer: tensor.allocation.buffer,
-        offset: (tensor.offsetElements ?? 0) * 4,
-        size: tensor.elements * 4,
-      } })),
-    }));
+    let bindGroups = this.#bindGroups.get(pipeline);
+    if (bindGroups === undefined) {
+      bindGroups = new Map();
+      this.#bindGroups.set(pipeline, bindGroups);
+    }
+    const key = tensors.map((tensor) => `${bufferId(tensor.allocation.buffer)}:`
+      + `${tensor.offsetElements ?? 0}:${tensor.elements}`).join(",");
+    let bindGroup = bindGroups.get(key);
+    if (bindGroup === undefined) {
+      bindGroup = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: tensors.map((tensor, binding) => ({ binding, resource: {
+          buffer: tensor.allocation.buffer,
+          offset: (tensor.offsetElements ?? 0) * 4,
+          size: tensor.elements * 4,
+        } })),
+      });
+      if (++this.#cachedBindGroups > BIND_GROUP_CACHE_LIMIT) {
+        this.#bindGroups.clear();
+        this.#cachedBindGroups = 1;
+        bindGroups = new Map();
+        this.#bindGroups.set(pipeline, bindGroups);
+      }
+      bindGroups.set(key, bindGroup);
+    }
+    pass.setBindGroup(0, bindGroup);
     pass.dispatchWorkgroups(x, y, z);
     if (reusable) {
       if (label !== undefined) pass.popDebugGroup();
@@ -499,6 +547,8 @@ export class WebGpuExecution {
   }
 
   release(): void {
+    this.#bindGroups.clear();
+    this.#cachedBindGroups = 0;
     this.releaseSince(0);
     this.allocator.destroyPooled();
   }
