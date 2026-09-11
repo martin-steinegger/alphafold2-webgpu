@@ -92,7 +92,15 @@ const read = (precision: Precision, expression: string): string =>
 export function triangleOverrides(
   shape: TriangleShape, blockRows = shape.length,
 ): Record<string, number> {
-  return { L: shape.length, WHOLE_STRIDE: wholeProjectionStride(shape.length), BLOCK_ROWS: blockRows };
+  // PAIRS and BLOCK_PAIRS are given too, although their initializers say how
+  // to derive them. Safari 26 cannot evaluate an override's initializer when it
+  // names other overrides, and fails the pipeline with "Failed to evaluate
+  // override value". The pipeline cache passes each kernel only the ones it uses.
+  return {
+    L: shape.length, PAIRS: shape.length * shape.length,
+    WHOLE_STRIDE: wholeProjectionStride(shape.length),
+    BLOCK_ROWS: blockRows, BLOCK_PAIRS: blockRows * shape.length,
+  };
 }
 
 /**

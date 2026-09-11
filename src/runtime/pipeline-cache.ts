@@ -1,8 +1,38 @@
 import { timedSync } from "./phase-ledger.js";
+
+const OVERRIDE = /^\s*override\s+(\w+)\s*(?::\s*\w+)?\s*(?:=\s*([^;]*))?;/gm;
+
+/**
+ * The overrides a WGSL source uses, so a pipeline is given only those.
+ *
+ * WebGPU lets a pipeline supply a value for an override its entry point does
+ * not use, and Dawn and naga ignore it. Safari 26 does not: WebKit's
+ * createLibrary fails the pipeline, with only "Compute library failed
+ * creation" to say so, for any constant the entry point does not use. The
+ * triangle kernels share one preamble of five overrides and each uses some of
+ * them, which failed every prediction in Safari from d66fc10 on.
+ *
+ * An override is used when its name is anywhere in the source outside the
+ * override declarations, or in the initializer of one that is used. This keeps
+ * too many rather than too few: an override that is used but dropped would
+ * take its default, which is a wrong answer where a kept unused one is only a
+ * failure in Safari.
+ */
+export function usedOverrides(source: string): ReadonlySet<string> {
+  const code = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+  const initializers = new Map([...code.matchAll(OVERRIDE)].map((match) => [match[1]!, match[2] ?? ""]));
+  const words = (text: string): string[] => text.match(/\b\w+\b/g) ?? [];
+  const used = new Set(words(code.replace(OVERRIDE, "")).filter((word) => initializers.has(word)));
+  for (const name of used) {
+    for (const word of words(initializers.get(name)!)) if (initializers.has(word)) used.add(word);
+  }
+  return used;
+}
+
 export class ComputePipelineCache {
   readonly device: GPUDevice;
   /** Modules by source, so an override-only difference costs no compile. */
-  readonly #modules = new Map<string, GPUShaderModule>();
+  readonly #modules = new Map<string, { module: GPUShaderModule; overrides: ReadonlySet<string> }>();
   readonly #pipelines = new Map<string, {
     readonly code: string;
     readonly entryPoint: string;
@@ -47,12 +77,16 @@ export class ComputePipelineCache {
       return cached.pipeline;
     }
     const source = timedSync("shader source", () => typeof code === "string" ? code : code());
-    let module = this.#modules.get(source);
-    if (module === undefined) {
-      module = timedSync("shader module", () =>
-        this.device.createShaderModule({ label: `${key}.wgsl`, code: source }));
-      this.#modules.set(source, module);
+    let compiled = this.#modules.get(source);
+    if (compiled === undefined) {
+      compiled = timedSync("shader module", () => ({
+        module: this.device.createShaderModule({ label: `${key}.wgsl`, code: source }),
+        overrides: usedOverrides(source),
+      }));
+      this.#modules.set(source, compiled);
     }
+    const { module, overrides } = compiled;
+    const given = Object.entries(constants ?? {}).filter(([name]) => overrides.has(name));
     // A failure names the pipeline and is not kept. WebKit reports a shader it
     // cannot compile as "Compute library failed creation" and nothing else,
     // which says neither which of ninety kernels it was nor why; and a device
@@ -61,7 +95,7 @@ export class ComputePipelineCache {
     const pipeline = this.device.createComputePipelineAsync({
       label: key,
       layout: "auto",
-      compute: { module, entryPoint, ...(constants === undefined ? {} : { constants }) },
+      compute: { module, entryPoint, ...(given.length === 0 ? {} : { constants: Object.fromEntries(given) }) },
     }).catch(async (error: unknown) => {
       this.#pipelines.delete(key);
       const messages = (await module.getCompilationInfo().catch(() => undefined))?.messages
