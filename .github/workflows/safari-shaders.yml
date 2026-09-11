@@ -1,0 +1,128 @@
+name: Safari shader compile
+
+# Safari compiles WGSL with WebKit's own compiler and rules Dawn and naga do
+# not share, and it reports a rejected pipeline only as "Compute library failed
+# creation". This records every pipeline the page builds and replays each one
+# through that compiler, built from the WebKit tag the shipping Safari uses.
+# See tools/record-safari-pipelines.ts and tools/safari/.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "tools/record-safari-pipelines.ts"
+      - "tools/safari/**"
+      - "test.a3m"
+      - "package-lock.json"
+      - ".github/workflows/safari-shaders.yml"
+  pull_request:
+    paths:
+      - "src/**"
+      - "tools/record-safari-pipelines.ts"
+      - "tools/safari/**"
+      - "test.a3m"
+      - "package-lock.json"
+      - ".github/workflows/safari-shaders.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: safari-shaders-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Safari 26.5 (21624.2.5.11.4). To follow a newer Safari, take the build from
+  # "About Safari", drop its first digit, and prefix WebKit-.
+  WEBKIT_TAG: WebKit-7624.2.5.11.4
+
+jobs:
+  # WebKit's WGSL compiler with the replay tool, built once a tag and cached.
+  compiler:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - id: cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/wgslreplay
+          key: wgslreplay-${{ env.WEBKIT_TAG }}-${{ hashFiles('tools/safari/**') }}
+      - if: steps.cache.outputs.cache-hit != 'true'
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: tools/safari/environment.yml
+      - if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash -el {0}
+        run: tools/safari/build-wgslreplay.sh "$WEBKIT_TAG" "$RUNNER_TEMP/webkit" "$RUNNER_TEMP/wgslreplay"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wgslreplay
+          path: ${{ runner.temp }}/wgslreplay
+
+  # The page's pipelines, once for each projection variant a device without
+  # matrix units can calibrate to, since Safari picks its own.
+  record:
+    strategy:
+      fail-fast: false
+      matrix:
+        gemm: ["f32:8", "f32:16", "f16-chunked:8", "f16-chunked:16", "f16-mixed:8", "f16-mixed:16"]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      # No GPU on a hosted runner, so Mesa's software Vulkan stands in. The
+      # recorder hides everything Safari does not report, so what lavapipe has
+      # beyond that does not matter.
+      - name: Install a software Vulkan driver
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers
+          echo "VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json" >> "$GITHUB_ENV"
+          echo "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json" >> "$GITHUB_ENV"
+
+      # The bundle the page serves.
+      - name: Download the q8 model-1 PTM bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download model1-ptm-q8-v2 --pattern afwebgpu-model1-ptm-q8-v2.tar.gz --dir "$RUNNER_TEMP"
+          tar -xzf "$RUNNER_TEMP/afwebgpu-model1-ptm-q8-v2.tar.gz" -C "$RUNNER_TEMP"
+
+      - name: Record the pipelines
+        env:
+          AFWEBGPU_MANIFEST: ${{ runner.temp }}/model/manifest.json
+          GEMM: ${{ matrix.gemm }}
+        run: npx tsx tools/record-safari-pipelines.ts test.a3m "$RUNNER_TEMP/recording/${GEMM/:/-}" --gemm "$GEMM"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: recording-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/recording
+
+  replay:
+    needs: [compiler, record]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: wgslreplay
+          path: ${{ runner.temp }}/wgslreplay
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: recording-*
+          path: ${{ runner.temp }}/recordings
+          merge-multiple: true
+      # An artifact does not keep the executable bit.
+      - run: chmod +x "$RUNNER_TEMP/wgslreplay/bin/wgslreplay"
+      - name: Replay every pipeline through Safari's compiler
+        run: tools/safari/replay.sh "$RUNNER_TEMP/wgslreplay" "$RUNNER_TEMP"/recordings/*

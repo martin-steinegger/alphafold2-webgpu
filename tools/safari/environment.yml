@@ -1,0 +1,18 @@
+# Everything tools/safari/build-wgslreplay.sh needs to build WebKit's WGSL
+# compiler on Linux. clang, because the Safari 26 branch does not compile with
+# GCC; GCC 14 still, for its libstdc++; CMake 3, because CMake 4 cannot
+# configure that branch.
+name: wgslreplay
+channels: [conda-forge]
+dependencies:
+  - clangxx=20
+  - compiler-rt
+  - lld
+  - gxx_linux-64=14
+  - gcc_linux-64=14
+  - icu>=73
+  - cmake=3.31
+  - ninja
+  - ruby
+  - perl
+  - python
