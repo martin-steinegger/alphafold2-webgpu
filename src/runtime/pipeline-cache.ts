@@ -53,10 +53,21 @@ export class ComputePipelineCache {
         this.device.createShaderModule({ label: `${key}.wgsl`, code: source }));
       this.#modules.set(source, module);
     }
+    // A failure names the pipeline and is not kept. WebKit reports a shader it
+    // cannot compile as "Compute library failed creation" and nothing else,
+    // which says neither which of ninety kernels it was nor why; and a device
+    // held across predictions would otherwise hand the same rejected promise
+    // to every later one, so one bad compile fails the page until it reloads.
     const pipeline = this.device.createComputePipelineAsync({
       label: key,
       layout: "auto",
       compute: { module, entryPoint, ...(constants === undefined ? {} : { constants }) },
+    }).catch(async (error: unknown) => {
+      this.#pipelines.delete(key);
+      const messages = (await module.getCompilationInfo().catch(() => undefined))?.messages
+        .map((message) => `${message.type} at ${message.lineNum}:${message.linePos}: ${message.message}`) ?? [];
+      throw new Error(`Pipeline ${key} failed: ${error instanceof Error ? error.message : String(error)}`
+        + (messages.length === 0 ? "" : ` (${messages.join("; ")})`), { cause: error });
     });
     this.#pipelines.set(key, { code: source, entryPoint, pipeline });
     return pipeline;
