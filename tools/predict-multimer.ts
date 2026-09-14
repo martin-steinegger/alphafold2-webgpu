@@ -8,6 +8,7 @@ import { create, globals } from "webgpu";
 import { dawnInstanceFlags, fitScratchBudgetScale, scratchBudgetScalesFor } from "../src/runtime/dawn.js";
 import { nativeMemoryBudgetBytes, selectGpu } from "./native-device.js";
 import { AlphaFoldMultimerGpu } from "../src/model/multimer.js";
+import { interfaceMaxima } from "../src/heads/interface-scores.js";
 import { EXACT_STORAGE } from "../src/model/monomer.js";
 import {
   iterateMultimerA3mFeatures, iterateMultimerQueryOnlyFeatures,
@@ -94,8 +95,13 @@ const prediction = await new AlphaFoldMultimerGpu(device, storage).predict(featu
       prediction.final.confidence.plddt, chains.map((chain) => chain.length)));
     console.error(`wrote ${pdbOut}`);
   }
+  // The better direction of each interface, as ColabFold reports them.
+  const interfaces = prediction.final.confidence.interfaces;
   console.log(JSON.stringify({
     length, chains: chains.map((chain) => chain.length), recycles,
+    ...(interfaces === undefined ? {} : {
+      ipsae: interfaceMaxima(interfaces.ipsae), pdockq2: interfaceMaxima(interfaces.pdockq2),
+    }),
     millisecondsPerRecycle: Math.round(prediction.elapsedMilliseconds / recycles),
     peakConcurrentMiB: Math.round(prediction.memory.peakBytes / 1024 ** 2),
     peakResidentMiB: Math.round(prediction.memory.combinedPeakResidentBytes / 1024 ** 2),

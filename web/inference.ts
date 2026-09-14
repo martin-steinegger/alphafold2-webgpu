@@ -12,6 +12,7 @@ import {
 import {
   AlphaFoldMultimerGpu, type MultimerPrediction, type MultimerRecycleSummary,
 } from "../src/model/multimer.js";
+import { interfaceMaxima, type InterfaceScores } from "../src/heads/interface-scores.js";
 import { iterateA3mFeatures, type RecycleFeatureSource } from "../src/input/a3m-features.js";
 import { prepareTemplate, withTemplate } from "../src/input/template.js";
 import {
@@ -399,5 +400,13 @@ export async function runInference(job: InferenceJob, reporter: InferenceReporte
   reporter.stage("inference", "done", formatSeconds(prediction.elapsedMilliseconds));
   reporter.log(`Measured allocator peak: ${formatMib(prediction.memory.combinedPeakResidentBytes)} combined resident `
     + `(${formatMib(prediction.memory.mainPeakResidentBytes)} trunk).`);
+  // The interface scores read the final coordinates, so they belong here rather
+  // than beside a recycle. ColabFold prints the same two, in the same order.
+  const interfaces = (prediction.final.confidence as { readonly interfaces?: InterfaceScores }).interfaces;
+  if (interfaces !== undefined) {
+    const report = (scores: Readonly<Record<string, number>>): string => Object.entries(interfaceMaxima(scores))
+      .map(([name, value]) => `${name}:${value.toFixed(3)}`).join(",");
+    reporter.log(`ipSAE=${report(interfaces.ipsae)} pDockQ2=${report(interfaces.pdockq2)}`);
+  }
   return { prediction, modelLoadMilliseconds, adapterName };
 }

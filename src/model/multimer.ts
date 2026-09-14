@@ -19,12 +19,15 @@ import type { RecycleFeatureSource } from "../input/a3m-features.js";
 import {
   multimerRankingConfidence, predictedInterfaceTmScoreFromExpected,
 } from "../heads/confidence.js";
+import { interfaceScores, type InterfaceScores } from "../heads/interface-scores.js";
 
 export type MultimerModelWeights = MultimerCompatibleModelWeights;
 
 export interface MultimerConfidenceResult extends PredictionConfidenceResult {
   readonly iptm: number;
   readonly rankingConfidence: number;
+  /** Of the final structure, whose coordinates they read; absent for one chain. */
+  readonly interfaces?: InterfaceScores;
 }
 
 export interface MultimerRecycleResult extends Omit<MonomerRecycleResult, "confidence"> {
@@ -98,9 +101,10 @@ export class AlphaFoldMultimerGpu {
   ): Promise<MultimerPrediction> {
     if (featuresByRecycle.length === 0) throw new RangeError("at least one multimer feature set is required");
     const mappedDuringRun: MultimerRecycleSummary[] = [];
+    let asymId: Float32Array | undefined;
     const prediction = await this.#model.predict(featuresByRecycle, weights, paeBreaks, undefined,
       (result, recycle, features) => {
-      const asymId = features.chainRelative!.asymId;
+      asymId = features.chainRelative!.asymId;
       const mapped = summarizeMultimerDetails(result, asymId);
       mappedDuringRun.push(mapped);
       onRecycle?.(mapped, recycle);
@@ -110,6 +114,13 @@ export class AlphaFoldMultimerGpu {
     }
     const finalSummary = mappedDuringRun.at(-1);
     if (finalSummary === undefined) throw new Error("multimer prediction has no confidence summary");
+    const interfaces = interfaceScores({
+      predictedAlignedError: prediction.final.confidence.predictedAlignedError,
+      plddt: prediction.final.confidence.plddt,
+      asymId: asymId!,
+      atom37: prediction.final.structure.atom37,
+      atom37Mask: prediction.final.structure.atom37Mask,
+    });
     return {
       ...prediction,
       recycles: mappedDuringRun,
@@ -119,6 +130,7 @@ export class AlphaFoldMultimerGpu {
           ...prediction.final.confidence,
           iptm: finalSummary.confidence.iptm,
           rankingConfidence: finalSummary.confidence.rankingConfidence,
+          ...(interfaces === undefined ? {} : { interfaces }),
         },
       },
     };

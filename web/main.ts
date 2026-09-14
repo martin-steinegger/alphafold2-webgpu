@@ -8,6 +8,7 @@ import {
 import type { TensorDownloadProgress } from "../src/reference/http-tensor-store.js";
 import type { MonomerPrediction, MonomerRecycleSummary } from "../src/model/monomer.js";
 import type { MultimerPrediction, MultimerRecycleSummary } from "../src/model/multimer.js";
+import { interfaceMaxima, type InterfaceScores } from "../src/heads/interface-scores.js";
 import {
   clearInferenceCaches, isMemoryFailure, resetInferenceDevice, runInference,
   type InferenceJob, type InferenceOutcome, type InferenceReporter, type InferenceStage, type InferenceStageState,
@@ -532,6 +533,24 @@ function showChainTable(
   }
 }
 
+/** One row an interface: the better direction of each score, as ColabFold reports it. */
+function showInterfaceTable(scores: InterfaceScores | undefined): void {
+  const card = element<HTMLElement>("interface-card");
+  card.hidden = scores === undefined;
+  if (scores === undefined) return;
+  const ipsae = interfaceMaxima(scores.ipsae);
+  const pdockq2 = interfaceMaxima(scores.pdockq2);
+  const body = element<HTMLTableSectionElement>("interface-rows");
+  body.replaceChildren();
+  for (const name of Object.keys(ipsae)) {
+    const row = document.createElement("tr");
+    for (const value of [name, ipsae[name]!.toFixed(3), pdockq2[name]!.toFixed(3)]) {
+      const cell = document.createElement("td"); cell.textContent = value; row.append(cell);
+    }
+    body.append(row);
+  }
+}
+
 /** Everything the archive reports about a run beyond the prediction itself. */
 interface ResultContext {
   readonly sequence: string;
@@ -642,7 +661,7 @@ function showResults(prediction: MonomerPrediction | MultimerPrediction, context
   element<HTMLElement>("plddt-label").textContent = confidenceLabel(confidence.meanPlddt);
   element<HTMLElement>("ptm").textContent = confidence.ptm.toFixed(3);
   const multimerConfidence = confidence as typeof confidence
-    & { readonly iptm?: number; readonly rankingConfidence?: number };
+    & { readonly iptm?: number; readonly rankingConfidence?: number; readonly interfaces?: InterfaceScores };
   element<HTMLElement>("iptm-card").hidden = multimerConfidence.iptm === undefined;
   if (multimerConfidence.iptm !== undefined) element<HTMLElement>("iptm").textContent = multimerConfidence.iptm.toFixed(3);
   // ColabFold ranks complexes by 0.8 ipTM + 0.2 pTM, so a complex shows the
@@ -675,6 +694,7 @@ function showResults(prediction: MonomerPrediction | MultimerPrediction, context
   if (chains.length > 1) updateInterfaceSelection();
   showChainLegend(chains, confidence.plddt);
   showChainTable(chains, confidence.plddt, confidence.predictedAlignedError);
+  showInterfaceTable(multimerConfidence.interfaces);
   // A complex opens coloured by chain, which is what its viewer has to show
   // first; a single chain opens by confidence, where pLDDT is the whole story.
   const coloring = element<HTMLSelectElement>("viewer-color");

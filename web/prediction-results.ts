@@ -1,4 +1,5 @@
 import type { ConfidenceResult } from "../src/heads/confidence.js";
+import type { InterfaceScores } from "../src/heads/interface-scores.js";
 import type { StructureModuleResult } from "../src/structure/module.js";
 
 const RESIDUE_NAMES: Readonly<Record<string, string>> = {
@@ -66,7 +67,9 @@ export function confidenceJson(
   sequence: string,
   confidence: Omit<ConfidenceResult, "lddtLogits" | "paeLogits">,
 ): string {
-  const multimer = confidence as typeof confidence & { readonly iptm?: number; readonly rankingConfidence?: number };
+  const multimer = confidence as typeof confidence & {
+    readonly iptm?: number; readonly rankingConfidence?: number; readonly interfaces?: InterfaceScores;
+  };
   return JSON.stringify({
     sequence,
     plddt: Array.from(confidence.plddt),
@@ -74,6 +77,8 @@ export function confidenceJson(
     ptm: confidence.ptm,
     ...(multimer.iptm === undefined ? {} : { iptm: multimer.iptm }),
     ...(multimer.rankingConfidence === undefined ? {} : { ranking_confidence: multimer.rankingConfidence }),
+    // The same names ColabFold writes into its own scores file.
+    ...(multimer.interfaces ?? {}),
     predicted_aligned_error: Array.from(confidence.predictedAlignedError),
     max_predicted_aligned_error: confidence.maxPredictedAlignedError,
   }, null, 2);

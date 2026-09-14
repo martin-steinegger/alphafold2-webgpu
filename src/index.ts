@@ -90,6 +90,8 @@ export type {
   PredictedLddtWeights,
   ReducedConfidenceOptions, ReducedConfidenceResult,
 } from "./heads/confidence.js";
+export { interfaceMaxima, interfaceScores } from "./heads/interface-scores.js";
+export type { InterfaceScores } from "./heads/interface-scores.js";
 export { parseA3m } from "./input/a3m.js";
 export type { A3mAlignment } from "./input/a3m.js";
 export { parseColabFoldComplexA3m } from "./input/colabfold-complex-a3m.js";
